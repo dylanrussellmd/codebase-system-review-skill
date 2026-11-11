@@ -1,5 +1,5 @@
 -- =====================================================================
--- Code review ledger — schema version 7
+-- Code review ledger — schema version 8
 -- One SQLite file per project: <project root>/.code-review/ledger.sqlite
 -- Every connection must run:  PRAGMA foreign_keys = ON;
 -- Times are UTC ISO-8601 text with milliseconds (strftime('%Y-%m-%dT%H:%M:%fZ','now')); the tr_time_*
@@ -433,6 +433,10 @@ CREATE TABLE finding_locations (
                                             -- truncated = a whole-file excerpt holds only its first 200 lines;
                                             -- not-text = binary or not UTF-8: no excerpt, excerpt_sha256 is of
                                             -- the file's bytes
+  source         TEXT NOT NULL DEFAULT 'commit' CHECK (source IN ('commit','working-tree')),
+                                            -- where the excerpt was read: the commit, or (schema 8) the working
+                                            -- tree of a review that recorded uncommitted changes (is_dirty), since
+                                            -- that is the text its reviewers saw (snapshot saves the patch)
   CHECK (line_end IS NULL OR line_start IS NULL OR line_end >= line_start),
   -- path: relative (no leading / or -), no backslash, no .. segment, no control characters
   CHECK (length(path) > 0 AND path NOT GLOB '/*' AND path NOT GLOB '-*' AND path NOT GLOB '*\*'
@@ -2546,6 +2550,19 @@ JOIN reviews r ON r.id = f.review_id
 LEFT JOIN issues i ON i.id = f.issue_id
 ORDER BY p.code, s.number, r.code, f.point_id;
 
+-- The next code of each coded table (plan step 98): the highest number + 1, zero-padded like the code triggers
+-- require (ISS-0001 ... ; G-01 ...). Write commands take codes from here (ledger.py next-code ISS), never by hand.
+CREATE VIEW v_next_codes AS
+SELECT 'ISS' AS prefix, 'ISS-' || printf('%04d', COALESCE(max(CAST(substr(code, 5) AS INTEGER)), 0) + 1) AS next_code
+FROM issues
+UNION ALL SELECT 'R', 'R-' || printf('%04d', COALESCE(max(CAST(substr(code, 3) AS INTEGER)), 0) + 1) FROM reviews
+UNION ALL SELECT 'P', 'P-' || printf('%04d', COALESCE(max(CAST(substr(code, 3) AS INTEGER)), 0) + 1) FROM plans
+UNION ALL SELECT 'D', 'D-' || printf('%04d', COALESCE(max(CAST(substr(code, 3) AS INTEGER)), 0) + 1) FROM decisions
+UNION ALL SELECT 'GATE', 'GATE-' || printf('%04d', COALESCE(max(CAST(substr(code, 6) AS INTEGER)), 0) + 1) FROM gates
+UNION ALL SELECT 'REQ', 'REQ-' || printf('%04d', COALESCE(max(CAST(substr(code, 5) AS INTEGER)), 0) + 1)
+FROM requirements
+UNION ALL SELECT 'G', 'G-' || printf('%02d', COALESCE(max(CAST(substr(code, 3) AS INTEGER)), 0) + 1) FROM design_goals;
+
 -- Steps still to do (in a plan that is not superseded or abandoned) whose issues are all closed already, e.g. by a
 -- review's check of 'fixed': mark the step done or dropped. Listed by `ledger.py gates`; not a must-be-empty check.
 CREATE VIEW v_stale_steps AS
@@ -2890,6 +2907,8 @@ INSERT INTO enum_labels(enum, value, label, position) VALUES
  ('location_role','primary','Main place',1), ('location_role','also','Also here',2), ('location_role','test','Test',3),
  ('location_role','doc','Documentation',4), ('location_role','config','Configuration',5),
  ('excerpt_status','truncated','First 200 lines only',1), ('excerpt_status','not-text','Not text',2),
+ ('location_source','commit','Read from the commit',1),
+ ('location_source','working-tree','Read from the reviewed working tree',2),
  ('verdict','matches','Matches',1), ('verdict','differs','Differs',2), ('verdict','partly','Partly matches',3),
  ('verdict','missing','Missing',4), ('verdict','untested','Not tested',5),
  ('tested','yes','Tested',1), ('tested','partly','Partly tested',2), ('tested','no','Not tested',3),
@@ -2942,11 +2961,12 @@ INSERT INTO ledger_checks(view, label, tier, position) VALUES
  ('v_closed_without_reason','Issues accepted or declined with no reason recorded','error',78),
  ('v_relation_problems','Related-to pairs stored in both directions','error',80),
  ('v_check_finding_owner','Review checks citing a finding of another issue','error',82);
-INSERT INTO meta(key, value) VALUES ('schema_version','7');
+INSERT INTO meta(key, value) VALUES ('schema_version','8');
 INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger schema'),
   (2, 'url, path, hash and code checks; repositories.allow_outside_root; finding_locations.excerpt_redacted'),
   (3, 'integrity rules: codes, hashes, checks, append-only history, owner actor on gate answers'),
   (4, 'check registry, requirement trace, review agents, metric catalog, domain descriptions, foreign-key indexes'),
   (5, 'one UTC time format; whole-file and not-text references; report, plan narrative and fix-time discoveries'),
   (6, 'lookup tables for the ledger''s words and labels; RESTRICT keys under reviews and findings; metrics.name catalogued'),
-  (7, 'must-be-empty checks for history gaps, matches, off-plan and done-step coverage, closings, relations and checks; steps.no_findings_reason');
+  (7, 'must-be-empty checks for history gaps, matches, off-plan and done-step coverage, closings, relations and checks; steps.no_findings_reason'),
+  (8, 'finding_locations.source (the reviewed text of a dirty working tree); v_next_codes for the write commands');

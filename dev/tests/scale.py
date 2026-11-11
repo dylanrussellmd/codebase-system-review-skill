@@ -8,6 +8,9 @@ build     DIR (missing or empty) becomes a git project of F source files with R 
           then every review tagged so `check` passes. Prints the timing of each write phase.
           Scale 1 = 5 reviews x 2,000 findings (1-3 locations each), about 4,000 issues, a 600-step plan, 200 gates
           (the shape of review R-0005 and plan P-0001). Scale 10 is ten times each count.
+fill-refs Times `ledger.py fill-refs` on N fresh references (lines given, nothing filled) spread over F files of 400
+          lines in one commit: wall time of the command, the time per 1,000 references, and the git processes it
+          started (PERF-V3: python3 dev/tests/scale.py fill-refs --refs 1000,10000).
 baseline  Builds the scales asked for in a temporary folder (or --work) and measures: ledger and dump size and their
           gzip ratio, the size and gzip ratio of the viewer's /api/review and /api/plan payloads, and git object
           growth over five consecutive ledger commits at the first scale. With --reports, the text in the ledger is
@@ -645,6 +648,45 @@ def baseline(scales=(1, 10), reports=None, work=None, ledger_py=None, verbose=Tr
     return rows, raw
 
 
+def fill_refs_timing(refs, files=50, lines=400, ledger_py=None, work=None):
+    """Time `ledger.py fill-refs` (the command, as an agent runs it) on `refs` new references over `files` files of
+    `lines` lines each, in one commit with a permalink template. Returns {"refs", "files", "seconds",
+    "ms_per_1000", "git_processes", "filled_line"}; git processes are counted with a PATH shim."""
+    work = Path(work) if work else Path(tempfile.mkdtemp(prefix="ledger-fillrefs-"))
+    repo = fixtures.ScratchRepo(work / f"proj-{refs}")
+    for i in range(files):
+        repo.write(f"src/f{i:03d}.py", "".join(f"    x_{n} = compute(value, {n})  # file {i}\n"
+                                              for n in range(1, lines + 1)))
+    sha = repo.commit("files")
+    L = fixtures.Ledger(repo, ledger_py=ledger_py) if ledger_py else fixtures.Ledger(repo)
+    try:
+        rep = L.repository("proj", ".", permalink_template=TEMPLATE)
+        rid = L.review("R-0001", commit_sha=sha, repository_id=rep)
+        rnd = random.Random(5)
+        for k in range(refs):
+            fid = L.finding(rid, point_id=f"SPEC-M{k + 1}")
+            a = rnd.randrange(1, lines - 10)
+            L.location(fid, f"src/f{k % files:03d}.py", a, a + rnd.randrange(0, 10))
+        L.commit()
+        shim = work / "shim"
+        shim.mkdir(exist_ok=True)
+        log = work / f"git-calls-{refs}.log"
+        real_git = subprocess.run(["sh", "-c", "command -v git"], capture_output=True, text=True).stdout.strip()
+        (shim / "git").write_text(f'#!/bin/sh\necho "$@" >> "{log}"\nexec "{real_git}" "$@"\n')
+        (shim / "git").chmod(0o755)
+        env = {"PATH": f"{shim}{os.pathsep}{os.environ.get('PATH', '')}"}
+        t0 = time.perf_counter()
+        p = L.run("fill-refs", env=fixtures.git_env(env))
+        took = time.perf_counter() - t0
+        if p.returncode != 0:
+            raise RuntimeError(f"fill-refs failed:\n{p.stdout[-2000:]}\n{p.stderr}")
+        calls = log.read_text().splitlines() if log.exists() else []
+        return {"refs": refs, "files": files, "seconds": round(took, 3), "ms_per_1000": round(took * 1e6 / refs, 1),
+                "git_processes": len(calls), "filled_line": p.stdout.strip().splitlines()[-1]}
+    finally:
+        L.close()
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="scale.py", description="Build large ledgers and measure them.")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -656,6 +698,11 @@ def main(argv=None):
     b.add_argument("--reports", help="folder of *.md reports to take prose from")
     b.add_argument("--ledger", help="ledger.py to use (default: build one from the sources)")
     b.add_argument("--json", help="write timings and counts to this file")
+    fr = sub.add_parser("fill-refs", help="time fill-refs on fresh references (PERF-V3)")
+    fr.add_argument("--refs", default="1000,10000", help="comma-separated reference counts")
+    fr.add_argument("--files", type=int, default=50)
+    fr.add_argument("--ledger")
+    fr.add_argument("--work")
     m = sub.add_parser("baseline", help="build 1x and 10x ledgers and record the baseline measurements")
     m.add_argument("--scales", default="1,10")
     m.add_argument("--reports")
@@ -674,6 +721,10 @@ def main(argv=None):
         c = check(info, a.ledger)
         print(c.stdout, end="")
         return c.returncode
+    if a.cmd == "fill-refs":
+        for n in (int(x) for x in a.refs.split(",")):
+            print(json.dumps(fill_refs_timing(n, a.files, ledger_py=a.ledger, work=a.work)), flush=True)
+        return 0
     rows, raw = baseline(tuple(int(s) for s in a.scales.split(",")), reports=a.reports, work=a.work,
                          ledger_py=a.ledger)
     if a.out:

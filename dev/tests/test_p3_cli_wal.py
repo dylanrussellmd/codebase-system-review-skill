@@ -62,7 +62,8 @@ class Wal(unittest.TestCase):
         import subprocess, sys
         p = subprocess.Popen([sys.executable, str(L.ledger_py), "--root", str(L.root), "fill-refs"],
                              env=fixtures.git_env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        time.sleep(0.3)
+        # Since step 101 fill-refs reads git through one batch process and finishes in well under a second, so
+        # the concurrent writes start at once (they used to wait 0.3 s for fill-refs to reach its git calls).
         waits = []
         con = L.connect()
         con.execute("PRAGMA busy_timeout = 5000")

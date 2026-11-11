@@ -2,6 +2,19 @@
 
 The tool version is `version:` in SKILL.md's frontmatter; `ledger.py --version` prints it with the schema version.
 
+## 1.5.0 (schema 8)
+
+- Commands that write the ledger, each in one transaction with `--actor`, refusing with one line and exit 1:
+  `next-code`, `add-repo`, `add-actor`, `new-review`, `review-status`, `snapshot`, `add-run`, `issue-status`,
+  `step-status`, `import-steps`, `open-gate`, `answer-gate`, `apply-gate`, `import-findings`, `import-checks`,
+  `load-index`, `match` and `report-finding` (records a discovery at an explicit commit, refuses lines or symbols not
+  at that commit, fills the excerpt and amends the plan). The viewer's answers go through the same `answer_gate()`.
+  Formats in `references/formats/`; implementer brief template in `references/implementer-brief.md`.
+- Other commands: `query [--readonly] [--json]`, `progress-md`, `progress-page` (one self-contained owner page),
+  `import-answers`, `restore`, `merge`; `check --quiet`; `gates` lists waiting steps, open decisions and stale steps.
+- fill-refs reads through one `git cat-file --batch` per repository, is idempotent and refuses files over 20 MB.
+- Schema 8 (migration 0008): `finding_locations.source` and `v_next_codes`. init writes `.code-review/.gitattributes`.
+
 ## 1.4.0 (schema 7)
 
 - Schema 6 (migration 0006, lookups): issue statuses, severities, match types, relation types and gate kinds are

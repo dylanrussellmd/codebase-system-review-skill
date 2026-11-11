@@ -36,6 +36,7 @@ COLUMN_ENUMS = {
     ("findings", "verification"): "verification",
     ("finding_locations", "role"): "location_role",
     ("finding_locations", "excerpt_status"): "excerpt_status",
+    ("finding_locations", "source"): "location_source",   # schema 8 (step 98)
     ("finding_requirements", "verdict"): "verdict",
     ("review_requirement_checks", "verdict"): "verdict",
     ("review_requirement_checks", "tested"): "tested",

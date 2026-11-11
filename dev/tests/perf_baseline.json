@@ -2,7 +2,8 @@
  "_about": [
   "Baseline measurements for plan step 29, made with `python3 dev/tests/scale.py baseline` on a 2-CPU Linux machine while the test suite was also running, so timings are upper bounds.",
   "x1 = 10,000 findings and 600 plan steps; x10 = 100,000 and 6,000. Text is generated from a 46-word vocabulary unless the name says _prose (sentences taken from real review reports).",
-  "git growth: 5 consecutive commits of ledger.sqlite and its SQL dump at x1, each after 30 steps were marked done and 20 check evidences rewritten."
+  "git growth: 5 consecutive commits of ledger.sqlite and its SQL dump at x1, each after 30 steps were marked done and 20 check evidences rewritten.",
+  "fill_refs.* (plan step 102, PERF-V3, measured 2026-11-11 with `python3 dev/tests/scale.py fill-refs --refs 1000,10000`): wall time of the whole `ledger.py fill-refs` command (start-up and schema verification included) on fresh references over 50 files of 400 lines in one commit, through one `git cat-file --batch`. marginal_ms_per_1000 = (x10 - x1) / 9, the cost per 1,000 references once the command is running; the review estimated < 300 ms per 1,000 (before: about 3,700 ms per 1,000, two git processes per reference)."
  ],
  "measured": "2026-11-10",
  "measurements": {
@@ -251,6 +252,38 @@
   "x10.api_plan_ms": {
    "value": 995.3,
    "unit": "ms"
+  },
+  "fill_refs.x1.refs": {
+   "value": 1000,
+   "unit": "rows"
+  },
+  "fill_refs.x1.seconds": {
+   "value": 0.46,
+   "unit": "s"
+  },
+  "fill_refs.x1.git_processes": {
+   "value": 1,
+   "unit": "processes"
+  },
+  "fill_refs.x10.refs": {
+   "value": 10000,
+   "unit": "rows"
+  },
+  "fill_refs.x10.seconds": {
+   "value": 1.63,
+   "unit": "s"
+  },
+  "fill_refs.x10.ms_per_1000": {
+   "value": 163,
+   "unit": "ms per 1,000 refs"
+  },
+  "fill_refs.x10.git_processes": {
+   "value": 1,
+   "unit": "processes"
+  },
+  "fill_refs.marginal_ms_per_1000": {
+   "value": 131,
+   "unit": "ms per 1,000 refs"
   }
  }
 }

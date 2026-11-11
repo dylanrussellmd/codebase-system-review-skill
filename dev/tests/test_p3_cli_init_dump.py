@@ -68,7 +68,7 @@ class AtomicInit(unittest.TestCase):
                 self.assertEqual(ledger_names(db), shipped_names())
                 self.assertEqual((d / ".code-review" / "ledger.py").read_bytes(), built_ledger_path().read_bytes())
                 self.assertEqual(sorted(x.name for x in (d / ".code-review").iterdir()),
-                                 [".gitignore", "ledger.py", "ledger.sqlite"])
+                                 [".gitattributes", ".gitignore", "ledger.py", "ledger.sqlite"])
 
     def test_init_atomic(self):
         mod = fixtures.load_ledger_module(fresh=True)
@@ -153,7 +153,7 @@ class AtomicInit(unittest.TestCase):
         self.assertEqual(M.counts(db), before)
         self.assertEqual((d / ".code-review" / "ledger.py").read_bytes(), built_ledger_path().read_bytes())
         self.assertEqual(sorted(x.name for x in (d / ".code-review").iterdir()),
-                         [".gitignore", "ledger.py", "ledger.sqlite"])
+                         [".gitattributes", ".gitignore", "ledger.py", "ledger.sqlite"])
 
 
 class AtomicDump(unittest.TestCase):
@@ -286,7 +286,8 @@ class CustomDb(unittest.TestCase):
         db2 = d / ".code-review" / "ledger.sqlite"
         p = run_ledger("--root", d, "--db", db2, "init")
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertEqual(sorted(x.name for x in db2.parent.iterdir()), [".gitignore", "ledger.py", "ledger.sqlite"])
+        self.assertEqual(sorted(x.name for x in db2.parent.iterdir()),
+                         [".gitattributes", ".gitignore", "ledger.py", "ledger.sqlite"])
 
 
 if __name__ == "__main__":
