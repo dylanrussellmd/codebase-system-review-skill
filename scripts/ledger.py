@@ -24,8 +24,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
-TOOL_VERSION = "1.2.0"  # stamped by dev/build.py from `version:` in SKILL.md's frontmatter
-TOOL_HASH = "bec3f6b568a3f3811829fba500e495976fb08184f928533f464c86f0de95398e"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
+TOOL_VERSION = "1.2.1"  # stamped by dev/build.py from `version:` in SKILL.md's frontmatter
+TOOL_HASH = "4ab5de9b9f468ac394088e26013eb5431e6da3c482e9fbcefa9ac93634855b30"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
 SCHEMA = r"""-- =====================================================================
 -- Code review ledger — schema version 2
 -- One SQLite file per project: <project root>/.code-review/ledger.sqlite

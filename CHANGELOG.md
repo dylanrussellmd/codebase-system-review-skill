@@ -2,6 +2,10 @@
 
 The tool version is `version:` in SKILL.md's frontmatter; `ledger.py --version` prints it with the schema version.
 
+## 1.2.1 (schema 2)
+
+- `migrate` writes its `ledger.sqlite.bak-v<N>` backup owner-only (0600), and `init` makes existing backups private.
+
 ## 1.2.0 (schema 2)
 
 - Schema 2 (migration 0002): ledger links are http(s) only (`permalink`, `summary_doc_url`, `pr_url`,
