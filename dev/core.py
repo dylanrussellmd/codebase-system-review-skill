@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Code review ledger: one SQLite file per project that records every review,
 every point it raised, how points relate across reviews, the fix plan, and
-what is waiting on the owner. Standard library only (Python 3.9+).
+what is waiting on the owner. Standard library only (Python 3.9+; tested on 3.9.0, 3.9.25 and 3.13).
 
     python3 ledger.py init               create .code-review/ledger.sqlite here
     python3 ledger.py serve [--port N]   open the local viewer (127.0.0.1 only)
@@ -106,6 +106,8 @@ def now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
+# Twin of the must-be-empty list in SKILL.md (Rules for the ledger / check) and of the 'must be empty' comments in
+# references/schema.sql; change all three together. dev/tests/test_check.py enforces that they agree.
 MUST_BE_EMPTY = [
     ("v_unmatched_findings", "Findings not matched to an issue"),
     ("v_unchecked_known_issues", "Known issues in a domain that ran, with no check recorded"),
@@ -524,7 +526,7 @@ def run_readonly(db, sql):
         cols = [d[0] for d in cur.description or []]
         data = cur.fetchmany(1001)
         return {"columns": cols, "rows": [list(r) for r in data[:1000]], "truncated": len(data) > 1000}
-    except sqlite3.Error as e:
+    except (sqlite3.Error, sqlite3.Warning) as e:  # before Python 3.11, several statements raise sqlite3.Warning
         return {"error": f"The query did not run: {e}"}, 400
     finally:
         con.close()
@@ -532,10 +534,12 @@ def run_readonly(db, sql):
 
 # ---------------------------------------------------------------- HTTP
 
-def serve(root, db, port, open_browser):
+def make_server(root, db, port=0):
+    """Build the viewer's handler and bind it to 127.0.0.1:port (0 = any free port); returns (server, token).
+    The caller runs server.serve_forever(). The Host allow-list uses the port actually bound."""
     token = secrets.token_urlsafe(24)
     page = PAGE.replace("@@TOKEN@@", token)
-    hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
+    hosts = set()
 
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -600,7 +604,14 @@ def serve(root, db, port, open_browser):
             self.handle_api(body if isinstance(body, dict) else {})
 
     srv = ThreadingHTTPServer(("127.0.0.1", port), H)
-    url = f"http://127.0.0.1:{port}/"
+    bound = srv.server_address[1]
+    hosts.update({f"127.0.0.1:{bound}", f"localhost:{bound}"})
+    return srv, token
+
+
+def serve(root, db, port, open_browser):
+    srv, _ = make_server(root, db, port)
+    url = f"http://127.0.0.1:{srv.server_address[1]}/"
     print(f"Ledger viewer for {db} at {url}  (Ctrl+C to stop)")
     if open_browser:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()

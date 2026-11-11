@@ -1,0 +1,256 @@
+{
+ "_about": [
+  "Baseline measurements for plan step 29, made with `python3 dev/tests/scale.py baseline` on a 2-CPU Linux machine while the test suite was also running, so timings are upper bounds.",
+  "x1 = 10,000 findings and 600 plan steps; x10 = 100,000 and 6,000. Text is generated from a 46-word vocabulary unless the name says _prose (sentences taken from real review reports).",
+  "git growth: 5 consecutive commits of ledger.sqlite and its SQL dump at x1, each after 30 steps were marked done and 20 check evidences rewritten."
+ ],
+ "measured": "2026-11-10",
+ "measurements": {
+  "x1.build_seconds": {
+   "value": 6.7,
+   "unit": "s"
+  },
+  "x1.check_exit": {
+   "value": 0,
+   "unit": "exit code"
+  },
+  "x1.findings": {
+   "value": 10000,
+   "unit": "rows"
+  },
+  "x1.issues": {
+   "value": 4000,
+   "unit": "rows"
+  },
+  "x1.steps": {
+   "value": 600,
+   "unit": "rows"
+  },
+  "x1.insert_findings_us_per_row": {
+   "value": 284.9,
+   "unit": "us/row"
+  },
+  "x1.match_new_issue_us_per_row": {
+   "value": 165.3,
+   "unit": "us/row"
+  },
+  "x1.match_existing_issue_us_per_row": {
+   "value": 77.9,
+   "unit": "us/row"
+  },
+  "x1.insert_checks_us_per_row": {
+   "value": 48.9,
+   "unit": "us/row"
+  },
+  "x1.ledger_bytes": {
+   "value": 72089600,
+   "unit": "bytes"
+  },
+  "x1.ledger_gzip_ratio": {
+   "value": 4.7,
+   "unit": "raw/gzip"
+  },
+  "x1.dump_bytes": {
+   "value": 49650272,
+   "unit": "bytes"
+  },
+  "x1.dump_gzip_ratio": {
+   "value": 5.46,
+   "unit": "raw/gzip"
+  },
+  "x1.api_review_bytes": {
+   "value": 6596814,
+   "unit": "bytes"
+  },
+  "x1.api_review_gzip_ratio": {
+   "value": 5.76,
+   "unit": "raw/gzip"
+  },
+  "x1.api_review_ms": {
+   "value": 111.9,
+   "unit": "ms"
+  },
+  "x1.api_plan_bytes": {
+   "value": 3503604,
+   "unit": "bytes"
+  },
+  "x1.api_plan_gzip_ratio": {
+   "value": 5.54,
+   "unit": "raw/gzip"
+  },
+  "x1.api_plan_ms": {
+   "value": 126.3,
+   "unit": "ms"
+  },
+  "x1.git_loose_growth_per_ledger_commit_mean": {
+   "value": 29316.8,
+   "unit": "KiB"
+  },
+  "x1.git_loose_growth_per_ledger_commit": {
+   "value": [
+    29308,
+    29316,
+    29320,
+    29320,
+    29320
+   ],
+   "unit": "KiB"
+  },
+  "x1.git_pack_growth_per_ledger_commit_after_gc": {
+   "value": 3445.4,
+   "unit": "KiB"
+  },
+  "x1_prose.build_seconds": {
+   "value": 18.4,
+   "unit": "s"
+  },
+  "x1_prose.check_exit": {
+   "value": 0,
+   "unit": "exit code"
+  },
+  "x1_prose.findings": {
+   "value": 10000,
+   "unit": "rows"
+  },
+  "x1_prose.issues": {
+   "value": 4000,
+   "unit": "rows"
+  },
+  "x1_prose.steps": {
+   "value": 600,
+   "unit": "rows"
+  },
+  "x1_prose.insert_findings_us_per_row": {
+   "value": 649.4,
+   "unit": "us/row"
+  },
+  "x1_prose.match_new_issue_us_per_row": {
+   "value": 344.5,
+   "unit": "us/row"
+  },
+  "x1_prose.match_existing_issue_us_per_row": {
+   "value": 226.3,
+   "unit": "us/row"
+  },
+  "x1_prose.insert_checks_us_per_row": {
+   "value": 152.2,
+   "unit": "us/row"
+  },
+  "x1_prose.ledger_bytes": {
+   "value": 88084480,
+   "unit": "bytes"
+  },
+  "x1_prose.ledger_gzip_ratio": {
+   "value": 3.13,
+   "unit": "raw/gzip"
+  },
+  "x1_prose.dump_bytes": {
+   "value": 71400625,
+   "unit": "bytes"
+  },
+  "x1_prose.dump_gzip_ratio": {
+   "value": 3.31,
+   "unit": "raw/gzip"
+  },
+  "x1_prose.api_review_bytes": {
+   "value": 9535861,
+   "unit": "bytes"
+  },
+  "x1_prose.api_review_gzip_ratio": {
+   "value": 3.22,
+   "unit": "raw/gzip"
+  },
+  "x1_prose.api_review_ms": {
+   "value": 332.4,
+   "unit": "ms"
+  },
+  "x1_prose.api_plan_bytes": {
+   "value": 5680691,
+   "unit": "bytes"
+  },
+  "x1_prose.api_plan_gzip_ratio": {
+   "value": 3.12,
+   "unit": "raw/gzip"
+  },
+  "x1_prose.api_plan_ms": {
+   "value": 154.9,
+   "unit": "ms"
+  },
+  "x10.build_seconds": {
+   "value": 71.8,
+   "unit": "s"
+  },
+  "x10.check_exit": {
+   "value": 0,
+   "unit": "exit code"
+  },
+  "x10.findings": {
+   "value": 100000,
+   "unit": "rows"
+  },
+  "x10.issues": {
+   "value": 40000,
+   "unit": "rows"
+  },
+  "x10.steps": {
+   "value": 6000,
+   "unit": "rows"
+  },
+  "x10.insert_findings_us_per_row": {
+   "value": 337.5,
+   "unit": "us/row"
+  },
+  "x10.match_new_issue_us_per_row": {
+   "value": 256.3,
+   "unit": "us/row"
+  },
+  "x10.match_existing_issue_us_per_row": {
+   "value": 132.0,
+   "unit": "us/row"
+  },
+  "x10.insert_checks_us_per_row": {
+   "value": 67.1,
+   "unit": "us/row"
+  },
+  "x10.ledger_bytes": {
+   "value": 720822272,
+   "unit": "bytes"
+  },
+  "x10.ledger_gzip_ratio": {
+   "value": 4.67,
+   "unit": "raw/gzip"
+  },
+  "x10.dump_bytes": {
+   "value": 498062576,
+   "unit": "bytes"
+  },
+  "x10.dump_gzip_ratio": {
+   "value": 5.47,
+   "unit": "raw/gzip"
+  },
+  "x10.api_review_bytes": {
+   "value": 65675093,
+   "unit": "bytes"
+  },
+  "x10.api_review_gzip_ratio": {
+   "value": 5.77,
+   "unit": "raw/gzip"
+  },
+  "x10.api_review_ms": {
+   "value": 1205.5,
+   "unit": "ms"
+  },
+  "x10.api_plan_bytes": {
+   "value": 35287692,
+   "unit": "bytes"
+  },
+  "x10.api_plan_gzip_ratio": {
+   "value": 5.44,
+   "unit": "raw/gzip"
+  },
+  "x10.api_plan_ms": {
+   "value": 995.3,
+   "unit": "ms"
+  }
+ }
+}

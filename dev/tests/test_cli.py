@@ -1,0 +1,245 @@
+"""The ledger.py command line, run from the fresh build by subprocess in temporary folders: init, schema, serve options,
+the missing-ledger guard, subcommand handling, and show."""
+import socket
+import sqlite3
+import sys
+import time
+import subprocess
+import unittest
+from unittest import mock
+
+from dev.tests import fixtures
+from dev.tests.fixtures import built_ledger_path, run_ledger, temp_dir
+from dev.tests._core_helpers import project, ref
+
+SCHEMA_SQL = fixtures.REPO_ROOT / "references" / "schema.sql"
+
+
+def fresh_project(name="myproj"):
+    d = temp_dir("cli-") / name
+    d.mkdir()
+    return d
+
+
+def object_counts(db):
+    con = sqlite3.connect(str(db))
+    try:
+        return dict(con.execute("SELECT type, count(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' "
+                                "GROUP BY type").fetchall())
+    finally:
+        con.close()
+
+
+class Init(unittest.TestCase):
+    def test_init_creates_schema_objects(self):
+        d = fresh_project()
+        p = run_ledger("--root", d, "init")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        db = d / ".code-review" / "ledger.sqlite"
+        self.assertIn(f"project root: {d}", p.stdout)
+        self.assertIn(f"created {db}", p.stdout)
+        self.assertIn(f"copied ledger.py to {d / '.code-review' / 'ledger.py'}", p.stdout)
+        counts = object_counts(db)
+        # The counts at commit ea00196; a schema migration changes them on purpose.
+        self.assertEqual((counts["table"], counts["view"], counts["trigger"]), (35, 18, 16))
+        # Same objects as the source schema.
+        mem = sqlite3.connect(":memory:")
+        mem.executescript(SCHEMA_SQL.read_text(encoding="utf-8"))
+        want = sorted(mem.execute("SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'").fetchall())
+        mem.close()
+        con = sqlite3.connect(str(db))
+        got = sorted(con.execute("SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'").fetchall())
+        meta = dict(con.execute("SELECT key, value FROM meta").fetchall())
+        con.close()
+        self.assertEqual(got, want)
+        self.assertEqual(meta["schema_version"], "1")
+        self.assertEqual(meta["project_name"], "myproj")
+        self.assertRegex(meta["created_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$")
+        # ledger.py copied byte-identical; .gitignore written.
+        self.assertEqual((d / ".code-review" / "ledger.py").read_bytes(), built_ledger_path().read_bytes())
+        self.assertEqual((d / ".code-review" / ".gitignore").read_text(),
+                         "ledger.sqlite-journal\nledger.sqlite-wal\nledger.sqlite-shm\n")
+
+        # Second run: reports the existing schema, leaves the data alone, does not copy again.
+        con = sqlite3.connect(str(db))
+        con.execute("INSERT INTO meta(key, value) VALUES ('probe', 'kept')")
+        con.commit()
+        con.close()
+        p = run_ledger("--root", d, "init")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn(f"{db} already exists (schema 1)", p.stdout)
+        self.assertNotIn("copied", p.stdout)
+        con = sqlite3.connect(str(db))
+        self.assertEqual(con.execute("SELECT value FROM meta WHERE key='probe'").fetchone()[0], "kept")
+        con.close()
+
+        # A changed ledger.py in the folder is replaced, with a note.
+        (d / ".code-review" / "ledger.py").write_text("# old\n")
+        p = run_ledger("--root", d, "init")
+        self.assertIn("note: replacing", p.stdout)
+        self.assertEqual((d / ".code-review" / "ledger.py").read_bytes(), built_ledger_path().read_bytes())
+
+    def test_init_keeps_existing_gitignore(self):
+        d = fresh_project()
+        (d / ".code-review").mkdir()
+        (d / ".code-review" / ".gitignore").write_text("custom\n")
+        p = run_ledger("--root", d, "init")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual((d / ".code-review" / ".gitignore").read_text(), "custom\n")
+
+    def set_version(self, db, value):
+        con = sqlite3.connect(str(db))
+        if value is None:
+            con.execute("DELETE FROM meta WHERE key='schema_version'")
+        else:
+            con.execute("UPDATE meta SET value=? WHERE key='schema_version'", (value,))
+        con.commit()
+        con.close()
+
+    def test_init_refuses_other_schema_versions(self):
+        d = fresh_project()
+        run_ledger("--root", d, "init")
+        db = d / ".code-review" / "ledger.sqlite"
+        self.set_version(db, "2")
+        p = run_ledger("--root", d, "init")
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("is schema 2; this ledger.py only knows 1. Use a newer ledger.py.", p.stderr)
+        self.set_version(db, "0")
+        p = run_ledger("--root", d, "init")
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("is schema 0; run the migrations for 1..1 first.", p.stderr)
+
+    def test_current_init_tracebacks_on_bad_ledgers(self):
+        d = fresh_project()
+        run_ledger("--root", d, "init")
+        db = d / ".code-review" / "ledger.sqlite"
+        self.set_version(db, None)
+        p = run_ledger("--root", d, "init")
+        # characterization: TEST-T1 (ISS-0282, probed) - no schema_version row gives a TypeError traceback; phase 7
+        # tightens this to a clean message.
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("TypeError", p.stderr)
+        db.write_bytes(b"this is not a database at all" * 100)
+        p = run_ledger("--root", d, "init")
+        # characterization: TEST-T1 (ISS-0282, probed) - a file that is not SQLite gives a DatabaseError traceback.
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("DatabaseError", p.stderr)
+
+
+class SchemaAndGuards(unittest.TestCase):
+    def test_cli_schema_prints_source_schema(self):
+        d = fresh_project()
+        p = run_ledger("--root", d, "schema")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout, SCHEMA_SQL.read_text(encoding="utf-8") + "\n")
+        self.assertFalse((d / ".code-review").exists(), "schema must not create a ledger")
+
+    def test_commands_refuse_without_ledger(self):
+        d = fresh_project()
+        db = d / ".code-review" / "ledger.sqlite"
+        for args in (["check"], ["gates"], ["show", "1"], ["dump"], ["fill-refs"], ["tag-review", "R-0001"],
+                     ["serve", "--no-open"]):
+            with self.subTest(args=args):
+                p = run_ledger("--root", d, *args, timeout=20)
+                self.assertEqual(p.returncode, 1)
+                self.assertIn(f"no ledger at {db}; run: python3 ledger.py init", p.stderr)
+        self.assertFalse((d / ".code-review").exists())
+
+    def test_cli_requires_subcommand(self):
+        d = fresh_project()
+        p = run_ledger("--root", d)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("required", p.stderr)
+        p = run_ledger("--root", d, "frobnicate")
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("invalid choice", p.stderr)
+
+
+class Serve(unittest.TestCase):
+    def test_cli_serve_port_and_no_open(self):
+        # Argument mapping, in-process: default port 8765 and opening the browser; --port N and --no-open.
+        L, _, _, _ = project(test=self)
+        L.commit()
+        m = fixtures.load_ledger_module(fresh=True)
+        calls = []
+        m.serve = lambda root, db, port, open_browser: calls.append((root, db, port, open_browser))
+        for argv, want in ((["serve"], (8765, True)), (["serve", "--port", "9123", "--no-open"], (9123, False))):
+            with mock.patch.object(sys, "argv", ["ledger.py", "--root", str(L.root), *argv]):
+                m.main()
+            self.assertEqual(calls[-1], (L.root, L.db, *want))
+
+        # The real CLI: --port N binds N; --no-open never calls webbrowser.open (a sitecustomize shim records calls).
+        shim = temp_dir("shim-")
+        marker = shim / "opened.txt"
+        (shim / "sitecustomize.py").write_text(
+            "import webbrowser\n"
+            f"def _open(url, *a, **k):\n    open({str(marker)!r}, 'a').write(url + '\\n'); return True\n"
+            "webbrowser.open = _open\n")
+        env = fixtures.git_env({"PYTHONPATH": str(shim), "BROWSER": "true"})
+
+        def run_serve(*extra):
+            port = fixtures.free_port()
+            proc = subprocess.Popen([sys.executable, str(L.ledger_py), "--root", str(L.root), "serve",
+                                     "--port", str(port), *extra], env=env, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True)
+            try:
+                deadline = time.time() + 10
+                while True:
+                    try:
+                        socket.create_connection(("127.0.0.1", port), timeout=0.2).close()
+                        break
+                    except OSError:
+                        if proc.poll() is not None or time.time() > deadline:
+                            self.fail(f"serve did not listen on {port}: {proc.communicate()}")
+                        time.sleep(0.05)
+                time.sleep(1.0)  # the browser would open after 0.5 s
+            finally:
+                proc.terminate()
+                out, err = proc.communicate(timeout=5)
+            return port, out
+
+        port, out = run_serve("--no-open")
+        self.assertIn(f"at http://127.0.0.1:{port}/", out)
+        self.assertFalse(marker.exists(), "--no-open must not open a browser")
+        port, out = run_serve()  # control: without --no-open the shim sees the call
+        self.assertEqual(marker.read_text(), f"http://127.0.0.1:{port}/\n")
+
+
+class Show(unittest.TestCase):
+    def make(self):
+        L, sha, rid, _ = project(test=self)
+        self.sha = sha
+        lid = ref(L, rid, "src/a.py", 10, 12, excerpt="line 10\nline 11\nline 12")
+        L.commit()
+        return L, lid
+
+    def test_cli_show_lines(self):
+        L, lid = self.make()
+        p = L.run_ok("show", lid)
+        self.assertEqual(p.stdout, f"# demo src/a.py @ {self.sha} (from git)\n"
+                                   "    10  line 10\n    11  line 11\n    12  line 12\n")
+        p = L.run("show", "abc")
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("invalid int value", p.stderr)
+
+    def test_cli_show_unknown(self):
+        L, _ = self.make()
+        p = L.run("show", "99999")
+        self.assertEqual(p.returncode, 1)
+        self.assertEqual(p.stderr.strip(), "no such reference")
+        self.assertEqual(p.stdout, "")
+
+    def test_cli_show_falls_back_to_excerpt(self):
+        """SPEC-T3: the commit is lost, show prints the saved excerpt."""
+        L, lid = self.make()
+        L.repo.rewrite_history()
+        p = L.run_ok("show", lid)
+        lines = p.stdout.splitlines()
+        self.assertEqual(lines[0], f"# demo src/a.py @ {self.sha} (from excerpt)")
+        self.assertTrue(lines[1].startswith("# git: "), lines[1])
+        self.assertEqual(lines[2:], ["    10  line 10", "    11  line 11", "    12  line 12"])
+
+
+
+if __name__ == "__main__":
+    unittest.main()

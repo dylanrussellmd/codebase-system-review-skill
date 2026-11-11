@@ -1,5 +1,5 @@
 # Checks every push and pull request: the shipped scripts/ledger.py matches its sources, and the test suite passes.
-# Standard library only: nothing is installed. Browser tests skip themselves when Playwright is absent.
+# The main jobs use the standard library only. Browser tests (Playwright) and slow scale tests run in their own jobs.
 name: ci
 
 on:
@@ -33,3 +33,31 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Test suite
         run: python3 -m unittest discover -s dev/tests -t . -v
+
+  browser-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Playwright and Chromium (test-only; the tool itself needs nothing)
+        run: |
+          python3 -m pip install playwright
+          python3 -m playwright install --with-deps chromium
+      - name: Browser tests
+        env:
+          LEDGER_BROWSER_TESTS: "1"
+        run: python3 -m unittest discover -s dev/tests -t . -p "test_browser_*.py" -v
+
+  slow-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Scale and performance tests
+        env:
+          LEDGER_SLOW_TESTS: "1"
+        run: python3 -m unittest dev.tests.test_perf -v
