@@ -55,7 +55,7 @@ class InterviewInViewer(browser.ViewerTestCase):
         self.assertIn("Anyone can run it from the README alone.", body)
         self.assertIn("Approved", body)
         self.assertIn("IQ-0002: Who will look after this next year?", body)
-        self.assertEqual(page.contents("#app h3")[0], "Whole project")
+        self.assertEqual(page.contents("#app h2.sec")[0], "Whole project")
 
     def test_approval_under_waiting_on_you(self):
         page = self.open("#/inbox")

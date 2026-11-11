@@ -24,10 +24,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
-TOOL_VERSION = "1.6.0"  # stamped by dev/build.py from `version:` in SKILL.md's frontmatter
-TOOL_HASH = "057587b4ce84e40a76ab92b626bfa4c5d3c6ac19393eea7f994ac7ed0bc66718"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
+TOOL_VERSION = "1.7.0"  # stamped by dev/build.py from `version:` in SKILL.md's frontmatter
+TOOL_HASH = "861ff85fb6f52b8049867c604361f7ceac6311c4438ac5c65d29d07e92a79878"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
 SCHEMA = r"""-- =====================================================================
--- Code review ledger — schema version 9
+-- Code review ledger — schema version 10
 -- One SQLite file per project: <project root>/.code-review/ledger.sqlite
 -- Every connection must run:  PRAGMA foreign_keys = ON;
 -- Times are UTC ISO-8601 text with milliseconds (strftime('%Y-%m-%dT%H:%M:%fZ','now')); the tr_time_*
@@ -42,17 +42,21 @@ SCHEMA = r"""-- ================================================================
 
 -- ---------- Housekeeping ----------------------------------------------
 
+-- Facts about this ledger file, one per row.
 CREATE TABLE meta (
-  key   TEXT PRIMARY KEY,                -- schema_version, project_name, created_at, created_by_skill
+  key   TEXT PRIMARY KEY,                -- schema_version, project_name, created_at, ledger_location,
+                                         -- created_by_skill, written_by_tool, schema_hash
   value TEXT NOT NULL
 );
 
+-- The schema upgrades this ledger has been through.
 CREATE TABLE schema_migrations (
   version     INTEGER PRIMARY KEY,
   description TEXT NOT NULL,
   applied_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
+-- The checks that say whether the ledger is complete and consistent.
 -- The checks `ledger.py check` and the viewer's home page run, in position order: each view must be empty (tier
 -- 'error': check exits 1 when it is not) or should be (tier 'warning': listed, check still exits 0). Seeded at the
 -- end of this file; a schema that adds a check inserts its row in its migration.
@@ -70,6 +74,7 @@ CREATE TABLE ledger_checks (
 -- column keeps its CHECK list, with its labels in enum_labels (a test keeps the two equal). Seeded at the end of
 -- this file.
 
+-- The statuses an issue can have, with the label shown for each.
 CREATE TABLE issue_statuses (
   value    TEXT PRIMARY KEY,
   label    TEXT NOT NULL,
@@ -84,12 +89,18 @@ CREATE TABLE issue_statuses (
   CHECK (reopens = 0 OR (resolved = 1 AND fixed = 0))
 );
 
+-- How serious a point is: high, medium, low, or a missing test.
 CREATE TABLE severities (
   value    TEXT PRIMARY KEY,                 -- H, M, L, T
   label    TEXT NOT NULL,
   position INTEGER NOT NULL UNIQUE           -- most severe first
 );
 
+-- How a point relates to the issue it was matched to.
+-- new: this review opened the issue. still-present, changed: an open issue seen again, as before or differently.
+-- recurrence: an issue closed without a fix was raised again. regression: a fixed issue came back. continuation: a
+-- new issue that continues an earlier one (with a continuation-of relation). references/indexing.md says how to
+-- choose.
 CREATE TABLE match_types (
   value     TEXT PRIMARY KEY,
   label     TEXT NOT NULL,
@@ -97,6 +108,7 @@ CREATE TABLE match_types (
   came_back INTEGER NOT NULL CHECK (came_back IN (0,1))  -- the issue was closed and was raised again
 );
 
+-- The ways two issues can be related.
 CREATE TABLE relation_types (
   value         TEXT PRIMARY KEY,
   label         TEXT NOT NULL,              -- read from the issue the relation starts at ("Duplicate of")
@@ -105,15 +117,17 @@ CREATE TABLE relation_types (
   closes        INTEGER NOT NULL CHECK (closes IN (0,1))  -- recording it closes the active issue as duplicate
 );
 
+-- The kinds of question the owner is asked.
 CREATE TABLE gate_kinds (
   value    TEXT PRIMARY KEY,
   label    TEXT NOT NULL,
   position INTEGER NOT NULL UNIQUE
 );
 
--- The statuses of a design goal (schema 9): proposed from the owner interview, approved or rejected by the owner,
--- retired once it no longer applies. served = given to reviewers, drafters and implementers (`ledger.py goals`,
--- v_goals_for_brief, the goals a plan step may serve).
+-- The statuses a design goal can have.
+-- Proposed from the owner interview, approved or rejected by the owner, retired once it no longer applies. served =
+-- given to reviewers, drafters and implementers (`ledger.py goals`, v_goals_for_brief, the goals a plan step may
+-- serve).
 CREATE TABLE goal_statuses (
   value    TEXT PRIMARY KEY,
   label    TEXT NOT NULL,
@@ -121,6 +135,7 @@ CREATE TABLE goal_statuses (
   served   INTEGER NOT NULL CHECK (served IN (0,1))    -- given to reviewers, drafters and implementers (`goals`)
 );
 
+-- The labels shown for the words of every other fixed list.
 -- Labels of the words of every other word column (whose CHECK lists the allowed words). enum names the list:
 -- issue_kind is issues.kind and findings.kind, confidence is issue_relations.confidence and
 -- findings.match_confidence, verdict is the verdict of finding_requirements and review_requirement_checks.
@@ -135,6 +150,9 @@ CREATE TABLE enum_labels (
 
 -- ---------- Who and what ----------------------------------------------
 
+-- The git repositories the project is made of.
+-- permalink_template builds the web link to cited lines: {sha} is the commit, {path} the file, {start} and {end}
+-- the first and last line. A whole-file reference drops the #fragment that holds {start} or {end}.
 CREATE TABLE repositories (
   id             INTEGER PRIMARY KEY,
   name           TEXT NOT NULL UNIQUE,   -- short name used in the brief
@@ -157,8 +175,8 @@ CREATE TABLE repositories (
               AND path NOT GLOB '../*' AND path NOT GLOB '*/../*' AND path NOT GLOB '*/..'))))
 );
 
--- People and agents. One row per agent instance (each subagent run gets
--- its own row), so "who said this" is always answerable.
+-- The people and agents who did or decided something.
+-- One row per agent instance (each subagent run gets its own row), so "who said this" is always answerable.
 CREATE TABLE actors (
   id              INTEGER PRIMARY KEY,
   kind            TEXT NOT NULL CHECK (kind IN
@@ -174,6 +192,11 @@ CREATE TABLE actors (
 
 -- ---------- Catalogs ----------------------------------------------------
 
+-- The review domains: the angles a codebase is reviewed from.
+-- report_file is the default report name; <module> in it stands for the part of the code one reviewer of a split
+-- domain covers (tests-<module>.md gives tests-api.md). description is optional and empty for the built-in domains,
+-- which references/domains.md describes. A domain with retired_at set takes no new reviews, findings, issues,
+-- metrics or goals (the tr_*_domain_active triggers); rows that already use it stay.
 CREATE TABLE domains (
   code        TEXT PRIMARY KEY,          -- 'security', 'logging', 'docs-developer' ...
   name        TEXT NOT NULL,
@@ -185,6 +208,8 @@ CREATE TABLE domains (
   retired_at  TEXT
 );
 
+-- The topics a point can be filed under, whatever its domain.
+-- A theme with retired_at set is not accepted for new findings; rows that already use it stay.
 CREATE TABLE themes (
   code       TEXT PRIMARY KEY,           -- 'authorization', 'logging-audit' ...
   name       TEXT NOT NULL,
@@ -193,13 +218,14 @@ CREATE TABLE themes (
 
 -- ---------- Standards the code is judged against ----------------------
 
--- Design goals (schema 9, plan step 129): what the owner wants the code to be, by approved domain (domain_code;
--- NULL = the whole project). Written from the owner interview as 'proposed' (`ledger.py propose-goal`, citing the
--- interview questions it summarizes in goal_sources) and given to agents only once the owner approved it
--- (`approve-goals`, or the confirm gate gate_id answered 'approve' in the viewer or hub; approved_by_actor_id and
--- approved_at say who and when). A rejected goal keeps the owner's reason in note; an approved goal is never edited:
--- it is retired (setting status 'retired' or retired_at sets the other) and a new one proposed (superseded_by).
--- Goals recorded before schema 9 became approved whole-project goals.
+-- What the owner wants the code to be, one statement per goal.
+-- Each goal belongs to an approved domain (domain_code; NULL = the whole project). Written from the owner interview
+-- as 'proposed' (`ledger.py propose-goal`, citing the interview questions it summarizes in goal_sources) and given
+-- to agents only once the owner approved it (`approve-goals`, or the confirm gate gate_id answered 'approve' in the
+-- viewer or hub; approved_by_actor_id and approved_at say who and when). A rejected goal keeps the owner's reason
+-- in note; an approved goal is never edited: it is retired (setting status 'retired' or retired_at sets the other)
+-- and a new one proposed (superseded_by). Goals recorded before schema 9 became approved whole-project goals.
+-- retired_at alone means the goal no longer applies; with superseded_by, that another goal replaced it.
 CREATE TABLE design_goals (
   id            INTEGER PRIMARY KEY,
   code          TEXT NOT NULL UNIQUE     -- G-01
@@ -234,6 +260,10 @@ CREATE TABLE design_goals (
 -- only parents nothing protects (a plan with no steps, for instance). Abandon a review (status 'abandoned')
 -- instead of deleting it.
 
+-- One row for each review of the project.
+-- status runs planning <-> awaiting-approval -> approved -> running -> verifying -> indexing -> consolidating ->
+-- handed-off, or abandoned from any status (tr_review_transition has the exact moves). skill_version is the version
+-- of the skill that started the review, as `ledger.py --version` prints it.
 CREATE TABLE reviews (
   id                    INTEGER PRIMARY KEY,
   code                  TEXT NOT NULL UNIQUE    -- R-0001
@@ -269,7 +299,7 @@ CREATE TABLE reviews (
                                                 -- viewer; written in Step 6 with `ledger.py set-report`
 );
 
--- The exact code state each review looked at.
+-- The exact commit of each repository that a review looked at.
 CREATE TABLE review_repositories (
   review_id     INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
   repository_id INTEGER NOT NULL REFERENCES repositories(id),
@@ -287,13 +317,15 @@ CREATE TABLE review_repositories (
   PRIMARY KEY (review_id, repository_id)
 );
 
+-- The design goals each review judged the code against.
 CREATE TABLE review_goals (
   review_id INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
   goal_id   INTEGER NOT NULL REFERENCES design_goals(id),
   PRIMARY KEY (review_id, goal_id)
 );
 
--- Which domains were proposed, approved, skipped, and why.
+-- The domains proposed for each review, and whether each was reviewed or skipped.
+-- reason says why; owner_change records what the owner changed in the proposal.
 CREATE TABLE review_domains (
   review_id         INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
   domain_code       TEXT NOT NULL REFERENCES domains(code),
@@ -306,13 +338,15 @@ CREATE TABLE review_domains (
   PRIMARY KEY (review_id, domain_code)
 );
 
--- One row per reviewer (subagent) run.
+-- One row for each reviewer that ran in a review.
+-- label names the run within its review. items_reviewed and the high, medium, low and test counts are what the
+-- reviewer reported in its final message; v_review_summary counts the findings that were indexed.
 CREATE TABLE reviewer_runs (
   id             INTEGER PRIMARY KEY,
   review_id      INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
   domain_code    TEXT NOT NULL REFERENCES domains(code),
   actor_id       INTEGER NOT NULL REFERENCES actors(id),
-  label          TEXT NOT NULL,           -- 'tests-engine-A'
+  label          TEXT NOT NULL,           -- names the run within its review: 'tests-api'
   scope          TEXT NOT NULL,
   prompt         TEXT,
   report_path    TEXT,
@@ -330,8 +364,9 @@ CREATE TABLE reviewer_runs (
   UNIQUE (review_id, label)
 );
 
--- Every other agent that worked on a review (verifiers, indexers, matchers, drafters, fixers ...): reviewers are
--- tied to it by reviewer_runs and the manager by reviews.manager_actor_id. v_review_agents lists all of them.
+-- The other agents that worked on each review.
+-- Verifiers, indexers, matchers, drafters and fixers: reviewers are tied to it by reviewer_runs and the manager by
+-- reviews.manager_actor_id. v_review_agents lists all of them.
 CREATE TABLE review_actors (
   review_id  INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
   actor_id   INTEGER NOT NULL REFERENCES actors(id),
@@ -341,6 +376,10 @@ CREATE TABLE review_actors (
 
 -- ---------- Requirements (for spec conformance over time) -------------
 
+-- What the code is required to do, and where each requirement was stated.
+-- source is the document, issue or conversation, source_location the place in it, stated_at when it was stated. A
+-- requirement replaced by another is superseded (superseded_by names the new one); one that no longer applies is
+-- withdrawn. first_review_id is the review that recorded it.
 CREATE TABLE requirements (
   id              INTEGER PRIMARY KEY,
   code            TEXT NOT NULL UNIQUE    -- REQ-0001
@@ -358,6 +397,9 @@ CREATE TABLE requirements (
 
 -- ---------- Issues: the longitudinal record ----------------------------
 
+-- A problem in the code, followed from review to review until it is closed.
+-- severity is H, M or L (high, medium, low), or T for a missing test and nothing else. fingerprint is
+-- domain:theme:sub, what findings are matched on.
 CREATE TABLE issues (
   id                     INTEGER PRIMARY KEY,
   code                   TEXT NOT NULL UNIQUE    -- ISS-0001, never reused
@@ -371,7 +413,7 @@ CREATE TABLE issues (
                             'logging','perf','security','ops','verify')),
   severity               TEXT NOT NULL REFERENCES severities(value),             -- current
   status                 TEXT NOT NULL DEFAULT 'open' REFERENCES issue_statuses(value),
-  fingerprint            TEXT,                   -- domain:theme:sub[:symbol], for matching
+  fingerprint            TEXT,                   -- domain:theme:sub, for matching
   before_state           TEXT,                   -- what the system did when first found
   current_state          TEXT,                   -- what the latest review observed
   after_state            TEXT,                   -- what it does once fixed
@@ -397,7 +439,9 @@ CREATE TABLE issues (
   change_note            TEXT
 );
 
--- How issues relate across time and across reviews.
+-- How one issue is related to another.
+-- Read it from left to right: from_issue_id is a duplicate of, continues, is caused by, blocks ... to_issue_id
+-- (relation_types has the label for each reading). A relation is stored once, in that direction.
 CREATE TABLE issue_relations (
   id                       INTEGER PRIMARY KEY,
   from_issue_id            INTEGER NOT NULL REFERENCES issues(id),
@@ -414,6 +458,8 @@ CREATE TABLE issue_relations (
 
 -- ---------- Findings: every point from every review ---------------------
 
+-- Every point a review raised, as the reviewer reported it.
+-- match_type says how the point relates to its issue (match_types lists the values and what each means).
 CREATE TABLE findings (
   id                   INTEGER PRIMARY KEY,
   review_id            INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
@@ -451,7 +497,7 @@ CREATE TABLE findings (
   UNIQUE (review_id, point_id)
 );
 
--- Where in the code a finding points, pinned to the exact commit reviewed.
+-- Where in the code each point is, pinned to the commit that was reviewed.
 -- Three ways back to the lines, strongest first:
 --   1. git: `git -C <repo path> show <commit_sha>:<path>`, lines line_start..line_end
 --      (the review's commit is protected by the tag in review_repositories.tag_name,
@@ -499,12 +545,16 @@ CREATE TABLE finding_locations (
          AND (path NOT GLOB '*[' || char(1) || '-' || char(31) || char(127) || ']*'))
 );
 
+-- The design goals each point goes against.
 CREATE TABLE finding_goals (
   finding_id INTEGER NOT NULL REFERENCES findings(id) ON DELETE RESTRICT,
   goal_id    INTEGER NOT NULL REFERENCES design_goals(id),
   PRIMARY KEY (finding_id, goal_id)
 );
 
+-- The requirements each point is about, and how the code compares.
+-- verdict: matches (the code does what is required), differs (it does something else), partly, missing (not
+-- implemented), untested (implemented, but no test asserts it).
 CREATE TABLE finding_requirements (
   finding_id     INTEGER NOT NULL REFERENCES findings(id) ON DELETE RESTRICT,
   requirement_id INTEGER NOT NULL REFERENCES requirements(id),
@@ -512,8 +562,9 @@ CREATE TABLE finding_requirements (
   PRIMARY KEY (finding_id, requirement_id)
 );
 
--- The spec reviewer's verdict on every requirement a review traced, findings or not (a 'matches' or 'untested'
--- row has no finding). One row per review and requirement; v_requirement_trace lists them with counts.
+-- A review's verdict on each requirement it traced.
+-- Recorded by the spec reviewer whether or not a finding was raised (a 'matches' or 'untested' row has no finding).
+-- One row per review and requirement; v_requirement_trace lists them with counts.
 CREATE TABLE review_requirement_checks (
   id                INTEGER PRIMARY KEY,
   review_id         INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
@@ -526,7 +577,7 @@ CREATE TABLE review_requirement_checks (
   UNIQUE (review_id, requirement_id)
 );
 
--- What each review concluded about each issue already known when it started.
+-- What each review concluded about each issue that was already known.
 -- Absence of a finding is NOT evidence of a fix; only a row here is.
 CREATE TABLE review_issue_checks (
   review_id  INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
@@ -542,6 +593,10 @@ CREATE TABLE review_issue_checks (
 
 -- ---------- Owner decisions -------------------------------------------
 
+-- The owner's rulings: each question, the answer and the reason.
+-- status: open (asked), decided (the answer is set and decided_at filled), revisit (to be asked again; revisit_when
+-- says what reopens it). options is a JSON array of the choices offered. review_id and step_id say where the
+-- question came up; decision_issues lists the issues it settles.
 CREATE TABLE decisions (
   id                  INTEGER PRIMARY KEY,
   code                TEXT NOT NULL UNIQUE    -- D-0001
@@ -561,16 +616,17 @@ CREATE TABLE decisions (
   decided_at          TEXT
 );
 
+-- The issues each decision settles.
 CREATE TABLE decision_issues (
   decision_id INTEGER NOT NULL REFERENCES decisions(id) ON DELETE CASCADE,
   issue_id    INTEGER NOT NULL REFERENCES issues(id),
   PRIMARY KEY (decision_id, issue_id)
 );
 
--- Gates: anything waiting on the owner. The agent opens a gate and does not
--- pass it until it is answered (in chat or in the viewer). When the agent
--- acts on the answer it sets status = 'applied'. Decisions are the durable
--- rulings; a gate of kind 'decision' records its answer in decisions too.
+-- Questions waiting for the owner's answer.
+-- The agent opens a gate and does not pass it until it is answered (in chat or in the viewer). When the agent acts
+-- on the answer it sets status = 'applied'. Decisions are the durable rulings; a gate of kind 'decision' records
+-- its answer in decisions too.
 CREATE TABLE gates (
   id              INTEGER PRIMARY KEY,
   code            TEXT NOT NULL UNIQUE      -- GATE-0001
@@ -617,6 +673,7 @@ CREATE TABLE gates (
 -- earlier one). A question asked in the hub as well has gate_id: the owner's answer to that gate is recorded here
 -- (via 'viewer') by tr_gate_answers_question. `ledger.py interview` lists them.
 
+-- The questions the owner was asked about the codebase and what they want from it.
 CREATE TABLE interview_questions (
   id                INTEGER PRIMARY KEY,
   code              TEXT NOT NULL UNIQUE    -- IQ-0001
@@ -630,6 +687,7 @@ CREATE TABLE interview_questions (
   asked_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
+-- The owner's answers to the interview questions, in their own words.
 CREATE TABLE interview_answers (
   id                   INTEGER PRIMARY KEY,
   question_id          INTEGER NOT NULL REFERENCES interview_questions(id) ON DELETE RESTRICT,
@@ -639,7 +697,7 @@ CREATE TABLE interview_answers (
   answered_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
--- Which interview questions a design goal summarizes.
+-- The interview questions each design goal was drawn from.
 CREATE TABLE goal_sources (
   goal_id     INTEGER NOT NULL REFERENCES design_goals(id) ON DELETE RESTRICT,
   question_id INTEGER NOT NULL REFERENCES interview_questions(id) ON DELETE RESTRICT,
@@ -648,6 +706,9 @@ CREATE TABLE goal_sources (
 
 -- ---------- Fix plans -----------------------------------------------------
 
+-- A fix plan: the ordered work that closes the points of one or more reviews.
+-- page_url is the address of the plan's hub page (set when `add-artifact` records a progress-page with a URL);
+-- doc_url is a document the owner keeps elsewhere, if any. superseded_by names the plan that replaced this one.
 CREATE TABLE plans (
   id                   INTEGER PRIMARY KEY,
   code                 TEXT NOT NULL UNIQUE    -- P-0001
@@ -674,12 +735,15 @@ CREATE TABLE plans (
                                                -- why this order), shown in the viewer; `ledger.py set-narrative`
 );
 
+-- The reviews each fix plan covers.
 CREATE TABLE plan_reviews (
   plan_id   INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
   review_id INTEGER NOT NULL REFERENCES reviews(id),
   PRIMARY KEY (plan_id, review_id)
 );
 
+-- The phases of a fix plan, in order.
+-- goal is one sentence saying what the phase achieves; why says why it sits where it does.
 CREATE TABLE phases (
   id      INTEGER PRIMARY KEY,
   plan_id INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
@@ -690,6 +754,10 @@ CREATE TABLE phases (
   UNIQUE (plan_id, number)
 );
 
+-- One change of a fix plan, with the test that proves it.
+-- number is the step's place in the whole plan, not in its phase. drafter_key is the key the plan's drafter gave
+-- the step, unique in the plan; `step-status` accepts it in place of the number. A status change sets change_note,
+-- and change_actor_id and change_commit_sha where they apply, in the same UPDATE, as for issues.
 -- A step waiting on the owner asks through a gate of the kind its owner_need maps to (a test checks the map):
 --   owner_need decision -> gate kind decision
 --   owner_need confirm -> gate kind confirm
@@ -726,6 +794,8 @@ CREATE TABLE steps (
   UNIQUE (plan_id, number)
 );
 
+-- The earlier steps each step has to wait for.
+-- A step depends only on earlier steps of its own plan (tr_dep_order).
 CREATE TABLE step_dependencies (
   step_id            INTEGER NOT NULL REFERENCES steps(id) ON DELETE CASCADE,
   depends_on_step_id INTEGER NOT NULL REFERENCES steps(id),
@@ -733,7 +803,7 @@ CREATE TABLE step_dependencies (
   CHECK (step_id <> depends_on_step_id)
 );
 
--- The coverage link: which step closes which finding.
+-- The points each plan step closes.
 CREATE TABLE step_findings (
   step_id      INTEGER NOT NULL REFERENCES steps(id) ON DELETE CASCADE,
   finding_id   INTEGER NOT NULL REFERENCES findings(id),
@@ -741,13 +811,15 @@ CREATE TABLE step_findings (
   PRIMARY KEY (step_id, finding_id)
 );
 
--- Which approved design goals a plan step serves (schema 9): the plan is built against the owner's goals.
+-- The approved design goals each plan step serves.
 CREATE TABLE step_goals (
   step_id INTEGER NOT NULL REFERENCES steps(id) ON DELETE CASCADE,
   goal_id INTEGER NOT NULL REFERENCES design_goals(id),
   PRIMARY KEY (step_id, goal_id)
 );
 
+-- The commits that carried out each plan step.
+-- One row per step and commit (`ledger.py add-commit`); pr_url when it went through a pull request.
 CREATE TABLE step_commits (
   id            INTEGER PRIMARY KEY,
   step_id       INTEGER NOT NULL REFERENCES steps(id) ON DELETE CASCADE,
@@ -761,7 +833,10 @@ CREATE TABLE step_commits (
   UNIQUE (step_id, commit_sha)
 );
 
--- Tests that guard a fixed issue. Future reviews check they still exist.
+-- The tests that keep a fixed issue fixed.
+-- failed_before_fix and passes_after_fix record the proof. A later review checks that each test is still there:
+-- `confirm-guard` sets still_exists and last_confirmed_review_id. A fixed issue whose guard tests are all gone is
+-- listed by v_unguarded_fixes.
 CREATE TABLE guard_tests (
   id                      INTEGER PRIMARY KEY,
   issue_id                INTEGER NOT NULL REFERENCES issues(id),
@@ -780,6 +855,10 @@ CREATE TABLE guard_tests (
 
 -- ---------- Measurements over time ------------------------------------
 
+-- Test runs recorded as evidence, with their results.
+-- purpose: baseline (the suite before a review or a plan starts), targeted (chosen tests), flake-check (repeated
+-- runs to find unstable tests), mutation (a mutation run), before-fix (the proof test failing), after-fix (the same
+-- test passing), ci (a run by CI).
 CREATE TABLE test_runs (
   id            INTEGER PRIMARY KEY,
   review_id     INTEGER REFERENCES reviews(id),
@@ -800,9 +879,10 @@ CREATE TABLE test_runs (
   started_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
--- The catalog of metric names: what the viewer shows for each (label, default unit) and which way is better.
--- Seeded with the names the domains ask for; a metric recorded under a new name gets a row here from
--- tr_metric_defined (label = the name with spaces, capitalized), which can then be given a better label.
+-- The names of the numbers a review measures, with the label shown for each.
+-- unit is the default unit; better says which way is an improvement. Seeded with the names the domains ask for; a
+-- metric recorded under a new name gets a row here from tr_metric_defined (label = the name with spaces,
+-- capitalized), which can then be given a better label.
 CREATE TABLE metric_defs (
   name   TEXT PRIMARY KEY,                 -- the stable key used in metrics.name
   label  TEXT NOT NULL,
@@ -810,8 +890,9 @@ CREATE TABLE metric_defs (
   better TEXT NOT NULL DEFAULT 'none' CHECK (better IN ('higher','lower','none'))
 );
 
--- Numbers worth trending: mutation score, coverage %, cases asserted,
--- page weight, queries per page, p95 job time, dependency count ...
+-- Numbers measured in a review, kept to follow them over time.
+-- For example mutation score, coverage %, cases asserted, page weight, queries per page, p95 job time, dependency
+-- count ...
 CREATE TABLE metrics (
   id            INTEGER PRIMARY KEY,
   review_id     INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
@@ -833,6 +914,7 @@ CREATE TRIGGER tr_metric_defined AFTER INSERT ON metrics BEGIN
     VALUES (NEW.name, upper(substr(NEW.name, 1, 1)) || replace(substr(NEW.name, 2), '_', ' '), NEW.unit);
 END;
 
+-- The same when a metric is renamed.
 CREATE TRIGGER tr_metric_renamed AFTER UPDATE OF name ON metrics BEGIN
   INSERT OR IGNORE INTO metric_defs(name, label, unit)
     VALUES (NEW.name, upper(substr(NEW.name, 1, 1)) || replace(substr(NEW.name, 2), '_', ' '), NEW.unit);
@@ -840,6 +922,10 @@ END;
 
 -- ---------- Files and links produced ---------------------------------
 
+-- Files and links a review or plan produced.
+-- kind: brief, report (one reviewer's), index, summary-doc, plan-file, progress-page (the hub; its url is copied to
+-- plans.page_url), probe-script or other. sha256 is the file's hash when it was recorded. At least one of path and
+-- url is set.
 CREATE TABLE artifacts (
   id              INTEGER PRIMARY KEY,
   review_id       INTEGER REFERENCES reviews(id),
@@ -857,6 +943,7 @@ CREATE TABLE artifacts (
 
 -- ---------- History of everything that changes state ------------------
 
+-- The history: every status change and every other tracked change, in order.
 -- Append-only (G-04): triggers refuse every UPDATE and DELETE on events (tr_events_no_update/no_delete).
 -- Which tables write events (plan step 73; a test keeps these two lists equal to the triggers and the tables):
 -- Logged: reviews, reviewer_runs, issues, issue_relations, findings, review_issue_checks, decisions, gates, plans,
@@ -1025,15 +1112,19 @@ WHEN NEW.code GLOB 'ISS-[0-9][0-9][0-9][0-9]*' AND NEW.code NOT GLOB 'ISS-*[^0-9
   SELECT RAISE(ABORT, 'issue codes are sequential: ISS- and the next number (ISS-0001, ISS-0002 ...)');
 END;
 
+-- A code never changes.
 CREATE TRIGGER tr_issue_code_fixed BEFORE UPDATE OF code ON issues WHEN OLD.code IS NOT NEW.code BEGIN
   SELECT RAISE(ABORT, 'codes never change');
 END;
 
+-- A retired domain takes no new issues.
 CREATE TRIGGER tr_issue_domain_active BEFORE INSERT ON issues
 WHEN EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL) BEGIN
   SELECT RAISE(ABORT, 'that domain is retired; use a current one');
 END;
 
+-- Logs 'opened'. The INSERT may carry change_actor_id, change_step_id, change_commit_sha and change_note: they go
+-- into the event and are then cleared (tr_issue_context_cleared_ins).
 CREATE TRIGGER tr_issue_opened AFTER INSERT ON issues BEGIN
   INSERT INTO events(entity_type, entity_id, event, to_value, actor_id, review_id, step_id, commit_sha, note)
   VALUES ('issue', NEW.id, 'opened', NEW.status, NEW.change_actor_id,
@@ -1060,6 +1151,7 @@ WHEN NEW.status IN ('accepted-risk','wont-fix') AND NULLIF(trim(NEW.resolution),
   SELECT RAISE(ABORT, 'an issue closed as accepted-risk or wont-fix needs a resolution (the reason)');
 END;
 
+-- The same for an issue inserted already closed.
 CREATE TRIGGER tr_issue_closed_needs_reason_ins BEFORE INSERT ON issues
 WHEN NEW.status IN ('accepted-risk','wont-fix') AND NULLIF(trim(NEW.resolution), '') IS NULL BEGIN
   SELECT RAISE(ABORT, 'an issue closed as accepted-risk or wont-fix needs a resolution (the reason)');
@@ -1101,6 +1193,7 @@ WHEN OLD.status IS NOT NEW.status BEGIN
   WHERE id = NEW.id;
 END;
 
+-- Logs 'severity-changed' with the change context (change_note is required: tr_issue_change_needs_note).
 CREATE TRIGGER tr_issue_severity AFTER UPDATE OF severity ON issues
 WHEN OLD.severity IS NOT NEW.severity BEGIN
   INSERT INTO events(entity_type, entity_id, event, from_value, to_value,
@@ -1117,6 +1210,7 @@ CREATE TRIGGER tr_issue_title_changed AFTER UPDATE OF title ON issues WHEN OLD.t
           NEW.change_step_id, NEW.change_note);
 END;
 
+-- Logs 'before-state-changed'.
 CREATE TRIGGER tr_issue_before_changed AFTER UPDATE OF before_state ON issues
 WHEN OLD.before_state IS NOT NEW.before_state BEGIN
   INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id, step_id, note)
@@ -1124,6 +1218,7 @@ WHEN OLD.before_state IS NOT NEW.before_state BEGIN
           NEW.change_review_id, NEW.change_step_id, NEW.change_note);
 END;
 
+-- Logs 'current-state-changed'.
 CREATE TRIGGER tr_issue_current_changed AFTER UPDATE OF current_state ON issues
 WHEN OLD.current_state IS NOT NEW.current_state BEGIN
   INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id, step_id, note)
@@ -1131,6 +1226,7 @@ WHEN OLD.current_state IS NOT NEW.current_state BEGIN
           NEW.change_review_id, NEW.change_step_id, NEW.change_note);
 END;
 
+-- Logs 'after-state-changed'.
 CREATE TRIGGER tr_issue_after_changed AFTER UPDATE OF after_state ON issues
 WHEN OLD.after_state IS NOT NEW.after_state BEGIN
   INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id, step_id, note)
@@ -1138,6 +1234,7 @@ WHEN OLD.after_state IS NOT NEW.after_state BEGIN
           NEW.change_review_id, NEW.change_step_id, NEW.change_note);
 END;
 
+-- Logs 'recommendation-changed'.
 CREATE TRIGGER tr_issue_recommendation_changed AFTER UPDATE OF recommendation ON issues
 WHEN OLD.recommendation IS NOT NEW.recommendation BEGIN
   INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id, step_id, note)
@@ -1145,6 +1242,7 @@ WHEN OLD.recommendation IS NOT NEW.recommendation BEGIN
           NEW.change_review_id, NEW.change_step_id, NEW.change_note);
 END;
 
+-- Logs 'resolution-changed'.
 CREATE TRIGGER tr_issue_resolution_changed AFTER UPDATE OF resolution ON issues
 WHEN OLD.resolution IS NOT NEW.resolution BEGIN
   INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id, step_id, note)
@@ -1152,6 +1250,8 @@ WHEN OLD.resolution IS NOT NEW.resolution BEGIN
           NEW.change_review_id, NEW.change_step_id, NEW.change_note);
 END;
 
+-- An update that leaves updated_at alone sets it to now. The trigger's own UPDATE does not fire it again only
+-- because recursive triggers are off (SQLite's default; ledger.py never turns them on).
 CREATE TRIGGER tr_issue_touch AFTER UPDATE ON issues
 WHEN NEW.updated_at IS OLD.updated_at BEGIN
   UPDATE issues SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = NEW.id;
@@ -1166,6 +1266,7 @@ WHEN NEW.change_actor_id IS NOT NULL OR NEW.change_review_id IS NOT NULL OR NEW.
                     change_commit_sha = NULL, change_note = NULL WHERE id = NEW.id;
 END;
 
+-- The same after an INSERT that carried context (tr_issue_opened has logged it).
 CREATE TRIGGER tr_issue_context_cleared_ins AFTER INSERT ON issues
 WHEN NEW.change_actor_id IS NOT NULL OR NEW.change_review_id IS NOT NULL OR NEW.change_step_id IS NOT NULL
   OR NEW.change_commit_sha IS NOT NULL OR NEW.change_note IS NOT NULL BEGIN
@@ -1173,6 +1274,7 @@ WHEN NEW.change_actor_id IS NOT NULL OR NEW.change_review_id IS NOT NULL OR NEW.
                     change_commit_sha = NULL, change_note = NULL WHERE id = NEW.id;
 END;
 
+-- Refuses DELETE: an issue is closed with a status.
 CREATE TRIGGER tr_issue_no_delete BEFORE DELETE ON issues BEGIN
   SELECT RAISE(ABORT, 'history is append-only: issues cannot be deleted; close one with a status instead');
 END;
@@ -1191,12 +1293,14 @@ WHEN (SELECT status IN ('planning','awaiting-approval','abandoned') OR approved_
   SELECT RAISE(ABORT, 'findings need an approved review (approved_at set, status past awaiting-approval)');
 END;
 
+-- A finding's reviewer run is a run of the finding's own review.
 CREATE TRIGGER tr_finding_run_same_review BEFORE INSERT ON findings
 WHEN NEW.reviewer_run_id IS NOT NULL
  AND (SELECT review_id FROM reviewer_runs WHERE id = NEW.reviewer_run_id) IS NOT NEW.review_id BEGIN
   SELECT RAISE(ABORT, 'the reviewer run belongs to another review');
 END;
 
+-- A retired domain takes no new findings.
 CREATE TRIGGER tr_finding_domain_active BEFORE INSERT ON findings
 WHEN EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL) BEGIN
   SELECT RAISE(ABORT, 'that domain is retired; use a current one');
@@ -1208,6 +1312,7 @@ WHEN NEW.severity = 'T' AND NEW.kind IS NOT 'test' BEGIN
   SELECT RAISE(ABORT, 'severity T is for a missing test: give the finding kind test, or another severity');
 END;
 
+-- Logs 'created' with the point id and the summary.
 CREATE TRIGGER tr_finding_created AFTER INSERT ON findings BEGIN
   INSERT INTO events(entity_type, entity_id, event, to_value, actor_id, review_id, note)
   VALUES ('finding', NEW.id, 'created', NEW.point_id, NULL, NEW.review_id, NEW.summary);
@@ -1227,6 +1332,7 @@ WHEN OLD.review_id IS NOT NEW.review_id OR OLD.reviewer_run_id IS NOT NEW.review
   SELECT RAISE(ABORT, 'history is append-only: only issue_id, match_* and verification* of a finding can change');
 END;
 
+-- Refuses DELETE: a wrong finding is marked verification = 'false'.
 CREATE TRIGGER tr_finding_no_delete BEFORE DELETE ON findings BEGIN
   SELECT RAISE(ABORT, 'history is append-only: findings cannot be deleted; mark a wrong one verification = false');
 END;
@@ -1353,13 +1459,16 @@ WHEN OLD.finding_id IS NOT NEW.finding_id OR OLD.repository_id IS NOT NEW.reposi
   SELECT RAISE(ABORT, 'history is append-only: a location''s finding, repository, commit, path, symbol and role cannot change');
 END;
 
+-- Refuses DELETE: where a point was found is history.
 CREATE TRIGGER tr_location_no_delete BEFORE DELETE ON finding_locations BEGIN
   SELECT RAISE(ABORT, 'history is append-only: finding locations cannot be deleted');
 END;
 
 -- ----- Relations
 
--- No relation stored both ways: directional ones and related-to (which is symmetric).
+-- No relation is stored both ways: with A duplicate-of B recorded, B duplicate-of A is refused, and related-to is
+-- symmetric, so one row says it. blocks is not in the list because a blocks pair both ways is a cycle, which
+-- tr_relation_no_cycle refuses.
 CREATE TRIGGER tr_relation_noreverse_dup BEFORE INSERT ON issue_relations
 WHEN NEW.relation IN ('duplicate-of','continuation-of','regression-of','supersedes','merged-into','split-from',
                       'caused-by','related-to')
@@ -1370,6 +1479,7 @@ BEGIN
                   AND relation = NEW.relation);
 END;
 
+-- The same when a relation is edited.
 CREATE TRIGGER tr_relation_noreverse_dup_upd BEFORE UPDATE OF from_issue_id, to_issue_id, relation ON issue_relations
 WHEN NEW.relation IN ('duplicate-of','continuation-of','regression-of','supersedes','merged-into','split-from',
                       'caused-by','related-to')
@@ -1392,6 +1502,7 @@ WHEN NEW.relation IN ('blocks','duplicate-of','merged-into') BEGIN
                 SELECT 1 FROM reach WHERE n = NEW.from_issue_id);
 END;
 
+-- The same when a relation is edited.
 CREATE TRIGGER tr_relation_no_cycle_upd BEFORE UPDATE OF from_issue_id, to_issue_id, relation ON issue_relations
 WHEN NEW.relation IN ('blocks','duplicate-of','merged-into') BEGIN
   SELECT RAISE(ABORT, 'that relation would make a cycle')
@@ -1403,6 +1514,7 @@ WHEN NEW.relation IN ('blocks','duplicate-of','merged-into') BEGIN
                 SELECT 1 FROM reach WHERE n = NEW.from_issue_id);
 END;
 
+-- Logs 'created' on the relation: the two issue codes, the relation and the rationale.
 CREATE TRIGGER tr_relation_created AFTER INSERT ON issue_relations BEGIN
   INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id, note)
   VALUES ('relation', NEW.id, 'created', (SELECT code FROM issues WHERE id = NEW.from_issue_id),
@@ -1424,6 +1536,7 @@ WHEN NEW.relation IN (SELECT value FROM relation_types WHERE closes = 1) BEGIN
   WHERE id = NEW.from_issue_id AND status IN (SELECT value FROM issue_statuses WHERE active = 1);
 END;
 
+-- Refuses DELETE: relations are history.
 CREATE TRIGGER tr_relation_no_delete BEFORE DELETE ON issue_relations BEGIN
   SELECT RAISE(ABORT, 'history is append-only: relations cannot be deleted');
 END;
@@ -1438,6 +1551,7 @@ WHEN NEW.outcome IN ('fixed','regressed','changed') AND NULLIF(trim(NEW.evidence
   SELECT RAISE(ABORT, 'a fixed, regressed or changed check needs evidence (what the review saw)');
 END;
 
+-- The rules above, each with its own message.
 CREATE TRIGGER tr_check_guard BEFORE INSERT ON review_issue_checks BEGIN
   SELECT RAISE(ABORT, 'checks are history: this review already recorded a check of this issue')
   WHERE EXISTS (SELECT 1 FROM review_issue_checks WHERE review_id = NEW.review_id AND issue_id = NEW.issue_id);
@@ -1452,10 +1566,12 @@ CREATE TRIGGER tr_check_guard BEFORE INSERT ON review_issue_checks BEGIN
                   AND f.verification <> 'false');
 END;
 
+-- A recorded check is never changed.
 CREATE TRIGGER tr_check_no_update BEFORE UPDATE ON review_issue_checks BEGIN
   SELECT RAISE(ABORT, 'history is append-only: review checks cannot be changed');
 END;
 
+-- Refuses DELETE: checks are history.
 CREATE TRIGGER tr_check_no_delete BEFORE DELETE ON review_issue_checks BEGIN
   SELECT RAISE(ABORT, 'history is append-only: review checks cannot be deleted');
 END;
@@ -1509,6 +1625,7 @@ END;
 
 -- ----- Reviews
 
+-- Codes: R- and the next number, zero-padded to 4 digits (R-0001 ...); never reused.
 CREATE TRIGGER tr_review_code BEFORE INSERT ON reviews
 -- (a malformed code is left to the code CHECK, which names it)
 WHEN NEW.code GLOB 'R-[0-9][0-9][0-9][0-9]*' AND NEW.code NOT GLOB 'R-*[^0-9]*' AND (
@@ -1519,16 +1636,19 @@ WHEN NEW.code GLOB 'R-[0-9][0-9][0-9][0-9]*' AND NEW.code NOT GLOB 'R-*[^0-9]*' 
   SELECT RAISE(ABORT, 'review codes are sequential: R- and the next number (R-0001, R-0002 ...)');
 END;
 
+-- A code never changes.
 CREATE TRIGGER tr_review_code_fixed BEFORE UPDATE OF code ON reviews WHEN OLD.code IS NOT NEW.code BEGIN
   SELECT RAISE(ABORT, 'codes never change');
 END;
 
+-- A review's manager is an actor of kind manager.
 CREATE TRIGGER tr_review_manager_kind BEFORE INSERT ON reviews
 WHEN NEW.manager_actor_id IS NOT NULL
  AND (SELECT kind FROM actors WHERE id = NEW.manager_actor_id) IS NOT 'manager' BEGIN
   SELECT RAISE(ABORT, 'manager_actor_id must be an actor of kind manager');
 END;
 
+-- The same when the manager is changed.
 CREATE TRIGGER tr_review_manager_kind_upd BEFORE UPDATE OF manager_actor_id ON reviews
 WHEN NEW.manager_actor_id IS NOT NULL
  AND (SELECT kind FROM actors WHERE id = NEW.manager_actor_id) IS NOT 'manager' BEGIN
@@ -1559,6 +1679,8 @@ WHEN OLD.status IS NOT NEW.status BEGIN
                   AND g.status IN ('open','answered'));
 END;
 
+-- Logs 'status-changed' with change_actor_id and change_note, sets updated_at, and sets completed_at on handed-off
+-- or abandoned (cleared when the review leaves them).
 CREATE TRIGGER tr_review_status AFTER UPDATE OF status ON reviews
 WHEN OLD.status IS NOT NEW.status BEGIN
   INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id, note)
@@ -1569,16 +1691,19 @@ WHEN OLD.status IS NOT NEW.status BEGIN
   WHERE id = NEW.id;
 END;
 
+-- Once logged, the change context is cleared: a later change gives its own.
 CREATE TRIGGER tr_review_context_cleared AFTER UPDATE ON reviews
 WHEN NEW.change_actor_id IS NOT NULL OR NEW.change_note IS NOT NULL BEGIN
   UPDATE reviews SET change_actor_id = NULL, change_note = NULL WHERE id = NEW.id;
 END;
 
+-- The same after an INSERT that carried context.
 CREATE TRIGGER tr_review_context_cleared_ins AFTER INSERT ON reviews
 WHEN NEW.change_actor_id IS NOT NULL OR NEW.change_note IS NOT NULL BEGIN
   UPDATE reviews SET change_actor_id = NULL, change_note = NULL WHERE id = NEW.id;
 END;
 
+-- Refuses DELETE: a review is abandoned with a status.
 CREATE TRIGGER tr_review_no_delete BEFORE DELETE ON reviews BEGIN
   SELECT RAISE(ABORT, 'history is append-only: reviews cannot be deleted; set status abandoned instead');
 END;
@@ -1595,22 +1720,26 @@ CREATE TRIGGER tr_run_review_approved BEFORE INSERT ON reviewer_runs BEGIN
   WHERE EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL);
 END;
 
+-- Logs 'reviewer-run-created' on the review, with the run's label, domain and scope.
 CREATE TRIGGER tr_run_created AFTER INSERT ON reviewer_runs BEGIN
   INSERT INTO events(entity_type, entity_id, event, to_value, actor_id, review_id, note)
   VALUES ('review', NEW.review_id, 'reviewer-run-created', NEW.label, NEW.actor_id, NEW.review_id,
           NEW.domain_code || ': ' || NEW.scope);
 END;
 
+-- A retired domain takes no new reviews.
 CREATE TRIGGER tr_review_domain_active BEFORE INSERT ON review_domains
 WHEN EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL) BEGIN
   SELECT RAISE(ABORT, 'that domain is retired; use a current one');
 END;
 
+-- A retired domain takes no new metrics.
 CREATE TRIGGER tr_metric_domain_active BEFORE INSERT ON metrics
 WHEN EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL) BEGIN
   SELECT RAISE(ABORT, 'that domain is retired; use a current one');
 END;
 
+-- Logs 'metric-recorded' on the review, with the value, name and scope.
 CREATE TRIGGER tr_metric_created AFTER INSERT ON metrics BEGIN
   INSERT INTO events(entity_type, entity_id, event, to_value, review_id, note)
   VALUES ('review', NEW.review_id, 'metric-recorded', CAST(NEW.value AS TEXT), NEW.review_id,
@@ -1619,11 +1748,13 @@ END;
 
 -- ----- Actors, catalogs and standards
 
+-- An actor is not its own parent.
 CREATE TRIGGER tr_actor_parent_self BEFORE INSERT ON actors
 WHEN NEW.parent_actor_id IS NOT NULL AND NEW.parent_actor_id = NEW.id BEGIN
   SELECT RAISE(ABORT, 'an actor cannot be its own parent');
 END;
 
+-- Nor its own ancestor: changing a parent may not close a loop.
 CREATE TRIGGER tr_actor_parent_cycle BEFORE UPDATE OF parent_actor_id ON actors
 WHEN NEW.parent_actor_id IS NOT NULL BEGIN
   SELECT RAISE(ABORT, 'that parent would make a cycle of actors')
@@ -1634,6 +1765,7 @@ WHEN NEW.parent_actor_id IS NOT NULL BEGIN
                 SELECT 1 FROM up WHERE n = NEW.id);
 END;
 
+-- Codes: G- and the next number, zero-padded to 2 digits (G-01 ...); never reused.
 CREATE TRIGGER tr_design_goal_code BEFORE INSERT ON design_goals
 -- (a malformed code is left to the code CHECK, which names it)
 WHEN NEW.code GLOB 'G-[0-9][0-9]*' AND NEW.code NOT GLOB 'G-*[^0-9]*' AND (
@@ -1644,10 +1776,12 @@ WHEN NEW.code GLOB 'G-[0-9][0-9]*' AND NEW.code NOT GLOB 'G-*[^0-9]*' AND (
   SELECT RAISE(ABORT, 'design goal codes are sequential: G- and the next number (G-01, G-02 ...)');
 END;
 
+-- A code never changes.
 CREATE TRIGGER tr_design_goal_code_fixed BEFORE UPDATE OF code ON design_goals WHEN OLD.code IS NOT NEW.code BEGIN
   SELECT RAISE(ABORT, 'codes never change');
 END;
 
+-- Codes: REQ- and the next number, zero-padded to 4 digits (REQ-0001 ...); never reused.
 CREATE TRIGGER tr_requirement_code BEFORE INSERT ON requirements
 -- (a malformed code is left to the code CHECK, which names it)
 WHEN NEW.code GLOB 'REQ-[0-9][0-9][0-9][0-9]*' AND NEW.code NOT GLOB 'REQ-*[^0-9]*' AND (
@@ -1658,6 +1792,7 @@ WHEN NEW.code GLOB 'REQ-[0-9][0-9][0-9][0-9]*' AND NEW.code NOT GLOB 'REQ-*[^0-9
   SELECT RAISE(ABORT, 'requirement codes are sequential: REQ- and the next number (REQ-0001, REQ-0002 ...)');
 END;
 
+-- A code never changes.
 CREATE TRIGGER tr_requirement_code_fixed BEFORE UPDATE OF code ON requirements WHEN OLD.code IS NOT NEW.code BEGIN
   SELECT RAISE(ABORT, 'codes never change');
 END;
@@ -1673,23 +1808,27 @@ WHEN NEW.status NOT IN ('proposed','approved') BEGIN
   SELECT RAISE(ABORT, 'a design goal starts proposed (or approved, with its approver)');
 END;
 
+-- A retired domain takes no new design goals.
 CREATE TRIGGER tr_goal_domain_active BEFORE INSERT ON design_goals
 WHEN EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL) BEGIN
   SELECT RAISE(ABORT, 'that domain is retired; use a current one');
 END;
 
+-- An approved goal's approver is an actor of kind owner or human.
 CREATE TRIGGER tr_goal_approver BEFORE INSERT ON design_goals
 WHEN NEW.status = 'approved'
  AND NOT EXISTS (SELECT 1 FROM actors WHERE id = NEW.approved_by_actor_id AND kind IN ('owner','human')) BEGIN
   SELECT RAISE(ABORT, 'a design goal is approved by the owner: its approver (approved_by_actor_id) must be an actor of kind owner or human');
 END;
 
+-- The same when a goal is approved later, or its approver changed.
 CREATE TRIGGER tr_goal_approver_upd BEFORE UPDATE OF status, approved_by_actor_id ON design_goals
 WHEN NEW.status = 'approved'
  AND NOT EXISTS (SELECT 1 FROM actors WHERE id = NEW.approved_by_actor_id AND kind IN ('owner','human')) BEGIN
   SELECT RAISE(ABORT, 'a design goal is approved by the owner: its approver (approved_by_actor_id) must be an actor of kind owner or human');
 END;
 
+-- The moves a goal's status may make.
 CREATE TRIGGER tr_goal_transition BEFORE UPDATE OF status ON design_goals
 WHEN OLD.status IS NOT NEW.status
  AND NOT ((OLD.status = 'proposed' AND NEW.status IN ('approved','rejected','retired'))
@@ -1697,6 +1836,7 @@ WHEN OLD.status IS NOT NEW.status
   SELECT RAISE(ABORT, 'a design goal moves proposed -> approved, rejected or retired, and approved -> retired; propose a new goal instead');
 END;
 
+-- Once a goal is no longer proposed, its text, domain, review and approval are fixed.
 CREATE TRIGGER tr_goal_fixed BEFORE UPDATE OF text, domain_code, review_id, approved_by_actor_id, approved_at ON design_goals
 WHEN OLD.status <> 'proposed'
  AND (OLD.text IS NOT NEW.text OR OLD.domain_code IS NOT NEW.domain_code OR OLD.review_id IS NOT NEW.review_id
@@ -1704,6 +1844,8 @@ WHEN OLD.status <> 'proposed'
   SELECT RAISE(ABORT, 'an approved, rejected or retired design goal is not edited: retire it and propose a new one');
 END;
 
+-- Logs 'proposed' (or 'recorded' for a goal inserted approved); a goal inserted approved for a review is also
+-- listed in review_goals.
 CREATE TRIGGER tr_goal_created AFTER INSERT ON design_goals BEGIN
   INSERT INTO events(entity_type, entity_id, event, to_value, actor_id, review_id, note)
   VALUES ('goal', NEW.id, CASE NEW.status WHEN 'proposed' THEN 'proposed' ELSE 'recorded' END, NEW.status,
@@ -1713,6 +1855,8 @@ CREATE TRIGGER tr_goal_created AFTER INSERT ON design_goals BEGIN
     SELECT NEW.review_id, NEW.id WHERE NEW.status = 'approved' AND NEW.review_id IS NOT NULL;
 END;
 
+-- Logs 'status-changed' (who approved, or the note of a rejection or retirement) and keeps retired_at in step with
+-- the status.
 CREATE TRIGGER tr_goal_status AFTER UPDATE OF status ON design_goals
 WHEN OLD.status IS NOT NEW.status BEGIN
   INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id, note)
@@ -1732,20 +1876,24 @@ WHEN NEW.retired_at IS NOT NULL AND NEW.status <> 'retired' BEGIN
   UPDATE design_goals SET status = 'retired' WHERE id = NEW.id;
 END;
 
+-- Logs 'text-changed' with the old and new text (possible only while the goal is proposed).
 CREATE TRIGGER tr_goal_text_changed AFTER UPDATE OF text ON design_goals WHEN OLD.text IS NOT NEW.text BEGIN
   INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id)
   VALUES ('goal', NEW.id, 'text-changed', OLD.text, NEW.text, NEW.change_actor_id, NEW.review_id);
 END;
 
+-- Once logged, change_actor_id is cleared.
 CREATE TRIGGER tr_goal_context_cleared AFTER UPDATE ON design_goals WHEN NEW.change_actor_id IS NOT NULL BEGIN
   UPDATE design_goals SET change_actor_id = NULL WHERE id = NEW.id;
 END;
 
+-- The same after an INSERT that carried it.
 CREATE TRIGGER tr_goal_context_cleared_ins AFTER INSERT ON design_goals
 WHEN NEW.change_actor_id IS NOT NULL BEGIN
   UPDATE design_goals SET change_actor_id = NULL WHERE id = NEW.id;
 END;
 
+-- Refuses DELETE: a goal is retired.
 CREATE TRIGGER tr_goal_no_delete BEFORE DELETE ON design_goals BEGIN
   SELECT RAISE(ABORT, 'history is append-only: design goals cannot be deleted; retire it instead');
 END;
@@ -1788,6 +1936,7 @@ WHEN (SELECT approved_at FROM reviews WHERE id = NEW.review_id) IS NULL BEGIN
   SELECT RAISE(ABORT, 'the interview comes after the owner approves the review''s domains (review-status <review> approved)');
 END;
 
+-- A question about a domain names a domain the review included.
 CREATE TRIGGER tr_question_domain_in_review BEFORE INSERT ON interview_questions
 WHEN NEW.domain_code IS NOT NULL
  AND NOT EXISTS (SELECT 1 FROM review_domains WHERE review_id = NEW.review_id AND domain_code = NEW.domain_code
@@ -1795,29 +1944,35 @@ WHEN NEW.domain_code IS NOT NULL
   SELECT RAISE(ABORT, 'the review did not include that domain; ask about an approved domain, or leave the domain out for a whole-project question');
 END;
 
+-- Logs 'asked' with the question.
 CREATE TRIGGER tr_question_asked AFTER INSERT ON interview_questions BEGIN
   INSERT INTO events(entity_type, entity_id, event, to_value, actor_id, review_id, note)
   VALUES ('question', NEW.id, 'asked', NEW.code, NEW.asked_by_actor_id, NEW.review_id, NEW.question);
 END;
 
+-- A question is kept as asked.
 CREATE TRIGGER tr_question_no_update BEFORE UPDATE ON interview_questions BEGIN
   SELECT RAISE(ABORT, 'history is append-only: an interview question is kept as asked; ask a new one');
 END;
 
+-- Refuses DELETE: questions are history.
 CREATE TRIGGER tr_question_no_delete BEFORE DELETE ON interview_questions BEGIN
   SELECT RAISE(ABORT, 'history is append-only: interview questions cannot be deleted');
 END;
 
+-- Logs 'answered' on the question, with the answer and how it was given.
 CREATE TRIGGER tr_answer_recorded AFTER INSERT ON interview_answers BEGIN
   INSERT INTO events(entity_type, entity_id, event, to_value, actor_id, review_id, note)
   VALUES ('question', NEW.question_id, 'answered', NEW.answered_via, NEW.answered_by_actor_id,
           (SELECT review_id FROM interview_questions WHERE id = NEW.question_id), NEW.answer);
 END;
 
+-- An answer is kept as given; a correction is a new answer.
 CREATE TRIGGER tr_answer_no_update BEFORE UPDATE ON interview_answers BEGIN
   SELECT RAISE(ABORT, 'history is append-only: an answer is kept as given; record a new answer instead');
 END;
 
+-- Refuses DELETE: answers are history.
 CREATE TRIGGER tr_answer_no_delete BEFORE DELETE ON interview_answers BEGIN
   SELECT RAISE(ABORT, 'history is append-only: interview answers cannot be deleted');
 END;
@@ -1833,16 +1988,19 @@ CREATE TRIGGER tr_goal_source_rules BEFORE INSERT ON goal_sources BEGIN
                   AND q.domain_code <> g.domain_code);
 END;
 
+-- Logs 'source-linked' on the goal, with the question.
 CREATE TRIGGER tr_goal_source_linked AFTER INSERT ON goal_sources BEGIN
   INSERT INTO events(entity_type, entity_id, event, to_value, review_id, note)
   SELECT 'goal', NEW.goal_id, 'source-linked', q.code, q.review_id, q.question
   FROM interview_questions q WHERE q.id = NEW.question_id;
 END;
 
+-- A goal's sources are kept as recorded.
 CREATE TRIGGER tr_goal_source_no_update BEFORE UPDATE ON goal_sources BEGIN
   SELECT RAISE(ABORT, 'history is append-only: a goal''s sources are kept as recorded');
 END;
 
+-- Refuses DELETE: a goal's sources are history.
 CREATE TRIGGER tr_goal_source_no_delete BEFORE DELETE ON goal_sources BEGIN
   SELECT RAISE(ABORT, 'history is append-only: a goal''s sources cannot be deleted');
 END;
@@ -1854,22 +2012,26 @@ WHEN NOT EXISTS (SELECT 1 FROM design_goals g JOIN goal_statuses s ON s.value = 
   SELECT RAISE(ABORT, 'a plan step serves approved design goals only; ask the owner to approve the goal first');
 END;
 
+-- Logs 'step-linked' on the goal, with the plan and step number.
 CREATE TRIGGER tr_step_goal_linked AFTER INSERT ON step_goals BEGIN
   INSERT INTO events(entity_type, entity_id, event, to_value, step_id)
   SELECT 'goal', NEW.goal_id, 'step-linked', p.code || ' #' || s.number, NEW.step_id
   FROM steps s JOIN plans p ON p.id = s.plan_id WHERE s.id = NEW.step_id;
 END;
 
+-- A link is not moved to another goal: add the other link.
 CREATE TRIGGER tr_step_goal_no_update BEFORE UPDATE ON step_goals BEGIN
   SELECT RAISE(ABORT, 'history is append-only: link the step to another goal instead');
 END;
 
+-- Refuses DELETE: a step's goals stay linked.
 CREATE TRIGGER tr_step_goal_no_delete BEFORE DELETE ON step_goals BEGIN
   SELECT RAISE(ABORT, 'history is append-only: a step''s goals cannot be unlinked');
 END;
 
 -- ----- Decisions
 
+-- Codes: D- and the next number, zero-padded to 4 digits (D-0001 ...); never reused.
 CREATE TRIGGER tr_decision_code BEFORE INSERT ON decisions
 -- (a malformed code is left to the code CHECK, which names it)
 WHEN NEW.code GLOB 'D-[0-9][0-9][0-9][0-9]*' AND NEW.code NOT GLOB 'D-*[^0-9]*' AND (
@@ -1880,6 +2042,7 @@ WHEN NEW.code GLOB 'D-[0-9][0-9][0-9][0-9]*' AND NEW.code NOT GLOB 'D-*[^0-9]*' 
   SELECT RAISE(ABORT, 'decision codes are sequential: D- and the next number (D-0001, D-0002 ...)');
 END;
 
+-- A code never changes.
 CREATE TRIGGER tr_decision_code_fixed BEFORE UPDATE OF code ON decisions WHEN OLD.code IS NOT NEW.code BEGIN
   SELECT RAISE(ABORT, 'codes never change');
 END;
@@ -1895,6 +2058,8 @@ CREATE TRIGGER tr_decision_created AFTER INSERT ON decisions BEGIN
   WHERE id = NEW.id AND NEW.status = 'decided' AND NEW.decided_at IS NULL;
 END;
 
+-- Logs 'status-changed' with decided_by_actor_id and the answer as the note, and fills decided_at when the decision
+-- is decided.
 CREATE TRIGGER tr_decision_status AFTER UPDATE OF status ON decisions
 WHEN OLD.status IS NOT NEW.status BEGIN
   INSERT INTO events(entity_type, entity_id, event, from_value, to_value,
@@ -1913,12 +2078,14 @@ WHEN OLD.answer IS NOT NULL AND OLD.answer IS NOT NEW.answer BEGIN
           NEW.step_id, NEW.rationale);
 END;
 
+-- Refuses DELETE: a decision to reconsider is set to revisit.
 CREATE TRIGGER tr_decision_no_delete BEFORE DELETE ON decisions BEGIN
   SELECT RAISE(ABORT, 'history is append-only: decisions cannot be deleted; set status revisit instead');
 END;
 
 -- ----- Gates
 
+-- Codes: GATE- and the next number, zero-padded to 4 digits (GATE-0001 ...); never reused.
 CREATE TRIGGER tr_gate_code BEFORE INSERT ON gates
 -- (a malformed code is left to the code CHECK, which names it)
 WHEN NEW.code GLOB 'GATE-[0-9][0-9][0-9][0-9]*' AND NEW.code NOT GLOB 'GATE-*[^0-9]*' AND (
@@ -1929,6 +2096,7 @@ WHEN NEW.code GLOB 'GATE-[0-9][0-9][0-9][0-9]*' AND NEW.code NOT GLOB 'GATE-*[^0
   SELECT RAISE(ABORT, 'gate codes are sequential: GATE- and the next number (GATE-0001, GATE-0002 ...)');
 END;
 
+-- A code never changes.
 CREATE TRIGGER tr_gate_code_fixed BEFORE UPDATE OF code ON gates WHEN OLD.code IS NOT NEW.code BEGIN
   SELECT RAISE(ABORT, 'codes never change');
 END;
@@ -1943,6 +2111,7 @@ WHEN NEW.options IS NOT NULL AND json_valid(NEW.options) AND json_type(NEW.optio
   SELECT RAISE(ABORT, 'gate options must be objects with a text value and label (and an optional description)');
 END;
 
+-- The same when the options are changed.
 CREATE TRIGGER tr_gate_options_shape_upd BEFORE UPDATE OF options ON gates
 WHEN NEW.options IS NOT NULL AND json_valid(NEW.options) AND json_type(NEW.options) = 'array'
  AND EXISTS (SELECT 1 FROM json_each(NEW.options) j
@@ -1974,6 +2143,7 @@ WHEN OLD.status IS NOT NEW.status AND NEW.status <> 'open'
   SELECT RAISE(ABORT, 'a gate moves open -> answered -> applied (or withdrawn); answer it before applying it');
 END;
 
+-- Logs 'opened' with the gate's title and who opened it.
 CREATE TRIGGER tr_gate_created AFTER INSERT ON gates BEGIN
   INSERT INTO events(entity_type, entity_id, event, to_value, actor_id, review_id, step_id, note)
   VALUES ('gate', NEW.id, 'opened', NEW.status, NEW.opened_by_actor_id, NEW.review_id, NEW.step_id, NEW.title);
@@ -2015,6 +2185,7 @@ WHEN OLD.status <> 'open' AND NEW.status <> 'open'
   SELECT RAISE(ABORT, 'who answered a gate, how and when cannot be changed once it is answered');
 END;
 
+-- Logs 'answer-cleared', with the answer it held, when a gate is reopened.
 CREATE TRIGGER tr_gate_answer_cleared AFTER UPDATE OF answer_value, answer_text ON gates
 WHEN OLD.status <> 'open' AND NEW.status = 'open'
  AND (OLD.answer_value IS NOT NULL OR OLD.answer_text IS NOT NULL) BEGIN
@@ -2032,21 +2203,25 @@ WHEN OLD.status = 'open' AND (OLD.answer_value IS NOT NULL OR OLD.answer_text IS
           NEW.step_id, 'was: ' || COALESCE(OLD.answer_text, '') || '; now: ' || COALESCE(NEW.answer_text, ''));
 END;
 
+-- Once logged, change_actor_id is cleared.
 CREATE TRIGGER tr_gate_context_cleared AFTER UPDATE ON gates WHEN NEW.change_actor_id IS NOT NULL BEGIN
   UPDATE gates SET change_actor_id = NULL WHERE id = NEW.id;
 END;
 
+-- The same after an INSERT that carried it.
 CREATE TRIGGER tr_gate_context_cleared_ins AFTER INSERT ON gates
 WHEN NEW.change_actor_id IS NOT NULL BEGIN
   UPDATE gates SET change_actor_id = NULL WHERE id = NEW.id;
 END;
 
+-- Refuses DELETE: a gate no longer needed is withdrawn.
 CREATE TRIGGER tr_gate_no_delete BEFORE DELETE ON gates BEGIN
   SELECT RAISE(ABORT, 'history is append-only: gates cannot be deleted; set status withdrawn instead');
 END;
 
 -- ----- Plans
 
+-- Codes: P- and the next number, zero-padded to 4 digits (P-0001 ...); never reused.
 CREATE TRIGGER tr_plan_code BEFORE INSERT ON plans
 -- (a malformed code is left to the code CHECK, which names it)
 WHEN NEW.code GLOB 'P-[0-9][0-9][0-9][0-9]*' AND NEW.code NOT GLOB 'P-*[^0-9]*' AND (
@@ -2057,10 +2232,12 @@ WHEN NEW.code GLOB 'P-[0-9][0-9][0-9][0-9]*' AND NEW.code NOT GLOB 'P-*[^0-9]*' 
   SELECT RAISE(ABORT, 'plan codes are sequential: P- and the next number (P-0001, P-0002 ...)');
 END;
 
+-- A code never changes.
 CREATE TRIGGER tr_plan_code_fixed BEFORE UPDATE OF code ON plans WHEN OLD.code IS NOT NEW.code BEGIN
   SELECT RAISE(ABORT, 'codes never change');
 END;
 
+-- Logs 'created' with the plan's title and change_actor_id.
 CREATE TRIGGER tr_plan_created AFTER INSERT ON plans BEGIN
   INSERT INTO events(entity_type, entity_id, event, to_value, actor_id, note)
   VALUES ('plan', NEW.id, 'created', NEW.status, NEW.change_actor_id, NEW.title);
@@ -2087,6 +2264,7 @@ WHEN OLD.status IS NOT NEW.status BEGIN
                   AND g.status IN ('open','answered'));
 END;
 
+-- Logs 'status-changed' with change_actor_id and change_note, and sets updated_at.
 CREATE TRIGGER tr_plan_status AFTER UPDATE OF status ON plans
 WHEN OLD.status IS NOT NEW.status BEGIN
   INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, note)
@@ -2094,21 +2272,26 @@ WHEN OLD.status IS NOT NEW.status BEGIN
   UPDATE plans SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = NEW.id;
 END;
 
+-- Logs 'title-changed' with the old and new title.
 CREATE TRIGGER tr_plan_title_changed AFTER UPDATE OF title ON plans WHEN OLD.title IS NOT NEW.title BEGIN
   INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, note)
   VALUES ('plan', NEW.id, 'title-changed', OLD.title, NEW.title, NEW.change_actor_id, NEW.change_note);
 END;
 
+-- An update that leaves updated_at alone sets it to now (relies on recursive triggers being off, like
+-- tr_issue_touch).
 CREATE TRIGGER tr_plan_touch AFTER UPDATE ON plans
 WHEN NEW.updated_at IS OLD.updated_at BEGIN
   UPDATE plans SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = NEW.id;
 END;
 
+-- Once logged, the change context is cleared: a later change gives its own.
 CREATE TRIGGER tr_plan_context_cleared AFTER UPDATE ON plans
 WHEN NEW.change_actor_id IS NOT NULL OR NEW.change_note IS NOT NULL BEGIN
   UPDATE plans SET change_actor_id = NULL, change_note = NULL WHERE id = NEW.id;
 END;
 
+-- The same after an INSERT that carried context.
 CREATE TRIGGER tr_plan_context_cleared_ins AFTER INSERT ON plans
 WHEN NEW.change_actor_id IS NOT NULL OR NEW.change_note IS NOT NULL BEGIN
   UPDATE plans SET change_actor_id = NULL, change_note = NULL WHERE id = NEW.id;
@@ -2124,6 +2307,7 @@ CREATE TRIGGER tr_dep_order BEFORE INSERT ON step_dependencies BEGIN
     WHERE a.id = NEW.step_id AND b.id = NEW.depends_on_step_id AND b.number < a.number);
 END;
 
+-- The same when a dependency is edited.
 CREATE TRIGGER tr_dep_order_upd BEFORE UPDATE ON step_dependencies BEGIN
   SELECT RAISE(ABORT, 'a step may only depend on an earlier step of the same plan')
   WHERE NOT EXISTS (
@@ -2131,6 +2315,7 @@ CREATE TRIGGER tr_dep_order_upd BEFORE UPDATE ON step_dependencies BEGIN
     WHERE a.id = NEW.step_id AND b.id = NEW.depends_on_step_id AND b.number < a.number);
 END;
 
+-- Logs 'dependency-added' on the step, with the number of the step it depends on.
 CREATE TRIGGER tr_dep_created AFTER INSERT ON step_dependencies BEGIN
   INSERT INTO events(entity_type, entity_id, event, to_value, step_id, note)
   VALUES ('step', NEW.step_id, 'dependency-added',
@@ -2138,16 +2323,20 @@ CREATE TRIGGER tr_dep_created AFTER INSERT ON step_dependencies BEGIN
           'depends on step ' || (SELECT number FROM steps WHERE id = NEW.depends_on_step_id));
 END;
 
+-- A step's phase is a phase of the step's own plan. The foreign keys cannot say this: phase_id and plan_id each
+-- point at a valid row on their own.
 CREATE TRIGGER tr_step_phase_plan BEFORE INSERT ON steps BEGIN
   SELECT RAISE(ABORT, 'step phase belongs to another plan')
   WHERE (SELECT plan_id FROM phases WHERE id = NEW.phase_id) IS NOT NEW.plan_id;
 END;
 
+-- The same when a step is moved to another phase or plan.
 CREATE TRIGGER tr_step_phase_plan_upd BEFORE UPDATE OF phase_id, plan_id ON steps BEGIN
   SELECT RAISE(ABORT, 'step phase belongs to another plan')
   WHERE (SELECT plan_id FROM phases WHERE id = NEW.phase_id) IS NOT NEW.plan_id;
 END;
 
+-- And when a phase with steps is moved to another plan.
 CREATE TRIGGER tr_phase_plan_upd BEFORE UPDATE OF plan_id ON phases
 WHEN OLD.plan_id IS NOT NEW.plan_id BEGIN
   SELECT RAISE(ABORT, 'step phase belongs to another plan')
@@ -2173,12 +2362,14 @@ WHEN OLD.status IS NOT NEW.status AND NEW.change_note IS NULL
   SELECT RAISE(ABORT, 'give change_note with a step status change');
 END;
 
+-- The second rule above: a blocking gate that is open or answered holds the step.
 CREATE TRIGGER tr_step_gate_blocks BEFORE UPDATE OF status ON steps
 WHEN OLD.status IS NOT NEW.status AND NEW.status IN ('doing','done')
  AND EXISTS (SELECT 1 FROM gates g WHERE g.step_id = NEW.id AND g.blocking = 1 AND g.status IN ('open','answered')) BEGIN
   SELECT RAISE(ABORT, 'a blocking gate on this step is not applied yet');
 END;
 
+-- Logs 'created' with the step's title and change_actor_id.
 CREATE TRIGGER tr_step_created AFTER INSERT ON steps BEGIN
   INSERT INTO events(entity_type, entity_id, event, to_value, actor_id, step_id, note)
   VALUES ('step', NEW.id, 'created', NEW.status, NEW.change_actor_id, NEW.id, NEW.title);
@@ -2199,37 +2390,45 @@ WHEN OLD.status IS NOT NEW.status BEGIN
   WHERE id = NEW.id;
 END;
 
+-- Logs 'title-changed' with the old and new title.
 CREATE TRIGGER tr_step_title_changed AFTER UPDATE OF title ON steps WHEN OLD.title IS NOT NEW.title BEGIN
   INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, step_id, note)
   VALUES ('step', NEW.id, 'title-changed', OLD.title, NEW.title, NEW.change_actor_id, NEW.id, NEW.change_note);
 END;
 
+-- Logs 'change-text-changed' with the old and new text.
 CREATE TRIGGER tr_step_change_changed AFTER UPDATE OF change ON steps WHEN OLD.change IS NOT NEW.change BEGIN
   INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, step_id, note)
   VALUES ('step', NEW.id, 'change-text-changed', OLD.change, NEW.change, NEW.change_actor_id, NEW.id,
           NEW.change_note);
 END;
 
+-- Logs 'proof-changed' with the old and new text.
 CREATE TRIGGER tr_step_proof_changed AFTER UPDATE OF proof ON steps WHEN OLD.proof IS NOT NEW.proof BEGIN
   INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, step_id, note)
   VALUES ('step', NEW.id, 'proof-changed', OLD.proof, NEW.proof, NEW.change_actor_id, NEW.id, NEW.change_note);
 END;
 
+-- An update that leaves updated_at alone sets it to now (relies on recursive triggers being off, like
+-- tr_issue_touch).
 CREATE TRIGGER tr_step_touch AFTER UPDATE ON steps
 WHEN NEW.updated_at IS OLD.updated_at BEGIN
   UPDATE steps SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = NEW.id;
 END;
 
+-- Once logged, the change context is cleared: a later change gives its own.
 CREATE TRIGGER tr_step_context_cleared AFTER UPDATE ON steps
 WHEN NEW.change_actor_id IS NOT NULL OR NEW.change_commit_sha IS NOT NULL OR NEW.change_note IS NOT NULL BEGIN
   UPDATE steps SET change_actor_id = NULL, change_commit_sha = NULL, change_note = NULL WHERE id = NEW.id;
 END;
 
+-- The same after an INSERT that carried context.
 CREATE TRIGGER tr_step_context_cleared_ins AFTER INSERT ON steps
 WHEN NEW.change_actor_id IS NOT NULL OR NEW.change_commit_sha IS NOT NULL OR NEW.change_note IS NOT NULL BEGIN
   UPDATE steps SET change_actor_id = NULL, change_commit_sha = NULL, change_note = NULL WHERE id = NEW.id;
 END;
 
+-- Refuses DELETE: a step not to be done is dropped.
 CREATE TRIGGER tr_step_no_delete BEFORE DELETE ON steps BEGIN
   SELECT RAISE(ABORT, 'history is append-only: steps cannot be deleted; set status dropped instead');
 END;
@@ -2242,6 +2441,7 @@ WHEN NOT EXISTS (SELECT 1 FROM steps s JOIN findings f ON f.id = NEW.finding_id
   SELECT RAISE(ABORT, 'the finding''s review is not one of the step''s plan reviews (plan_reviews)');
 END;
 
+-- Logs 'linked' on the finding, with the step that closes it.
 CREATE TRIGGER tr_step_finding_created AFTER INSERT ON step_findings BEGIN
   INSERT INTO events(entity_type, entity_id, event, to_value, step_id, review_id, note)
   VALUES ('step-finding', NEW.finding_id, 'linked', (SELECT point_id FROM findings WHERE id = NEW.finding_id),
@@ -2251,10 +2451,12 @@ END;
 
 -- ----- Events
 
+-- An event is never changed.
 CREATE TRIGGER tr_events_no_update BEFORE UPDATE ON events BEGIN
   SELECT RAISE(ABORT, 'history is append-only: events cannot be changed');
 END;
 
+-- Refuses DELETE: events are the history.
 CREATE TRIGGER tr_events_no_delete BEFORE DELETE ON events BEGIN
   SELECT RAISE(ABORT, 'history is append-only: events cannot be deleted');
 END;
@@ -2561,9 +2763,9 @@ END;
 
 -- ---------- Views ---------------------------------------------------------
 
--- Issues not yet closed, oldest and most severe first. locations: the primary locations of the issue's real
--- findings (v_real_findings), each prefixed with its repository name when the ledger has more than one, so the
--- same path in two repositories stays two places.
+-- Issues still to fix, most severe first, then oldest.
+-- locations: the primary locations of the issue's real findings (v_real_findings), each prefixed with its
+-- repository name when the ledger has more than one, so the same path in two repositories stays two places.
 CREATE VIEW v_open_issues AS
 SELECT i.code, i.title, i.severity, i.status, i.domain_code, i.theme_code, i.sub,
        i.times_seen, fr.code AS first_seen, fr.started_at AS first_seen_at,
@@ -2581,8 +2783,9 @@ WHERE i.status IN (SELECT value FROM issue_statuses WHERE active = 1)
 ORDER BY CASE i.severity WHEN 'H' THEN 0 WHEN 'M' THEN 1 WHEN 'L' THEN 2 ELSE 3 END,
          fr.started_at;
 
--- Known issues to hand each reviewer in the brief, by domain: with where they were seen (primary locations, as in
--- v_open_issues) and the owner's standing decisions on them (decided or to revisit).
+-- The known issues each reviewer is told about before it starts, by domain.
+-- Each comes with where it was seen (primary locations, as in v_open_issues) and the owner's standing decisions on
+-- it (decided or to revisit).
 CREATE VIEW v_known_issues_for_brief AS
 SELECT i.domain_code, i.code, i.title, i.severity, i.status, i.current_state,
        i.recommendation, i.resolution,
@@ -2599,8 +2802,9 @@ FROM issues i
 WHERE i.status IN (SELECT value FROM issue_statuses WHERE briefed = 1)
 ORDER BY i.domain_code, i.id;   -- by id, so ISS-9999 comes before ISS-10000
 
--- Issues raised by more than one review, or that came back after a fix. Only real findings count (v_real_findings;
--- times_seen counts them too): a false re-raise does not make an issue recurring.
+-- Issues raised by more than one review, or that came back after a fix.
+-- Only real findings count (v_real_findings; times_seen counts them too): a false re-raise does not make an issue
+-- recurring.
 CREATE VIEW v_recurring_issues AS
 SELECT i.code, i.title, i.severity, i.status, i.times_seen,
        (SELECT count(*) FROM events e WHERE e.entity_type = 'issue' AND e.entity_id = i.id
@@ -2613,7 +2817,8 @@ WHERE i.times_seen > 1 OR EXISTS (SELECT 1 FROM events e WHERE e.entity_type = '
         AND e.entity_id = i.id AND e.to_value = 'regressed')
 ORDER BY regressions DESC, i.times_seen DESC;
 
--- Full life of one issue: filter by code.
+-- The full history of each issue, oldest event first.
+-- Filter by code.
 CREATE VIEW v_issue_timeline AS
 SELECT i.code, e.at, e.event, e.from_value, e.to_value, r.code AS review,
        s.number AS step, e.commit_sha, a.name AS actor, e.note
@@ -2624,7 +2829,8 @@ LEFT JOIN steps s ON s.id = e.step_id
 LEFT JOIN actors a ON a.id = e.actor_id
 ORDER BY i.code, e.at, e.id;
 
--- Every relation in both directions, with codes.
+-- How issues are related to each other.
+-- Each relation once, in its stored direction (from_issue is a duplicate of, blocks ... to_issue), with codes.
 CREATE VIEW v_issue_graph AS
 SELECT a.code AS from_issue, r.relation, b.code AS to_issue, r.confidence, r.rationale,
        rv.code AS established_in
@@ -2633,11 +2839,12 @@ JOIN issues a ON a.id = r.from_issue_id
 JOIN issues b ON b.id = r.to_issue_id
 LEFT JOIN reviews rv ON rv.id = r.established_in_review_id;
 
--- Per review and domain: counts by severity, verified and false. Every count but false_findings is of real
--- findings (the v_real_findings rule, verification <> 'false'); false_findings counts the rest. came_back counts
--- the issues of this review's real findings that this review sent back, from their events (the trigger's own
--- record): regressed, reopened from a closed status, or raised again while accepted. r.code is a GROUP BY term so
--- that a WHERE review = ? filter is pushed into the findings scan (one review's findings, not every review's).
+-- The number of points each review raised, by domain and severity.
+-- Also counts the verified and the false ones. Every count but false_findings is of real findings (the
+-- v_real_findings rule, verification <> 'false'); false_findings counts the rest. came_back counts the issues of
+-- this review's real findings that this review sent back, from their events (the trigger's own record): regressed,
+-- reopened from a closed status, or raised again while accepted. r.code is a GROUP BY term so that a WHERE review =
+-- ? filter is pushed into the findings scan (one review's findings, not every review's).
 CREATE VIEW v_review_summary AS
 SELECT r.code AS review, r.started_at, f.domain_code,
        sum(f.verification <> 'false') AS points,
@@ -2660,23 +2867,39 @@ FROM findings f JOIN reviews r ON r.id = f.review_id
 GROUP BY r.id, r.code, f.domain_code
 ORDER BY r.started_at, f.domain_code;
 
--- Findings not yet matched to an issue (must be empty before consolidating). False findings too: a false finding
--- is matched to an issue closed as obsolete, so the ledger keeps what was claimed and why it was wrong. An
--- abandoned review's findings are not required to be matched.
+-- Each review with its point counts.
+-- One row per review (0, not NULL, for a review with no findings): its real findings (v_real_findings) by
+-- severity, those that opened an issue, and those whose match type says the issue came back
+-- (match_types.came_back). The viewer's review lists read this view. r.code is a GROUP BY term so that a
+-- WHERE review = ? filter is pushed into the findings scan.
+CREATE VIEW v_review_totals AS
+SELECT r.code AS review, r.started_at, count(f.id) AS points,
+       COALESCE(sum(f.severity = 'H'), 0) AS high, COALESCE(sum(f.severity = 'M'), 0) AS medium,
+       COALESCE(sum(f.severity = 'L'), 0) AS low, COALESCE(sum(f.severity = 'T'), 0) AS tests,
+       COALESCE(sum(f.match_type IN ('new','continuation')), 0) AS new_issues,
+       COALESCE(sum(f.match_type IN (SELECT value FROM match_types WHERE came_back = 1)), 0) AS came_back
+FROM reviews r LEFT JOIN v_real_findings f ON f.review_id = r.id
+GROUP BY r.id, r.code;
+
+-- Points not yet matched to an issue.
+-- Must be empty before consolidating. False findings too: a false finding is matched to an issue closed as
+-- obsolete, so the ledger keeps what was claimed and why it was wrong. An abandoned review's findings are not
+-- required to be matched.
 CREATE VIEW v_unmatched_findings AS
 SELECT r.code AS review, f.point_id, f.severity, f.summary
 FROM findings f JOIN reviews r ON r.id = f.review_id
 WHERE f.issue_id IS NULL AND r.status <> 'abandoned';
 
--- Every finding but the false ones: the one definition of a real finding. Counts (times_seen, v_recurring_issues,
--- v_review_summary, v_file_hotspots, v_open_issues' locations) use it; the must-be-empty checks do not, since a
--- false finding must still be matched (to an issue closed as obsolete) and closed by a plan step.
+-- Every point except those found to be false.
+-- The one definition of a real finding. Counts (times_seen, v_recurring_issues, v_review_summary, v_file_hotspots,
+-- v_open_issues' locations) use it; the must-be-empty checks do not, since a false finding must still be matched
+-- (to an issue closed as obsolete) and closed by a plan step.
 CREATE VIEW v_real_findings AS
 SELECT * FROM findings WHERE verification <> 'false';
 
--- Known issues in domains that ran, with no check recorded (must be empty). Known = first seen in another review
--- and opened before this one started, compared as julianday() values (an instant, not text). An abandoned review
--- needs no checks.
+-- Known issues a review should have looked for and did not.
+-- Must be empty. Counted in the domains that ran. Known = first seen in another review and opened before this one
+-- started, compared as julianday() values (an instant, not text). An abandoned review needs no checks.
 CREATE VIEW v_unchecked_known_issues AS
 SELECT r.code AS review, i.code AS issue, i.domain_code, i.title
 FROM reviews r
@@ -2688,12 +2911,13 @@ WHERE r.status <> 'abandoned'
   AND i.status IN (SELECT value FROM issue_statuses WHERE briefed = 1)
   AND NOT EXISTS (SELECT 1 FROM review_issue_checks c WHERE c.review_id = r.id AND c.issue_id = i.id);
 
--- Coverage: findings of a plan's reviews closed by no step (must be empty). A finding is covered by a step of
--- this plan, or by a done step of a plan this plan supersedes (work already finished under the old plan). The
--- probe goes from the finding to its steps (ix_step_findings_find), never over a whole plan's steps per finding.
--- False findings count too (the plan's 'record false findings' step closes them). A dropped step covers nothing
--- unless a decided decision is linked to it (the owner chose not to do it). Superseded and abandoned plans, and
--- abandoned reviews, are not checked.
+-- Points that no step of the fix plan closes.
+-- Must be empty. Counted over the reviews a plan covers. A finding is covered by a step of this plan, or by a done
+-- step of a plan this plan supersedes (work already finished under the old plan). The probe goes from the finding
+-- to its steps (ix_step_findings_find), never over a whole plan's steps per finding. False findings count too (the
+-- plan's 'record false findings' step closes them). A dropped step covers nothing unless a decided decision is
+-- linked to it (the owner chose not to do it). Superseded and abandoned plans, and abandoned reviews, are not
+-- checked.
 CREATE VIEW v_uncovered_findings AS
 SELECT p.code AS plan, r.code AS review, f.point_id, f.severity, f.summary
 FROM plans p
@@ -2708,10 +2932,10 @@ WHERE p.status NOT IN ('superseded','abandoned') AND r.status <> 'abandoned'
                     AND (s.status <> 'dropped'
                          OR EXISTS (SELECT 1 FROM decisions d WHERE d.step_id = s.id AND d.status = 'decided')));
 
--- Coverage (must be empty): steps that close nothing, and findings closed by several steps without a reason. A
--- dropped step, or one whose no_findings_reason says why it closes nothing by design (the follow-up review that
--- verifies the plan), is not a problem; dropped steps do not count towards closing a finding twice. Superseded
--- and abandoned plans are not checked.
+-- Plan steps that close nothing, and points closed by several steps without a reason.
+-- Must be empty. A dropped step, or one whose no_findings_reason says why it closes nothing by design (the
+-- follow-up review that verifies the plan), is not a problem; dropped steps do not count towards closing a finding
+-- twice. Superseded and abandoned plans are not checked.
 CREATE VIEW v_coverage_problems AS
 SELECT p.code AS plan, 'step closes nothing' AS problem, CAST(s.number AS TEXT) AS item
 FROM steps s JOIN plans p ON p.id = s.plan_id
@@ -2726,7 +2950,7 @@ WHERE p.status NOT IN ('superseded','abandoned') AND s.status <> 'dropped'
 GROUP BY p.id, sf.finding_id
 HAVING count(*) > 1 AND sum(sf.multi_reason IS NULL) > 0;
 
--- Progress per phase.
+-- How far each phase of a fix plan has come.
 CREATE VIEW v_plan_progress AS
 SELECT p.code AS plan, ph.number AS phase, ph.title,
        min(s.number) AS first_step, max(s.number) AS last_step, count(s.id) AS steps,
@@ -2738,12 +2962,41 @@ FROM phases ph JOIN plans p ON p.id = ph.plan_id
 LEFT JOIN steps s ON s.phase_id = ph.id
 GROUP BY ph.id ORDER BY p.code, ph.number;
 
--- The owner's to-do list: open gates, answered gates the agent has not
--- acted on yet, and anything else waiting on the owner without a gate (steps, decisions, and design goals proposed
--- for a review and not on an open approval gate).
--- Each thing once: a step or decision with an open or answered gate (on it, or for a decision on its step) is
--- listed as that gate. A step's question falls back to its progress note, then to its change text, so it is never
--- blank; it is blocking when an unfinished step depends on it.
+-- Each fix plan with its step counts.
+-- One row per plan (0, not NULL, for a plan with no steps), with the reviews it covers. The viewer's plan lists
+-- read this view.
+CREATE VIEW v_plan_totals AS
+SELECT p.code AS plan, p.title, p.status, p.created_at, p.approved_at, count(s.id) AS steps,
+       COALESCE(sum(s.status = 'done'), 0) AS done, COALESCE(sum(s.status = 'doing'), 0) AS doing,
+       COALESCE(sum(s.status = 'waiting-owner'), 0) AS waiting_owner,
+       COALESCE(sum(s.status = 'not-started'), 0) AS not_started,
+       COALESCE(sum(s.status = 'dropped'), 0) AS dropped,
+       (SELECT group_concat(r.code, ', ') FROM plan_reviews pr JOIN reviews r ON r.id = pr.review_id
+         WHERE pr.plan_id = p.id) AS reviews
+FROM plans p LEFT JOIN steps s ON s.plan_id = p.id
+GROUP BY p.id, p.code;
+
+-- Gates still on the owner's list.
+-- Open gates (to answer) and answered ones the agent has not acted on yet: the ones to answer first, blocking
+-- before the rest, then oldest, each with the codes of what it is about. The viewer's inbox and its count of
+-- questions read this view.
+CREATE VIEW v_pending_gates AS
+SELECT g.id, g.code, g.kind, g.title, g.question, g.status, g.blocking, g.created_at,
+       r.code AS review_code, pl.code AS plan_code, s.number AS step_number, i.code AS issue_code,
+       d.code AS decision_code
+FROM gates g
+LEFT JOIN reviews r ON r.id = g.review_id LEFT JOIN plans pl ON pl.id = g.plan_id
+LEFT JOIN steps s ON s.id = g.step_id LEFT JOIN issues i ON i.id = g.issue_id
+LEFT JOIN decisions d ON d.id = g.decision_id
+WHERE g.status IN ('open','answered')
+ORDER BY g.status = 'answered', g.blocking DESC, g.created_at;
+
+-- Everything waiting on the owner.
+-- Open gates, answered gates the agent has not acted on yet, and anything else waiting on the owner without a gate
+-- (steps, decisions, and design goals proposed for a review and not on an open approval gate). Each thing once: a
+-- step or decision with an open or answered gate (on it, or for a decision on its step) is listed as that gate. A
+-- step's question falls back to its progress note, then to its change text, so it is never blank; it is blocking
+-- when an unfinished step depends on it.
 CREATE VIEW v_owner_queue AS
 SELECT 'gate' AS kind, g.code AS ref, g.kind AS need, g.title, g.question,
        g.status, g.blocking, g.created_at
@@ -2766,9 +3019,10 @@ SELECT 'goal', g.code, 'confirm', 'Approve a design goal', g.text, g.status, 1, 
 FROM design_goals g WHERE g.status = 'proposed' AND g.review_id IS NOT NULL
   AND NOT EXISTS (SELECT 1 FROM gates x WHERE x.id = g.gate_id AND x.status IN ('open','answered'));
 
--- Every code reference with what is needed to get back to the exact lines. commit_sha is the location's own
--- commit, else its review's commit for that repository (commit_from says which: 'location', 'review', or NULL
--- when neither is known; git_command is then NULL and v_untraceable_refs lists the row as 'no commit').
+-- Every place in the code a point cites, with how to get back to the exact lines.
+-- commit_sha is the location's own commit, else its review's commit for that repository (commit_from says which:
+-- 'location', 'review', or NULL when neither is known; git_command is then NULL and v_untraceable_refs lists the
+-- row as 'no commit').
 CREATE VIEW v_code_refs AS
 SELECT r.code AS review, f.point_id, i.code AS issue, fl.id AS location_id, fl.role,
        rp.name AS repository, rp.path AS repo_path, COALESCE(fl.commit_sha, rr.commit_sha) AS commit_sha,
@@ -2791,13 +3045,13 @@ JOIN repositories rp ON rp.id = fl.repository_id
 LEFT JOIN review_repositories rr ON rr.review_id = f.review_id AND rr.repository_id = fl.repository_id
 LEFT JOIN issues i ON i.id = f.issue_id;
 
--- References that could not be traced back (must be empty after indexing). A whole-file reference (whole_file = 1)
--- needs no symbol; a not-text one (binary or not UTF-8) needs no excerpt. An excerpt whose line count differs from
--- its line range (lines past the end of the file, or a hand-written excerpt) is a problem, except a whole-file
--- excerpt cut at 200 lines (excerpt_status 'truncated'). An empty excerpt is no excerpt; a location whose commit
--- differs from the commit its review looked at is a problem (unless the finding was discovered during fix work,
--- at a later commit: discovered_in_step_id); a finding with no location at all is one too. An
--- abandoned review's findings are not checked.
+-- Cited code that cannot be traced back to its lines.
+-- Must be empty after indexing. A whole-file reference (whole_file = 1) needs no symbol; a not-text one (binary or
+-- not UTF-8) needs no excerpt. An excerpt whose line count differs from its line range (lines past the end of the
+-- file, or a hand-written excerpt) is a problem, except a whole-file excerpt cut at 200 lines (excerpt_status
+-- 'truncated'). An empty excerpt is no excerpt; a location whose commit differs from the commit its review looked
+-- at is a problem (unless the finding was discovered during fix work, at a later commit: discovered_in_step_id); a
+-- finding with no location at all is one too. An abandoned review's findings are not checked.
 CREATE VIEW v_untraceable_refs AS
 SELECT review, point_id, path, problem FROM (
   SELECT r.code AS review, f.point_id, fl.path,
@@ -2828,9 +3082,10 @@ SELECT review, point_id, path, problem FROM (
     AND NOT EXISTS (SELECT 1 FROM finding_locations fl WHERE fl.finding_id = f.id)
 ) WHERE problem IS NOT NULL;
 
--- Defects found during fix work (findings.discovered_in_step_id) that no plan step closes yet while their issue is
--- still open (must be empty): a discovery goes through the same process as a review finding. A step closes it when
--- it is linked (step_findings, step not dropped) to the finding itself or to another finding of the same issue.
+-- Defects found during fix work that no plan step closes yet.
+-- Must be empty while the issue is still open (findings.discovered_in_step_id marks a discovery): a discovery goes
+-- through the same process as a review finding. A step closes it when it is linked (step_findings, step not
+-- dropped) to the finding itself or to another finding of the same issue.
 CREATE VIEW v_unplanned_discoveries AS
 SELECT p.code AS plan, s.number AS found_in_step, r.code AS review, f.point_id, i.code AS issue,
        i.status AS issue_status, f.summary
@@ -2847,7 +3102,8 @@ WHERE f.verification <> 'false'
                   JOIN steps cs ON cs.id = sf.step_id
                   WHERE f.issue_id IS NOT NULL AND f2.issue_id = f.issue_id AND cs.status <> 'dropped');
 
--- Fixed issues with no guard test, or whose guard test has disappeared.
+-- Fixed issues with no test guarding the fix, or whose guard test is gone.
+-- Issues of kind docs or design need no guard test.
 CREATE VIEW v_unguarded_fixes AS
 SELECT i.code, i.title, i.status,
        CASE WHEN NOT EXISTS (SELECT 1 FROM guard_tests g WHERE g.issue_id = i.id)
@@ -2856,8 +3112,8 @@ FROM issues i
 WHERE i.status IN (SELECT value FROM issue_statuses WHERE fixed = 1) AND COALESCE(i.kind, '') NOT IN ('docs','design')
   AND NOT EXISTS (SELECT 1 FROM guard_tests g WHERE g.issue_id = i.id AND g.still_exists = 1);
 
--- Trend of each metric across reviews, with its label and direction from metric_defs (the unit falls back to the
--- catalog's).
+-- How each measured number changed from review to review.
+-- Label and direction come from metric_defs; a metric without a unit takes the catalog's.
 CREATE VIEW v_metric_trends AS
 SELECT m.name, m.scope, COALESCE(rp.name, 'all') AS repository, r.code AS review,
        r.started_at, m.value, COALESCE(m.unit, md.unit) AS unit, m.method,
@@ -2868,8 +3124,8 @@ LEFT JOIN repositories rp ON rp.id = m.repository_id
 LEFT JOIN metric_defs md ON md.name = m.name
 ORDER BY m.name, m.scope, r.started_at;
 
--- Hotspot memory: files that keep producing issues, per repository (the same path in two repositories is two
--- files), from real findings only (v_real_findings).
+-- Files that keep producing issues.
+-- Per repository (the same path in two repositories is two files), from real findings only (v_real_findings).
 CREATE VIEW v_file_hotspots AS
 SELECT rp.name AS repository, fl.path, count(DISTINCT f.issue_id) AS issues,
        count(DISTINCT f.review_id) AS reviews, sum(f.severity = 'H') AS high_points
@@ -2877,14 +3133,15 @@ FROM finding_locations fl JOIN v_real_findings f ON f.id = fl.finding_id
 JOIN repositories rp ON rp.id = fl.repository_id
 GROUP BY fl.repository_id, fl.path ORDER BY issues DESC, high_points DESC, rp.name, fl.path;
 
--- Decisions the owner has already made, so future reviews don't re-raise them blindly.
+-- Decisions the owner has already made, so a later review does not raise them again.
 CREATE VIEW v_standing_decisions AS
 SELECT d.code, d.question, d.answer, d.rationale, d.revisit_when, d.decided_at,
        (SELECT group_concat(i.code, ', ') FROM decision_issues di
           JOIN issues i ON i.id = di.issue_id WHERE di.decision_id = d.id) AS issues
 FROM decisions d WHERE d.status = 'decided';
 
--- What a plan step closes: each finding it closes and that finding's issue with its status (Step 9 "its issues").
+-- What each plan step closes: its points and their issues.
+-- Each finding the step closes and that finding's issue with its status.
 CREATE VIEW v_step_issues AS
 SELECT p.code AS plan, s.number AS step, s.title AS step_title, s.status AS step_status,
        r.code AS review, f.point_id, i.code AS issue, i.title AS issue_title, i.status AS issue_status
@@ -2896,8 +3153,9 @@ JOIN reviews r ON r.id = f.review_id
 LEFT JOIN issues i ON i.id = f.issue_id
 ORDER BY p.code, s.number, r.code, f.point_id;
 
--- The next code of each coded table (plan step 98): the highest number + 1, zero-padded like the code triggers
--- require (ISS-0001 ... ; G-01 ...; IQ-0001 ...). Write commands take codes from here (ledger.py next-code ISS), never by hand.
+-- The next free code for each kind of record.
+-- The highest number + 1, zero-padded as the code triggers require (ISS-0001 ..., G-01 ..., IQ-0001 ...). Write
+-- commands take codes from here (`ledger.py next-code ISS`), never by hand.
 CREATE VIEW v_next_codes AS
 SELECT 'ISS' AS prefix, 'ISS-' || printf('%04d', COALESCE(max(CAST(substr(code, 5) AS INTEGER)), 0) + 1) AS next_code
 FROM issues
@@ -2911,8 +3169,9 @@ UNION ALL SELECT 'G', 'G-' || printf('%02d', COALESCE(max(CAST(substr(code, 3) A
 UNION ALL SELECT 'IQ', 'IQ-' || printf('%04d', COALESCE(max(CAST(substr(code, 4) AS INTEGER)), 0) + 1)
 FROM interview_questions;
 
--- Steps still to do (in a plan that is not superseded or abandoned) whose issues are all closed already, e.g. by a
--- review's check of 'fixed': mark the step done or dropped. Listed by `ledger.py gates`; not a must-be-empty check.
+-- Plan steps still to do whose issues are already closed.
+-- Closed for example by a review's check of 'fixed': mark the step done or dropped. Superseded and abandoned plans
+-- are left out. Listed by `ledger.py gates`; not one of the checks.
 CREATE VIEW v_stale_steps AS
 SELECT p.code AS plan, s.number AS step, s.title, s.status,
        (SELECT group_concat(x.issue, ', ') FROM
@@ -2929,8 +3188,8 @@ WHERE s.status NOT IN ('done','dropped')
                     AND (i.id IS NULL OR i.status IN
                          (SELECT value FROM issue_statuses WHERE active = 1)));
 
--- Per repository, the commit the latest finished (handed-off) review looked at: the start of the next review's
--- `git log <commit>..HEAD`.
+-- The commit the latest finished review looked at, per repository.
+-- Finished means handed-off. It is the start of the next review's `git log <commit>..HEAD`.
 CREATE VIEW v_last_reviewed_commit AS
 SELECT rp.name AS repository, rp.path AS repo_path, r.code AS review, rr.commit_sha, rr.branch, rr.tag_name,
        r.completed_at
@@ -2942,7 +3201,8 @@ WHERE r.id = (SELECT r2.id FROM review_repositories rr2 JOIN reviews r2 ON r2.id
               ORDER BY COALESCE(r2.completed_at, r2.started_at) DESC, r2.id DESC LIMIT 1)
 ORDER BY rp.name;
 
--- The requirement trace of each review: every verdict, with the count of that verdict in that review.
+-- Whether the code does what each requirement says, per review.
+-- Every verdict, with the count of that verdict in that review.
 CREATE VIEW v_requirement_trace AS
 SELECT r.code AS review, q.code AS requirement, q.text, c.verdict, c.where_implemented, c.tested,
        f.point_id, c.evidence,
@@ -2954,7 +3214,8 @@ JOIN requirements q ON q.id = c.requirement_id
 LEFT JOIN findings f ON f.id = c.finding_id
 ORDER BY r.code, q.code;
 
--- Every agent that worked on a review: its manager, each reviewer run's agent and the agents in review_actors.
+-- Every agent that worked on a review.
+-- Its manager, each reviewer run's agent and the agents in review_actors.
 CREATE VIEW v_review_agents AS
 SELECT r.code AS review, x.role, a.id AS actor_id, a.kind, a.name, a.model, a.harness, a.session_ref,
        pa.name AS parent
@@ -2967,9 +3228,10 @@ JOIN actors a ON a.id = x.actor_id
 LEFT JOIN actors pa ON pa.id = a.parent_actor_id
 ORDER BY r.code, CASE a.kind WHEN 'manager' THEN 0 WHEN 'reviewer' THEN 1 ELSE 2 END, x.role, a.id;
 
--- History gaps (must be empty): an issue with no 'opened' event, an issue whose status is not the last status
--- its events logged, and a gate answered or applied with no event reaching that status. The triggers write
--- these events, so a gap means a row was written with the triggers bypassed.
+-- Records whose history is missing an entry.
+-- Must be empty. A gap is an issue with no 'opened' event, an issue whose status is not the last status its events
+-- logged, and a gate answered or applied with no event reaching that status. The triggers write these events, so a
+-- gap means a row was written with the triggers bypassed.
 CREATE VIEW v_history_gaps AS
 SELECT 'issue' AS kind, i.code AS ref, 'no opened event' AS problem
 FROM issues i
@@ -2988,11 +3250,12 @@ WHERE g.status IN ('answered','applied')
   AND NOT EXISTS (SELECT 1 FROM events e WHERE e.entity_type = 'gate' AND e.entity_id = g.id
                     AND e.to_value = g.status);
 
--- Matches whose type disagrees with the issue (must be empty): a continuation needs a continuation-of relation
--- from its new issue; 'new' (or 'continuation') is for an issue this review opened; 'still-present', 'changed',
--- 'recurrence' and 'regression' are for an issue an earlier review opened; a recurrence is of an issue that was
--- closed at some point; a real finding still present on an issue fixed before this review started is a
--- regression (match it so: it then regresses the issue). Abandoned reviews are not checked.
+-- Points matched to an issue in a way the issue's history contradicts.
+-- Must be empty. The rules: a continuation needs a continuation-of relation from its new issue; 'new' (or
+-- 'continuation') is for an issue this review opened; 'still-present', 'changed', 'recurrence' and 'regression' are
+-- for an issue an earlier review opened; a recurrence is of an issue that was closed at some point; a real finding
+-- still present on an issue fixed before this review started is a regression (match it so: it then regresses the
+-- issue). Abandoned reviews are not checked.
 CREATE VIEW v_match_problems AS
 SELECT review, point_id, issue, match_type, problem FROM (
   SELECT r.code AS review, f.point_id, i.code AS issue, f.match_type,
@@ -3021,9 +3284,10 @@ SELECT review, point_id, issue, match_type, problem FROM (
   WHERE r.status <> 'abandoned'
 ) WHERE problem IS NOT NULL;
 
--- Steps closing a finding of a review their plan does not cover (must be empty): add the review back to
--- plan_reviews or close the finding in its own plan. tr_step_finding_in_plan refuses such a link when it is made;
--- this lists links made before it, or left behind when a plan_reviews row was removed.
+-- Plan steps that close a point from a review the plan does not cover.
+-- Must be empty: add the review back to plan_reviews or close the finding in its own plan. tr_step_finding_in_plan
+-- refuses such a link when it is made; this lists links made before it, or left behind when a plan_reviews row was
+-- removed.
 CREATE VIEW v_off_plan_coverage AS
 SELECT p.code AS plan, s.number AS step, r.code AS review, f.point_id
 FROM step_findings sf
@@ -3034,9 +3298,10 @@ JOIN reviews r ON r.id = f.review_id
 WHERE p.status NOT IN ('superseded','abandoned')
   AND NOT EXISTS (SELECT 1 FROM plan_reviews pr WHERE pr.plan_id = p.id AND pr.review_id = f.review_id);
 
--- Done steps whose issues are still to do (must be empty): when a step is done, its issues move on (fixed with
--- after_state, or another closing status), unless another unfinished step still works on them. Regressed issues
--- are left to the next plan. Superseded and abandoned plans are not checked.
+-- Finished plan steps whose issues are still to fix.
+-- Must be empty: when a step is done, its issues move on (fixed with after_state, or another closing status),
+-- unless another unfinished step still works on them. Regressed issues are left to the next plan. Superseded and
+-- abandoned plans are not checked.
 CREATE VIEW v_done_steps_open_issues AS
 SELECT DISTINCT p.code AS plan, s.number AS step, i.code AS issue, i.status AS issue_status
 FROM steps s
@@ -3052,14 +3317,16 @@ WHERE s.status = 'done' AND p.status NOT IN ('superseded','abandoned') AND f.ver
                     AND p2.status NOT IN ('superseded','abandoned'))
 ORDER BY p.code, s.number, i.id;
 
--- Issues closed as accepted-risk or wont-fix with no resolution (must be empty): the reason is the record. New
--- closings are refused by tr_issue_closed_needs_reason; this lists rows written before it.
+-- Issues closed as an accepted risk or as not to be fixed, with no reason given.
+-- Must be empty: the reason is the record. New closings are refused by tr_issue_closed_needs_reason; this lists
+-- rows written before it.
 CREATE VIEW v_closed_without_reason AS
 SELECT code, title, status FROM issues
 WHERE status IN ('accepted-risk','wont-fix') AND NULLIF(trim(resolution), '') IS NULL;
 
--- Relation problems (must be empty): a related-to pair stored in both directions (related-to is symmetric, so one
--- row says it; tr_relation_noreverse_dup refuses the second for new rows). The later row is listed.
+-- Pairs of issues recorded as related twice, once in each direction.
+-- Must be empty. A related-to pair stored in both directions (related-to is symmetric, so one row says it;
+-- tr_relation_noreverse_dup refuses the second for new rows). The later row is listed.
 CREATE VIEW v_relation_problems AS
 SELECT a.code AS from_issue, b.code AS to_issue, ir.relation, 'related-to stored in both directions' AS problem
 FROM issue_relations ir
@@ -3069,8 +3336,8 @@ WHERE ir.relation = 'related-to'
   AND EXISTS (SELECT 1 FROM issue_relations rv WHERE rv.relation = 'related-to'
                 AND rv.from_issue_id = ir.to_issue_id AND rv.to_issue_id = ir.from_issue_id AND rv.id < ir.id);
 
--- Review checks citing a finding matched to another issue (must be empty): a check's finding is the evidence for
--- that issue.
+-- Checks of a known issue that cite a point belonging to another issue.
+-- Must be empty: a check's finding is the evidence for that issue.
 CREATE VIEW v_check_finding_owner AS
 SELECT r.code AS review, i.code AS issue, f.point_id, fi.code AS finding_issue
 FROM review_issue_checks c
@@ -3080,9 +3347,9 @@ JOIN findings f ON f.id = c.finding_id
 JOIN issues fi ON fi.id = f.issue_id
 WHERE f.issue_id <> c.issue_id;
 
--- The owner's approved design goals for the brief and the reviewer prompts (schema 9, plan step 129), whole-project
--- goals (domain_code NULL) first, then by domain: a reviewer of domain D gets the rows of D and the whole-project
--- ones (`ledger.py goals --domain D`). sources: the interview questions each goal summarizes.
+-- The owner's approved design goals, as given to reviewers.
+-- Whole-project goals (domain_code NULL) first, then by domain: a reviewer of domain D gets the rows of D and the
+-- whole-project ones (`ledger.py goals --domain D`). sources: the interview questions each goal summarizes.
 CREATE VIEW v_goals_for_brief AS
 SELECT g.domain_code, g.code, g.text,
        (SELECT group_concat(x.code, ', ') FROM
@@ -3327,7 +3594,7 @@ INSERT INTO ledger_checks(view, label, tier, position) VALUES
  ('v_closed_without_reason','Issues accepted or declined with no reason recorded','error',78),
  ('v_relation_problems','Related-to pairs stored in both directions','error',80),
  ('v_check_finding_owner','Review checks citing a finding of another issue','error',82);
-INSERT INTO meta(key, value) VALUES ('schema_version','9');
+INSERT INTO meta(key, value) VALUES ('schema_version','10');
 INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger schema'),
   (2, 'url, path, hash and code checks; repositories.allow_outside_root; finding_locations.excerpt_redacted'),
   (3, 'integrity rules: codes, hashes, checks, append-only history, owner actor on gate answers'),
@@ -3336,7 +3603,8 @@ INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger s
   (6, 'lookup tables for the ledger''s words and labels; RESTRICT keys under reviews and findings; metrics.name catalogued'),
   (7, 'must-be-empty checks for history gaps, matches, off-plan and done-step coverage, closings, relations and checks; steps.no_findings_reason'),
   (8, 'finding_locations.source (the reviewed text of a dirty working tree); v_next_codes for the write commands'),
-  (9, 'owner interview (interview_questions, interview_answers) and per-domain design goals the owner approves');
+  (9, 'owner interview (interview_questions, interview_answers) and per-domain design goals the owner approves'),
+  (10, 'v_plan_totals, v_review_totals and v_pending_gates: the counts the viewer''s lists show');
 """
 PAGE = r"""<!doctype html>
 <html lang="en">
@@ -3345,13 +3613,14 @@ PAGE = r"""<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Review ledger</title>
 <style>
-:root{--bg:#f7f8f6;--surface:#fff;--fg:#1b2420;--muted:#5d6b64;--line:#dfe4e0;--accent:#0f6b57;--accent-soft:#e2f1ec;--warn:#9a5b00;--warn-soft:#fbefd9;--crit:#a3271f;--crit-soft:#fae6e3;--info:#2b5c99;--info-soft:#e5eefa;
+:root{--bg:#f7f8f6;--surface:#fff;--fg:#1b2420;--muted:#5d6b64;--line:#dfe4e0;--field:#828f88;--accent:#0f6b57;--accent-soft:#e2f1ec;--warn:#9a5b00;--warn-soft:#fbefd9;--crit:#a3271f;--crit-soft:#fae6e3;--info:#2b5c99;--info-soft:#e5eefa;
  --display:ui-rounded,"SF Pro Rounded","Segoe UI Variable Display","Segoe UI",system-ui,sans-serif;--body:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;color-scheme:light}
-@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#121715;--surface:#1a211e;--fg:#e6ece8;--muted:#9aa8a1;--line:#2c3632;--accent:#5fc9ae;--accent-soft:#17352d;--warn:#e7b25a;--warn-soft:#3a2c12;--crit:#f08d84;--crit-soft:#3d1c19;--info:#8db6ee;--info-soft:#1a2a40;color-scheme:dark}}
-:root[data-theme="dark"]{--bg:#121715;--surface:#1a211e;--fg:#e6ece8;--muted:#9aa8a1;--line:#2c3632;--accent:#5fc9ae;--accent-soft:#17352d;--warn:#e7b25a;--warn-soft:#3a2c12;--crit:#f08d84;--crit-soft:#3d1c19;--info:#8db6ee;--info-soft:#1a2a40;color-scheme:dark}
+:root[data-theme="dark"]{--bg:#121715;--surface:#1a211e;--fg:#e6ece8;--muted:#9aa8a1;--line:#2c3632;--field:#6b7a73;--accent:#5fc9ae;--accent-soft:#17352d;--warn:#e7b25a;--warn-soft:#3a2c12;--crit:#f08d84;--crit-soft:#3d1c19;--info:#8db6ee;--info-soft:#1a2a40;color-scheme:dark}
 *{box-sizing:border-box}
+html{scroll-padding-top:var(--top,110px)}
 body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 var(--body);padding:0 max(16px,env(safe-area-inset-right)) 64px max(16px,env(safe-area-inset-left))}
 a{color:var(--accent)}
+.skip{position:absolute;left:8px;top:-80px;z-index:10;background:var(--surface);padding:8px 12px;border:1px solid var(--field);border-radius:6px}.skip:focus{top:8px}
 .wrap{max-width:1180px;margin:0 auto;display:flex;flex-direction:column;gap:18px}
 .top{position:sticky;top:0;z-index:5;background:var(--bg);border-bottom:1px solid var(--line);padding:12px 0 0;margin:0 -4px}
 .top .row{max-width:1180px;margin:0 auto;display:flex;gap:16px;align-items:center;flex-wrap:wrap;padding:0 4px}
@@ -3361,10 +3630,11 @@ a{color:var(--accent)}
 .tabs a{text-decoration:none;color:var(--muted);padding:8px 12px;border-bottom:2px solid transparent;white-space:nowrap;font-weight:500}
 .tabs a[aria-current="page"]{color:var(--fg);border-color:var(--accent)}
 .badge{display:inline-block;min-width:20px;padding:0 6px;border-radius:999px;background:var(--warn);color:var(--bg);font:600 12px/20px var(--mono);text-align:center;margin-left:6px}
-.theme{margin-left:auto;all:unset;cursor:pointer;color:var(--muted);font-size:13px;padding:4px 8px;border:1px solid var(--line);border-radius:6px}
+.theme{all:unset;margin-left:auto;cursor:pointer;color:var(--muted);font-size:13px;padding:4px 8px;border:1px solid var(--line);border-radius:6px}
 h1{font:600 26px/1.15 var(--display);margin:18px 0 0;text-wrap:balance}
-h2{font:600 19px/1.2 var(--display);margin:8px 0 0}
-h3{font:600 12px var(--body);letter-spacing:.07em;text-transform:uppercase;color:var(--muted);margin:14px 0 4px}
+h1,h2,h3,.lede,.status,.note,.gate .q,.gate .ctx,.refline,.refline code,.opts label,.timeline>div,li{overflow-wrap:anywhere}
+h2,h3.title{font:600 19px/1.2 var(--display);margin:8px 0 0;letter-spacing:normal;text-transform:none;color:inherit}
+h3,h2.sec{font:600 12px var(--body);letter-spacing:.07em;text-transform:uppercase;color:var(--muted);margin:14px 0 4px}
 .lede{color:var(--muted);max-width:72ch;margin:4px 0 0}
 .facts{display:flex;flex-wrap:wrap;gap:10px 28px;font-variant-numeric:tabular-nums}
 .facts div b{font:600 22px var(--display);display:block}
@@ -3373,22 +3643,29 @@ h3{font:600 12px var(--body);letter-spacing:.07em;text-transform:uppercase;color
 .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}
 .tools{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
 input,select,textarea,button{font:inherit;color:var(--fg)}
-.tools input,.tools select,textarea{background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:8px 10px;min-width:0}
+.field{background:var(--surface);border:1px solid var(--field);border-radius:6px;padding:8px 10px;min-width:0}
 .tools input{flex:1 1 240px}
 textarea{width:100%;min-height:72px;resize:vertical}
+input[type=radio]{accent-color:var(--accent)}
 button.btn{cursor:pointer;background:var(--accent);color:var(--bg);border:0;border-radius:6px;padding:8px 14px;font-weight:600}
 button.btn.ghost{background:transparent;color:var(--accent);border:1px solid var(--line)}
 button.btn:disabled{opacity:.5;cursor:default}
 :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+h1:focus{outline:none}
 table{border-collapse:collapse;width:100%;font-size:14px}
 th{text-align:left;font:600 12px var(--body);color:var(--muted);text-transform:uppercase;letter-spacing:.05em;padding:6px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
 td{padding:7px 8px;border-bottom:1px solid var(--line);vertical-align:top;overflow-wrap:break-word;min-width:4ch}
 .grid td{white-space:nowrap;max-width:360px;overflow:hidden;text-overflow:ellipsis}
-td:first-child{white-space:nowrap}tr.link{cursor:pointer}tr.link:hover td{background:var(--accent-soft)}
+td:first-child{white-space:nowrap}tr.link{cursor:pointer}tr.link:hover td{background:var(--accent-soft)}tr.link a{text-decoration:none}tr.link a:hover,tr.link a:focus-visible{text-decoration:underline}
 .scroll{overflow-x:auto}
 .num{font-variant-numeric:tabular-nums;text-align:right}
 .mono,code{font:500 12.5px var(--mono)}
 .muted{color:var(--muted)}
+.visually-hidden{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip-path:inset(50%);white-space:nowrap;border:0}
+.stack{display:flex;flex-direction:column;gap:8px;min-width:0}.stack.loose{gap:10px}
+.card-link{margin:10px 0}
+.progress{display:flex;flex-direction:column;gap:4px;margin-top:4px}
+.card.grid{padding:0}
 .tag{display:inline-block;font:500 11px/1.6 var(--mono);padding:0 7px;border-radius:999px;background:var(--line);color:var(--fg);white-space:nowrap;margin:0 4px 2px 0}
 .tag.H,.tag.crit{background:var(--crit-soft);color:var(--crit)}.tag.M,.tag.warn{background:var(--warn-soft);color:var(--warn)}
 .tag.info{background:var(--info-soft);color:var(--info)}.tag.ok{background:var(--accent-soft);color:var(--accent)}.tag.solid{background:var(--accent);color:var(--bg)}.tag.you{background:var(--warn);color:var(--bg)}
@@ -3396,26 +3673,28 @@ details.item{background:var(--surface);border:1px solid var(--line);border-radiu
 details.item>summary{cursor:pointer;list-style:none;display:grid;grid-template-columns:minmax(90px,auto) minmax(0,1fr) auto;gap:10px;padding:10px 12px;align-items:baseline}
 details.item>summary::-webkit-details-marker{display:none}
 details.item>summary .n{font:500 13px var(--mono);color:var(--muted)}
-details.item>summary .t{font-weight:500}
+details.item>summary .n::before{content:"▸ ";content:"▸ " / ""}details.item[open]>summary .n::before{content:"▾ ";content:"▾ " / ""}
+details.item>summary .t{font-weight:500;overflow-wrap:anywhere}
 details.item>summary .tags{display:flex;flex-wrap:wrap;justify-content:flex-end}
 .body{padding:2px 14px 14px;display:flex;flex-direction:column;gap:10px}
 dl.kv{margin:0;display:grid;grid-template-columns:150px minmax(0,1fr);gap:6px 14px}
 dl.kv dt{color:var(--muted);font-size:13px}dl.kv dd{margin:0;overflow-wrap:anywhere;white-space:pre-wrap}
 .ref{border-top:1px solid var(--line);padding-top:8px;display:flex;flex-direction:column;gap:6px}
-.refline{display:flex;flex-wrap:wrap;gap:6px 12px;align-items:baseline;font-size:13px}
+.refline{display:flex;flex-wrap:wrap;gap:6px 12px;align-items:baseline;font-size:13px}.refline>*{min-width:0}
 .code{background:var(--bg);border:1px solid var(--line);border-radius:6px;overflow:auto;max-height:420px}
 .code table{font:12.5px/1.45 var(--mono)}
 .code td{border:0;padding:0 10px;white-space:pre;overflow-wrap:normal}
 .code td.ln{color:var(--muted);text-align:right;user-select:none;width:1%}
-.code tr.hit td{background:var(--warn-soft)}
+.code tr.hit td{background:var(--warn-soft)}.code tr.hit td.ln{box-shadow:inset 3px 0 var(--warn);color:var(--fg)}
 .note{font-size:13px;color:var(--muted)}
 .mdtext{white-space:pre-wrap;overflow-wrap:anywhere;max-height:480px;overflow:auto;font-size:14px}
 .status{padding:10px 12px;border-radius:6px;background:var(--accent-soft);color:var(--accent)}
 .status.err{background:var(--crit-soft);color:var(--crit)}
 .cols{display:grid;grid-template-columns:270px minmax(0,1fr);gap:24px;align-items:start}
-nav.rail{display:flex;flex-direction:column;gap:2px;position:sticky;top:110px}
+nav.rail{display:flex;flex-direction:column;gap:2px;position:sticky;top:var(--top,110px)}
 nav.rail button{all:unset;cursor:pointer;display:grid;grid-template-columns:24px 1fr auto;gap:8px;padding:7px 10px;border-radius:6px;font-size:14px;align-items:baseline}
 nav.rail button:hover{background:var(--accent-soft)}
+nav.rail button:focus-visible,.tlist button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 nav.rail button[aria-current="true"]{background:var(--accent);color:var(--bg)}
 nav.rail .i,nav.rail .c{font:500 12px var(--mono);opacity:.8}
 .bar{height:8px;border-radius:999px;background:var(--line);overflow:hidden;display:flex;max-width:520px}.bar i{display:block;height:100%}
@@ -3424,7 +3703,7 @@ nav.rail .i,nav.rail .c{font:500 12px var(--mono);opacity:.8}
 .gate .q{font-weight:500;white-space:pre-wrap}
 .gate .ctx{white-space:pre-wrap;color:var(--muted);font-size:14px;max-height:260px;overflow:auto}
 .opts{display:flex;flex-direction:column;gap:6px}
-.opts label{display:grid;grid-template-columns:20px 1fr;gap:6px;padding:8px 10px;border:1px solid var(--line);border-radius:6px;cursor:pointer}
+.opts label{display:grid;grid-template-columns:20px 1fr;gap:6px;padding:8px 10px;border:1px solid var(--field);border-radius:6px;cursor:pointer}
 .opts label:has(input:checked){border-color:var(--accent);background:var(--accent-soft)}
 .opts small{display:block;color:var(--muted)}
 .timeline{display:flex;flex-direction:column;gap:0;border-left:2px solid var(--line);margin-left:6px}
@@ -3433,19 +3712,22 @@ nav.rail .i,nav.rail .c{font:500 12px var(--mono);opacity:.8}
 .empty{color:var(--muted);padding:18px 0}
 .chart svg{width:100%;height:auto;display:block}
 .split{display:grid;grid-template-columns:260px minmax(0,1fr);gap:20px;align-items:start}
-.tlist{display:flex;flex-direction:column;gap:1px;max-height:70vh;overflow:auto}
+.tlist{display:flex;flex-direction:column;gap:1px;max-height:70vh;overflow:auto;padding:4px}
 .tlist button{all:unset;cursor:pointer;display:flex;justify-content:space-between;gap:8px;padding:5px 8px;border-radius:5px;font:13px var(--mono)}
 .tlist button:hover{background:var(--accent-soft)}.tlist button[aria-current="true"]{background:var(--accent);color:var(--bg)}
-@media (max-width:820px){.cols,.split{grid-template-columns:minmax(0,1fr)}nav.rail{position:static;flex-direction:row;overflow-x:auto}nav.rail button{grid-template-columns:auto auto auto;white-space:nowrap;border:1px solid var(--line)}
+@media (max-width:600px){.tabs{flex-wrap:wrap;overflow-x:visible}.top{position:static}}
+@media (max-width:820px){.cols,.split{grid-template-columns:minmax(0,1fr)}nav.rail{position:static;flex-direction:row;overflow-x:auto;padding:4px}nav.rail button{grid-template-columns:auto auto auto;white-space:nowrap;border:1px solid var(--line)}
  details.item>summary{grid-template-columns:auto minmax(0,1fr)}details.item>summary .tags{grid-column:1/-1;justify-content:flex-start}dl.kv{grid-template-columns:minmax(0,1fr)}dl.kv dt{margin-top:6px}.tlist{max-height:220px}}
 </style>
 </head>
 <body>
+<a class="skip" id="skip" href="#app">Skip to content</a>
 <header class="top">
-  <div class="row"><span class="brand" id="brand">Review ledger</span><button class="theme" id="theme" type="button">Theme: auto</button></div>
+  <div class="row"><span class="brand" id="brand">Review ledger</span><button class="theme" id="theme" type="button">Theme: Automatic</button></div>
   <nav class="tabs" id="tabs" aria-label="Sections"></nav>
 </header>
-<div class="wrap" id="app" aria-live="polite"></div>
+<main class="wrap" id="app"></main>
+<div class="visually-hidden" id="live" role="status"></div>
 <script>
 "use strict";
 // The token arrives once, in the launch URL's fragment (#k=<token>, optionally followed by #/route); it is kept in
@@ -3463,6 +3745,121 @@ function takeToken(){
 }
 takeToken();
 let LABELS = {domains:{}, themes:{}}, OVERVIEW = null;
+
+// ---------- the shared copy
+// `ledger.py progress-page` writes this page as one file with every API answer embedded (window.LEDGER_SNAPSHOT).
+// STATIC is that data; in the viewer it is null. With it the page answers api() from the data, routes on hash names
+// an artifact allows (#issue-ISS-0019), shows the How it works tab, and saves gate answers in the artifact's
+// database (collection "answers", one document per gate code) for `ledger.py import-answers`.
+const STATIC = (s => s && typeof s === "object" && s.responses ? s : null)(window.LEDGER_SNAPSHOT);
+let CUR_PATH = null;
+const ACTIVE = STATIC ? STATIC.active : [];
+const slugOf = p => (p || "").split("?")[0].replace(/^#\/?/, "").replace(/[\/_]/g, "-").replace(/[^A-Za-z0-9-]/g, "") || "home";
+function pathFromSlug(s){
+  s = (s || "").replace(/^#/, "");
+  if (!s || s === "home") return STATIC && STATIC.start && CUR_PATH === null ? STATIC.start : "";
+  const m = s.match(/^([a-z]+)(?:-(.*))?$/); if (!m) return "";
+  const [, view, rest] = m;
+  if (!rest) return view;
+  if (view === "plan") { const p = rest.match(/^(P-\d+)(?:-phase-(\d+))?$/); return p ? `plan/${p[1]}` + (p[2] ? `/phase/${p[2]}` : "") : "plans"; }
+  if (view === "explore") { const t = (STATIC.responses.tables || []).find(t => t.name.replace(/_/g, "-") === rest); return t ? `explore/${t.name}` : "explore"; }
+  return `${view}/${rest}`;
+}
+function nav(hash){ CUR_PATH = hash.replace(/^#\/?/, ""); const s = slugOf(CUR_PATH); if (location.hash.slice(1) === s) route(); else location.hash = s; }
+function setPath(hash){ if (!STATIC) { history.replaceState(null, "", hash); return; } CUR_PATH = hash.replace(/^#\/?/, ""); try { history.replaceState(null, "", "#" + slugOf(CUR_PATH)); } catch {} }
+function currentPath(){
+  if (!STATIC) return location.hash.replace(/^#\/?/, "");
+  const s = location.hash.slice(1);
+  if (CUR_PATH === null || slugOf(CUR_PATH) !== (s || "home")) CUR_PATH = pathFromSlug(s);
+  return CUR_PATH;
+}
+function staticApi(path, body){
+  if (body !== undefined) return Promise.reject(new Error("This shared copy is read-only. Answer in the chat with Claude, or run the local viewer."));
+  const S = STATIC.responses, [p, q] = path.split("?"), qs = new URLSearchParams(q || "");
+  const copy = v => JSON.parse(JSON.stringify(v));
+  if (p === "issues") {
+    const st = qs.get("status"), sv = qs.get("severity"), dm = qs.get("domain_code"), t = (qs.get("q") || "").toLowerCase();
+    return Promise.resolve(copy(S.issues.filter(i => (!st || (st === "active" ? ACTIVE.includes(i.status) : i.status === st))
+      && (!sv || i.severity === sv) && (!dm || i.domain_code === dm) && (!t || i.search.toLowerCase().includes(t)))));
+  }
+  if (p === "gates") return Promise.resolve(copy(S["gates?status=" + (qs.get("status") || "pending")] || S["gates?status=all"]));
+  if (p.startsWith("table/")) {
+    const t = S[p]; if (!t) return Promise.reject(new Error("That table is not in this snapshot."));
+    const off = Number(qs.get("offset")) || 0, lim = Number(qs.get("limit")) || 100;
+    return Promise.resolve({columns: t.columns, rows: copy(t.rows.slice(off, off + lim)), count: t.count, offset: off, limit: lim});
+  }
+  if (S[p] === undefined) return Promise.reject(new Error("This view is not in the snapshot."));
+  return Promise.resolve(copy(S[p]));
+}
+
+const HUB = {db: null, answers: {}, error: null};
+const OPEN_GATES = () => STATIC ? (STATIC.responses["gates?status=pending"].gates || []).filter(g => g.status === "open").map(g => g.code) : [];
+const hubAnsweredOpen = () => OPEN_GATES().filter(c => HUB.answers[c]).length;
+async function hubInit(){
+  if (!STATIC || !window.claude || typeof window.claude.use !== "function") return;
+  try {
+    const db = await window.claude.use("db"); if (!db) return;
+    HUB.db = db;
+    db.collection("answers").onSnapshot(snap => {
+      HUB.answers = Object.fromEntries(snap.docs.map(d => [d.id, d.data()]));
+      const cur = document.querySelector('#tabs a[aria-current="page"]');
+      if (OVERVIEW) drawTabs(cur ? (cur.dataset.k || "") : "");
+    }, e => { HUB.error = e && e.code; });
+  } catch (e) { HUB.error = String(e); }
+}
+function md(text){
+  const lines = String(text || "").split("\n"), out = []; let i = 0;
+  const inline = str => { const parts = []; const re = /(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\(https?:\/\/[^)\s]+\))/g; let last = 0, m;
+    while ((m = re.exec(str))) { if (m.index > last) parts.push(str.slice(last, m.index)); const t = m[0];
+      if (t.startsWith("**")) parts.push(h("b", null, t.slice(2, -2)));
+      else if (t.startsWith("`")) parts.push(h("code", null, t.slice(1, -1)));
+      else { const mm = t.match(/^\[([^\]]+)\]\((.+)\)$/); parts.push(h("a", {href: mm[2], target: "_blank", rel: "noopener noreferrer"}, mm[1])); }
+      last = re.lastIndex; }
+    if (last < str.length) parts.push(str.slice(last)); return parts; };
+  const cells = r => r.replace(/^\|/, "").replace(/\|\s*$/, "").split("|").map(c => c.trim());
+  while (i < lines.length) {
+    const l = lines[i]; let m;
+    if (!l.trim()) { i++; continue; }
+    if ((m = l.match(/^(#{1,4})\s+(.*)/))) { out.push(h("h" + Math.min(m[1].length + 1, 4), null, inline(m[2]))); i++; continue; }
+    if (l.startsWith("|")) { const rows = []; while (i < lines.length && lines[i].startsWith("|")) rows.push(lines[i++]);
+      out.push(h("div", {class: "scroll"}, h("table", null, h("thead", null, h("tr", null, cells(rows[0]).map(c => h("th", null, inline(c))))),
+        h("tbody", null, rows.slice(2).map(r => h("tr", null, cells(r).map(c => h("td", null, inline(c))))))))); continue; }
+    if (/^(\d+\.|-)\s/.test(l)) { const ordered = /^\d+\./.test(l), items = []; while (i < lines.length && /^(\d+\.|-)\s/.test(lines[i])) items.push(lines[i++].replace(/^(\d+\.|-)\s+/, ""));
+      out.push(h(ordered ? "ol" : "ul", null, items.map(t => h("li", null, inline(t))))); continue; }
+    const para = []; while (i < lines.length && lines[i].trim() && !/^(#{1,4}\s|\||\d+\.\s|-\s)/.test(lines[i])) para.push(lines[i++]);
+    out.push(h("p", null, inline(para.join(" "))));
+  }
+  return h("div", {class: "md"}, out);
+}
+function hubGateBody(card, g, hid){
+  const saved = HUB.answers[g.code];
+  if (saved) { add(card, h("p", {class: "status"}, "You answered: ", answerText({options: g.options, ...saved}, true), ". Claude records it the next time it checks (or tell Claude in the chat to check now).")); return card; }
+  if (!HUB.db) { add(card, h("p", {class: "note"}, "Answer in the chat with Claude; answering here needs you signed in to claude.ai as this page's owner.")); return card; }
+  const nm = "opt-" + g.code;
+  const opts = (g.options || []).length ? h("div", {class: "opts", role: "radiogroup", "aria-labelledby": hid},
+    g.options.map(o => h("label", null, h("input", {type: "radio", name: nm, value: o.value}), h("span", null, o.label, o.description ? h("small", null, o.description) : null)))) : null;
+  const ta = g.allow_text ? h("textarea", {class: "field", placeholder: opts ? "Add a note or a different answer (optional)" : "Your answer", id: hid + "-text", "aria-label": "Your answer", "aria-labelledby": `${hid}-text ${hid}`}) : null;
+  const msg = h("div"), form = h("div", {class: "gate"});
+  const send = h("button", {class: "btn", type: "button", id: hid + "-send", "aria-labelledby": `${hid}-send ${hid}`, onclick: async () => {
+    const picked = card.querySelector(`input[name="${nm}"]:checked`), val = picked ? picked.value : null, txt = ta ? ta.value.trim() : "";
+    if (!val && !txt) { put(msg, errorBox("Choose an option or write an answer.")); return; }
+    send.disabled = true;
+    try {
+      await HUB.db.doc("answers/" + g.code).set({gate: g.code, answer_value: val, answer_text: txt || null, answered_at: new Date().toISOString()});
+      HUB.answers[g.code] = {answer_value: val, answer_text: txt || null};
+      put(form, h("p", {class: "status"}, "Saved. Claude records it the next time it checks (or tell Claude in the chat to check now)."));
+      say("Answer saved.");
+      drawTabs("inbox");
+    } catch (e) { put(msg, errorBox("Your answer could not be saved here" + (e && e.code === "invalid_argument" ? ": only this page's owner can answer." : ". Try again, or answer in the chat."))); send.disabled = false; }
+  }}, "Send answer");
+  add(form, opts, ta, h("div", null, send), msg); add(card, form); return card;
+}
+
+if (STATIC) document.addEventListener("click", e => {
+  const a = e.target.closest && e.target.closest('a[href^="#/"]');
+  if (!a || e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey) return;
+  e.preventDefault(); nav(a.getAttribute("href"));
+});
 
 // ---------- helpers
 function h(tag, attrs, ...kids){
@@ -3487,6 +3884,7 @@ function extLink(u, text){
 function put(el, ...kids){ el.replaceChildren(...kids.flat(Infinity).filter(k => k != null && k !== false && k !== "").map(k => k instanceof Node ? k : document.createTextNode(String(k)))); return el; }
 function add(el, ...kids){ for (const k of kids.flat(Infinity)) if (k != null && k !== false && k !== "") el.append(k instanceof Node ? k : String(k)); return el; }
 async function api(path, body){
+  if (STATIC) return staticApi(path, body);
   const opt = {headers:{"X-Ledger-Token":TOKEN}};
   if (body !== undefined) { opt.method = "POST"; opt.headers["Content-Type"] = "application/json"; opt.body = JSON.stringify(body); }
   const r = await fetch("/api/" + path, opt);
@@ -3510,40 +3908,125 @@ setLabels({});
 const lab = (map, v) => (L[map] && L[map][v] !== undefined) ? L[map][v] : words(v);
 const domainName = c => c ? (LABELS.domains[c] || words(c)) : "";
 const themeName = c => c ? (LABELS.themes[c] || words(c)) : "";
-const sevTag = s => h("span", {class:"tag " + s, title:"Severity"}, lab("sev", s));
-const issueTone = s => ({open:"warn","needs-decision":"you",regressed:"crit",planned:"info","in-progress":"info",fixed:"ok",verified:"solid"})[s] || "";
-const issueTag = s => h("span", {class:"tag " + issueTone(s)}, lab("issue", s));
-function when(iso, withTime=true){
-  if (!iso) return "";
-  const d = new Date(iso); if (isNaN(d)) return iso;
+// The colour of a tag, by label map and stored value: the one place a value gets its tone.
+const TONE = {
+  issue:{open:"warn", "needs-decision":"you", regressed:"crit", planned:"info", "in-progress":"info", fixed:"ok", verified:"solid"},
+  match:{recurrence:"crit", regression:"crit", new:"info"},
+  verif:{confirmed:"ok"},
+  gate:{"production-action":"crit"}, gstat:{open:"you"},
+  goal:{approved:"ok", proposed:"you"},
+  step:{done:"solid", doing:"ok", "waiting-owner":"you"},
+  need:{production:"crit", decision:"warn", confirm:"info", review:"info"},
+  area:{included:"ok"},
+};
+const tone = (map, v) => (TONE[map] && TONE[map][v]) || "";
+const tag = (text, cls, title) => h("span", {class:"tag" + (cls ? " " + cls : ""), title}, text);
+const labTag = (map, v) => tag(lab(map, v), tone(map, v));
+const sevTag = s => tag(lab("sev", s), s, "Severity");
+const issueTag = s => labTag("issue", s);
+const plural = (n, one, many) => `${n} ${n === 1 ? one : (many || one + "s")}`;
+// A stored time in the reader's own words and time zone. Stored times are UTC: "2026-01-02T03:04:05.000Z", also
+// with a space for the T, without the Z, or with an offset. A date alone is shown as that day. Nothing gives "",
+// and text that is not a time gives "date unknown".
+const NO_DATE = "date unknown";
+function when(stored, withTime=true){
+  if (stored == null || stored === "") return "";
+  const text = String(stored).trim(), valid = d => !isNaN(d) && d.toISOString().slice(0, 10);
+  let m = /^(\d{4})-(\d\d)-(\d\d)$/.exec(text);
+  if (m) {
+    const d = new Date(Date.UTC(+m[1], m[2] - 1, +m[3]));
+    return valid(d) === text ? d.toLocaleDateString(undefined, {dateStyle:"medium", timeZone:"UTC"}) : NO_DATE;
+  }
+  m = /^(\d{4}-\d\d-\d\d)[T ](\d\d:\d\d)(:\d\d)?(\.\d{1,3})?\d*\s*(Z|[+-]\d\d:?\d\d)?$/i.exec(text);
+  if (!m) return NO_DATE;
+  const zone = (m[5] || "Z").replace(/^([+-]\d\d)(\d\d)$/, "$1:$2").toUpperCase();
+  const d = new Date(`${m[1]}T${m[2]}${m[3] || ":00"}${m[4] || ""}${zone}`);
+  if (!valid(d) || valid(new Date(m[1] + "T00:00:00Z")) !== m[1]) return NO_DATE;
   return d.toLocaleString(undefined, withTime ? {dateStyle:"medium", timeStyle:"short"} : {dateStyle:"medium"});
+}
+// The same, for a table cell or a value shown on its own: text that is not a time keeps what was stored as a tooltip.
+function whenCell(stored, withTime){
+  const t = when(stored, withTime);
+  return t === NO_DATE ? h("span", {title:String(stored)}, t) : t;
 }
 const short = sha => sha ? sha.slice(0, 10) : "";
 const kv = pairs => h("dl", {class:"kv"}, pairs.filter(p => p[1] != null && p[1] !== "" && !(Array.isArray(p[1]) && !p[1].length)).map(([k,v]) => [h("dt", null, k), h("dd", null, v)]));
 const empty = t => h("p", {class:"empty"}, t);
-function table(cols, data, onRow){
-  if (!data.length) return empty("Nothing here yet.");
+const sect = title => h("h2", {class:"sec"}, title);   // a section of a page: second level, in the small style
+// Words for a screen reader about something that just happened (a count after filtering, an answer saved, an error).
+const say = text => { document.getElementById("live").textContent = text || ""; };
+function errorBox(e, quiet){
+  const text = e && e.message ? e.message : String(e);
+  if (!quiet) say(text);
+  return h("p", {class:"status err"}, text);
+}
+const fact = (n, label) => h("div", null, h("b", null, n), h("span", null, label));
+// One expandable row: number, title, tags, and the body shown when it is opened.
+function item(n, title, tags, body){
+  return h("details", {class:"item"},
+    h("summary", null, h("span", {class:"n"}, n), h("span", {class:"t"}, title), h("span", {class:"tags"}, tags)),
+    h("div", {class:"body"}, body));
+}
+const select = (label, options, attrs) => h("select", {class:"field", "aria-label":label, ...attrs}, options.map(([v, t]) => h("option", {value:v}, t)));
+// A row of filters. onChange(true) runs when a select changes and as a search box is typed in (after `wait` ms of quiet).
+function filterBar(controls, onChange, wait=0){
+  let timer;
+  const now = () => onChange(true), typed = wait ? () => { clearTimeout(timer); timer = setTimeout(now, wait); } : now;
+  for (const c of controls) c.addEventListener(c.tagName === "SELECT" ? "change" : "input", c.tagName === "SELECT" ? now : typed);
+  return h("div", {class:"tools"}, controls);
+}
+// A gate's answer as the owner gave it: the chosen option's label, then the note.
+function answerText(g, strong){
+  const label = g.answer_value ? optLabel(g) : "", note = g.answer_text || "";
+  if (!strong) return [label, note].filter(Boolean).join(" — ");
+  return [label ? h("b", null, label) : null, note ? (label ? " — " : "") + note : null];
+}
+// A table. href(row) gives the page a row opens ("#/issue/ISS-0001"), or nothing for a row that opens none: the row's
+// first cell (or the column marked link) is then a real link, and a click anywhere on the row follows it.
+function table(cols, data, href, none="Nothing here yet."){
+  if (!data.length) return empty(none);
+  const at = Math.max(0, cols.findIndex(c => c.link));
+  const row = r => {
+    const to = href && href(r);
+    const cell = (c, i) => { const v = c.get ? c.get(r) : (r[c.key] ?? ""); return h("td", {class:c.num ? "num" : null}, to && i === at ? h("a", {href:to}, v) : v); };
+    const open = e => { if (!e.target.closest("a, button") && !String(getSelection())) go(to); };
+    return h("tr", to ? {class:"link", onclick:open} : null, cols.map(cell));
+  };
   return h("div", {class:"scroll"}, h("table", null,
     h("thead", null, h("tr", null, cols.map(c => h("th", {class:c.num ? "num" : null}, c.label)))),
-    h("tbody", null, data.map(r => h("tr", onRow ? {class:"link", tabindex:"0", onclick:() => onRow(r), onkeydown:e => { if (e.key === "Enter") onRow(r); }} : null,
-      cols.map(c => h("td", {class:c.num ? "num" : null}, c.get ? c.get(r) : (r[c.key] ?? ""))))))));
+    h("tbody", null, data.map(row))));
 }
-function copyBtn(text, label="Copy"){
-  return h("button", {class:"btn ghost", type:"button", onclick:async e => {
+// name: what a screen reader calls the button when the page has several with the same label.
+function copyBtn(text, label="Copy", name){
+  return h("button", {class:"btn ghost", type:"button", "aria-label":name, onclick:async e => {
     try { await navigator.clipboard.writeText(text); e.target.textContent = "Copied"; } catch { e.target.textContent = "Select and copy by hand"; }
+    say(e.target.textContent);
   }}, label);
 }
-function go(hash){ location.hash = hash; }
-function setView(...kids){ put(document.getElementById("app"), kids); window.scrollTo(0,0); }
-function failed(err){ setView(h("h1", null, "Could not load this view"), h("p", {class:"status err"}, err.message), h("p", {class:"lede"}, "Make sure the viewer is still running in your terminal, then reload the page.")); }
+function go(hash){ if (STATIC) return nav(hash); location.hash = hash; }
+// Draws a view. After the first one, focus moves to the new page's heading, so the keyboard and a screen reader
+// start where the page starts.
+let DRAWN = false;
+function focusHeading(){ const t = document.querySelector("#app h1") || document.getElementById("app"); t.tabIndex = -1; t.focus({preventScroll:true}); }
+function setView(...kids){
+  put(document.getElementById("app"), kids); window.scrollTo(0,0);
+  if (DRAWN) focusHeading();
+  DRAWN = true;
+}
+function failed(err){ setView(h("h1", null, "Could not load this view"), errorBox(err), h("p", {class:"lede"}, STATIC ? "This is a read-only snapshot; reload the page to start again." : "Make sure the viewer is still running in your terminal, then reload the page.")); }
 
 // ---------- code at a commit
-function codeRef(loc){
+// point: the id of the point citing these lines (it tells this reference's buttons from another's).
+function codeRef(loc, point){
   const box = h("div");
   const range = loc.line_start ? (loc.line_end && loc.line_end !== loc.line_start ? `lines ${loc.line_start}–${loc.line_end}` : `line ${loc.line_start}`) : "";
+  const where = `${point}, ${loc.path}${range ? ", " + range : ""}, commit ${short(loc.commit_sha)}`;
+  const label = t => { btn.textContent = t; btn.setAttribute("aria-label", `${t}: ${where}`); };
+  let busy = false;   // not `disabled`: a disabled button drops the keyboard focus
   const btn = h("button", {class:"btn ghost", type:"button", onclick:async () => {
-    if (box.childElementCount) { put(box, ); btn.textContent = "Show code at this commit"; return; }
-    btn.disabled = true;
+    if (busy) return;
+    if (box.childElementCount) { put(box, ); label("Show code at this commit"); return; }
+    busy = true; btn.setAttribute("aria-busy", "true");
     try {
       const s = await api("source/" + loc.id);
       const hi = [s.line_start, s.line_end || s.line_start];
@@ -3553,35 +4036,36 @@ function codeRef(loc){
       if (s.excerpt_matches === false) notes.push("The saved copy of these lines differs from the file at this commit; the line numbers may have been recorded wrong.");
       put(box, 
         notes.length ? h("p", {class:"note"}, notes.join(" ")) : null,
-        s.lines && s.lines.length ? h("div", {class:"code"}, h("table", null, h("tbody", null, s.lines.map(l =>
-          h("tr", {class: hi[0] && l.n >= hi[0] && l.n <= hi[1] ? "hit" : null}, h("td", {class:"ln"}, l.n), h("td", null, l.text)))))) : null,
-        h("div", {class:"refline"}, h("code", null, s.git_command), copyBtn(s.git_command, "Copy git command"),
+        s.lines && s.lines.length ? h("div", {class:"code"}, h("table", null, h("tbody", null, s.lines.map(l => {
+            const cited = hi[0] && l.n >= hi[0] && l.n <= hi[1];
+            return h("tr", {class: cited ? "hit" : null}, h("td", {class:"ln"}, l.n, cited ? h("span", {class:"visually-hidden"}, " cited") : null), h("td", null, l.text)); })))) : null,
+        h("div", {class:"refline"}, h("code", null, s.git_command), copyBtn(s.git_command, "Copy git command", "Copy git command: " + where),
           s.permalink ? extLink(s.permalink, "Open on the code host") : null));
-      btn.textContent = "Hide code";
-    } catch (e) { put(box, h("p", {class:"status err"}, e.message)); }
-    btn.disabled = false;
-  }}, "Show code at this commit");
+      label("Hide code");
+    } catch (e) { put(box, errorBox(e)); }
+    busy = false; btn.removeAttribute("aria-busy");
+  }});
+  label("Show code at this commit");
   return h("div", {class:"ref"},
     h("div", {class:"refline"},
-      h("span", {class:"tag"}, words(loc.role)), h("b", null, loc.repo), h("code", null, loc.path), range ? h("span", null, range) : null,
+      tag(words(loc.role)), h("b", null, loc.repo), h("code", null, loc.path), range ? h("span", null, range) : null,
       loc.symbol ? h("code", {class:"muted"}, loc.symbol) : null,
       h("span", {class:"muted"}, "at commit ", h("code", null, short(loc.commit_sha))), btn),
     box);
 }
 
 function findingItem(f, opts={}){
-  return h("details", {class:"item"},
-    h("summary", null, h("span", {class:"n"}, opts.showReview ? `${f.review_code} · ${f.point_id}` : f.point_id), h("span", {class:"t"}, f.summary),
-      h("span", {class:"tags"}, sevTag(f.severity), f.match_type ? h("span", {class:"tag " + (["recurrence","regression"].includes(f.match_type) ? "crit" : f.match_type === "new" ? "info" : "")}, lab("match", f.match_type)) : null,
-        f.verification === "false" ? h("span", {class:"tag"}, "False finding") : f.verification === "confirmed" ? h("span", {class:"tag ok"}, "Confirmed") : null)),
-    h("div", {class:"body"},
-      kv([["Area", domainName(f.domain_code)], ["Theme", themeName(f.theme_code)], ["Kind", lab("kind", f.kind)],
+  const id = opts.showReview ? `${f.review_code} · ${f.point_id}` : f.point_id;
+  return item(id, f.summary,
+    [sevTag(f.severity), f.match_type ? labTag("match", f.match_type) : null,
+     f.verification === "false" ? tag("False finding") : f.verification === "confirmed" ? tag("Confirmed", tone("verif", "confirmed")) : null],
+    [ kv([["Area", domainName(f.domain_code)], ["Theme", themeName(f.theme_code)], ["Kind", lab("kind", f.kind)],
           ["Issue", f.issue_code && !opts.hideIssue ? h("a", {href:"#/issue/" + f.issue_code}, f.issue_code) : null],
           ["How it was matched", f.match_rationale], ["What it does now", f.before_state], ["Detail", f.detail],
           ["Recommended fix", f.recommendation], ["Test to add", f.recommended_test], ["Evidence", f.evidence],
           ["Checked by the manager", f.verification ? lab("verif", f.verification) + (f.verification_note ? " — " + f.verification_note : "") : null],
           ["Reviewer", f.run_label], ["In the report", f.where_report]]),
-      (f.locations || []).map(codeRef)));
+      (f.locations || []).map(loc => codeRef(loc, id))]);
 }
 
 // ---------- views
@@ -3596,29 +4080,26 @@ VIEWS.home = async () => {
     h("h1", null, o.project),
     h("p", {class:"lede"}, "Every review of this project, every point it raised, how those points carried over between reviews, the fix plans, and anything waiting on you."),
     h("div", {class:"facts"},
-      h("div", null, h("b", null, o.queue), h("span", null, "waiting on you")),
-      h("div", null, h("b", null, openTotal), h("span", null, "open issues")),
-      h("div", null, h("b", null, sev.H || 0), h("span", null, "open and high")),
-      h("div", null, h("b", null, o.recurring), h("span", null, "came back or seen again"))),
-    o.queue ? h("p", {class:"status"}, h("a", {href:"#/inbox"}, `${o.queue} ${o.queue === 1 ? "thing needs" : "things need"} your input or approval →`)) : null,
+      fact(o.queue, "waiting on you"), fact(openTotal, "open issues"), fact(sev.H || 0, "open and high"), fact(o.recurring, "came back or seen again")),
+    o.queue ? h("p", {class:"status"}, h("a", {href:"#/inbox"}, plural(o.queue, "thing needs", "things need") + " your input or approval →")) : null,
     h("div", {class:"grid2"},
       h("div", {class:"card"}, h("h2", null, "Latest reviews"),
         table([{label:"Review", get:r => r.code}, {label:"Title", key:"title"}, {label:"Status", get:r => lab("review", r.status)},
-               {label:"Started", get:r => when(r.started_at, false)}, {label:"High", key:"high", num:1}, {label:"Points", key:"points", num:1}],
-              o.reviews, r => go("#/review/" + r.code))),
+               {label:"Started", get:r => whenCell(r.started_at, false)}, {label:"High", key:"high", num:1}, {label:"Points", key:"points", num:1}],
+              o.reviews, r => "#/review/" + r.code)),
       h("div", {class:"card"}, h("h2", null, "Fix plans"),
-        o.plans.length ? o.plans.map(p => h("div", {style:"margin:10px 0"},
+        o.plans.length ? o.plans.map(p => h("div", {class:"card-link"},
           h("a", {href:"#/plan/" + p.code}, `${p.code} · ${p.title}`), h("span", {class:"muted"}, " — " + lab("plan", p.status)),
           progressBar(p.done || 0, 0, p.waiting || 0, p.steps || 0))) : empty("No fix plan yet."))),
     h("div", {class:"card"}, h("h2", null, "Ledger checks"),
       h("p", {class:"note"}, "These should all be zero once a review has been indexed and matched."),
-      table([{label:"Check", key:"label"}, {label:"Count", key:"n", num:1}], o.checks, c => c.n && go("#/explore/" + c.view)),
-      failing.length ? h("p", {class:"status err"}, `${failing.length} ${failing.length === 1 ? "check needs" : "checks need"} attention.`) : null));
+      table([{label:"Check", key:"label"}, {label:"Count", key:"n", num:1}], o.checks, c => c.n ? "#/explore/" + c.view : null),
+      failing.length ? errorBox(plural(failing.length, "check needs", "checks need") + " attention.", true) : null));
 };
 
 function progressBar(done, doing, waiting, total){
   const pct = n => total ? (100 * n / total).toFixed(2) + "%" : "0";
-  return h("div", {style:"display:flex;flex-direction:column;gap:4px;margin-top:4px"},
+  return h("div", {class:"progress"},
     h("div", {class:"bar", role:"img", "aria-label":`${done} of ${total} done`},
       h("i", {class:"d", style:`width:${pct(done)}`}), h("i", {class:"g", style:`width:${pct(doing)}`}), h("i", {class:"y", style:`width:${pct(waiting)}`})),
     h("span", {class:"note"}, `${done} of ${total} done` + (doing ? ` · ${doing} in progress` : "") + (waiting ? ` · ${waiting} waiting on you` : "")));
@@ -3629,10 +4110,11 @@ VIEWS.inbox = async () => {
   const open = d.gates.filter(g => g.status === "open"), answered = d.gates.filter(g => g.status === "answered");
   setView(
     h("h1", null, "Waiting on you"),
-    h("p", {class:"lede"}, "Questions and approvals the agent cannot get past without you. Answer here or in the chat; the agent picks answers up the next time it checks the ledger."),
-    open.length ? open.map(gateCard) : empty("Nothing is waiting on you right now."),
-    answered.length ? [h("h3", null, "Answered, waiting for the agent to act"), answered.map(gateCard)] : null,
-    d.other.length ? [h("h3", null, "Also waiting on you (answer in the chat)"),
+    h("p", {class:"lede"}, STATIC ? "Questions and approvals the agent cannot get past without you. Answer here: your answer is saved with this page, and Claude records it the next time it checks."
+      : "Questions and approvals the agent cannot get past without you. Answer here or in the chat; the agent picks answers up the next time it checks the ledger."),
+    open.length ? open.map(g => gateCard(g)) : empty("Nothing is waiting on you right now."),
+    answered.length ? [sect("Answered, waiting for the agent to act"), answered.map(g => gateCard(g, "h3"))] : null,
+    d.other.length ? [sect("Also waiting on you (answer in the chat)"),
       table([{label:"What", get:r => (r.kind === "step" ? "Plan step " : r.kind === "goal" ? "Design goal " : "Decision ") + r.ref}, {label:"Needs", get:r => lab("need", r.need) || "Your input"},
              {label:"Title", key:"title"}, {label:"Question", key:"question"}], d.other)] : null,
     h("p", null, h("a", {href:"#/history"}, "See every question and answer so far")));
@@ -3641,41 +4123,44 @@ VIEWS.inbox = async () => {
 VIEWS.history = async () => {
   const d = await api("gates?status=all");
   setView(h("h1", null, "Questions and answers"),
-    table([{label:"Asked", get:g => when(g.created_at)}, {label:"About", get:g => lab("gate", g.kind)}, {label:"Title", key:"title"},
+    table([{label:"Asked", get:g => whenCell(g.created_at)}, {label:"About", get:g => lab("gate", g.kind)}, {label:"Title", key:"title"},
            {label:"Status", get:g => lab("gstat", g.status)}, {label:"Answer", get:g => [g.answer_value ? optLabel(g) : "", g.answer_text ? " " + g.answer_text : ""]},
            {label:"What the agent did", key:"applied_note"}], d.gates));
 };
 const optLabel = g => ((g.options || []).find(o => o.value === g.answer_value) || {}).label || words(g.answer_value);
 
-function gateCard(g){
+// level: "h3" for a gate listed under a section heading.
+function gateCard(g, level){
+  const hid = "gate-" + g.code;   // the title's id: it names this gate's choices, text box and button
   const refs = [g.review_code && h("a", {href:"#/review/" + g.review_code}, "Review " + g.review_code),
                 g.plan_code && h("a", {href:"#/plan/" + g.plan_code}, "Plan " + g.plan_code + (g.step_number ? " step " + g.step_number : "")),
                 g.issue_code && h("a", {href:"#/issue/" + g.issue_code}, "Issue " + g.issue_code)].filter(Boolean);
   const card = h("div", {class:"card gate"},
-    h("div", null, h("span", {class:"tag " + (g.kind === "production-action" ? "crit" : g.status === "open" ? "you" : "info")}, lab("gate", g.kind)),
-      g.blocking && g.status === "open" ? h("span", {class:"tag warn"}, "Work is paused until you answer") : null,
+    h("div", null, tag(lab("gate", g.kind), tone("gate", g.kind) || tone("gstat", g.status) || "info"),
+      g.blocking && g.status === "open" ? tag("Work is paused until you answer", "warn") : null,
       h("span", {class:"note"}, " Asked " + when(g.created_at))),
-    h("h2", null, g.title), h("div", {class:"q"}, g.question),
+    h(level || "h2", {id:hid, class: level ? "title" : null}, g.title), h("div", {class:"q"}, g.question),
     g.context ? h("div", {class:"ctx"}, g.context) : null,
     refs.length ? h("div", {class:"refline"}, refs) : null);
   if (g.status === "answered") {
-    add(card, h("p", {class:"status"}, "You answered: ", g.answer_value ? h("b", null, optLabel(g)) : null, g.answer_text ? (g.answer_value ? " — " : "") + g.answer_text : "",
-      ` (${when(g.answered_at)})`));
+    add(card, h("p", {class:"status"}, "You answered: ", answerText(g, true), ` (${when(g.answered_at)})`));
     return card;
   }
+  if (STATIC) return hubGateBody(card, g, hid);
   const name = "opt-" + g.code;
-  const opts = (g.options || []).length ? h("div", {class:"opts", role:"radiogroup", "aria-label":"Choices"},
+  const opts = (g.options || []).length ? h("div", {class:"opts", role:"radiogroup", "aria-labelledby":hid},
     g.options.map(o => h("label", null, h("input", {type:"radio", name, value:o.value}), h("span", null, o.label, o.description ? h("small", null, o.description) : null)))) : null;
-  const ta = g.allow_text ? h("textarea", {placeholder: opts ? "Add a note or a different answer (optional)" : "Your answer", "aria-label":"Your answer"}) : null;
+  const ta = g.allow_text ? h("textarea", {class:"field", placeholder: opts ? "Add a note or a different answer (optional)" : "Your answer", id:hid + "-text", "aria-label":"Your answer", "aria-labelledby":`${hid}-text ${hid}`}) : null;
   const msg = h("div");
-  const send = h("button", {class:"btn", type:"button", onclick:async () => {
+  const send = h("button", {class:"btn", type:"button", id:hid + "-send", "aria-labelledby":`${hid}-send ${hid}`, onclick:async () => {
     const picked = card.querySelector(`input[name="${name}"]:checked`);
     send.disabled = true;
     try {
       await api(`gates/${encodeURIComponent(g.code)}/answer`, {answer_value: picked ? picked.value : null, answer_text: ta ? ta.value : null});
       put(msg, h("p", {class:"status"}, "Answer saved. The agent will act on it the next time it checks."));
+      say("Answer saved.");
       setTimeout(() => route(), 1200);
-    } catch (e) { put(msg, h("p", {class:"status err"}, e.message)); send.disabled = false; }
+    } catch (e) { put(msg, errorBox(e)); send.disabled = false; }
   }}, "Send answer");
   add(card, opts, ta, h("div", null, send), msg);
   return card;
@@ -3685,66 +4170,69 @@ VIEWS.reviews = async () => {
   const list = await api("reviews");
   setView(h("h1", null, "Reviews"), h("p", {class:"lede"}, "Every review run on this project, newest first."),
     table([{label:"Review", key:"code"}, {label:"Title", key:"title"}, {label:"Kind", get:r => lab("scope", r.scope)},
-           {label:"Status", get:r => lab("review", r.status)}, {label:"Started", get:r => when(r.started_at)}, {label:"Code reviewed", get:r => h("span", {class:"mono"}, r.commits || "")},
+           {label:"Status", get:r => lab("review", r.status)}, {label:"Started", get:r => whenCell(r.started_at)}, {label:"Code reviewed", get:r => h("span", {class:"mono"}, r.commits || "")},
            {label:"High", key:"high", num:1}, {label:"Medium", key:"medium", num:1}, {label:"Low", key:"low", num:1}, {label:"New", key:"new_issues", num:1}, {label:"Came back", key:"came_back", num:1}],
-          list, r => go("#/review/" + r.code)));
+          list, r => "#/review/" + r.code));
 };
 
 const REQ_VERDICT = {matches:"matches", differs:"differs", partly:"partly matches", missing:"missing", untested:"not tested"};
 VIEWS.review = async ([code]) => {
   const d = await api("review/" + encodeURIComponent(code)); const r = d.review;
   const fs = d.findings;
-  const sel = (id, label, values, fmt) => h("select", {id, "aria-label":label}, h("option", {value:""}, label), [...new Set(values)].filter(v => v != null).map(v => h("option", {value:v}, fmt(v))));
-  const q = h("input", {type:"search", placeholder:"Search points, ids, files", "aria-label":"Search points"});
-  const fd = sel("fd", "All areas", fs.map(f => f.domain_code), domainName), fsv = sel("fs", "All severities", ["H","M","L","T"].filter(s => fs.some(f => f.severity === s)), v => lab("sev", v));
-  const fm = sel("fm", "Any match", fs.map(f => f.match_type), v => lab("match", v)), fv = sel("fv", "Any check", fs.map(f => f.verification), v => lab("verif", v));
-  const listBox = h("div", {style:"display:flex;flex-direction:column;gap:8px"});
+  const sel = (id, label, all, values, fmt) => select(label, [["", all], ...[...new Set(values)].filter(v => v != null).map(v => [v, fmt(v)])], {id});
+  const q = h("input", {class:"field", type:"search", placeholder:"Search points, ids, files", "aria-label":"Search points"});
+  const fd = sel("fd", "Area", "All areas", fs.map(f => f.domain_code), domainName), fsv = sel("fs", "Severity", "All severities", ["H","M","L","T"].filter(s => fs.some(f => f.severity === s)), v => lab("sev", v));
+  const fm = sel("fm", "Match", "Any match", fs.map(f => f.match_type), v => lab("match", v)), fv = sel("fv", "Check", "Any check", fs.map(f => f.verification), v => lab("verif", v));
+  const listBox = h("div", {class:"stack"});
   let shown = 100;
   const draw = () => {
     const t = q.value.trim().toLowerCase();
     const hit = fs.filter(f => (!fd.value || f.domain_code === fd.value) && (!fsv.value || f.severity === fsv.value) && (!fm.value || f.match_type === fm.value) && (!fv.value || f.verification === fv.value)
       && (!t || [f.point_id, f.summary, f.detail, f.issue_code, ...(f.locations||[]).map(l => l.path)].join(" ").toLowerCase().includes(t)));
-    put(listBox, h("p", {class:"note"}, `${hit.length} of ${fs.length} points`), hit.slice(0, shown).map(f => findingItem(f)),
-      hit.length > shown ? h("button", {class:"btn ghost", type:"button", onclick:() => { shown += 200; draw(); }}, `Show more (${hit.length - shown} left)`) : null);
+    const count = `${hit.length} of ${fs.length} points`;
+    const more = () => { const first = shown; shown += 200; draw(); listBox.querySelectorAll("details.item > summary")[first].focus(); };
+    put(listBox, h("p", {class:"note"}, count), hit.slice(0, shown).map(f => findingItem(f)),
+      hit.length > shown ? h("button", {class:"btn ghost", type:"button", onclick:more}, `Show more (${hit.length - shown} left)`) : null);
+    return count;
   };
-  [q, fd, fsv, fm, fv].forEach(e => e.addEventListener("input", () => { shown = 100; draw(); }));
+  const filters = filterBar([q, fd, fsv, fm, fv], () => { shown = 100; say(draw()); });
   const sumBy = k => fs.filter(f => f.severity === k).length;
   setView(
     h("h1", null, `${r.code} · ${r.title}`),
     h("p", {class:"lede"}, `${lab("scope", r.scope)} · ${lab("review", r.status)} · started ${when(r.started_at)}` + (r.completed_at ? ` · finished ${when(r.completed_at)}` : "")),
-    h("div", {class:"facts"}, h("div", null, h("b", null, fs.length), h("span", null, "points")), ["H","M","L","T"].map(s => h("div", null, h("b", null, sumBy(s)), h("span", null, lab("sev", s)))),
-      h("div", null, h("b", null, fs.filter(f => ["new","continuation"].includes(f.match_type)).length), h("span", null, "new issues")),
-      h("div", null, h("b", null, fs.filter(f => ["recurrence","regression"].includes(f.match_type)).length), h("span", null, "came back"))),
-    d.gates.length ? h("div", {class:"card"}, h("h2", null, "Questions asked during this review"), table([{label:"About", get:g => lab("gate", g.kind)}, {label:"Title", key:"title"}, {label:"Status", get:g => lab("gstat", g.status)}, {label:"Answer", get:g => [g.answer_value || "", " ", g.answer_text || ""]}], d.gates, () => go("#/inbox"))) : null,
+    h("div", {class:"facts"}, fact(fs.length, "points"), ["H","M","L","T"].map(s => fact(sumBy(s), lab("sev", s))),
+      fact(fs.filter(f => ["new","continuation"].includes(f.match_type)).length, "new issues"),
+      fact(fs.filter(f => ["recurrence","regression"].includes(f.match_type)).length, "came back")),
+    d.gates.length ? h("div", {class:"card"}, h("h2", null, "Questions asked during this review"), table([{label:"About", get:g => lab("gate", g.kind)}, {label:"Title", key:"title"}, {label:"Status", get:g => lab("gstat", g.status)}, {label:"Answer", get:g => [g.answer_value || "", " ", g.answer_text || ""]}], d.gates, () => "#/inbox")) : null,
     h("div", {class:"card"}, kv([["Verdict", r.verdict], ["Summary", r.summary], ["What was asked", r.request_text], ["Run by", r.manager ? `${r.manager}${r.manager_model ? " (" + r.manager_model + ")" : ""}` : null],
       ["Domains approved by", r.approved_by ? `${r.approved_by}, ${when(r.approved_at)}` : null], ["Follows", r.previous_code ? h("a", {href:"#/review/" + r.previous_code}, r.previous_code) : null],
       ["Write-up", r.summary_doc_url ? extLink(r.summary_doc_url, "Open the review document") : null]])),
-    r.report_md ? h("div", {class:"card"}, h("h2", null, "The review document"), h("div", {class:"mdtext"}, r.report_md)) : null,
-    h("h3", null, "Code reviewed"),
-    table([{label:"Repository", key:"name"}, {label:"Branch", key:"branch"}, {label:"Commit", get:x => [h("code", null, short(x.commit_sha)), " ", copyBtn(x.commit_sha, "Copy")]},
+    r.report_md ? h("div", {class:"card"}, h("h2", null, "The review document"), (STATIC ? md(r.report_md) : h("div", {class:"mdtext"}, r.report_md))) : null,
+    sect("Code reviewed"),
+    table([{label:"Repository", key:"name"}, {label:"Branch", key:"branch"}, {label:"Commit", get:x => [h("code", null, short(x.commit_sha)), " ", copyBtn(x.commit_sha, "Copy", "Copy commit " + short(x.commit_sha))]},
            {label:"Commit message", key:"commit_subject"}, {label:"Kept by tag", get:x => x.tag_name ? x.tag_name + (x.tag_pushed ? "" : " (not pushed)") : "Not tagged"},
            {label:"Uncommitted changes", get:x => x.is_dirty ? (x.dirty_note || "Yes") : "None"}], d.repos),
-    d.goals.length ? [h("h3", null, "Design goals used"), h("ul", null, d.goals.map(g => h("li", null, g.text)))] : null,
+    d.goals.length ? [sect("Design goals used"), h("ul", null, d.goals.map(g => h("li", null, g.text)))] : null,
     (d.interview || []).length ? interviewSection(d.interview) : null,
-    (d.review_goals || []).length ? [h("h3", null, "Design goals from this interview"), goalsTable(d.review_goals)] : null,
-    h("h3", null, "Areas reviewed and skipped"),
-    table([{label:"Area", get:x => x.name}, {label:"", get:x => x.decision === "included" ? h("span", {class:"tag ok"}, "Reviewed") : h("span", {class:"tag"}, "Skipped")},
+    (d.review_goals || []).length ? [sect("Design goals from this interview"), goalsTable(d.review_goals)] : null,
+    sect("Areas reviewed and skipped"),
+    table([{label:"Area", get:x => x.name}, {label:"Reviewed?", get:x => tag(x.decision === "included" ? "Reviewed" : "Skipped", tone("area", x.decision))},
            {label:"Why", key:"reason"}, {label:"Your change", get:x => x.owner_change === "none" ? "" : words(x.owner_change)}, {label:"Reviewers", key:"reviewers_planned", num:1}], d.domains),
-    h("h3", null, "Reviewers"),
+    sect("Reviewers"),
     table([{label:"Reviewer", key:"label"}, {label:"Area", get:x => domainName(x.domain_code)}, {label:"Agent", get:x => x.model ? `${x.actor} (${x.model})` : x.actor},
            {label:"Status", get:x => lab("run", x.status)}, {label:"Items", key:"items_reviewed", num:1}, {label:"High", key:"high_count", num:1}, {label:"Medium", key:"medium_count", num:1}, {label:"Low", key:"low_count", num:1}], d.runs),
-    d.agents.length ? [h("h3", null, "Agents"),
+    d.agents.length ? [sect("Agents"),
       table([{label:"Agent", key:"name"}, {label:"Did", key:"role"}, {label:"Kind", get:x => words(x.kind)}, {label:"Model", key:"model"}, {label:"Run in", key:"harness"}, {label:"Started by", key:"parent"}], d.agents)] : null,
-    d.requirements.length ? [h("h3", null, "Requirements"),
+    d.requirements.length ? [sect("Requirements"),
       h("p", {class:"note"}, [...new Map(d.requirements.map(x => [x.verdict, x.verdict_count]))].map(([v, n]) => `${n} ${REQ_VERDICT[v] || words(v)}`).join(" · ")),
       table([{label:"Requirement", key:"requirement"}, {label:"Says", key:"text"}, {label:"Found", get:x => REQ_VERDICT[x.verdict] || words(x.verdict)}, {label:"Where", key:"where_implemented"},
              {label:"Tested", get:x => words(x.tested)}, {label:"Point", key:"point_id"}, {label:"Evidence", key:"evidence"}], d.requirements)] : null,
-    d.checks.length ? [h("h3", null, "Earlier issues this review looked for"),
+    d.checks.length ? [sect("Earlier issues this review looked for"),
       table([{label:"Issue", key:"issue_code"}, {label:"Title", key:"title"}, {label:"Found", get:x => lab("check", x.outcome)}, {label:"Evidence", key:"evidence"}, {label:"Now", get:x => issueTag(x.status)}],
-            d.checks, x => go("#/issue/" + x.issue_code))] : null,
-    d.metrics.length ? [h("h3", null, "Measurements"), table([{label:"Measure", get:m => m.label || words(m.name)}, {label:"Of", key:"scope"}, {label:"Value", get:m => `${m.value}${m.unit ? " " + m.unit : ""}`, num:1}, {label:"How", get:m => words(m.method)}, {label:"Note", key:"note"}], d.metrics)] : null,
-    h("h3", null, "Points raised"),
-    h("div", {class:"tools"}, q, fd, fsv, fm, fv), listBox);
+            d.checks, x => "#/issue/" + x.issue_code)] : null,
+    d.metrics.length ? [sect("Measurements"), table([{label:"Measure", get:m => m.label || words(m.name)}, {label:"Of", key:"scope"}, {label:"Value", get:m => `${m.value}${m.unit ? " " + m.unit : ""}`, num:1}, {label:"How", get:m => words(m.method)}, {label:"Note", key:"note"}], d.metrics)] : null,
+    sect("Points raised"),
+    filters, listBox);
   draw();
 };
 
@@ -3767,7 +4255,7 @@ function interviewSection(qs){
 }
 function goalsTable(goals){
   return table([{label:"Goal", key:"code"}, {label:"Area", get:g => areaName(g.domain)}, {label:"Statement", key:"text"},
-    {label:"Status", get:g => h("span", {class:"tag " + (g.status === "approved" ? "ok" : g.status === "proposed" ? "you" : "")}, lab("goal", g.status))},
+    {label:"Status", get:g => labTag("goal", g.status)},
     {label:"From your answers to", get:g => g.sources.map(q => q.code + ": " + q.question).join("; ")},
     {label:"Note", get:g => g.note || (g.status === "approved" && g.approved_at ? "Approved " + when(g.approved_at) : "")}], goals);
 }
@@ -3775,31 +4263,30 @@ VIEWS.goals = async () => {
   const d = await api("goals");
   setView(h("h1", null, "Design goals"),
     h("p", {class:"lede"}, "What you want the code to be, by area, written from your interview answers. Reviewers, fix plans and every agent work to the approved ones."),
-    d.goals.length ? byDomain(d.goals).map(([dom, list]) => [h("h3", null, areaName(dom)), goalsTable(list)])
+    d.goals.length ? byDomain(d.goals).map(([dom, list]) => [sect(areaName(dom)), goalsTable(list)])
       : empty("No design goals yet."),
     d.goals.some(g => g.status === "proposed") ? h("p", {class:"status"}, h("a", {href:"#/inbox"}, "Goals are waiting for your approval →")) : null);
 };
 
 VIEWS.issues = async (_, params) => {
   const o = OVERVIEW || await api("overview");
-  const q = h("input", {type:"search", placeholder:"Search titles, ids, point ids", "aria-label":"Search issues", value:params.get("q") || ""});
-  const st = h("select", {"aria-label":"Status"}, [["active","Still to fix"],["","Any status"], ...Object.entries(L.issue)].map(([v,t]) => h("option", {value:v}, t)));
-  const sv = h("select", {"aria-label":"Severity"}, [["","Any severity"], ...Object.entries(L.sev)].map(([v,t]) => h("option", {value:v}, t)));
-  const dm = h("select", {"aria-label":"Area"}, [["","All areas"], ...Object.entries(o.labels.domains)].map(([v,t]) => h("option", {value:v}, t)));
+  const q = h("input", {class:"field", type:"search", placeholder:"Search titles, ids, point ids", "aria-label":"Search issues", value:params.get("q") || ""});
+  const st = select("Status", [["active","Still to fix"],["","Any status"], ...Object.entries(L.issue)]);
+  const sv = select("Severity", [["","Any severity"], ...Object.entries(L.sev)]);
+  const dm = select("Area", [["","All areas"], ...Object.entries(o.labels.domains)]);
   st.value = params.has("status") ? params.get("status") : "active"; sv.value = params.get("severity") || ""; dm.value = params.get("domain") || "";
   const box = h("div");
-  let timer;
-  const load = async () => {
+  const load = async announce => {
     const p = new URLSearchParams(); if (st.value) p.set("status", st.value); if (sv.value) p.set("severity", sv.value); if (dm.value) p.set("domain_code", dm.value); if (q.value.trim()) p.set("q", q.value.trim());
     try {
       const list = await api("issues?" + p);
+      if (announce) say(`${list.length} issues`);
       put(box, h("p", {class:"note"}, `${list.length} issues`), table([{label:"Issue", key:"code"}, {label:"Title", key:"title"}, {label:"Severity", get:i => sevTag(i.severity)},
         {label:"Status", get:i => issueTag(i.status)}, {label:"Area", get:i => domainName(i.domain_code)}, {label:"First seen", key:"first_seen"}, {label:"Last seen", key:"last_seen"}, {label:"Reviews", key:"times_seen", num:1}],
-        list, i => go("#/issue/" + i.code)));
-    } catch (e) { put(box, h("p", {class:"status err"}, e.message)); }
+        list, i => "#/issue/" + i.code));
+    } catch (e) { put(box, errorBox(e)); }
   };
-  [st, sv, dm].forEach(e => e.addEventListener("change", load)); q.addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(load, 250); });
-  setView(h("h1", null, "Issues"), h("p", {class:"lede"}, "An issue is one underlying problem, followed across every review that raised it or looked for it."), h("div", {class:"tools"}, q, st, sv, dm), box);
+  setView(h("h1", null, "Issues"), h("p", {class:"lede"}, "An issue is one underlying problem, followed across every review that raised it or looked for it."), filterBar([q, st, sv, dm], load, 250), box);
   load();
 };
 
@@ -3809,37 +4296,37 @@ VIEWS.issue = async ([code]) => {
   const continues = "Raised as a new issue that continues " + (cont ? cont.other : "an earlier issue");
   setView(
     h("h1", null, `${i.code} · ${i.title}`),
-    h("div", null, sevTag(i.severity), issueTag(i.status), h("span", {class:"tag"}, domainName(i.domain_code)), i.theme_code ? h("span", {class:"tag"}, themeName(i.theme_code)) : null),
+    h("div", null, sevTag(i.severity), issueTag(i.status), tag(domainName(i.domain_code)), i.theme_code ? tag(themeName(i.theme_code)) : null),
     h("div", {class:"card"}, kv([["First found", h("span", null, h("a", {href:"#/review/" + i.first_seen}, i.first_seen), " · " + when(i.opened_at))],
       ["Last raised", i.last_seen ? h("a", {href:"#/review/" + i.last_seen}, i.last_seen) : null], ["Last looked for", i.last_checked ? h("a", {href:"#/review/" + i.last_checked}, i.last_checked) : null],
-      ["Raised in", `${i.times_seen} ${i.times_seen === 1 ? "review" : "reviews"}`],
+      ["Raised in", plural(i.times_seen, "review")],
       ["Before", i.before_state], ["Now", i.current_state], ["After the fix", i.after_state], ["Agreed fix", i.recommendation], ["Resolution", i.resolution],
-      ["Fixed", when(i.resolved_at)], ["Fix confirmed", when(i.verified_at)]])),
-    d.relations.length ? [h("h3", null, "Related issues"), table([{label:"", get:x => x.dir === "out" ? lab("rel", x.relation) : lab("relIn", x.relation)},
-      {label:"Issue", key:"other"}, {label:"Title", key:"other_title"}, {label:"Status", get:x => issueTag(x.other_status)}, {label:"How sure", get:x => words(x.confidence)}, {label:"Why", key:"rationale"}, {label:"Linked in", key:"review"}],
-      d.relations, x => go("#/issue/" + x.other))] : null,
-    d.decisions.length ? [h("h3", null, "Your decisions about it"), table([{label:"Decision", key:"code"}, {label:"Question", key:"question"}, {label:"Answer", key:"answer"}, {label:"Why", key:"rationale"}, {label:"When", get:x => when(x.decided_at)}], d.decisions)] : null,
-    d.steps.length ? [h("h3", null, "Fix plan steps"), table([{label:"Plan", key:"plan"}, {label:"Step", key:"number", num:1}, {label:"Title", key:"title"}, {label:"Status", get:x => lab("step", x.status)},
-      {label:"Commits", get:x => h("span", {class:"mono"}, x.commits || "")}, {label:"Note", key:"progress_note"}], d.steps, x => go(`#/plan/${x.plan}`))] : null,
-    d.guard_tests.length ? [h("h3", null, "Tests that guard the fix"), table([{label:"Test", get:t => h("code", null, `${t.test_path} › ${t.test_name}`)},
+      ["Fixed", whenCell(i.resolved_at)], ["Fix confirmed", whenCell(i.verified_at)]])),
+    d.relations.length ? [sect("Related issues"), table([{label:"Link", get:x => x.dir === "out" ? lab("rel", x.relation) : lab("relIn", x.relation)},
+      {label:"Issue", key:"other", link:true}, {label:"Title", key:"other_title"}, {label:"Status", get:x => issueTag(x.other_status)}, {label:"How sure", get:x => words(x.confidence)}, {label:"Why", key:"rationale"}, {label:"Linked in", key:"review"}],
+      d.relations, x => "#/issue/" + x.other)] : null,
+    d.decisions.length ? [sect("Your decisions about it"), table([{label:"Decision", key:"code"}, {label:"Question", key:"question"}, {label:"Answer", key:"answer"}, {label:"Why", key:"rationale"}, {label:"When", get:x => whenCell(x.decided_at)}], d.decisions)] : null,
+    d.steps.length ? [sect("Fix plan steps"), table([{label:"Plan", key:"plan"}, {label:"Step", key:"number", num:1}, {label:"Title", key:"title"}, {label:"Status", get:x => lab("step", x.status)},
+      {label:"Commits", get:x => h("span", {class:"mono"}, x.commits || "")}, {label:"Note", key:"progress_note"}], d.steps, x => `#/plan/${x.plan}`)] : null,
+    d.guard_tests.length ? [sect("Tests that guard the fix"), table([{label:"Test", get:t => h("code", null, `${t.test_path} › ${t.test_name}`)},
       {label:"Failed before the fix", get:t => t.failed_before_fix == null ? "Not recorded" : t.failed_before_fix ? "Yes" : "No"}, {label:"Still in the code", get:t => t.still_exists ? "Yes" : "Removed"},
       {label:"Added in", get:t => h("code", null, short(t.added_commit_sha))}], d.guard_tests)] : null,
-    d.checks.length ? [h("h3", null, "What each review found"), table([{label:"Review", key:"review"}, {label:"When", get:x => when(x.started_at, false)}, {label:"Found", get:x => lab("check", x.outcome)}, {label:"Evidence", key:"evidence"}], d.checks, x => go("#/review/" + x.review))] : null,
-    h("h3", null, "Every time it was raised, with the code at that commit"),
+    d.checks.length ? [sect("What each review found"), table([{label:"Review", key:"review"}, {label:"When", get:x => whenCell(x.started_at, false)}, {label:"Found", get:x => lab("check", x.outcome)}, {label:"Evidence", key:"evidence"}], d.checks, x => "#/review/" + x.review)] : null,
+    sect("Every time it was raised, with the code at that commit"),
     d.findings.map(f => findingItem(f, {showReview:true, hideIssue:true})),
-    h("h3", null, "History"),
-    d.timeline.length ? h("div", {class:"timeline"}, d.timeline.map(e => h("div", null, h("b", null, when(e.at)), " — ",
+    sect("History"),
+    d.timeline.length ? h("div", {class:"timeline"}, d.timeline.map(e => h("div", null, h("b", null, whenCell(e.at)), " — ",
       e.event === "status-changed" ? `${lab("issue", e.from_value)} → ${lab("issue", e.to_value)}` : e.event === "severity-changed" ? `Severity ${lab("sev", e.from_value)} → ${lab("sev", e.to_value)}`
       : e.event === "seen" ? (e.to_value === "new" ? "Raised as a new issue" : e.to_value === "continuation" ? continues : `Raised again (${lab("match", e.to_value)})`) : e.event === "opened" ? "Opened" : words(e.event),
       e.review ? ` · ${e.review}` : "", e.step ? ` · step ${e.step}` : "", e.commit_sha ? [" · ", h("code", null, short(e.commit_sha))] : "", e.actor ? ` · ${e.actor}` : "",
-      e.note ? h("div", {class:"note", style:"padding:0;border:0"}, e.note) : null))) : empty("No history recorded."));
+      e.note ? h("div", {class:"note"}, e.note) : null))) : empty("No history recorded."));
 };
 
 VIEWS.plans = async () => {
   const list = await api("plans");
   setView(h("h1", null, "Fix plans"),
     table([{label:"Plan", key:"code"}, {label:"Title", key:"title"}, {label:"From reviews", key:"reviews"}, {label:"Status", get:p => lab("plan", p.status)},
-           {label:"Progress", get:p => progressBar(p.done || 0, p.doing || 0, p.waiting || 0, p.steps || 0)}], list, p => go("#/plan/" + p.code)));
+           {label:"Progress", get:p => progressBar(p.done || 0, p.doing || 0, p.waiting || 0, p.steps || 0)}], list, p => "#/plan/" + p.code));
 };
 
 VIEWS.plan = async ([code, , phaseArg]) => {
@@ -3847,10 +4334,10 @@ VIEWS.plan = async ([code, , phaseArg]) => {
   const steps = d.steps, phases = d.phase_rows, prog = Object.fromEntries(d.phases.map(p => [p.phase, p]));
   let phase = Number(phaseArg) || (phases[0] && phases[0].number) || 1;
   const count = s => steps.filter(x => x.status === s).length;
-  const q = h("input", {type:"search", placeholder:"Search steps, or a point id", "aria-label":"Search steps or point ids"});
-  const f = h("select", {"aria-label":"Filter steps"}, [["","All steps"],["st-done","Done"],["st-doing","In progress"],["st-waiting-owner","Waiting on you"],["st-not-started","Not started"],
-    ["any","Needs you (any)"],["decision","Needs your decision"],["confirm","Needs you to confirm"],["review","Needs your review"],["production","Production action"],["behavior","Changes behaviour on purpose"]].map(([v,t]) => h("option", {value:v}, t)));
-  const nav = h("nav", {class:"rail", "aria-label":"Phases"}), main = h("main", {style:"min-width:0;display:flex;flex-direction:column;gap:8px"});
+  const q = h("input", {class:"field", type:"search", placeholder:"Search steps, or a point id", "aria-label":"Search steps or point ids"});
+  const f = select("Filter steps", [["","All steps"],["st-done","Done"],["st-doing","In progress"],["st-waiting-owner","Waiting on you"],["st-not-started","Not started"],
+    ["any","Needs you (any)"],["decision","Needs your decision"],["confirm","Needs you to confirm"],["review","Needs your review"],["production","Production action"],["behavior","Changes behaviour on purpose"]]);
+  const nav = h("nav", {class:"rail", "aria-label":"Phases"}), main = h("div", {class:"stack steps"});
   const match = s => {
     const t = q.value.trim().toLowerCase(), v = f.value;
     if (v.startsWith("st-") && s.status !== v.slice(3)) return false;
@@ -3859,23 +4346,31 @@ VIEWS.plan = async ([code, , phaseArg]) => {
     if (v === "behavior" && !s.behavior_change) return false;
     return !t || [s.number, s.title, s.change, s.proof, ...s.closes.map(c => c.point_id + " " + (c.issue || ""))].join(" ").toLowerCase().includes(t);
   };
-  const stepItem = s => h("details", {class:"item"},
-    h("summary", null, h("span", {class:"n"}, s.number), h("span", {class:"t"}, s.title),
-      h("span", {class:"tags"}, s.status !== "not-started" ? h("span", {class:"tag " + ({done:"solid",doing:"ok","waiting-owner":"you"}[s.status] || "")}, lab("step", s.status)) : null,
-        s.owner_need !== "none" ? h("span", {class:"tag " + (s.owner_need === "production" ? "crit" : s.owner_need === "decision" ? "warn" : "info")}, lab("need", s.owner_need)) : null,
-        s.behavior_change ? h("span", {class:"tag"}, "Changes behaviour") : null)),
-    h("div", {class:"body"}, kv([["Change", s.change], ["Proof", s.proof], ["Depends on", s.depends.length ? (s.depends.length === 1 ? "Step " : "Steps ") + s.depends.join(", ") : null], ["Behaviour change", s.behavior_note],
+  const stepItem = s => item(s.number, s.title,
+    [s.status !== "not-started" ? labTag("step", s.status) : null,
+     s.owner_need !== "none" ? tag(lab("need", s.owner_need), tone("need", s.owner_need) || "info") : null,
+     s.behavior_change ? tag("Changes behaviour") : null],
+    [ kv([["Change", s.change], ["Proof", s.proof], ["Depends on", s.depends.length ? (s.depends.length === 1 ? "Step " : "Steps ") + s.depends.join(", ") : null], ["Behaviour change", s.behavior_note],
       ["Needs from you", s.owner_question], ["Progress", s.progress_note], ["Commits", s.commits.length ? s.commits.map(c => h("div", null, h("code", null, short(c.commit_sha)), c.summary ? " " + c.summary : "", c.pr_url ? [" ", extLink(c.pr_url, "pull request")] : "")) : null]]),
-      s.closes.length ? h("div", {class:"ref"}, h("span", {class:"note"}, `Closes ${s.closes.length} ${s.closes.length === 1 ? "point" : "points"}`),
-        s.closes.map(c => h("div", {class:"refline"}, h("code", null, `${c.review} · ${c.point_id}`), sevTag(c.severity), c.issue ? h("a", {href:"#/issue/" + c.issue}, c.issue) : null, h("span", null, c.summary)))) : null));
+      s.closes.length ? h("div", {class:"ref"}, h("span", {class:"note"}, "Closes " + plural(s.closes.length, "point")),
+        s.closes.map(c => h("div", {class:"refline"}, h("code", null, `${c.review} · ${c.point_id}`), sevTag(c.severity), c.issue ? h("a", {href:"#/issue/" + c.issue}, c.issue) : null, h("span", null, c.summary)))) : null]);
+  // The phase buttons are built once and marked in place, so the one just pressed keeps the keyboard focus.
+  const rail = phases.map(p => { const pr = prog[p.number] || {}; return h("button", {type:"button",
+    onclick:() => { phase = p.number; q.value = ""; f.value = ""; shown = PAGE_OF; setPath(`#/plan/${code}/phase/${phase}`); draw(); }},
+    h("span", {class:"i"}, p.number), h("span", null, p.title), h("span", {class:"c"}, `${pr.done || 0}/${pr.steps || 0}`)); });
+  add(nav, rail);
+  const PAGE_OF = 300;   // matching steps drawn at a time
+  let shown = PAGE_OF;
   const draw = () => {
     const filtering = q.value.trim() || f.value;
-    put(nav, ...phases.map(p => { const pr = prog[p.number] || {}; return h("button", {type:"button", "aria-current": String(!filtering && p.number === phase),
-      onclick:() => { phase = p.number; q.value = ""; f.value = ""; history.replaceState(null, "", `#/plan/${code}/phase/${phase}`); draw(); }},
-      h("span", {class:"i"}, p.number), h("span", null, p.title), h("span", {class:"c"}, `${pr.done || 0}/${pr.steps || 0}`)); }));
+    rail.forEach((b, i) => b.setAttribute("aria-current", String(!filtering && phases[i].number === phase)));
     if (filtering) {
-      const hit = steps.filter(match);
-      put(main, h("h2", null, `${hit.length} matching ${hit.length === 1 ? "step" : "steps"} across all phases`), hit.length ? hit.slice(0, 300).map(stepItem) : empty("No step matches."));
+      const hit = steps.filter(match), count = plural(hit.length, "matching step") + " across all phases";
+      const more = () => { const first = shown; shown += PAGE_OF; draw(); main.querySelectorAll("details.item > summary")[first].focus(); };
+      put(main, h("h2", null, count), hit.length > shown ? h("p", {class:"note"}, `Showing the first ${shown}.`) : null,
+        hit.length ? hit.slice(0, shown).map(stepItem) : empty("No step matches."),
+        hit.length > shown ? h("button", {class:"btn ghost", type:"button", onclick:more}, `Show more (${hit.length - shown} left)`) : null);
+      return count;
     } else {
       const p = phases.find(x => x.number === phase) || phases[0];
       const ps = steps.filter(s => s.phase === p.number);
@@ -3884,33 +4379,50 @@ VIEWS.plan = async ([code, , phaseArg]) => {
         sections.map(sec => [sec ? h("h3", null, sec) : null, ps.filter(s => (s.section || "") === sec).map(stepItem)]));
     }
   };
-  q.addEventListener("input", draw); f.addEventListener("change", draw);
+  const filters = filterBar([q, f], () => { shown = PAGE_OF; say(draw()); });
   const pl = d.plan;
-  setView(h("h1", null, `${pl.code} · ${pl.title}`),
+  const head = [h("h1", null, `${pl.code} · ${pl.title}`),
     h("p", {class:"lede"}, lab("plan", pl.status) + (pl.approved_at ? ` · approved ${when(pl.approved_at)}` : "")),
-    h("div", {class:"facts"}, h("div", null, h("b", null, steps.length), h("span", null, "steps")), h("div", null, h("b", null, phases.length), h("span", null, "phases")),
-      h("div", null, h("b", null, new Set(steps.flatMap(s => s.closes.map(c => c.review + c.point_id))).size), h("span", null, "points closed"))),
+    h("div", {class:"facts"}, fact(steps.length, "steps"), fact(phases.length, "phases"),
+      fact(new Set(steps.flatMap(s => s.closes.map(c => c.review + c.point_id))).size, "points closed")),
     progressBar(count("done"), count("doing"), count("waiting-owner"), steps.length),
-    pl.narrative_md ? h("div", {class:"card"}, h("h2", null, "About this plan"), h("div", {class:"mdtext"}, pl.narrative_md)) : null,
-    h("div", {class:"tools"}, q, f), h("div", {class:"cols"}, nav, main));
+    pl.narrative_md ? h("div", {class:"card"}, h("h2", null, "About this plan"), (STATIC ? md(pl.narrative_md) : h("div", {class:"mdtext"}, pl.narrative_md))) : null];
+  if (!phases.length) return setView(head, empty("This plan has no phases yet."), add(main, steps.map(stepItem)));
+  setView(head, filters, h("div", {class:"cols"}, nav, main));
   draw();
 };
 
+// A line of values over reviews. The drawing is as wide as its box (one unit is one pixel, so the 11 px labels stay
+// readable on a phone); labels that would run into each other are left out, the latest always shown. The same
+// values are in a table for screen readers.
 function lineChart(points, unit){
-  const W = 520, H = 160, P = 30;
+  const H = 160, P = 30;
   if (!points.length) return empty("No values.");
-  const vs = points.map(p => p.value), lo = Math.min(...vs), hi = Math.max(...vs), span = hi - lo || 1;
-  const x = i => P + (points.length === 1 ? (W - 2*P) / 2 : i * (W - 2*P) / (points.length - 1)), y = v => H - P - (v - lo) * (H - 2*P) / span;
+  const vs = points.map(p => p.value), lo = Math.min(...vs), hi = Math.max(...vs), span = hi - lo || 1, last = points.length - 1;
+  const value = p => `${+p.value.toFixed(2)}${unit ? " " + unit : ""}`;
   const ns = "http://www.w3.org/2000/svg", el = (t, a) => { const e = document.createElementNS(ns, t); for (const k in a) e.setAttribute(k, a[k]); return e; };
-  const svg = el("svg", {viewBox:`0 0 ${W} ${H}`, role:"img", "aria-label":"Values over reviews"});
-  svg.append(el("line", {x1:P, x2:W-P, y1:H-P, y2:H-P, stroke:"var(--line)"}));
-  svg.append(el("polyline", {points:points.map((p,i) => `${x(i)},${y(p.value)}`).join(" "), fill:"none", stroke:"var(--accent)", "stroke-width":2}));
-  points.forEach((p,i) => {
-    svg.append(el("circle", {cx:x(i), cy:y(p.value), r:3.5, fill:"var(--accent)"}));
-    const t1 = el("text", {x:x(i), y:y(p.value) - 8, "text-anchor":"middle", "font-size":11, fill:"var(--fg)"}); t1.textContent = `${+p.value.toFixed(2)}${unit ? " " + unit : ""}`; svg.append(t1);
-    const t2 = el("text", {x:x(i), y:H - 10, "text-anchor":"middle", "font-size":11, fill:"var(--muted)"}); t2.textContent = p.review; svg.append(t2);
-  });
-  return h("div", {class:"chart"}, svg);
+  const svg = el("svg", {role:"img", "aria-label":"Values over reviews"});
+  let width = 0;
+  const draw = W => {
+    width = W;
+    const x = i => P + (points.length === 1 ? (W - 2*P) / 2 : i * (W - 2*P) / last), y = v => H - P - (v - lo) * (H - 2*P) / span;
+    const every = Math.max(1, Math.ceil(points.length * 56 / (W - 2*P)));   // a label needs about 56 px
+    svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+    svg.replaceChildren(el("line", {x1:P, x2:W-P, y1:H-P, y2:H-P, stroke:"var(--line)"}),
+      el("polyline", {points:points.map((p,i) => `${x(i)},${y(p.value)}`).join(" "), fill:"none", stroke:"var(--accent)", "stroke-width":2}));
+    points.forEach((p,i) => {
+      svg.append(el("circle", {cx:x(i), cy:y(p.value), r:3.5, fill:"var(--accent)"}));
+      if ((last - i) % every) return;
+      const t1 = el("text", {x:x(i), y:y(p.value) - 8, "text-anchor":"middle", "font-size":11, fill:"var(--fg)"}); t1.textContent = value(p); svg.append(t1);
+      const t2 = el("text", {x:x(i), y:H - 10, "text-anchor":"middle", "font-size":11, fill:"var(--muted)"}); t2.textContent = p.review; svg.append(t2);
+    });
+  };
+  draw(520);
+  const box = h("div", {class:"chart"}, svg, h("table", {class:"visually-hidden"},
+    h("thead", null, h("tr", null, h("th", null, "Review"), h("th", null, "Value"))),
+    h("tbody", null, points.map(p => h("tr", null, h("td", null, p.review), h("td", null, value(p)))))));
+  new ResizeObserver(() => { const w = Math.max(200, Math.round(box.clientWidth)); if (box.clientWidth && w !== width) draw(w); }).observe(box);
+  return box;
 }
 
 VIEWS.trends = async () => {
@@ -3918,65 +4430,90 @@ VIEWS.trends = async () => {
   const groups = {};
   for (const m of d.metrics) (groups[`${m.name}|${m.scope}|${m.repository}`] ||= []).push(m);
   setView(h("h1", null, "Over time"), h("p", {class:"lede"}, "How the project has moved between reviews."),
-    h("h3", null, "Points per review"),
-    table([{label:"Review", key:"review"}, {label:"Started", get:r => when(r.started_at, false)}, {label:"Points", key:"points", num:1}, {label:"High", key:"high", num:1}, {label:"Medium", key:"medium", num:1}, {label:"Low", key:"low", num:1},
-           {label:"New", key:"new_issues", num:1}, {label:"Carried over", key:"carried_over", num:1}, {label:"Came back", key:"came_back", num:1}, {label:"False", key:"false_findings", num:1}], d.reviews, r => go("#/review/" + r.review)),
-    h("h3", null, "Measurements"),
+    sect("Points per review"),
+    table([{label:"Review", key:"review"}, {label:"Started", get:r => whenCell(r.started_at, false)}, {label:"Points", key:"points", num:1}, {label:"High", key:"high", num:1}, {label:"Medium", key:"medium", num:1}, {label:"Low", key:"low", num:1},
+           {label:"New", key:"new_issues", num:1}, {label:"Carried over", key:"carried_over", num:1}, {label:"Came back", key:"came_back", num:1}, {label:"False", key:"false_findings", num:1}], d.reviews, r => "#/review/" + r.review),
+    sect("Measurements"),
     Object.keys(groups).length ? h("div", {class:"grid2"}, Object.entries(groups).map(([k, pts]) => { const [n, sc, repo] = k.split("|");
       const better = {higher:"higher is better", lower:"lower is better"}[pts[0].better];
       return h("div", {class:"card"}, h("b", null, pts[0].label || words(n)), h("div", {class:"note"}, [[sc !== "all" ? sc : "", repo !== "all" ? repo : ""].filter(Boolean).join(" · ") || "Whole system", better].filter(Boolean).join(" · ")), lineChart(pts, pts[0].unit)); }))
       : empty("No measurements recorded yet."),
-    h("h3", null, "Issues that keep coming back"),
+    sect("Issues that keep coming back"),
     table([{label:"Issue", key:"code"}, {label:"Title", key:"title"}, {label:"Severity", get:i => sevTag(i.severity)}, {label:"Status", get:i => issueTag(i.status)}, {label:"Reviews", key:"times_seen", num:1}, {label:"Came back after a fix", key:"regressions", num:1}, {label:"Raised in", key:"reviews"}],
-          d.recurring, i => go("#/issue/" + i.code)),
-    h("h3", null, "Files that keep producing issues"),
+          d.recurring, i => "#/issue/" + i.code),
+    sect("Files that keep producing issues"),
     table([{label:"File", get:r => h("code", null, r.path)}, {label:"Issues", key:"issues", num:1}, {label:"Reviews", key:"reviews", num:1}, {label:"High points", key:"high_points", num:1}], d.hotspots,
-          r => go("#/issues?q=" + encodeURIComponent(r.path))));
+          r => "#/issues?q=" + encodeURIComponent(r.path)));
 };
 
 const cellText = v => v && typeof v === "object" && "blob_bytes" in v ? `<${v.blob_bytes} bytes>` : String(v);
 VIEWS.explore = async ([name]) => {
   const tables = await api("tables");
-  const list = h("div", {class:"tlist"}), right = h("div", {style:"min-width:0;display:flex;flex-direction:column;gap:10px"});
-  const grid = (cols, data) => data.length ? h("div", {class:"scroll card grid", style:"padding:0"}, h("table", null, h("thead", null, h("tr", null, cols.map(c => h("th", null, c)))),
+  const list = h("div", {class:"tlist"}), right = h("div", {class:"stack loose"});
+  const grid = (cols, data) => data.length ? h("div", {class:"scroll card grid"}, h("table", null, h("thead", null, h("tr", null, cols.map(c => h("th", null, c)))),
     h("tbody", null, data.map(r => h("tr", null, r.map(v => h("td", {class: typeof v === "number" ? "num mono" : null, title: v == null ? null : cellText(v).slice(0, 2000)}, v == null ? h("span", {class:"muted"}, "—") : cellText(v)))))))) : empty("No rows.");
-  const showTable = async (t, offset=0) => {
+  const showTable = async (t, offset=0, paged=false) => {
     list.querySelectorAll("button").forEach(b => b.setAttribute("aria-current", String(b.dataset.n === t)));
-    history.replaceState(null, "", "#/explore/" + t);
+    setPath("#/explore/" + t);
     try {
       const d = await api(`table/${t}?limit=100&offset=${offset}`);
       put(right, h("h2", null, t), h("p", {class:"note"}, `${d.count} rows` + (d.count > d.limit ? ` · showing ${offset + 1}–${Math.min(d.count, offset + d.limit)}` : "")),
-        h("div", {class:"tools"}, offset > 0 ? h("button", {class:"btn ghost", type:"button", onclick:() => showTable(t, Math.max(0, offset - 100))}, "Previous") : null,
-          offset + d.limit < d.count ? h("button", {class:"btn ghost", type:"button", onclick:() => showTable(t, offset + 100)}, "Next") : null,
+        h("div", {class:"tools"}, offset > 0 ? h("button", {class:"btn ghost", type:"button", onclick:() => showTable(t, Math.max(0, offset - 100), true)}, "Previous") : null,
+          offset + d.limit < d.count ? h("button", {class:"btn ghost", type:"button", onclick:() => showTable(t, offset + 100, true)}, "Next") : null,
           h("button", {class:"btn ghost", type:"button", onclick:() => { sql.value = `SELECT * FROM ${t} LIMIT 50`; sql.focus(); }}, "Query this")),
         grid(d.columns, d.rows));
-    } catch (e) { put(right, h("p", {class:"status err"}, e.message)); }
+      if (paged) right.querySelector("button").focus();   // the pressed button was redrawn: Previous, or Next on the first page
+    } catch (e) { put(right, errorBox(e)); }
   };
-  const sec = (title, type) => [h("h3", null, title), tables.filter(t => t.type === type).map(t => h("button", {type:"button", "data-n":t.name, onclick:() => showTable(t.name)}, h("span", null, t.name), h("span", {class:"muted"}, t.count)))];
+  const sec = (title, type) => [sect(title), tables.filter(t => t.type === type).map(t => h("button", {type:"button", "data-n":t.name, onclick:() => showTable(t.name)}, h("span", null, t.name), h("span", {class:"muted"}, t.count)))];
   add(list, sec("Saved views", "view"), sec("Tables", "table"));
-  const sql = h("textarea", {class:"mono", "aria-label":"SQL query", placeholder:"SELECT code, title, status FROM issues WHERE severity = 'H'"});
+  const sql = h("textarea", {class:"field mono", "aria-label":"SQL query", placeholder:"SELECT code, title, status FROM issues WHERE severity = 'H'"});
   const out = h("div");
   const run = async () => {
     try { const d = await api("sql", {sql: sql.value}); put(out, h("p", {class:"note"}, `${d.rows.length} rows${d.truncated ? ` (first ${d.rows.length.toLocaleString("en")} shown)` : ""}`), grid(d.columns, d.rows)); }
-    catch (e) { put(out, h("p", {class:"status err"}, e.message)); }
+    catch (e) { put(out, errorBox(e)); }
   };
   sql.addEventListener("keydown", e => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") run(); });
   setView(h("h1", null, "Explore the ledger"),
-    h("p", {class:"lede"}, "Browse every table and saved view, or run your own read-only query. Nothing here can change the ledger."),
-    h("div", {class:"card", style:"display:flex;flex-direction:column;gap:8px"}, h("b", null, "Query"), sql, h("div", {class:"tools"}, h("button", {class:"btn", type:"button", onclick:run}, "Run query"), h("span", {class:"note"}, "Ctrl or ⌘ + Enter runs it")), out),
+    h("p", {class:"lede"}, STATIC ? "Browse every table and saved view as they were when this snapshot was taken."
+      : "Browse every table and saved view, or run your own read-only query. Nothing here can change the ledger."),
+    STATIC ? h("p", {class:"note"}, "The query box needs the local viewer (python3 ledger.py serve). Here each table and view shows up to 500 rows, and long values are shortened.")
+    : h("div", {class:"card stack"}, h("b", null, "Query"), sql, h("div", {class:"tools"}, h("button", {class:"btn", type:"button", onclick:run}, "Run query"), h("span", {class:"note"}, "Ctrl or ⌘ + Enter runs it")), out),
     h("div", {class:"split"}, list, right));
   if (name && tables.some(t => t.name === name)) showTable(name); else add(right, empty("Choose a table or view on the left."));
 };
 
+// ---------- How it works (the shared copy)
+if (STATIC) VIEWS.guide = async () => {
+  const o = OVERVIEW || await api("overview");
+  const plans = await api("plans"), revs = await api("reviews");
+  const r = revs[0], p = plans[0], waiting = Math.max(0, o.queue - (STATIC ? hubAnsweredOpen() : 0));
+  setView(
+    h("h1", null, "How it works"),
+    h("p", {class:"lede"}, "What this site is, how a review runs, what the words mean, and where things stand right now."),
+    h("div", {class:"card"}, h("h2", null, "Where things stand"),
+      kv([["Latest review", r ? h("a", {href:"#/review/" + r.code}, `${r.code} · ${lab("review", r.status)} · ${r.points} points`) : "None yet"],
+          ["Fix plan", p ? h("a", {href:"#/plan/" + p.code}, `${p.code} · ${lab("plan", p.status)} · ${p.done || 0} of ${p.steps || 0} steps done`) : "None yet"],
+          ["Waiting on you", waiting ? h("a", {href:"#/inbox"}, plural(waiting, "question")) : "Nothing right now"],
+          ["Updated", whenCell(STATIC ? STATIC.taken : null)]])),
+    md(STATIC ? STATIC.guide : ""));
+};
+
 // ---------- routing
-const TABS = [["home","#/","Overview"],["inbox","#/inbox","Waiting on you"],["reviews","#/reviews","Reviews"],["goals","#/goals","Design goals"],["issues","#/issues","Issues"],["plans","#/plans","Fix plans"],["trends","#/trends","Over time"],["explore","#/explore","Explore"]];
+const GUIDE_TAB = ["guide","#/guide","How it works"];
+const TABS = [["home","#/","Overview"], ...(STATIC ? [GUIDE_TAB] : []),["inbox","#/inbox","Waiting on you"],["reviews","#/reviews","Reviews"],["goals","#/goals","Design goals"],["issues","#/issues","Issues"],["plans","#/plans","Fix plans"],["trends","#/trends","Over time"],["explore","#/explore","Explore"]];
 function drawTabs(active){
-  const n = OVERVIEW ? OVERVIEW.queue : 0;
-  put(document.getElementById("tabs"), ...TABS.map(([k, href, t]) => h("a", {href, "aria-current": active === k ? "page" : null}, t, k === "inbox" && n ? h("span", {class:"badge"}, n) : null)));
+  const n = Math.max(0, (OVERVIEW ? OVERVIEW.queue : 0) - (STATIC ? hubAnsweredOpen() : 0));
+  put(document.getElementById("tabs"), ...TABS.map(([k, href, t]) => {
+    const badge = k === "inbox" && n;
+    return h("a", {href, "data-k": k, "aria-current": active === k ? "page" : null, "aria-label": badge ? `${t}, ${n} waiting` : null}, t, badge ? h("span", {class:"badge"}, n) : null); }));
+  // Where the tabs scroll sideways, bring the current one into view (not scrollIntoView: Chrome then starts Tab from it).
+  const tabs = document.getElementById("tabs"), cur = tabs.querySelector('a[aria-current="page"]');
+  if (cur && tabs.scrollWidth > tabs.clientWidth) tabs.scrollLeft = cur.offsetLeft - tabs.offsetLeft - (tabs.clientWidth - cur.offsetWidth) / 2;
 }
 async function route(){
   takeToken();
-  const raw = location.hash.replace(/^#\/?/, "");
+  const raw = currentPath();
   const [pathPart, query] = raw.split("?");
   const parts = pathPart.split("/").filter(Boolean).map(decodeURIComponent);
   const name = parts[0] || "home";
@@ -3984,22 +4521,35 @@ async function route(){
   const tab = {review:"reviews", issue:"issues", plan:"plans", history:"inbox"}[name] || (VIEWS[name] ? name : "home");
   try {
     if (!OVERVIEW || name === "home" || name === "inbox") { OVERVIEW = await api("overview"); LABELS = OVERVIEW.labels; setLabels(LABELS.enums);
-      put(document.getElementById("brand"), OVERVIEW.project, h("small", null, "review ledger")); document.title = OVERVIEW.project + " · review ledger"; }
+      put(document.getElementById("brand"), OVERVIEW.project, h("small", null, STATIC ? "review ledger · updated " + when(STATIC.taken) : "review ledger")); document.title = OVERVIEW.project + " · review ledger"; }
     drawTabs(tab);
     await view(parts.slice(1), new URLSearchParams(query || ""));
   } catch (e) { drawTabs(tab); failed(e); }
 }
 window.addEventListener("hashchange", route);
+document.getElementById("skip").addEventListener("click", e => { e.preventDefault(); focusHeading(); });
+// --top: the sticky header's height, which scrolling to a focused control and the plan's phase list stay clear of.
+(() => {
+  const top = document.querySelector("header.top");
+  const set = () => document.documentElement.style.setProperty("--top", (getComputedStyle(top).position === "sticky" ? top.offsetHeight : 0) + 8 + "px");
+  new ResizeObserver(set).observe(top); set();
+})();
 
 // ---------- theme
 (() => {
-  const btn = document.getElementById("theme"), order = ["auto","light","dark"];
+  const btn = document.getElementById("theme"), order = ["auto","light","dark"], dark = matchMedia("(prefers-color-scheme:dark)");
+  const name = {auto:"Automatic", light:"Light", dark:"Dark"}, next = () => order[(order.indexOf(t) + 1) % 3];
   let t = "auto"; try { t = localStorage.getItem("ledger-theme") || "auto"; } catch {}
-  const apply = () => { if (t === "auto") document.documentElement.removeAttribute("data-theme"); else document.documentElement.setAttribute("data-theme", t); btn.textContent = "Theme: " + t; };
-  btn.addEventListener("click", () => { t = order[(order.indexOf(t) + 1) % 3]; try { localStorage.setItem("ledger-theme", t); } catch {} apply(); });
+  if (!order.includes(t)) t = "auto";
+  // data-theme is always the palette in use; "auto" follows the system setting, also when it changes.
+  const apply = () => { document.documentElement.setAttribute("data-theme", t === "auto" ? (dark.matches ? "dark" : "light") : t);
+    btn.textContent = "Theme: " + name[t]; btn.setAttribute("aria-label", `Theme: ${name[t]}. Switch to ${name[next()]}.`); };
+  dark.addEventListener("change", apply);
+  btn.addEventListener("click", () => { t = next(); try { localStorage.setItem("ledger-theme", t); } catch {} apply(); });
   apply();
 })();
 route();
+hubInit();
 </script>
 </body>
 </html>
@@ -5583,6 +6133,14 @@ CREATE INDEX ix_fk_events_step_id                    ON events(step_id);
 
 INSERT INTO enum_labels(enum, value, label, position) VALUES
  ('entity_type','goal','Design goal',11), ('entity_type','question','Interview question',12);
+-- migration: 0010-totals-views.sql
+-- v_plan_totals, v_review_totals and v_pending_gates: the counts the viewer's lists show
+-- Plan P-0001 (ABS-M7, DOC-X8). The viewer reads its list counts from three views instead of counting in its own
+-- SQL: v_plan_totals (steps per plan by status), v_review_totals (real findings per review by severity, new and
+-- come back) and v_pending_gates (open and answered gates in inbox order). migrate creates them with the shipped
+-- views; no table and no row changes.
+
+SELECT 1;
 """
 
 
@@ -6178,6 +6736,41 @@ def set_wal(db):
         print(f"note: could not switch {db} to WAL ({e}); it keeps its journal mode", file=sys.stderr)
 
 
+MIN_SQLITE = (3, 31, 0)  # the oldest SQLite the tests run on
+NAMED_CHECK_SQLITE = (3, 34, 0)  # from here a refused CHECK quotes the rule; older ones name only the table
+
+
+def _dotted(version):
+    return ".".join(str(n) for n in version[:2])
+
+
+def sqlite_problem():
+    """Why this Python's SQLite cannot hold a ledger (too old, or built without the JSON functions the schema's
+    CHECKs use), in one line; None when it can."""
+    if sqlite3.sqlite_version_info < MIN_SQLITE:
+        return (f"this Python's SQLite is {sqlite3.sqlite_version}; the ledger needs {_dotted(MIN_SQLITE)} or newer "
+                f"(run ledger.py with a newer Python)")
+    try:
+        con = sqlite3.connect(":memory:")
+        try:
+            con.execute("SELECT json_valid('[]')")
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return (f"this Python's SQLite ({sqlite3.sqlite_version}) has no JSON functions, which the ledger needs "
+                f"(run ledger.py with a Python whose SQLite is 3.38 or newer)")
+    return None
+
+
+def old_sqlite_note():
+    """The one line init and check print, once they have done their work, on a SQLite older than
+    NAMED_CHECK_SQLITE; None on a newer one."""
+    if sqlite3.sqlite_version_info >= NAMED_CHECK_SQLITE:
+        return None
+    return (f"note: SQLite {sqlite3.sqlite_version} is older than {_dotted(NAMED_CHECK_SQLITE)}: when the ledger "
+            f"refuses a value, the message names the table but not the rule (the schema's CHECK on that table has it)")
+
+
 def init(root, db, force=False, copy_tool=True, gitignore=True):
     """Create the ledger (or check and refresh an existing one), copy this ledger.py beside it and write its
     .gitignore. copy_tool / gitignore are off for a ledger file that is not in a ledger folder (--db elsewhere).
@@ -6190,6 +6783,9 @@ def init(root, db, force=False, copy_tool=True, gitignore=True):
 
 
 def _init(root, db, force, copy_tool, gitignore):
+    problem = sqlite_problem()
+    if problem:  # before anything is written
+        sys.exit(f"init: {problem}")
     home = db.parent / "ledger.py"
     if copy_tool and home.exists() and db.parent.name != ".code-review" and not looks_like_tool(home):
         sys.exit(f"{home} is not a ledger.py made by this tool; left it unchanged. Choose another folder for the "
@@ -6209,12 +6805,14 @@ def _init(root, db, force, copy_tool, gitignore):
         try:
             if keep:
                 write_atomic(home.with_name("ledger.py.bak"), home.read_bytes())
-            write_atomic(home, Path(__file__).resolve().read_bytes())
+            tool = Path(__file__).resolve().read_bytes()
+            write_atomic(home, tool)
         except OSError as e:
             sys.exit(f"init: could not copy ledger.py to {home} ({e}); nothing else was changed")
         if note:
             print(note)
-        print(f"copied ledger.py to {home}")
+        # the hash lets the owner compare the project's copy with the skill's (sha256sum scripts/ledger.py)
+        print(f"copied ledger.py to {home} (sha256 {hashlib.sha256(tool).hexdigest()})")
     if fresh:
         build_ledger(root, db)
         set_wal(db)
@@ -6576,12 +7174,24 @@ class BlobReader:
     """Files at commits of one repository folder, read through one `git cat-file --batch` process (started on the
     first read, stopped by close()), with a cache per (commit, path): fill-refs reads each file once however many
     references cite it. read() returns (blob sha, bytes) or raises RuntimeError with a one-line reason; a file over
-    MAX_BLOB_BYTES is skipped unread (its bytes are discarded as they arrive, never held)."""
+    MAX_BLOB_BYTES is skipped unread (its bytes are discarded as they arrive, never held). has_commit() says whether
+    the repository has a commit, asked once per commit. hung is True once git gave no answer within BLOB_SECONDS."""
 
     def __init__(self, d):
         self.d = d
         self.p = None
         self.cache = {}
+        self.hung = False
+
+    def has_commit(self, sha):
+        key = (sha, None)
+        if key not in self.cache:
+            self.cache[key] = self._object(sha, None)
+        return self.cache[key]
+
+    def _expire(self, p):
+        self.hung = True
+        p.kill()
 
     def read(self, sha, path):
         key = (sha, path)
@@ -6626,12 +7236,17 @@ class BlobReader:
         return b"".join(out)
 
     def _fetch(self, sha, path):
+        return self._object(sha, path)
+
+    def _object(self, sha, path):
+        """One question to git: the file at sha:path as (blob sha, bytes), or with path None whether commit sha
+        exists."""
         self._start()
-        guard = threading.Timer(BLOB_SECONDS, lambda p=self.p: p.kill())
+        guard = threading.Timer(BLOB_SECONDS, self._expire, (self.p,))
         guard.start()
         try:
             try:
-                self.p.stdin.write(f"{sha}:{path}\n".encode("utf-8"))
+                self.p.stdin.write((f"{sha}^{{commit}}\n" if path is None else f"{sha}:{path}\n").encode("utf-8"))
                 self.p.stdin.flush()
             except OSError:
                 raise self._dead()
@@ -6640,8 +7255,13 @@ class BlobReader:
                 raise self._dead()
             parts = head.decode("utf-8", "replace").rstrip("\n").rsplit(" ", 2)
             if len(parts) != 3 or not parts[2].isdigit():  # "<name> missing" / "<name> ambiguous"
+                if path is None:
+                    return False
                 raise RuntimeError(f"{path} is not in commit {sha[:10]}")
             blob, kind, size = parts[0], parts[1], int(parts[2])
+            if path is None:
+                self._exact(size + 1, keep=False)  # the commit's text and the newline after it
+                return True
             too_big = size > MAX_BLOB_BYTES
             data = self._exact(size, keep=kind == "blob" and not too_big)
             self._exact(1, keep=False)  # the newline after the content
@@ -6816,7 +7436,9 @@ def fill_refs(root, con, review_code=None):
     Idempotent: a reference is selected only when something can still be filled (a missing permalink only when its
     repository has a permalink template), only columns whose value changes are written, and 'filled N' counts the
     references that changed. Files are read through one `git cat-file --batch` per repository (BlobReader), each
-    (commit, path) once."""
+    (commit, path) once; a commit the repository lacks is reported as 'commit ... not found' for each reference that
+    cites it. When git gives no answer within BLOB_SECONDS the run stops: the references not yet read count as failed
+    and what was read is still written. With nothing to fill it prints 'already complete'."""
     sql = """SELECT fl.id FROM finding_locations fl JOIN findings f ON f.id = fl.finding_id
              JOIN reviews r ON r.id = f.review_id JOIN repositories rp ON rp.id = fl.repository_id
              WHERE fl.commit_sha IS NOT NULL
@@ -6829,11 +7451,16 @@ def fill_refs(root, con, review_code=None):
     failed = 0
     updates = []  # every git read happens first; the writes then go in one short transaction (DB-M8)
     readers = {}  # one BlobReader per repository folder
+    todo = [r[0] for r in con.execute(sql, args).fetchall()]
+    if not todo:
+        print("already complete: filled 0 references, 0 could not be read from git")
+        return 0
     try:
-        for (lid,) in con.execute(sql, args).fetchall():
+        for n, lid in enumerate(todo):
             loc = location(con, lid)
             where = f"ref {lid} {loc['path']}@{loc['commit_sha'][:10]}"
             outside = bool(loc["allow_outside_root"])
+            reader = None
             try:
                 if not HEX.match(loc["commit_sha"] or ""):
                     raise RuntimeError("commit is not a hex hash")
@@ -6841,8 +7468,16 @@ def fill_refs(root, con, review_code=None):
                     raise RuntimeError("bad path")
                 d = repo_dir(root, loc["repo_path"], outside)
                 reader = readers.get(d) or readers.setdefault(d, BlobReader(d))
+                if not reader.has_commit(loc["commit_sha"]):
+                    raise RuntimeError(f"commit {loc['commit_sha'][:10]} not found")
                 blob, data = reader.read(loc["commit_sha"], loc["path"])
             except Exception as e:
+                if reader is not None and reader.hung:
+                    left = len(todo) - n
+                    print(f"{where}: git is not responding (no answer in {BLOB_SECONDS:g} s); stopped, {left} "
+                          f"reference{'s' if left != 1 else ''} not read")
+                    failed += left
+                    break
                 print(f"{where}: {e}"); failed += 1; continue
             seen = working_tree_bytes(root, con, loc, data)  # a dirty review: the text its reviewers saw (D-14)
             if seen is not None and loc["excerpt"] is None:
@@ -7132,6 +7767,47 @@ def with_deadline(con, seconds):
     return lambda: monotonic() > end
 
 
+BUSY = "The ledger is busy (the agent is writing to it); try again in a moment."
+FAILED = "Something went wrong; see the terminal where ledger.py serve is running."
+
+
+class ApiError(Exception):
+    """A viewer request that is refused: the HTTP status, the sentence the page shows and any headers to send."""
+
+    def __init__(self, status, message, headers=None):
+        super().__init__(message)
+        self.status, self.message, self.headers = status, message, headers
+
+
+def error(status, message, headers=None):
+    """The one shape of a viewer API failure: ({"error": sentence}, status), with the headers third when any."""
+    return ({"error": message}, status, headers) if headers else ({"error": message}, status)
+
+
+def is_busy(e):
+    return isinstance(e, sqlite3.OperationalError) and ("locked" in str(e) or "busy" in str(e))
+
+
+def api_failure(e, what):
+    """The answer to a request that raised e: a refusal's own status and sentence, 503 while another writer holds
+    the ledger, else 500 with a fixed sentence. The request, the exception and its traceback go to stderr (the
+    terminal `ledger.py serve` runs in), never to the page."""
+    if isinstance(e, ApiError):
+        return error(e.status, e.message, e.headers)
+    if is_busy(e):
+        return error(503, BUSY)
+    import traceback
+    sys.stderr.write(f"viewer: {what} failed:\n" + "".join(traceback.format_exception(type(e), e, e.__traceback__)))
+    sys.stderr.flush()
+    return error(500, FAILED)
+
+
+def whole_number(text, what):
+    if not isinstance(text, str) or not re.fullmatch(r"-?[0-9]{1,18}", text):
+        raise ApiError(400, f"{what} must be a whole number.")
+    return int(text)
+
+
 def api(root, db, path, qs, body):
     """One viewer API request. Each request opens its own connection and closes it when the answer is built:
     sqlite3 connections are not shared between the server's threads, and a fresh one always sees the agent's latest
@@ -7139,14 +7815,14 @@ def api(root, db, path, qs, body):
     the gate answer route opens a second, writable connection of its own. A missing ledger is a 503 and is never
     created."""
     if not Path(db).exists():
-        return {"error": "ledger not found"}, 503
+        return error(503, "ledger not found")
     con = connect(db, readonly=True)
     timed_out = with_deadline(con, ROUTE_SECONDS)
     try:
         return route(root, db, con, path, qs, body)
     except sqlite3.OperationalError as e:
         if "interrupted" in str(e) and timed_out():
-            return {"error": TOO_LONG.format(ROUTE_SECONDS)}, 400
+            return error(400, TOO_LONG.format(ROUTE_SECONDS))
         raise
     finally:
         con.close()
@@ -7158,20 +7834,19 @@ def gate_answer_request(db, code, body, via="viewer"):
     answers cannot both be reported saved: the loser, or an answer to a gate answered meanwhile (in chat, say), gets
     409. If another writer holds the ledger past ANSWER_BUSY_MS the answer is not saved and the owner is told to try
     again (503); the page keeps what they typed. Returns {"ok": True} or (error, status)."""
-    busy = {"error": "The ledger is busy; your answer was not saved, try again."}, 503
     try:
         w = connect(db)
     except sqlite3.OperationalError:
-        return {"error": "ledger not found"}, 503
+        return error(503, "ledger not found")
     w.isolation_level = None
     try:
         w.execute(f"PRAGMA busy_timeout = {int(ANSWER_BUSY_MS)}")
         return answer_gate(w, code, body.get("answer_value"), body.get("answer_text"), via)
     except GateRefused as e:
-        return {"error": str(e)}, e.status
+        return error(e.status, str(e))
     except sqlite3.OperationalError as e:
-        if "locked" in str(e) or "busy" in str(e):
-            return busy
+        if is_busy(e):
+            return error(503, "The ledger is busy; your answer was not saved, try again.")
         raise
     finally:
         w.close()
@@ -7185,238 +7860,345 @@ def quote_name(name):
     return '"' + str(name).replace('"', '""') + '"'
 
 
-def route(root, db, con, path, qs, body):
+class Request:
+    """What a route handler is given: the project root, the ledger's path, this request's read-only connection, the
+    path's '*' segments in order (args), the query string and, for a POST, the JSON body."""
+
+    def __init__(self, root, db, con, args, qs, body):
+        self.root, self.db, self.con, self.args, self.qs, self.body = root, db, con, args, qs, body
+
+    def arg(self, name, default=None):
+        return self.qs.get(name, [default])[0]
+
+
+class Route:
+    """One row of ROUTES: an HTTP method, a path under /api/ ('*' is one segment of any text, handed to the handler
+    in Request.args) and its handler. hub, for a GET: the paths of this route the published hub embeds for this
+    ledger (hub(con) -> ["review/R-0001", ...]); the hub is read-only, so a POST has none."""
+
+    def __init__(self, method, path, handler, hub=None):
+        self.method, self.pattern, self.handler, self.hub = method, tuple(path.split("/")), handler, hub
+
+
+def get_overview(rq):
+    con = rq.con
+    meta = {r["key"]: r["value"] for r in rows(con, "SELECT key, value FROM meta")}
+    return {
+        "project": meta.get("project_name", rq.root.name),
+        "schema_version": meta.get("schema_version"),
+        "open_by_severity": rows(con, f"SELECT severity, count(*) n FROM issues WHERE status IN {ACTIVE} GROUP BY severity"),
+        "issues_by_status": rows(con, "SELECT status, count(*) n FROM issues GROUP BY status"),
+        "gates_open": one(con, "SELECT count(*) n FROM v_pending_gates WHERE status = 'open'")["n"],
+        "queue": one(con, "SELECT count(*) n FROM v_owner_queue")["n"],
+        "reviews": rows(con, """SELECT r.code, r.title, r.scope, r.status, r.started_at, r.completed_at, r.verdict,
+            t.points, t.high FROM v_review_totals t JOIN reviews r ON r.code = t.review
+            WHERE t.review IN (SELECT code FROM reviews ORDER BY started_at DESC LIMIT 5)
+            ORDER BY r.started_at DESC"""),
+        "plans": rows(con, """SELECT plan code, title, status, steps, done, waiting_owner waiting
+            FROM v_plan_totals ORDER BY created_at DESC"""),
+        "recurring": one(con, "SELECT count(*) n FROM v_recurring_issues")["n"],
+        "checks": [{"label": label, "view": v, "tier": tier, "n": count_view(con, v)}
+                   for v, label, tier in (ledger_checks(con) or [])],
+        "labels": {**{t: {r["code"]: r["name"] for r in rows(con, f"SELECT code, name FROM {t}")} for t in LABEL_TABLES},
+                   "enums": enum_labels(con)},
+    }
+
+
+def get_gates(rq):
+    """?status=pending (the default: v_pending_gates), all, or one gate status."""
+    con, st = rq.con, rq.arg("status", "pending")
+    where = {"pending": "g.id IN (SELECT id FROM v_pending_gates)", "all": "1"}.get(st, "g.status = ?")
+    args = () if st in ("pending", "all") else (st,)
+    gates = rows(con, f"""SELECT g.*, r.code review_code, pl.code plan_code, s.number step_number,
+            i.code issue_code, d.code decision_code FROM gates g
+            LEFT JOIN reviews r ON r.id=g.review_id LEFT JOIN plans pl ON pl.id=g.plan_id
+            LEFT JOIN steps s ON s.id=g.step_id LEFT JOIN issues i ON i.id=g.issue_id
+            LEFT JOIN decisions d ON d.id=g.decision_id
+            WHERE {where} ORDER BY g.status='answered', g.blocking DESC, g.created_at""", args)
+    for g in gates:
+        g["options"] = json.loads(g["options"]) if g["options"] else []
+    other = rows(con, "SELECT * FROM v_owner_queue WHERE kind <> 'gate'")
+    return {"gates": gates, "other": other}
+
+
+def post_gate_answer(rq):
+    return gate_answer_request(rq.db, rq.args[0], rq.body)
+
+
+def get_reviews(rq):
+    return rows(rq.con, """SELECT r.code, r.title, r.scope, r.status, r.started_at, r.completed_at, r.verdict,
+        (SELECT group_concat(rp.name || ' ' || substr(rr.commit_sha,1,10) || COALESCE(' on ' || rr.branch, ''), ' · ')
+           FROM review_repositories rr JOIN repositories rp ON rp.id=rr.repository_id WHERE rr.review_id=r.id) commits,
+        t.points, t.high, t.medium, t.low, t.new_issues, t.came_back
+        FROM v_review_totals t JOIN reviews r ON r.code = t.review ORDER BY r.started_at DESC""")
+
+
+def get_review(rq):
+    con, code = rq.con, rq.args[0]
+    r = one(con, """SELECT r.*, m.name manager, m.model manager_model, a.name approved_by,
+                    pr.code previous_code FROM reviews r
+                    LEFT JOIN actors m ON m.id=r.manager_actor_id LEFT JOIN actors a ON a.id=r.approved_by_actor_id
+                    LEFT JOIN reviews pr ON pr.id=r.previous_review_id WHERE r.code=?""", (code,))
+    if not r:
+        return error(404, "no such review")
+    rid = r["id"]
+    findings = rows(con, """SELECT f.*, i.code issue_code, i.status issue_status, rr.label run_label
+        FROM findings f LEFT JOIN issues i ON i.id=f.issue_id LEFT JOIN reviewer_runs rr ON rr.id=f.reviewer_run_id
+        WHERE f.review_id=? ORDER BY CASE f.severity WHEN 'H' THEN 0 WHEN 'M' THEN 1 WHEN 'L' THEN 2 ELSE 3 END, length(f.point_id), f.point_id""", (rid,))
+    locs = rows(con, """SELECT fl.id, fl.finding_id, fl.path, fl.line_start, fl.line_end, fl.symbol, fl.role,
+        fl.commit_sha, fl.permalink, rp.name repo FROM finding_locations fl
+        JOIN findings f ON f.id=fl.finding_id JOIN repositories rp ON rp.id=fl.repository_id WHERE f.review_id=?""", (rid,))
+    by = {}
+    for l in locs:
+        by.setdefault(l["finding_id"], []).append(l)
+    for f in findings:
+        f["locations"] = by.get(f["id"], [])
+    return {
+        "review": r,
+        "repos": rows(con, """SELECT rp.name, rr.* FROM review_repositories rr JOIN repositories rp
+                              ON rp.id=rr.repository_id WHERE rr.review_id=?""", (rid,)),
+        "goals": rows(con, """SELECT g.code, g.text FROM review_goals rg JOIN design_goals g ON g.id=rg.goal_id
+                              WHERE rg.review_id=? ORDER BY g.code""", (rid,)),
+        "domains": rows(con, """SELECT rd.*, d.name, d.category FROM review_domains rd JOIN domains d ON d.code=rd.domain_code
+                                WHERE rd.review_id=? ORDER BY rd.decision, d.category, d.name""", (rid,)),
+        "runs": rows(con, """SELECT rr.*, a.name actor, a.model FROM reviewer_runs rr JOIN actors a ON a.id=rr.actor_id
+                             WHERE rr.review_id=? ORDER BY rr.domain_code, rr.label""", (rid,)),
+        "checks": rows(con, """SELECT c.outcome, c.evidence, i.code issue_code, i.title, i.status
+                               FROM review_issue_checks c JOIN issues i ON i.id=c.issue_id WHERE c.review_id=?
+                               ORDER BY c.outcome, i.code""", (rid,)),
+        "summary": rows(con, "SELECT * FROM v_review_summary WHERE review=?", (code,)),
+        "agents": rows(con, "SELECT * FROM v_review_agents WHERE review=?", (code,)),
+        "requirements": rows(con, "SELECT * FROM v_requirement_trace WHERE review=?", (code,)),
+        "metrics": rows(con, """SELECT m.name, m.scope, m.value, COALESCE(m.unit, md.unit) unit, m.method, m.note,
+            COALESCE(md.label, upper(substr(m.name, 1, 1)) || replace(substr(m.name, 2), '_', ' ')) label,
+            COALESCE(md.better, 'none') better
+            FROM metrics m LEFT JOIN metric_defs md ON md.name=m.name WHERE m.review_id=? ORDER BY m.name, m.scope""", (rid,)),
+        "artifacts": rows(con, "SELECT kind, path, url FROM artifacts WHERE review_id=? ORDER BY kind", (rid,)),
+        "gates": rows(con, "SELECT code, kind, title, status, answer_value, answer_text FROM gates WHERE review_id=? ORDER BY created_at", (rid,)),
+        "interview": interview_list(con, code) if has_table(con, "interview_questions") else [],
+        "review_goals": goals_list(con, include_all=True, review=code) if has_table(con, "goal_statuses") else [],
+        "findings": findings,
+    }
+
+
+def get_issues(rq):
+    """?status= (active: the statuses still to fix; else one status), severity=, domain_code= (exact) and q= (text in
+    the code, title, sub, a finding's point id or summary, or a location's path), all ANDed."""
+    where, args = ["1"], []
+    for k in ("status", "severity", "domain_code"):
+        v = rq.arg(k)
+        if v == "active" and k == "status":
+            where.append(f"i.status IN {ACTIVE}")
+        elif v:
+            where.append(f"i.{k} = ?"); args.append(v)
+    q = rq.arg("q")
+    if q:
+        where.append("(i.code LIKE ? OR i.title LIKE ? OR i.sub LIKE ? OR EXISTS (SELECT 1 FROM findings f LEFT JOIN finding_locations fl ON fl.finding_id=f.id WHERE f.issue_id=i.id AND (f.point_id LIKE ? OR f.summary LIKE ? OR fl.path LIKE ?)))")
+        args += [f"%{q}%"] * 6
+    return rows(rq.con, f"""SELECT i.code, i.title, i.severity, i.status, i.domain_code, i.theme_code, i.times_seen,
+        i.opened_at, i.updated_at, fr.code first_seen, lr.code last_seen
+        FROM issues i JOIN reviews fr ON fr.id=i.first_seen_review_id LEFT JOIN reviews lr ON lr.id=i.last_seen_review_id
+        WHERE {' AND '.join(where)}
+        ORDER BY CASE i.severity WHEN 'H' THEN 0 WHEN 'M' THEN 1 WHEN 'L' THEN 2 ELSE 3 END, i.id LIMIT 2000""", args)
+
+
+def get_issue(rq):
+    con, code = rq.con, rq.args[0]
+    i = one(con, """SELECT i.*, fr.code first_seen, lr.code last_seen, cr.code last_checked FROM issues i
+                    JOIN reviews fr ON fr.id=i.first_seen_review_id LEFT JOIN reviews lr ON lr.id=i.last_seen_review_id
+                    LEFT JOIN reviews cr ON cr.id=i.last_checked_review_id WHERE i.code=?""", (code,))
+    if not i:
+        return error(404, "no such issue")
+    iid = i["id"]
+    findings = rows(con, """SELECT f.*, r.code review_code, r.started_at review_at FROM findings f
+                            JOIN reviews r ON r.id=f.review_id WHERE f.issue_id=? ORDER BY r.started_at""", (iid,))
+    for f in findings:
+        f["locations"] = rows(con, """SELECT fl.id, fl.path, fl.line_start, fl.line_end, fl.symbol, fl.role, fl.commit_sha,
+            fl.permalink, rp.name repo FROM finding_locations fl JOIN repositories rp ON rp.id=fl.repository_id
+            WHERE fl.finding_id=?""", (f["id"],))
+    return {
+        "issue": i,
+        "findings": findings,
+        "relations": rows(con, """SELECT 'out' dir, r.relation, b.code other, b.title other_title, b.status other_status,
+                r.confidence, r.rationale, rv.code review FROM issue_relations r JOIN issues b ON b.id=r.to_issue_id
+                LEFT JOIN reviews rv ON rv.id=r.established_in_review_id WHERE r.from_issue_id=?
+            UNION ALL SELECT 'in', r.relation, a.code, a.title, a.status, r.confidence, r.rationale, rv.code
+                FROM issue_relations r JOIN issues a ON a.id=r.from_issue_id
+                LEFT JOIN reviews rv ON rv.id=r.established_in_review_id WHERE r.to_issue_id=?""", (iid, iid)),
+        "checks": rows(con, """SELECT r.code review, r.started_at, c.outcome, c.evidence FROM review_issue_checks c
+                               JOIN reviews r ON r.id=c.review_id WHERE c.issue_id=? ORDER BY r.started_at""", (iid,)),
+        "timeline": rows(con, "SELECT * FROM v_issue_timeline WHERE code=?", (code,)),
+        "guard_tests": rows(con, "SELECT * FROM guard_tests WHERE issue_id=?", (iid,)),
+        "decisions": rows(con, """SELECT d.code, d.question, d.answer, d.rationale, d.status, d.decided_at
+                                  FROM decision_issues di JOIN decisions d ON d.id=di.decision_id WHERE di.issue_id=?""", (iid,)),
+        "steps": rows(con, """SELECT DISTINCT p.code plan, s.number, s.title, s.status, s.progress_note,
+                (SELECT group_concat(substr(sc.commit_sha,1,10), ', ') FROM step_commits sc WHERE sc.step_id=s.id) commits
+                FROM step_findings sf JOIN steps s ON s.id=sf.step_id JOIN plans p ON p.id=s.plan_id
+                JOIN findings f ON f.id=sf.finding_id WHERE f.issue_id=? ORDER BY p.code, s.number""", (iid,)),
+    }
+
+
+def get_plans(rq):
+    return rows(rq.con, """SELECT plan code, title, status, created_at, approved_at, steps, done, doing,
+        waiting_owner waiting, reviews FROM v_plan_totals ORDER BY created_at DESC""")
+
+
+def get_plan(rq):
+    con, code = rq.con, rq.args[0]
+    pl = one(con, "SELECT * FROM plans WHERE code=?", (code,))
+    if not pl:
+        return error(404, "no such plan")
+    pid = pl["id"]
+    steps = rows(con, """SELECT s.*, ph.number phase FROM steps s JOIN phases ph ON ph.id=s.phase_id
+                         WHERE s.plan_id=? ORDER BY s.number""", (pid,))
+    deps, closes, commits = {}, {}, {}
+    for d in rows(con, """SELECT sd.step_id, s.number FROM step_dependencies sd JOIN steps s ON s.id=sd.depends_on_step_id
+                          WHERE s.plan_id=?""", (pid,)):
+        deps.setdefault(d["step_id"], []).append(d["number"])
+    for c in rows(con, """SELECT sf.step_id, f.point_id, f.severity, f.summary, r.code review, i.code issue
+                          FROM step_findings sf JOIN steps s ON s.id=sf.step_id JOIN findings f ON f.id=sf.finding_id
+                          JOIN reviews r ON r.id=f.review_id LEFT JOIN issues i ON i.id=f.issue_id WHERE s.plan_id=?""", (pid,)):
+        closes.setdefault(c["step_id"], []).append(c)
+    for c in rows(con, """SELECT sc.step_id, sc.commit_sha, sc.branch, sc.pr_url, sc.summary FROM step_commits sc
+                          JOIN steps s ON s.id=sc.step_id WHERE s.plan_id=?""", (pid,)):
+        commits.setdefault(c["step_id"], []).append(c)
+    for s in steps:
+        s["depends"] = sorted(deps.get(s["id"], []))
+        s["closes"] = closes.get(s["id"], [])
+        s["commits"] = commits.get(s["id"], [])
+    return {"plan": pl,
+            "phases": rows(con, "SELECT * FROM v_plan_progress WHERE plan=?", (code,)),
+            "phase_rows": rows(con, "SELECT number, title, goal, why FROM phases WHERE plan_id=? ORDER BY number", (pid,)),
+            "steps": steps}
+
+
+def get_goals(rq):
+    """Every design goal by domain, with its status and sources (schema 9)."""
+    if not has_table(rq.con, "goal_statuses"):
+        return {"goals": []}
+    return {"goals": goals_list(rq.con, include_all=True)}
+
+
+def get_trends(rq):
+    con = rq.con
+    return {"metrics": rows(con, "SELECT * FROM v_metric_trends"),
+            "reviews": rows(con, """SELECT review, min(started_at) started_at, sum(points) points, sum(high) high,
+                sum(medium) medium, sum(low) low, sum(new_issues) new_issues, sum(carried_over) carried_over,
+                sum(came_back) came_back, sum(false_findings) false_findings
+                FROM v_review_summary GROUP BY review ORDER BY started_at"""),
+            "recurring": rows(con, "SELECT * FROM v_recurring_issues LIMIT 50"),
+            "hotspots": rows(con, "SELECT * FROM v_file_hotspots LIMIT 30")}
+
+
+def tables_and_views(con):
+    """The ledger's tables and views, by type then name."""
+    return rows(con, """SELECT name, type FROM sqlite_master WHERE type IN ('table','view')
+                        AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY type, name""")
+
+
+def get_tables(rq):
+    con, out = rq.con, []
+    for t in tables_and_views(con):
+        cols = [c["name"] for c in rows(con, "SELECT name FROM pragma_table_info(?)", (t["name"],))]
+        n = con.execute(f"SELECT count(*) FROM {quote_name(t['name'])}").fetchone()[0]
+        out.append({**t, "columns": cols, "count": n})
+    return out
+
+
+def get_table(rq):
+    """?limit= (1 to 500, default 100) and offset= rows of one table or view."""
+    con, name = rq.con, rq.args[0]
+    if not NAME.match(name) or not one(con, "SELECT 1 x FROM sqlite_master WHERE name=? AND type IN ('table','view')", (name,)):
+        return error(404, "no such table")
+    limit = max(1, min(500, whole_number(rq.arg("limit", "100"), "limit")))
+    offset = max(0, whole_number(rq.arg("offset", "0"), "offset"))
+    cur = con.execute(f'SELECT * FROM "{name}" LIMIT ? OFFSET ?', (limit, offset))
+    return {"columns": [d[0] for d in cur.description], "rows": [list(r) for r in cur.fetchall()],
+            "count": con.execute(f'SELECT count(*) FROM "{name}"').fetchone()[0], "offset": offset, "limit": limit}
+
+
+def post_sql(rq):
+    sql = rq.body.get("sql", "")
+    if not isinstance(sql, str):
+        return error(400, "sql must be text.")
+    return run_readonly(rq.db, sql)
+
+
+def get_source(rq):
+    res = source(rq.root, rq.con, whole_number(rq.args[0], "The reference id"))
+    if "error" in res and "path" not in res:
+        return error(404, res["error"])
+    return res
+
+
+def _hub(*paths):
+    return lambda con: list(paths)
+
+
+def _hub_each(prefix, sql):
+    return lambda con: [f"{prefix}/{r[0]}" for r in con.execute(sql)]
+
+
+# Every address under /api/. A path no row matches is 404; a path that matches under another method only is 405
+# with Allow. The published hub embeds the answers of every GET row (hub_snapshot).
+ROUTES = (
+    Route("GET", "overview", get_overview, _hub("overview")),
+    Route("GET", "gates", get_gates, _hub("gates?status=pending", "gates?status=all")),
+    Route("POST", "gates/*/answer", post_gate_answer),
+    Route("GET", "reviews", get_reviews, _hub("reviews")),
+    Route("GET", "review/*", get_review, _hub_each("review", "SELECT code FROM reviews ORDER BY code")),
+    Route("GET", "issues", get_issues, _hub("issues")),
+    Route("GET", "issue/*", get_issue, _hub_each("issue", "SELECT code FROM issues ORDER BY code")),
+    Route("GET", "plans", get_plans, _hub("plans")),
+    Route("GET", "plan/*", get_plan, _hub_each("plan", "SELECT code FROM plans ORDER BY code")),
+    Route("GET", "goals", get_goals, _hub("goals")),
+    Route("GET", "trends", get_trends, _hub("trends")),
+    Route("GET", "tables", get_tables, _hub("tables")),
+    Route("GET", "table/*", get_table,
+          lambda con: [f"table/{t['name']}?limit={HUB_MAX_ROWS}&offset=0" for t in tables_and_views(con)
+                       if NAME.match(t["name"])]),
+    Route("POST", "sql", post_sql),
+    Route("GET", "source/*", get_source, _hub_each("source", "SELECT id FROM finding_locations ORDER BY id")),
+)
+
+
+def api_segments(path):
+    """The segments after /api of a URL path, or None for a path that is not under /api."""
     parts = [x for x in path.split("/") if x]
-    if not parts or parts[0] != "api":
-        return {"error": "not found"}, 404
-    p = parts[1:]
-    arg = lambda k, d=None: qs.get(k, [d])[0]
+    return parts[1:] if parts and parts[0] == "api" else None
 
-    if p == ["overview"]:
-        meta = {r["key"]: r["value"] for r in rows(con, "SELECT key, value FROM meta")}
-        return {
-            "project": meta.get("project_name", root.name),
-            "schema_version": meta.get("schema_version"),
-            "open_by_severity": rows(con, """SELECT severity, count(*) n FROM issues
-                WHERE status IN {ACTIVE} GROUP BY severity""".format(ACTIVE=ACTIVE)),
-            "issues_by_status": rows(con, "SELECT status, count(*) n FROM issues GROUP BY status"),
-            "gates_open": one(con, "SELECT count(*) n FROM gates WHERE status='open'")["n"],
-            "queue": one(con, "SELECT count(*) n FROM v_owner_queue")["n"],
-            "reviews": rows(con, """SELECT r.code, r.title, r.scope, r.status, r.started_at, r.completed_at, r.verdict,
-                (SELECT count(*) FROM findings f WHERE f.review_id=r.id) points,
-                (SELECT count(*) FROM findings f WHERE f.review_id=r.id AND f.severity='H') high
-                FROM reviews r ORDER BY r.started_at DESC LIMIT 5"""),
-            "plans": rows(con, """SELECT p.code, p.title, p.status, count(s.id) steps,
-                sum(s.status='done') done, sum(s.status='waiting-owner') waiting
-                FROM plans p LEFT JOIN steps s ON s.plan_id=p.id GROUP BY p.id ORDER BY p.created_at DESC"""),
-            "recurring": one(con, "SELECT count(*) n FROM v_recurring_issues")["n"],
-            "checks": [{"label": label, "view": v, "tier": tier, "n": count_view(con, v)}
-                       for v, label, tier in (ledger_checks(con) or [])],
-            "labels": {**{t: {r["code"]: r["name"] for r in rows(con, f"SELECT code, name FROM {t}")} for t in LABEL_TABLES},
-                       "enums": enum_labels(con)},
-        }
 
-    if p == ["gates"]:
-        st = arg("status", "pending")
-        where = {"pending": "g.status IN ('open','answered')", "all": "1"}.get(st, "g.status = ?")
-        args = () if st in ("pending", "all") else (st,)
-        gates = rows(con, f"""SELECT g.*, r.code review_code, pl.code plan_code, s.number step_number,
-                i.code issue_code, d.code decision_code FROM gates g
-                LEFT JOIN reviews r ON r.id=g.review_id LEFT JOIN plans pl ON pl.id=g.plan_id
-                LEFT JOIN steps s ON s.id=g.step_id LEFT JOIN issues i ON i.id=g.issue_id
-                LEFT JOIN decisions d ON d.id=g.decision_id
-                WHERE {where} ORDER BY g.status='answered', g.blocking DESC, g.created_at""", args)
-        for g in gates:
-            g["options"] = json.loads(g["options"]) if g["options"] else []
-        other = rows(con, "SELECT * FROM v_owner_queue WHERE kind <> 'gate'")
-        return {"gates": gates, "other": other}
+def _matches(r, parts):
+    return len(r.pattern) == len(parts) and all(a == "*" or a == b for a, b in zip(r.pattern, parts))
 
-    if len(p) == 3 and p[0] == "gates" and p[2] == "answer" and body is not None:
-        return gate_answer_request(db, p[1], body)
 
-    if p == ["reviews"]:
-        return rows(con, """SELECT r.code, r.title, r.scope, r.status, r.started_at, r.completed_at, r.verdict,
-            (SELECT group_concat(rp.name || ' ' || substr(rr.commit_sha,1,10) || COALESCE(' on ' || rr.branch, ''), ' · ')
-               FROM review_repositories rr JOIN repositories rp ON rp.id=rr.repository_id WHERE rr.review_id=r.id) commits,
-            (SELECT count(*) FROM findings f WHERE f.review_id=r.id) points,
-            (SELECT count(*) FROM findings f WHERE f.review_id=r.id AND f.severity='H') high,
-            (SELECT count(*) FROM findings f WHERE f.review_id=r.id AND f.severity='M') medium,
-            (SELECT count(*) FROM findings f WHERE f.review_id=r.id AND f.severity='L') low,
-            (SELECT count(*) FROM findings f WHERE f.review_id=r.id AND f.match_type IN ('new','continuation')) new_issues,
-            (SELECT count(*) FROM findings f WHERE f.review_id=r.id AND f.match_type IN (SELECT value FROM match_types WHERE came_back = 1)) came_back
-            FROM reviews r ORDER BY r.started_at DESC""")
+def allowed_methods(path):
+    """The methods a URL path answers: GET for the page, its routes' methods under /api/, none for anything else."""
+    if path == "/":
+        return ["GET"]
+    parts = api_segments(path)
+    return [] if parts is None else [r.method for r in ROUTES if _matches(r, parts)]
 
-    if len(p) == 2 and p[0] == "review":
-        r = one(con, """SELECT r.*, m.name manager, m.model manager_model, a.name approved_by,
-                        pr.code previous_code FROM reviews r
-                        LEFT JOIN actors m ON m.id=r.manager_actor_id LEFT JOIN actors a ON a.id=r.approved_by_actor_id
-                        LEFT JOIN reviews pr ON pr.id=r.previous_review_id WHERE r.code=?""", (p[1],))
-        if not r:
-            return {"error": "no such review"}, 404
-        rid = r["id"]
-        findings = rows(con, """SELECT f.*, i.code issue_code, i.status issue_status, rr.label run_label
-            FROM findings f LEFT JOIN issues i ON i.id=f.issue_id LEFT JOIN reviewer_runs rr ON rr.id=f.reviewer_run_id
-            WHERE f.review_id=? ORDER BY CASE f.severity WHEN 'H' THEN 0 WHEN 'M' THEN 1 WHEN 'L' THEN 2 ELSE 3 END, length(f.point_id), f.point_id""", (rid,))
-        locs = rows(con, """SELECT fl.id, fl.finding_id, fl.path, fl.line_start, fl.line_end, fl.symbol, fl.role,
-            fl.commit_sha, fl.permalink, rp.name repo FROM finding_locations fl
-            JOIN findings f ON f.id=fl.finding_id JOIN repositories rp ON rp.id=fl.repository_id WHERE f.review_id=?""", (rid,))
-        by = {}
-        for l in locs:
-            by.setdefault(l["finding_id"], []).append(l)
-        for f in findings:
-            f["locations"] = by.get(f["id"], [])
-        return {
-            "review": r,
-            "repos": rows(con, """SELECT rp.name, rr.* FROM review_repositories rr JOIN repositories rp
-                                  ON rp.id=rr.repository_id WHERE rr.review_id=?""", (rid,)),
-            "goals": rows(con, """SELECT g.code, g.text FROM review_goals rg JOIN design_goals g ON g.id=rg.goal_id
-                                  WHERE rg.review_id=? ORDER BY g.code""", (rid,)),
-            "domains": rows(con, """SELECT rd.*, d.name, d.category FROM review_domains rd JOIN domains d ON d.code=rd.domain_code
-                                    WHERE rd.review_id=? ORDER BY rd.decision, d.category, d.name""", (rid,)),
-            "runs": rows(con, """SELECT rr.*, a.name actor, a.model FROM reviewer_runs rr JOIN actors a ON a.id=rr.actor_id
-                                 WHERE rr.review_id=? ORDER BY rr.domain_code, rr.label""", (rid,)),
-            "checks": rows(con, """SELECT c.outcome, c.evidence, i.code issue_code, i.title, i.status
-                                   FROM review_issue_checks c JOIN issues i ON i.id=c.issue_id WHERE c.review_id=?
-                                   ORDER BY c.outcome, i.code""", (rid,)),
-            "summary": rows(con, "SELECT * FROM v_review_summary WHERE review=?", (p[1],)),
-            "agents": rows(con, "SELECT * FROM v_review_agents WHERE review=?", (p[1],)),
-            "requirements": rows(con, "SELECT * FROM v_requirement_trace WHERE review=?", (p[1],)),
-            "metrics": rows(con, """SELECT m.name, m.scope, m.value, COALESCE(m.unit, md.unit) unit, m.method, m.note,
-                COALESCE(md.label, upper(substr(m.name, 1, 1)) || replace(substr(m.name, 2), '_', ' ')) label,
-                COALESCE(md.better, 'none') better
-                FROM metrics m LEFT JOIN metric_defs md ON md.name=m.name WHERE m.review_id=? ORDER BY m.name, m.scope""", (rid,)),
-            "artifacts": rows(con, "SELECT kind, path, url FROM artifacts WHERE review_id=? ORDER BY kind", (rid,)),
-            "gates": rows(con, "SELECT code, kind, title, status, answer_value, answer_text FROM gates WHERE review_id=? ORDER BY created_at", (rid,)),
-            "interview": interview_list(con, p[1]) if has_table(con, "interview_questions") else [],
-            "review_goals": goals_list(con, include_all=True, review=p[1]) if has_table(con, "goal_statuses") else [],
-            "findings": findings,
-        }
 
-    if p == ["issues"]:
-        where, args = ["1"], []
-        for k in ("status", "severity", "domain_code"):
-            v = arg(k)
-            if v == "active" and k == "status":
-                where.append(f"i.status IN {ACTIVE}")
-            elif v:
-                where.append(f"i.{k} = ?"); args.append(v)
-        q = arg("q")
-        if q:
-            where.append("(i.code LIKE ? OR i.title LIKE ? OR i.sub LIKE ? OR EXISTS (SELECT 1 FROM findings f LEFT JOIN finding_locations fl ON fl.finding_id=f.id WHERE f.issue_id=i.id AND (f.point_id LIKE ? OR f.summary LIKE ? OR fl.path LIKE ?)))")
-            args += [f"%{q}%"] * 6
-        return rows(con, f"""SELECT i.code, i.title, i.severity, i.status, i.domain_code, i.theme_code, i.times_seen,
-            i.opened_at, i.updated_at, fr.code first_seen, lr.code last_seen
-            FROM issues i JOIN reviews fr ON fr.id=i.first_seen_review_id LEFT JOIN reviews lr ON lr.id=i.last_seen_review_id
-            WHERE {' AND '.join(where)}
-            ORDER BY CASE i.severity WHEN 'H' THEN 0 WHEN 'M' THEN 1 WHEN 'L' THEN 2 ELSE 3 END, i.id LIMIT 2000""", args)
+def wrong_method(method, allowed):
+    return error(405, f"This address takes {' or '.join(allowed)}, not {method}.", {"Allow": ", ".join(allowed)})
 
-    if len(p) == 2 and p[0] == "issue":
-        i = one(con, """SELECT i.*, fr.code first_seen, lr.code last_seen, cr.code last_checked FROM issues i
-                        JOIN reviews fr ON fr.id=i.first_seen_review_id LEFT JOIN reviews lr ON lr.id=i.last_seen_review_id
-                        LEFT JOIN reviews cr ON cr.id=i.last_checked_review_id WHERE i.code=?""", (p[1],))
-        if not i:
-            return {"error": "no such issue"}, 404
-        iid = i["id"]
-        findings = rows(con, """SELECT f.*, r.code review_code, r.started_at review_at FROM findings f
-                                JOIN reviews r ON r.id=f.review_id WHERE f.issue_id=? ORDER BY r.started_at""", (iid,))
-        for f in findings:
-            f["locations"] = rows(con, """SELECT fl.id, fl.path, fl.line_start, fl.line_end, fl.symbol, fl.role, fl.commit_sha,
-                fl.permalink, rp.name repo FROM finding_locations fl JOIN repositories rp ON rp.id=fl.repository_id
-                WHERE fl.finding_id=?""", (f["id"],))
-        return {
-            "issue": i,
-            "findings": findings,
-            "relations": rows(con, """SELECT 'out' dir, r.relation, b.code other, b.title other_title, b.status other_status,
-                    r.confidence, r.rationale, rv.code review FROM issue_relations r JOIN issues b ON b.id=r.to_issue_id
-                    LEFT JOIN reviews rv ON rv.id=r.established_in_review_id WHERE r.from_issue_id=?
-                UNION ALL SELECT 'in', r.relation, a.code, a.title, a.status, r.confidence, r.rationale, rv.code
-                    FROM issue_relations r JOIN issues a ON a.id=r.from_issue_id
-                    LEFT JOIN reviews rv ON rv.id=r.established_in_review_id WHERE r.to_issue_id=?""", (iid, iid)),
-            "checks": rows(con, """SELECT r.code review, r.started_at, c.outcome, c.evidence FROM review_issue_checks c
-                                   JOIN reviews r ON r.id=c.review_id WHERE c.issue_id=? ORDER BY r.started_at""", (iid,)),
-            "timeline": rows(con, "SELECT * FROM v_issue_timeline WHERE code=?", (p[1],)),
-            "guard_tests": rows(con, "SELECT * FROM guard_tests WHERE issue_id=?", (iid,)),
-            "decisions": rows(con, """SELECT d.code, d.question, d.answer, d.rationale, d.status, d.decided_at
-                                      FROM decision_issues di JOIN decisions d ON d.id=di.decision_id WHERE di.issue_id=?""", (iid,)),
-            "steps": rows(con, """SELECT DISTINCT p.code plan, s.number, s.title, s.status, s.progress_note,
-                    (SELECT group_concat(substr(sc.commit_sha,1,10), ', ') FROM step_commits sc WHERE sc.step_id=s.id) commits
-                    FROM step_findings sf JOIN steps s ON s.id=sf.step_id JOIN plans p ON p.id=s.plan_id
-                    JOIN findings f ON f.id=sf.finding_id WHERE f.issue_id=? ORDER BY p.code, s.number""", (iid,)),
-        }
 
-    if p == ["plans"]:
-        return rows(con, """SELECT p.code, p.title, p.status, p.created_at, p.approved_at, count(s.id) steps,
-            sum(s.status='done') done, sum(s.status='doing') doing, sum(s.status='waiting-owner') waiting,
-            (SELECT group_concat(r.code, ', ') FROM plan_reviews pr JOIN reviews r ON r.id=pr.review_id WHERE pr.plan_id=p.id) reviews
-            FROM plans p LEFT JOIN steps s ON s.plan_id=p.id GROUP BY p.id ORDER BY p.created_at DESC""")
-
-    if len(p) == 2 and p[0] == "plan":
-        pl = one(con, "SELECT * FROM plans WHERE code=?", (p[1],))
-        if not pl:
-            return {"error": "no such plan"}, 404
-        pid = pl["id"]
-        steps = rows(con, """SELECT s.*, ph.number phase FROM steps s JOIN phases ph ON ph.id=s.phase_id
-                             WHERE s.plan_id=? ORDER BY s.number""", (pid,))
-        deps, closes, commits = {}, {}, {}
-        for d in rows(con, """SELECT sd.step_id, s.number FROM step_dependencies sd JOIN steps s ON s.id=sd.depends_on_step_id
-                              WHERE s.plan_id=?""", (pid,)):
-            deps.setdefault(d["step_id"], []).append(d["number"])
-        for c in rows(con, """SELECT sf.step_id, f.point_id, f.severity, f.summary, r.code review, i.code issue
-                              FROM step_findings sf JOIN steps s ON s.id=sf.step_id JOIN findings f ON f.id=sf.finding_id
-                              JOIN reviews r ON r.id=f.review_id LEFT JOIN issues i ON i.id=f.issue_id WHERE s.plan_id=?""", (pid,)):
-            closes.setdefault(c["step_id"], []).append(c)
-        for c in rows(con, """SELECT sc.step_id, sc.commit_sha, sc.branch, sc.pr_url, sc.summary FROM step_commits sc
-                              JOIN steps s ON s.id=sc.step_id WHERE s.plan_id=?""", (pid,)):
-            commits.setdefault(c["step_id"], []).append(c)
-        for s in steps:
-            s["depends"] = sorted(deps.get(s["id"], []))
-            s["closes"] = closes.get(s["id"], [])
-            s["commits"] = commits.get(s["id"], [])
-        return {"plan": pl,
-                "phases": rows(con, "SELECT * FROM v_plan_progress WHERE plan=?", (p[1],)),
-                "phase_rows": rows(con, "SELECT number, title, goal, why FROM phases WHERE plan_id=? ORDER BY number", (pid,)),
-                "steps": steps}
-
-    if p == ["goals"]:  # every design goal by domain, with its status and sources (schema 9)
-        if not has_table(con, "goal_statuses"):
-            return {"goals": []}
-        return {"goals": goals_list(con, include_all=True)}
-
-    if p == ["trends"]:
-        return {"metrics": rows(con, "SELECT * FROM v_metric_trends"),
-                "reviews": rows(con, """SELECT review, min(started_at) started_at, sum(points) points, sum(high) high,
-                    sum(medium) medium, sum(low) low, sum(new_issues) new_issues, sum(carried_over) carried_over,
-                    sum(came_back) came_back, sum(false_findings) false_findings
-                    FROM v_review_summary GROUP BY review ORDER BY started_at"""),
-                "recurring": rows(con, "SELECT * FROM v_recurring_issues LIMIT 50"),
-                "hotspots": rows(con, "SELECT * FROM v_file_hotspots LIMIT 30")}
-
-    if p == ["tables"]:
-        out = []
-        for t in rows(con, """SELECT name, type FROM sqlite_master WHERE type IN ('table','view')
-                              AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY type, name"""):
-            cols = [c["name"] for c in rows(con, "SELECT name FROM pragma_table_info(?)", (t["name"],))]
-            n = con.execute(f"SELECT count(*) FROM {quote_name(t['name'])}").fetchone()[0]
-            out.append({**t, "columns": cols, "count": n})
-        return out
-
-    if len(p) == 2 and p[0] == "table":
-        name = p[1]
-        if not NAME.match(name) or not one(con, "SELECT 1 x FROM sqlite_master WHERE name=? AND type IN ('table','view')", (name,)):
-            return {"error": "no such table"}, 404
-        limit = max(1, min(500, int(arg("limit", "100"))))
-        offset = max(0, int(arg("offset", "0")))
-        cur = con.execute(f'SELECT * FROM "{name}" LIMIT ? OFFSET ?', (limit, offset))
-        return {"columns": [d[0] for d in cur.description], "rows": [list(r) for r in cur.fetchall()],
-                "count": con.execute(f'SELECT count(*) FROM "{name}"').fetchone()[0], "offset": offset, "limit": limit}
-
-    if p == ["sql"] and body is not None:
-        return run_readonly(db, body.get("sql", ""))
-
-    if len(p) == 2 and p[0] == "source":
-        return source(root, con, int(p[1]))
-
-    return {"error": "not found"}, 404
+def route(root, db, con, path, qs, body):
+    """Answer one API request from ROUTES: the handler's result (a dict or list: 200) or error(...). body is None
+    for a GET and the JSON object for a POST."""
+    method = "GET" if body is None else "POST"
+    parts = api_segments(path)
+    allowed = [] if parts is None else allowed_methods(path)
+    if not allowed:
+        return error(404, "not found")
+    if method not in allowed:
+        return wrong_method(method, allowed)
+    r = next(r for r in ROUTES if r.method == method and _matches(r, parts))
+    try:
+        return r.handler(Request(root, db, con, [b for a, b in zip(r.pattern, parts) if a == "*"], qs, body))
+    except ApiError as e:
+        return error(e.status, e.message, e.headers)
 
 
 SQL_SECONDS = 4  # the SQL box stops a query after this long
@@ -7506,9 +8288,11 @@ def make_server(root, db, port=0):
         def log_message(self, *a):
             pass
 
-        def send(self, code, body, ctype="application/json; charset=utf-8"):
+        def send(self, code, body, ctype="application/json; charset=utf-8", headers=None):
             data = body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=False, default=str).encode()
             self.send_response(code)
+            for k, v in (headers or {}).items():
+                self.send_header(k, v)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Cache-Control", "no-store")
@@ -7521,7 +8305,25 @@ def make_server(root, db, port=0):
                 self.send_header("Connection", "close")
                 self.close_connection = True
             self.end_headers()
-            self.wfile.write(data)
+            if self.command != "HEAD":  # a HEAD answer is headers only
+                self.wfile.write(data)
+
+        def send_error(self, code, message=None, explain=None):
+            """Errors the HTTP library raises itself (a malformed request line, an unknown method, an address or
+            header that is too long) in the viewer's own shape: JSON with the security headers."""
+            self.send(code, {"error": message or self.responses.get(code, ("error",))[0]})
+
+        def refuse_method(self):
+            """Any method but GET and POST: 405 naming the methods the address takes, 404 for an unknown address."""
+            if not self.host_ok():
+                return
+            allowed = allowed_methods(urlparse(self.path).path)
+            if not allowed:
+                return self.send(404, {"error": "not found"})
+            res = wrong_method(self.command, allowed)
+            self.send(res[1], res[0], headers=res[2])
+
+        do_HEAD = do_PUT = do_DELETE = do_OPTIONS = do_PATCH = refuse_method
 
         def host_ok(self):
             if self.headers.get("Host") not in hosts:
@@ -7543,9 +8345,9 @@ def make_server(root, db, port=0):
             try:
                 res = api(root, db, u.path, parse_qs(u.query), body)
             except Exception as e:
-                res = ({"error": f"Something went wrong reading the ledger: {e}"}, 500)
-            code, res = (res[1], res[0]) if isinstance(res, tuple) else (200, res)
-            self.send(code, res)
+                res = api_failure(e, f"{self.command} {u.path}")
+            res = res if isinstance(res, tuple) else (res, 200)
+            self.send(res[1], res[0], headers=res[2] if len(res) > 2 else None)
 
         def do_GET(self):
             if not self.host_ok():
@@ -7563,10 +8365,16 @@ def make_server(root, db, port=0):
             if not self.host_ok():
                 return
             u = urlparse(self.path)  # the guard below and the dispatch use this one parsed path
+            if u.path == "/":
+                return self.refuse_method()
             if not u.path.startswith("/api/"):
                 return self.send(404, {"error": "not found"})
             if not self.token_ok():
                 return
+            allowed = allowed_methods(u.path)
+            if allowed and "POST" not in allowed:  # before the body is read
+                res = wrong_method("POST", allowed)
+                return self.send(res[1], res[0], headers=res[2])
             if self.headers.get("Content-Type", "").split(";")[0] != "application/json":
                 return self.send(415, {"error": "JSON only"})
             raw_n = self.headers.get("Content-Length")
@@ -7734,136 +8542,6 @@ def progress_md(con, plan_code):
 # a Claude artifact with a db capability, saves the owner's gate answers in that artifact's database (collection
 # "answers", one document per gate code). The agent exports those answers and runs `ledger.py import-answers`.
 # Nothing in the page makes an outside request; publishing it is the agent's job, outside this tool.
-HUB_JS = r'''
-const STATIC = window.LEDGER_SNAPSHOT || null;
-let CUR_PATH = null;
-const ACTIVE = STATIC ? STATIC.active : [];
-const slugOf = p => (p || "").split("?")[0].replace(/^#\/?/, "").replace(/[\/_]/g, "-").replace(/[^A-Za-z0-9-]/g, "") || "home";
-function pathFromSlug(s){
-  s = (s || "").replace(/^#/, "");
-  if (!s || s === "home") return STATIC && STATIC.start && CUR_PATH === null ? STATIC.start : "";
-  const m = s.match(/^([a-z]+)(?:-(.*))?$/); if (!m) return "";
-  const [, view, rest] = m;
-  if (!rest) return view;
-  if (view === "plan") { const p = rest.match(/^(P-\d+)(?:-phase-(\d+))?$/); return p ? `plan/${p[1]}` + (p[2] ? `/phase/${p[2]}` : "") : "plans"; }
-  if (view === "explore") { const t = (STATIC.responses.tables || []).find(t => t.name.replace(/_/g, "-") === rest); return t ? `explore/${t.name}` : "explore"; }
-  return `${view}/${rest}`;
-}
-function nav(hash){ CUR_PATH = hash.replace(/^#\/?/, ""); const s = slugOf(CUR_PATH); if (location.hash.slice(1) === s) route(); else location.hash = s; }
-function setPath(hash){ if (!STATIC) { history.replaceState(null, "", hash); return; } CUR_PATH = hash.replace(/^#\/?/, ""); try { history.replaceState(null, "", "#" + slugOf(CUR_PATH)); } catch {} }
-function currentPath(){
-  if (!STATIC) return location.hash.replace(/^#\/?/, "");
-  const s = location.hash.slice(1);
-  if (CUR_PATH === null || slugOf(CUR_PATH) !== (s || "home")) CUR_PATH = pathFromSlug(s);
-  return CUR_PATH;
-}
-function staticApi(path, body){
-  if (body !== undefined) return Promise.reject(new Error("This shared copy is read-only. Answer in the chat with Claude, or run the local viewer."));
-  const S = STATIC.responses, [p, q] = path.split("?"), qs = new URLSearchParams(q || "");
-  const copy = v => JSON.parse(JSON.stringify(v));
-  if (p === "issues") {
-    const st = qs.get("status"), sv = qs.get("severity"), dm = qs.get("domain_code"), t = (qs.get("q") || "").toLowerCase();
-    return Promise.resolve(copy(S.issues.filter(i => (!st || (st === "active" ? ACTIVE.includes(i.status) : i.status === st))
-      && (!sv || i.severity === sv) && (!dm || i.domain_code === dm) && (!t || i.search.toLowerCase().includes(t)))));
-  }
-  if (p === "gates") return Promise.resolve(copy(S["gates?status=" + (qs.get("status") || "pending")] || S["gates?status=all"]));
-  if (p.startsWith("table/")) {
-    const t = S[p]; if (!t) return Promise.reject(new Error("That table is not in this snapshot."));
-    const off = Number(qs.get("offset")) || 0, lim = Number(qs.get("limit")) || 100;
-    return Promise.resolve({columns: t.columns, rows: copy(t.rows.slice(off, off + lim)), count: t.count, offset: off, limit: lim});
-  }
-  if (S[p] === undefined) return Promise.reject(new Error("This view is not in the snapshot."));
-  return Promise.resolve(copy(S[p]));
-}
-
-const HUB = {db: null, answers: {}, error: null};
-const OPEN_GATES = () => STATIC ? (STATIC.responses["gates?status=pending"].gates || []).filter(g => g.status === "open").map(g => g.code) : [];
-const hubAnsweredOpen = () => OPEN_GATES().filter(c => HUB.answers[c]).length;
-async function hubInit(){
-  if (!STATIC || !window.claude || typeof window.claude.use !== "function") return;
-  try {
-    const db = await window.claude.use("db"); if (!db) return;
-    HUB.db = db;
-    db.collection("answers").onSnapshot(snap => {
-      HUB.answers = Object.fromEntries(snap.docs.map(d => [d.id, d.data()]));
-      const cur = document.querySelector('#tabs a[aria-current="page"]');
-      if (OVERVIEW) drawTabs(cur ? (cur.dataset.k || "") : "");
-    }, e => { HUB.error = e && e.code; });
-  } catch (e) { HUB.error = String(e); }
-}
-function md(text){
-  const lines = String(text || "").split("\n"), out = []; let i = 0;
-  const inline = str => { const parts = []; const re = /(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\(https?:\/\/[^)\s]+\))/g; let last = 0, m;
-    while ((m = re.exec(str))) { if (m.index > last) parts.push(str.slice(last, m.index)); const t = m[0];
-      if (t.startsWith("**")) parts.push(h("b", null, t.slice(2, -2)));
-      else if (t.startsWith("`")) parts.push(h("code", null, t.slice(1, -1)));
-      else { const mm = t.match(/^\[([^\]]+)\]\((.+)\)$/); parts.push(h("a", {href: mm[2], target: "_blank", rel: "noopener noreferrer"}, mm[1])); }
-      last = re.lastIndex; }
-    if (last < str.length) parts.push(str.slice(last)); return parts; };
-  const cells = r => r.replace(/^\|/, "").replace(/\|\s*$/, "").split("|").map(c => c.trim());
-  while (i < lines.length) {
-    const l = lines[i]; let m;
-    if (!l.trim()) { i++; continue; }
-    if ((m = l.match(/^(#{1,4})\s+(.*)/))) { out.push(h("h" + Math.min(m[1].length + 1, 4), null, inline(m[2]))); i++; continue; }
-    if (l.startsWith("|")) { const rows = []; while (i < lines.length && lines[i].startsWith("|")) rows.push(lines[i++]);
-      out.push(h("div", {class: "scroll"}, h("table", null, h("thead", null, h("tr", null, cells(rows[0]).map(c => h("th", null, inline(c))))),
-        h("tbody", null, rows.slice(2).map(r => h("tr", null, cells(r).map(c => h("td", null, inline(c))))))))); continue; }
-    if (/^(\d+\.|-)\s/.test(l)) { const ordered = /^\d+\./.test(l), items = []; while (i < lines.length && /^(\d+\.|-)\s/.test(lines[i])) items.push(lines[i++].replace(/^(\d+\.|-)\s+/, ""));
-      out.push(h(ordered ? "ol" : "ul", null, items.map(t => h("li", null, inline(t))))); continue; }
-    const para = []; while (i < lines.length && lines[i].trim() && !/^(#{1,4}\s|\||\d+\.\s|-\s)/.test(lines[i])) para.push(lines[i++]);
-    out.push(h("p", null, inline(para.join(" "))));
-  }
-  return h("div", {class: "md"}, out);
-}
-function hubGateBody(card, g){
-  const saved = HUB.answers[g.code];
-  const optLab = v => ((g.options || []).find(o => o.value === v) || {}).label || v;
-  if (saved) { add(card, h("p", {class: "status"}, "You answered: ", saved.answer_value ? h("b", null, optLab(saved.answer_value)) : null,
-      saved.answer_text ? (saved.answer_value ? " — " : "") + saved.answer_text : "", ". Claude records it the next time it checks (or tell Claude in the chat to check now).")); return card; }
-  if (!HUB.db) { add(card, h("p", {class: "note"}, "Answer in the chat with Claude; answering here needs you signed in to claude.ai as this page's owner.")); return card; }
-  const nm = "opt-" + g.code;
-  const opts = (g.options || []).length ? h("div", {class: "opts", role: "radiogroup", "aria-label": "Choices"},
-    g.options.map(o => h("label", null, h("input", {type: "radio", name: nm, value: o.value}), h("span", null, o.label, o.description ? h("small", null, o.description) : null)))) : null;
-  const ta = g.allow_text ? h("textarea", {placeholder: opts ? "Add a note or a different answer (optional)" : "Your answer", "aria-label": "Your answer"}) : null;
-  const msg = h("div"), form = h("div", {class: "gate"});
-  const send = h("button", {class: "btn", type: "button", onclick: async () => {
-    const picked = card.querySelector(`input[name="${nm}"]:checked`), val = picked ? picked.value : null, txt = ta ? ta.value.trim() : "";
-    if (!val && !txt) { put(msg, h("p", {class: "status err"}, "Choose an option or write an answer.")); return; }
-    send.disabled = true;
-    try {
-      await HUB.db.doc("answers/" + g.code).set({gate: g.code, answer_value: val, answer_text: txt || null, answered_at: new Date().toISOString()});
-      HUB.answers[g.code] = {answer_value: val, answer_text: txt || null};
-      put(form, h("p", {class: "status"}, "Saved. Claude records it the next time it checks (or tell Claude in the chat to check now)."));
-      drawTabs("inbox");
-    } catch (e) { put(msg, h("p", {class: "status err"}, "Your answer could not be saved here" + (e && e.code === "invalid_argument" ? ": only this page's owner can answer." : ". Try again, or answer in the chat."))); send.disabled = false; }
-  }}, "Send answer");
-  add(form, opts, ta, h("div", null, send), msg); add(card, form); return card;
-}
-
-if (STATIC) document.addEventListener("click", e => {
-  const a = e.target.closest && e.target.closest('a[href^="#/"]');
-  if (!a || e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey) return;
-  e.preventDefault(); nav(a.getAttribute("href"));
-});
-'''
-
-HUB_GUIDE_VIEW = r'''
-VIEWS.guide = async () => {
-  const o = OVERVIEW || await api("overview");
-  const plans = await api("plans"), revs = await api("reviews");
-  const r = revs[0], p = plans[0], waiting = Math.max(0, o.queue - (STATIC ? hubAnsweredOpen() : 0));
-  setView(
-    h("h1", null, "How it works"),
-    h("p", {class:"lede"}, "What this site is, how a review runs, what the words mean, and where things stand right now."),
-    h("div", {class:"card"}, h("h2", null, "Where things stand"),
-      kv([["Latest review", r ? h("a", {href:"#/review/" + r.code}, `${r.code} · ${lab("review", r.status)} · ${r.points} points`) : "None yet"],
-          ["Fix plan", p ? h("a", {href:"#/plan/" + p.code}, `${p.code} · ${lab("plan", p.status)} · ${p.done || 0} of ${p.steps || 0} steps done`) : "None yet"],
-          ["Waiting on you", waiting ? h("a", {href:"#/inbox"}, `${waiting} ${waiting === 1 ? "question" : "questions"}`) : "Nothing right now"],
-          ["Updated", when(STATIC ? STATIC.taken : null)]])),
-    md(STATIC ? STATIC.guide : ""));
-};
-'''
-
 HUB_GUIDE_MD = """## What this site is
 
 This is the review ledger for this project, shown as a website. Every review, every point it raised, the issues those points describe, the fix plan, and every question waiting on you live here. Claude updates the site after each step of a review and after each batch of fixes; the date at the top says when.
@@ -7898,32 +8576,11 @@ You can answer every question here, under **Waiting on you**. Your answer is sav
 **Overview** shows the totals and the ledger's own checks. **Reviews** lists every review; open one for its report, the areas reviewed and skipped, the reviewers, and every point with the code it cites. **Issues** lets you search and filter every issue and see its full history. **Fix plans** shows every step by phase, with what it changes, how it is proven, and which points it closes. **Over time** shows how the numbers move between reviews. **Explore** shows the raw tables behind everything.
 """
 
-# (text in page.html, its replacement): each must occur exactly once; hub_page refuses to build otherwise, so an edit
-# of page.html that moves one of these fails test_hub_patches_apply instead of shipping a broken hub.
+# The one change progress-page makes to page.html: the data script (%s is the JSON), put in front of the page's own
+# script. Everything the hub does with the data is in the page (STATIC). hub_page refuses to build when the first text
+# is not in the page exactly once.
 HUB_PATCHES = [
-    ('takeToken();\nlet LABELS', 'takeToken();\n' + HUB_JS + '\nlet LABELS'),
-    ('async function api(path, body){', 'async function api(path, body){\n  if (STATIC) return staticApi(path, body);'),
-    ('function go(hash){ location.hash = hash; }', 'function go(hash){ if (STATIC) return nav(hash); location.hash = hash; }'),
-    ('history.replaceState(null, "", `#/plan/${code}/phase/${phase}`)', 'setPath(`#/plan/${code}/phase/${phase}`)'),
-    ('history.replaceState(null, "", "#/explore/" + t);', 'setPath("#/explore/" + t);'),
-    ('const raw = location.hash.replace(/^#\\/?/, "");', 'const raw = currentPath();'),
-    ('"Make sure the viewer is still running in your terminal, then reload the page."',
-     'STATIC ? "This is a read-only snapshot; reload the page to start again." : "Make sure the viewer is still running in your terminal, then reload the page."'),
-    ('"Questions and approvals the agent cannot get past without you. Answer here or in the chat; the agent picks answers up the next time it checks the ledger."',
-     'STATIC ? "Questions and approvals the agent cannot get past without you. Answer here: your answer is saved with this page, and Claude records it the next time it checks." : "Questions and approvals the agent cannot get past without you. Answer here or in the chat; the agent picks answers up the next time it checks the ledger."'),
-    ('  const name = "opt-" + g.code;', '  if (STATIC) return hubGateBody(card, g);\n  const name = "opt-" + g.code;'),
-    ('    h("div", {class:"card", style:"display:flex;flex-direction:column;gap:8px"}, h("b", null, "Query"),',
-     '    STATIC ? h("p", {class:"note"}, "The query box needs the local viewer (python3 ledger.py serve). Here each table and view shows up to 500 rows, and long values are shortened.") : h("div", {class:"card", style:"display:flex;flex-direction:column;gap:8px"}, h("b", null, "Query"),'),
-    ('"Browse every table and saved view, or run your own read-only query. Nothing here can change the ledger."',
-     'STATIC ? "Browse every table and saved view as they were when this snapshot was taken." : "Browse every table and saved view, or run your own read-only query. Nothing here can change the ledger."'),
-    ('h("small", null, "review ledger")', 'h("small", null, STATIC ? "review ledger · updated " + when(STATIC.taken) : "review ledger")'),
-    ('h("div", {class:"mdtext"}, r.report_md)', '(STATIC ? md(r.report_md) : h("div", {class:"mdtext"}, r.report_md))'),
-    ('h("div", {class:"mdtext"}, pl.narrative_md)', '(STATIC ? md(pl.narrative_md) : h("div", {class:"mdtext"}, pl.narrative_md))'),
-    ('const TABS = [["home","#/","Overview"],', 'const TABS = [["home","#/","Overview"],["guide","#/guide","How it works"],'),
-    ('  const n = OVERVIEW ? OVERVIEW.queue : 0;', '  const n = Math.max(0, (OVERVIEW ? OVERVIEW.queue : 0) - (STATIC ? hubAnsweredOpen() : 0));'),
-    ('h("a", {href, "aria-current": active === k ? "page" : null}, t,', 'h("a", {href, "data-k": k, "aria-current": active === k ? "page" : null}, t,'),
-    ('// ---------- routing', HUB_GUIDE_VIEW + '\n// ---------- routing'),
-    ('route();\n</script>', 'route();\nhubInit();\n</script>'),
+    ('<script>\n"use strict";', '<script>window.LEDGER_SNAPSHOT = %s;</script>\n<script>\n"use strict";'),
 ]
 HUB_MAX_ROWS = 500   # rows of each table and view embedded (Explore)
 HUB_MAX_CELL = 400   # characters of one embedded table cell
@@ -7931,7 +8588,10 @@ HUB_MAX_LINES = 400  # lines of one embedded code excerpt
 
 
 def hub_snapshot(root, db, con, start=None):
-    """Every viewer API response the page can ask for, from route() on a read-only connection, as one dict."""
+    """Every viewer API response the page can ask for, as one dict keyed by path: each GET row of ROUTES, over the
+    paths its hub() lists for this ledger, answered by route() on a read-only connection. Three are reshaped: a
+    table keeps HUB_MAX_ROWS rows of cut cells under table/<name>; a code reference is the excerpt saved in the
+    ledger (the hub cannot read git); each issue of the list gains the text its search box matches."""
     def call(path):
         p, _, q = path.partition("?")
         res = route(root, db, con, "/api/" + p, parse_qs(q), None)
@@ -7939,35 +8599,19 @@ def hub_snapshot(root, db, con, start=None):
             raise LedgerError(f"progress-page: /api/{path} failed: {res[0].get('error')}")
         return res
 
-    R = {"overview": call("overview"), "gates?status=pending": call("gates?status=pending"),
-         "gates?status=all": call("gates?status=all"), "reviews": call("reviews"), "plans": call("plans"),
-         "trends": call("trends"), "goals": call("goals")}
-    for r in R["reviews"]:
-        R["review/" + r["code"]] = call("review/" + r["code"])
-    for p in R["plans"]:
-        R["plan/" + p["code"]] = call("plan/" + p["code"])
-    issues = call("issues?status=")
-    search = {}
-    for code, point, path in con.execute("""SELECT i.code, f.point_id, COALESCE(fl.path, '') FROM issues i
-                                            JOIN findings f ON f.issue_id=i.id
-                                            LEFT JOIN finding_locations fl ON fl.finding_id=f.id"""):
-        search.setdefault(code, set()).update([point, path])
-    for i in issues:
-        i["search"] = " ".join([i["code"], i["title"] or "", i.get("sub") or ""] + sorted(search.get(i["code"], ())))
-        R["issue/" + i["code"]] = call("issue/" + i["code"])
-    R["issues"] = issues
-    R["tables"] = call("tables")
-    for t in R["tables"]:
-        d = call(f"table/{t['name']}?limit={HUB_MAX_ROWS}&offset=0")
+    def table(path):
+        d = call(path)
         cut = [[(v[:HUB_MAX_CELL] + "…") if isinstance(v, str) and len(v) > HUB_MAX_CELL else
                 ({"blob_bytes": len(v)} if isinstance(v, bytes) else v) for v in r] for r in d["rows"]]
-        R["table/" + t["name"]] = {"columns": d["columns"], "rows": cut, "count": len(cut), "total": d["count"]}
+        return {"columns": d["columns"], "rows": cut, "count": len(cut), "total": d["count"]}
+
     cmds = {r[0]: r[1] for r in con.execute("SELECT location_id, git_command FROM v_code_refs")}
-    for (lid,) in con.execute("SELECT id FROM finding_locations ORDER BY id"):
+
+    def saved_excerpt(lid):
         loc = location(con, lid)
         a, b = loc["line_start"], loc["line_end"] or loc["line_start"]
         lines = loc["excerpt"].split("\n") if loc["excerpt"] is not None else []
-        R[f"source/{lid}"] = {
+        return {
             "path": loc["path"], "commit_sha": loc["commit_sha"], "line_start": a, "line_end": b,
             "symbol": loc["symbol"], "permalink": loc["permalink"], "repo_name": loc["repo_name"],
             "blob_sha": loc["blob_sha"], "excerpt_redacted": bool(loc.get("excerpt_redacted")),
@@ -7975,6 +8619,23 @@ def hub_snapshot(root, db, con, start=None):
             "git_error": (f"Showing the first {HUB_MAX_LINES} of {len(lines)} lines." if len(lines) > HUB_MAX_LINES
                           else "This copy shows the excerpt saved in the ledger."),
             "lines": [{"n": (a or 1) + k, "text": t} for k, t in enumerate(lines[:HUB_MAX_LINES])]}
+
+    R = {}
+    for r in ROUTES:
+        for path in (r.hub(con) if r.hub else ()):
+            if r.handler is get_source:
+                R[path] = saved_excerpt(int(path.split("/")[1]))
+            elif r.handler is get_table:
+                R[path.split("?")[0]] = table(path)
+            else:
+                R[path] = call(path)
+    search = {}
+    for code, point, path in con.execute("""SELECT i.code, f.point_id, COALESCE(fl.path, '') FROM issues i
+                                            JOIN findings f ON f.issue_id=i.id
+                                            LEFT JOIN finding_locations fl ON fl.finding_id=f.id"""):
+        search.setdefault(code, set()).update([point, path])
+    for i in R["issues"]:
+        i["search"] = " ".join([i["code"], i["title"] or "", i.get("sub") or ""] + sorted(search.get(i["code"], ())))
     try:
         active = [r[0] for r in con.execute("SELECT value FROM issue_statuses WHERE active = 1 ORDER BY position")]
     except sqlite3.Error:
@@ -7986,10 +8647,9 @@ def hub_page(root, db, start=None, page=None):
     """The hub: the viewer page with the snapshot embedded (see HUB_PATCHES). start is the route it opens on when the
     address has no #route (e.g. 'plan/P-0001'). Returns (html, number of responses)."""
     page = PAGE if page is None else page
-    for old, new in HUB_PATCHES:
-        if page.count(old) != 1:
-            raise LedgerError(f"progress-page: page.html changed; this text is not in it exactly once: {old[:70]!r}")
-        page = page.replace(old, new)
+    (marker, script), = HUB_PATCHES
+    if page.count(marker) != 1:
+        raise LedgerError("progress-page: page.html changed; its main <script> was not found")
     con = connect(db, readonly=True)
     try:
         snap = hub_snapshot(root, db, con, start)
@@ -7999,10 +8659,7 @@ def hub_page(root, db, start=None, page=None):
     # bend the data script.
     data = json.dumps(snap, ensure_ascii=False, default=str, separators=(",", ":")).replace("<", "\\u003c")
     data = data.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
-    marker = '<script>\n"use strict";'
-    if page.count(marker) != 1:
-        raise LedgerError("progress-page: page.html changed; its main <script> was not found")
-    page = page.replace(marker, f"<script>window.LEDGER_SNAPSHOT = {data};</script>\n{marker}", 1)
+    page = page.replace(marker, script % data, 1)
     name = snap["responses"]["overview"].get("project") or root.name
     esc = str(name).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     page = page.replace("<title>Review ledger</title>", f"<title>Review ledger: {esc}</title>", 1)
@@ -10699,6 +11356,39 @@ def cmd_set_verdict(ctx):
     return [f"{rv['code']}: verdict recorded"]
 
 
+@_command("set-doc-url", "record the address of the document the owner keeps for a review or a plan",
+          "ledger.py set-doc-url R-0001|P-0001 URL [--actor A-0001]")
+def cmd_set_doc_url(ctx):
+    a, con = ctx.a, ctx.con
+    code = _need(a.code, "the review's or plan's code")
+    if not re.match(r"^[RP]-[0-9]+$", code):
+        raise WriteError(f"{code!r} is not a review or a plan; give R-0001 or P-0001")
+    url = _need(a.url, "the address").strip()
+    if not SAFE_URL.match(url):
+        raise WriteError(f"{url!r} is not an http(s) address")
+    if code.startswith("R-"):
+        ctx.x("UPDATE reviews SET summary_doc_url=? WHERE id=?", (url, review_row(con, code)["id"]))
+    else:
+        ctx.x("UPDATE plans SET doc_url=? WHERE id=?", (url, plan_row(con, code)["id"]))
+    return [f"{code}: document {url}"]
+
+
+@_command("plan-add-review", "add a review to the reviews a plan covers",
+          "ledger.py plan-add-review P-0001 R-0002 [--actor A-0001]")
+def cmd_plan_add_review(ctx):
+    a, con = ctx.a, ctx.con
+    pl = plan_row(con, _need(a.plan, "the plan's code"))
+    rv = review_row(con, _need(a.review, "the review's code"))
+    if pl["status"] in ("superseded", "abandoned"):
+        raise WriteError(f"{pl['code']} is {pl['status']}; add the review to the plan that replaced it")
+    if one(con, "SELECT 1 x FROM plan_reviews WHERE plan_id=? AND review_id=?", (pl["id"], rv["id"])):
+        raise WriteError(f"{pl['code']} already covers {rv['code']}")
+    ctx.x("INSERT INTO plan_reviews(plan_id, review_id) VALUES (?, ?)", (pl["id"], rv["id"]))
+    covered = rows(con, "SELECT r.code FROM plan_reviews pr JOIN reviews r ON r.id = pr.review_id "
+                        "WHERE pr.plan_id=? ORDER BY r.code", (pl["id"],))
+    return [f"{pl['code']}: covers {', '.join(r['code'] for r in covered)}"]
+
+
 @_command("add-metric", "record a measured, counted or estimated metric of a review",
           "ledger.py add-metric R-0001 NAME VALUE --method measured|counted|estimated [--domain D] [--repo NAME] "
           "[--scope all] [--unit U] [--note TEXT] [--actor A-0001]")
@@ -11027,6 +11717,8 @@ def add_write_commands_131(p):
     s.add_argument("--test", help="PATH::NAME (default: every guard test of the issue)")
     s.add_argument("--gone", action="store_true", help="the test no longer exists or no longer guards the issue")
     s = p("set-verdict"); s.add_argument("review"); s.add_argument("--verdict"); s.add_argument("--summary")
+    s = p("set-doc-url"); s.add_argument("code", help="R-0001 or P-0001"); s.add_argument("url")
+    s = p("plan-add-review"); s.add_argument("plan"); s.add_argument("review")
     s = p("add-metric"); s.add_argument("review"); s.add_argument("name"); s.add_argument("value")
     for o in ("--method", "--domain", "--repo", "--scope", "--unit", "--note"):
         s.add_argument(o)
@@ -11094,14 +11786,38 @@ class _TerminalSafeStream:
         return getattr(self._stream, name)
 
 
+def _discard_stdout(out):
+    """Point the process's standard output at the null device, so nothing written or flushed after the reader
+    closed raises again."""
+    try:
+        fd = out.fileno()
+        null = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(null, fd)
+        finally:
+            os.close(null)
+    except (OSError, ValueError, AttributeError):  # not a real file (a test's StringIO)
+        pass
+
+
 def main():
     """The CLI. Whatever way a command ends (return, sys.exit, an exception), the ledger connection it opened is
     closed before main() returns or raises. Everything it prints goes through terminal_safe(), the message of a
-    sys.exit("...") included (the interpreter prints that one after main() has returned)."""
+    sys.exit("...") included (the interpreter prints that one after main() has returned). When the reader of its
+    output closes early (`| head`), it ends quietly with exit 0."""
     out, err = sys.stdout, sys.stderr
     sys.stdout, sys.stderr = _TerminalSafeStream(out), _TerminalSafeStream(err)
     try:
-        return _main()
+        try:
+            result = _main()
+            out.flush()  # here, so a closed reader is noticed now and not when the interpreter exits
+            return result
+        except SystemExit:
+            out.flush()
+            raise
+    except BrokenPipeError:
+        _discard_stdout(out)  # the reader closed early (`ledger.py gates | head`): end quietly
+        return None
     except SystemExit as e:
         if isinstance(e.code, str):
             raise SystemExit(terminal_safe(e.code)) from None
@@ -11169,6 +11885,8 @@ def _main():
         inside_root = db.parent == root or root in db.parent.parents
         init(root, db, force=a.force, copy_tool=in_ledger_folder or where == "env",
              gitignore=in_ledger_folder and inside_root)
+        if old_sqlite_note():
+            print(old_sqlite_note(), file=sys.stderr)
         return
     if a.cmd == "migrate":
         migrate(db); return
@@ -11192,6 +11910,8 @@ def _main():
                   f"init records the new place)", file=sys.stderr)
         bad = check(con, quiet=a.quiet, full=a.full)
         bad += check_git_refs(root, con, quiet=a.quiet)
+        if old_sqlite_note():
+            print(old_sqlite_note(), file=sys.stderr)
         sys.exit(1 if bad else 0)
     elif a.cmd == "fill-refs":
         sys.exit(1 if fill_refs(root, con, a.review) else 0)

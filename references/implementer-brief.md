@@ -20,15 +20,16 @@ You write to the ledger only what belongs to your own steps, with `step-status`,
 writes the rest (issue statuses, gates, the plan).
 
 - Start: `python3 .code-review/ledger.py step-status <step> doing --note "<what you start>" --actor <your A- code>`.
-- Finish: `step-status <step> done --note "<for the owner, in plain sentences: what a person would now see or what is
-  now refused, anything that turned out different from the plan>" --commit <sha> --guard <test path>::<test name>`
-  (`--failed-before` when you saw the test fail before the fix). A further commit or a pull request:
+- Finish: `step-status <step> done --note "<for the owner, in plain sentences: what a person sees or what is refused
+  once the step is in, anything that turned out different from the plan>" --commit <sha> --guard <test path>::<test name>`
+  (`--failed-before` when you saw the test fail without the fix). Notes follow `references/writing.md`: <its rules,
+  copied here>. A further commit or a pull request:
   `add-commit <step> <sha> --pr <URL>`; a guard test for one issue: `add-guard ISS-0001 <test path> <test name>`.
   Leave out `--commit` where the owner's rules keep you from committing, and say so in the note.
 - Blocked on the owner: `step-status <step> waiting-owner --question "<the question>"`.
 
 ## Defects you discover that the plan does not cover (mandatory)
-Never just mention a new defect in a note, a comment or your final reply. Record it the moment you find it:
+Never leave a new defect in a note, a comment or your final reply. Record it the moment you find it:
 
     python3 .code-review/ledger.py report-finding --step <the step you were on> --severity H|M|L|T \
         --domain <domain code> --where '<path>:<start>-<end>#<symbol>' --summary '<one sentence>' \

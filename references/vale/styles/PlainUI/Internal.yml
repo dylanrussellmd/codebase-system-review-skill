@@ -1,0 +1,10 @@
+extends: existence
+message: "Internal name or raw value on screen ('%s')."
+level: error
+ignorecase: false
+nonword: true
+tokens:
+  - '\b[a-z]+(?:_[a-z0-9]+)+\b'
+  - '\b[a-z]+[A-Z][A-Za-z]+\b'
+  - '\b(?:null|undefined|NaN)\b'
+  - '\b[45]\d\d\b'

@@ -1,6 +1,6 @@
 # Indexing and matching
 
-Read this in Step 5a, to brief the indexers, and in Step 5d, to match. The file formats themselves are in
+Read this in Step 5a, to brief the indexers, and in Step 5d, to match. The file formats are in
 `references/formats/index.md`.
 
 ## The indexer brief

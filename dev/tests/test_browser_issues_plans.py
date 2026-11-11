@@ -87,20 +87,20 @@ class IssuesPlansExplore(browser.ViewerTestCase):
                          ["Opened", "Current state changed", "Raised as a new issue", "After state changed",
                           "Open → Fixed", "Fixed → Fixed and confirmed", "Checked"])
         self.assertIn(" · step 2 · ", page.texts(".timeline > div")[4])
-        self.assertEqual([r.split("\t")[:2] for r in page.texts("h3:text('Related issues') + div tbody tr")],
+        self.assertEqual([r.split("\t")[:2] for r in page.texts("h2:text('Related issues') + div tbody tr")],
                          [["Related to", "ISS-0004"]])   # the incoming side of related-to
-        self.assertEqual(page.texts("h3:text('Tests that guard the fix') + div tbody td:first-child"),
+        self.assertEqual(page.texts("h2:text('Tests that guard the fix') + div tbody td:first-child"),
                          ["tests/test_auth.py › test_code_uses_secrets"])
         page.hash("#/issue/ISS-0002")
         self.assertIn("Raised again (Still present)", [t.split(" — ", 1)[1].split(" · ")[0]
                                                        for t in page.texts(".timeline > div")])
-        self.assertEqual([r.split("\t")[:2] for r in page.texts("h3:text('Related issues') + div tbody tr")],
+        self.assertEqual([r.split("\t")[:2] for r in page.texts("h2:text('Related issues') + div tbody tr")],
                          [["Blocked by", "ISS-0003"]])
         page.hash("#/issue/ISS-0003")
         lines = [t.split(" — ", 1)[1] for t in page.texts(".timeline > div")]
         # (schema 3: the event no longer carries a stale review from an earlier check, so the note follows directly)
         self.assertIn("Severity Low → Medium", [x.split(" · ")[0].split("\n")[0] for x in lines])
-        self.assertEqual([r.split("\t")[:2] for r in page.texts("h3:text('Related issues') + div tbody tr")],
+        self.assertEqual([r.split("\t")[:2] for r in page.texts("h2:text('Related issues') + div tbody tr")],
                          [["Blocks", "ISS-0002"]])
         self.assertEqual(page.texts("#app > div:nth-of-type(1) .tag"), ["Medium", "Open", "Spec conformance",
                                                                         "Spec mismatch"])
@@ -127,24 +127,24 @@ class IssuesPlansExplore(browser.ViewerTestCase):
     def test_page_plan_phase_routing(self):
         page = self.open("#/plan/P-0001")
         self.assertEqual(self._rail(page), [["1Safety net0/1", "true"], ["2Fix first1/2", "false"]])
-        self.assertEqual(page.text("#app main h2"), "Phase 1 · Safety net")
-        self.assertEqual(page.contents("#app main h3"), ["CI"])     # steps grouped by section
-        self.assertEqual(page.texts("main details.item > summary .n"), ["1"])
+        self.assertEqual(page.text("#app .steps h2"), "Phase 1 · Safety net")
+        self.assertEqual(page.contents("#app .steps h3"), ["CI"])     # steps grouped by section
+        self.assertEqual(page.texts(".steps details.item > summary .n"), ["1"])
         facts = dict(zip(page.texts(".facts span"), page.texts(".facts b")))
         self.assertEqual(facts, {"steps": "3", "phases": "2", "points closed": "3"})
         page.hash("#/plan/P-0001/phase/2")
-        self.assertEqual(page.text("#app main h2"), "Phase 2 · Fix first")
-        self.assertEqual(page.texts("main details.item > summary .n"), ["2", "3"])
+        self.assertEqual(page.text("#app .steps h2"), "Phase 2 · Fix first")
+        self.assertEqual(page.texts(".steps details.item > summary .n"), ["2", "3"])
         # A rail click switches phase in place, rewrites the URL and clears the filters.
         page.page.locator("#app .tools input").fill("secrets")
         page.page.locator("nav.rail button").first.click()
         page.settle()
         self.assertEqual(page.location_hash(), "#/plan/P-0001/phase/1")
         self.assertEqual(page.js("document.querySelector('#app .tools input').value"), "")
-        self.assertEqual(page.text("#app main h2"), "Phase 1 · Safety net")
+        self.assertEqual(page.text("#app .steps h2"), "Phase 1 · Safety net")
         # Step tags and body.
         page.hash("#/plan/P-0001/phase/2")
-        tags = page.page.locator("main details.item", has_text="Make the notice period").locator(".tags .tag")
+        tags = page.page.locator(".steps details.item", has_text="Make the notice period").locator(".tags .tag")
         self.assertEqual(tags.all_inner_texts(), ["Waiting on you", "Your decision", "Changes behaviour"])
 
     def test_page_plan_filters(self):
@@ -157,15 +157,15 @@ class IssuesPlansExplore(browser.ViewerTestCase):
                 page.page.select_option("#app select[aria-label='Filter steps']", value)
                 page.settle()
                 if want is None:
-                    self.assertEqual(page.text("#app main h2"), "Phase 1 · Safety net")
+                    self.assertEqual(page.text("#app .steps h2"), "Phase 1 · Safety net")
                     continue
-                self.assertEqual(page.texts("main details.item > summary .n"), want)
+                self.assertEqual(page.texts(".steps details.item > summary .n"), want)
                 n = len(want)
-                self.assertEqual(page.text("#app main h2"),
+                self.assertEqual(page.text("#app .steps h2"),
                                  f"{n} matching {'step' if n == 1 else 'steps'} across all phases")
                 self.assertEqual([c for _, c in self._rail(page)], ["false", "false"])  # no phase is current
                 if not want:
-                    self.assertEqual(page.texts("main p.empty"), ["No step matches."])
+                    self.assertEqual(page.texts(".steps p.empty"), ["No step matches."])
 
     def test_page_plan_search_point_id(self):
         page = self.open("#/plan/P-0001")
@@ -175,21 +175,25 @@ class IssuesPlansExplore(browser.ViewerTestCase):
             with self.subTest(term):
                 search.fill(term)
                 page.settle()
-                self.assertEqual(page.texts("main details.item > summary .n"), want)
+                self.assertEqual(page.texts(".steps details.item > summary .n"), want)
         search.fill("SEC-H1")
         page.settle()
-        item = page.page.locator("main details.item").first
+        item = page.page.locator(".steps details.item").first
         item.locator("summary").click()
         self.assertEqual(item.locator(".ref .note").inner_text(), "Closes 1 point")
         self.assertEqual(item.locator(".ref .refline").first.locator(":scope > *").all_text_contents(),
                          ["R-0001 · SEC-H1", "High", "ISS-0001", "Sign-in codes come from a predictable random "
                                                                  "generator."])
 
-    def test_page_plan_without_phases(self):
-        page = self.open("#/plan/P-0002")
-        # characterization: ISS-0096 a plan with no phases fails to draw, with a raw JavaScript error
-        self.assertEqual(page.text("#app h1"), "Could not load this view")
-        self.assertIn("Cannot read properties of undefined", page.text("#app .status.err"))
+    def test_plan_without_phases_renders(self):
+        page = self.open("#/plan/P-0002")                 # ISS-0096: this used to fail with a raw JavaScript error
+        self.assertEqual(page.text("#app h1"), "P-0002 · Empty plan")
+        self.assertEqual(page.texts("#app p.empty"), ["This plan has no phases yet."])
+        self.assertEqual(page.count(".status.err"), 0)
+        self.assertEqual(page.count("nav.rail"), 0)
+        self.assertEqual(page.count("#app .tools"), 0)    # nothing to search or filter
+        facts = dict(zip(page.texts(".facts span"), page.texts(".facts b")))
+        self.assertEqual(facts, {"steps": "0", "phases": "0", "points closed": "0"})
 
     def test_page_rail_and_table_list_focus(self):
         page = self.open("#/plan/P-0001")
@@ -197,15 +201,13 @@ class IssuesPlansExplore(browser.ViewerTestCase):
         page.page.keyboard.press("Tab")
         got = page.js("""() => { const e = document.activeElement;
           return [e.closest('nav.rail') !== null, e.matches(':focus-visible'), getComputedStyle(e).outlineStyle]; }""")
-        # characterization: ISS-0028 a keyboard-focused phase rail button shows no focus outline
-        self.assertEqual(got, [True, True, "none"])
+        self.assertEqual(got, [True, True, "solid"])     # ISS-0028: a phase button shows the focus outline
         page.hash("#/explore")
         page.page.locator(".tlist button").first.focus()
         page.page.keyboard.press("Tab")
         got = page.js("""() => { const e = document.activeElement;
           return [e.closest('.tlist') !== null, e.matches(':focus-visible'), getComputedStyle(e).outlineStyle]; }""")
-        # characterization: ISS-0028 a keyboard-focused Explore table button shows no focus outline
-        self.assertEqual(got, [True, True, "none"])
+        self.assertEqual(got, [True, True, "solid"])     # and so does a table button in Explore
         # Other controls do get the outline.
         page.page.locator("#app textarea").focus()
         page.page.keyboard.press("Tab")
@@ -243,10 +245,10 @@ class IssuesPlansExplore(browser.ViewerTestCase):
         self.assertEqual(sorted(got), [["Line coverage", "Whole system · higher is better", 2],
                                        ["Line coverage", "demo · higher is better", 1],
                                        ["Mutation score", "src · higher is better", 2]])
-        self.assertEqual(page.texts("h3:text('Points per review') + div tbody td:first-child"), ["R-0001", "R-0002"])
-        self.assertEqual(page.texts("h3:text('Issues that keep coming back') + div tbody td:first-child"),
+        self.assertEqual(page.texts("h2:text('Points per review') + div tbody td:first-child"), ["R-0001", "R-0002"])
+        self.assertEqual(page.texts("h2:text('Issues that keep coming back') + div tbody td:first-child"),
                          ["ISS-0002"])
-        hot = page.page.locator("h3:text('Files that keep producing issues') + div tbody tr", has_text="src/auth.py")
+        hot = page.page.locator("h2:text('Files that keep producing issues') + div tbody tr", has_text="src/auth.py")
         page.after(hot.click)
         self.assertEqual(page.location_hash(), "#/issues?q=src%2Fauth.py")
         self.assertEqual(page.js("document.querySelector('#app input[type=search]').value"), "src/auth.py")
@@ -258,7 +260,7 @@ class IssuesPlansExplore(browser.ViewerTestCase):
     def test_page_explore_paging(self):
         page = self.open("#/explore")
         self.assertEqual(page.texts("#app .split > div:last-child p.empty"), ["Choose a table or view on the left."])
-        self.assertEqual(page.contents(".tlist h3"), ["Saved views", "Tables"])
+        self.assertEqual(page.contents(".tlist h2"), ["Saved views", "Tables"])
         page.after(lambda: page.page.locator(".tlist button[data-n=design_goals]").click())
         self.assertEqual(page.location_hash(), "#/explore/design_goals")
         self.assertEqual(page.js("document.querySelector('.tlist button[aria-current=true]').dataset.n"),
@@ -319,6 +321,44 @@ class IssuesPlansExplore(browser.ViewerTestCase):
         page.after(lambda: sql.press("Control+Enter"))
         self.assertEqual(page.text(out + " p.note"), "1000 rows (first 1,000 shown)")
         self.assertEqual(page.count(out + " tbody tr"), 1000)
+
+
+class LargePlan(browser.ViewerTestCase):
+    """A plan of one phase and 320 steps, every one matching the search 'step'."""
+
+    @classmethod
+    def build_ledger(cls, L):
+        plan = L.plan("P-0001", "Large plan")
+        phase = L.phase(plan, 1, "Everything")
+        for n in range(1, 321):
+            L.step(plan, phase, n, f"Step number {n}")
+        return {}
+
+    def test_plan_filter_truncation_notice(self):
+        page = self.open("#/plan/P-0001")
+        self.assertEqual(page.count(".steps details.item"), 320)          # a phase shows all its steps
+        search = page.page.locator("#app .tools input")
+        search.fill("step number")
+        page.settle()
+        self.assertEqual(page.text("#app .steps h2"), "320 matching steps across all phases")
+        self.assertEqual(page.count(".steps details.item"), 300)
+        self.assertEqual(page.text("#app .steps p.note"), "Showing the first 300.")
+        more = page.page.locator("#app .steps button")
+        self.assertEqual(more.inner_text(), "Show more (20 left)")
+        more.focus()
+        page.page.keyboard.press("Enter")
+        page.settle()
+        self.assertEqual(page.count(".steps details.item"), 320)
+        self.assertEqual(page.count("#app .steps p.note"), 0)
+        self.assertEqual(more.count(), 0)
+        self.assertEqual(page.js("document.activeElement.querySelector('.n').textContent"), "301")
+        search.fill("step number 31")                                     # 31 and 310-319: under the limit, no notice
+        page.settle()
+        self.assertEqual(page.text("#app .steps h2"), "11 matching steps across all phases")
+        self.assertEqual(page.count("#app .steps p.note"), 0)
+        search.fill("step")                                               # a new search starts again at 300
+        page.settle()
+        self.assertEqual(page.count(".steps details.item"), 300)
 
 
 if __name__ == "__main__":

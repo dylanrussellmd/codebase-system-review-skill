@@ -1,0 +1,32 @@
+# Words that carry nothing. dev/tests/test_writing_lint.py reads these tokens.
+extends: existence
+message: "Cut '%s'."
+level: error
+ignorecase: true
+tokens:
+  - (?:please )?note that
+  - it(?:'s| is) (?:important|worth|useful|helpful) (?:to|noting|mentioning)
+  - it should be noted
+  - keep in mind
+  - bear in mind
+  - be aware that
+  - as (?:mentioned|noted|described|stated|discussed) (?:above|below|earlier|before|previously)
+  - simply
+  - just
+  - easily
+  - obviously
+  - clearly
+  - of course
+  - basically
+  - essentially
+  - actually
+  - really
+  - very
+  - quite
+  - needless to say
+  - feel free to
+  - go ahead and
+  - make sure to
+  - be sure to
+  - in other words
+  - at the end of the day

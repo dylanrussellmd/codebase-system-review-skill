@@ -40,15 +40,15 @@ class Inbox(browser.ViewerTestCase):
         return ids
 
     def card(self, page, title):
-        return page.page.locator(".card.gate", has=page.page.locator("h2", has_text=title))
+        return page.page.locator(".card.gate", has=page.page.locator("h2, h3", has_text=title))
 
     def test_page_inbox_sections(self):
         page = self.open("#/inbox")
         self.assertEqual(page.text("#app h1"), "Waiting on you")
         # Open gates first (blocking first, then oldest), then the answered ones under their own heading.
-        self.assertEqual(page.texts(".card.gate h2"), ["Default notice period", "Approve the domains for R-0002",
+        self.assertEqual(page.texts(".card.gate h2, .card.gate h3"), ["Default notice period", "Approve the domains for R-0002",
                                                        "Anything else?", "No way to answer", "Approve the fix plan"])
-        self.assertEqual(page.contents("#app h3"), ["Answered, waiting for the agent to act",
+        self.assertEqual(page.contents("#app h2.sec"), ["Answered, waiting for the agent to act",
                                                  "Also waiting on you (answer in the chat)"])
         answered = self.card(page, "Approve the fix plan")
         self.assertIn("You answered: Approve the plan — Go ahead.", answered.inner_text())
@@ -159,7 +159,7 @@ class Reviews(browser.ViewerTestCase):
         self.assertEqual(page.location_hash(), "#/review/R-0001")
         self.assertEqual(page.text("#app h1"), "R-0001 · Comprehensive review R-0001")
         page.hash("#/reviews")
-        page.page.locator("tbody tr", has_text="R-0002").focus()
+        page.page.locator("tbody tr", has_text="R-0002").locator("a").focus()
         page.after(lambda: page.page.keyboard.press("Enter"))
         self.assertEqual(page.location_hash(), "#/review/R-0002")
 
@@ -230,7 +230,7 @@ class Reviews(browser.ViewerTestCase):
         self.assertEqual(btn.inner_text(), "Hide code")
         rows = ref.locator(".code tr")
         self.assertEqual(rows.count(), 5)                   # the whole 5-line file (8 lines of context around 1-3)
-        self.assertEqual(ref.locator(".code tr.hit td.ln").all_inner_texts(), ["1", "2", "3"])
+        self.assertEqual(ref.locator(".code tr.hit td.ln").all_text_contents(), ["1 cited", "2 cited", "3 cited"])
         self.assertEqual(ref.locator(".code tr td:not(.ln)").all_inner_texts(),
                          fixtures.DEMO_FILES_1["src/auth.py"].rstrip("\n").split("\n"))
         self.assertEqual(ref.locator("p.note").count(), 0)  # read from git and the saved excerpt matches
@@ -285,10 +285,10 @@ class PointsAndCode(browser.ViewerTestCase):
         tags = {pid: self.item(page, pid).locator("summary .tag").evaluate_all(
                     "ts => ts.map(t => [t.className, t.textContent])")
                 for pid in ("SPEC-M2", "SPEC-M3", "SPEC-M4", "SPEC-M5", "SPEC-L1")}
-        self.assertEqual(tags["SPEC-M2"], [["tag M", "Medium"], ["tag ", "Still present"], ["tag ok", "Confirmed"]])
+        self.assertEqual(tags["SPEC-M2"], [["tag M", "Medium"], ["tag", "Still present"], ["tag ok", "Confirmed"]])
         self.assertEqual(tags["SPEC-M3"], [["tag M", "Medium"], ["tag crit", "Came back"], ["tag", "False finding"]])
         self.assertEqual(tags["SPEC-M4"], [["tag M", "Medium"], ["tag crit", "Came back after a fix"]])
-        self.assertEqual(tags["SPEC-M5"], [["tag M", "Medium"], ["tag ", "Changed"]])  # partly: no tag
+        self.assertEqual(tags["SPEC-M5"], [["tag M", "Medium"], ["tag", "Changed"]])  # partly: no tag
         self.assertEqual(tags["SPEC-L1"], [["tag L", "Low"]])                       # unmatched: no match tag
         it = self.item(page, "SPEC-M2")
         it.locator("summary").click()
@@ -319,7 +319,7 @@ class PointsAndCode(browser.ViewerTestCase):
         note = exc.locator("p.note").inner_text()
         self.assertTrue(note.startswith("The commit could not be read from git here, so this is the copy of the "
                                         "lines saved at review time. Git said: "), note)
-        self.assertEqual(exc.locator(".code td.ln").all_inner_texts(), ["5", "6"])
+        self.assertEqual(exc.locator(".code td.ln").all_text_contents(), ["5 cited", "6 cited"])
         self.assertEqual(exc.locator(".code tr.hit td:not(.ln)").all_inner_texts(), ["five = 5", "six = 6"])
         self.assertIn("lines 5–6", exc.locator(".refline").first.inner_text())
         none = self._show(page, "SPEC-L2")

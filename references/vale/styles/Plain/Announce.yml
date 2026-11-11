@@ -1,0 +1,14 @@
+# Sentences that say a thing is coming, in place of the thing. dev/tests/test_writing_lint.py reads these tokens.
+extends: existence
+message: "Show it; don't announce it ('%s')."
+level: error
+ignorecase: true
+tokens:
+  - this (?:section|document|page|guide|file|README|chapter|table|module|function|method|class) (?:describes|explains|contains|covers|provides|shows|lists|outlines|is|will|handles)
+  - (?:the )?following (?:section|table|list|example|code|steps?) (?:describes?|shows?|lists?|explains?|illustrates?|contains?)
+  - (?:below|here) (?:is|are) (?:a|an|the|some)
+  - as (?:shown|seen|you can see) (?:below|above|here)
+  - in this (?:section|document|guide|tutorial),? (?:we|you)(?:'ll| will)
+  - let(?:'s| us) (?:take a look|look at|dive|explore|walk through|start by)
+  - welcome to
+  - we(?:'ll| will) (?:now )?(?:look at|cover|discuss|explain|go over|walk through)

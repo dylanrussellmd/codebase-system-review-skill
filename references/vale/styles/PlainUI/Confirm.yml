@@ -1,0 +1,6 @@
+extends: existence
+message: "Name the action and its consequence, not '%s'."
+level: error
+ignorecase: true
+tokens:
+  - are you sure

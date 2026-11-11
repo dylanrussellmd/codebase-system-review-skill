@@ -5,13 +5,14 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Review ledger</title>
 <style>
-:root{--bg:#f7f8f6;--surface:#fff;--fg:#1b2420;--muted:#5d6b64;--line:#dfe4e0;--accent:#0f6b57;--accent-soft:#e2f1ec;--warn:#9a5b00;--warn-soft:#fbefd9;--crit:#a3271f;--crit-soft:#fae6e3;--info:#2b5c99;--info-soft:#e5eefa;
+:root{--bg:#f7f8f6;--surface:#fff;--fg:#1b2420;--muted:#5d6b64;--line:#dfe4e0;--field:#828f88;--accent:#0f6b57;--accent-soft:#e2f1ec;--warn:#9a5b00;--warn-soft:#fbefd9;--crit:#a3271f;--crit-soft:#fae6e3;--info:#2b5c99;--info-soft:#e5eefa;
  --display:ui-rounded,"SF Pro Rounded","Segoe UI Variable Display","Segoe UI",system-ui,sans-serif;--body:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;color-scheme:light}
-@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#121715;--surface:#1a211e;--fg:#e6ece8;--muted:#9aa8a1;--line:#2c3632;--accent:#5fc9ae;--accent-soft:#17352d;--warn:#e7b25a;--warn-soft:#3a2c12;--crit:#f08d84;--crit-soft:#3d1c19;--info:#8db6ee;--info-soft:#1a2a40;color-scheme:dark}}
-:root[data-theme="dark"]{--bg:#121715;--surface:#1a211e;--fg:#e6ece8;--muted:#9aa8a1;--line:#2c3632;--accent:#5fc9ae;--accent-soft:#17352d;--warn:#e7b25a;--warn-soft:#3a2c12;--crit:#f08d84;--crit-soft:#3d1c19;--info:#8db6ee;--info-soft:#1a2a40;color-scheme:dark}
+:root[data-theme="dark"]{--bg:#121715;--surface:#1a211e;--fg:#e6ece8;--muted:#9aa8a1;--line:#2c3632;--field:#6b7a73;--accent:#5fc9ae;--accent-soft:#17352d;--warn:#e7b25a;--warn-soft:#3a2c12;--crit:#f08d84;--crit-soft:#3d1c19;--info:#8db6ee;--info-soft:#1a2a40;color-scheme:dark}
 *{box-sizing:border-box}
+html{scroll-padding-top:var(--top,110px)}
 body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 var(--body);padding:0 max(16px,env(safe-area-inset-right)) 64px max(16px,env(safe-area-inset-left))}
 a{color:var(--accent)}
+.skip{position:absolute;left:8px;top:-80px;z-index:10;background:var(--surface);padding:8px 12px;border:1px solid var(--field);border-radius:6px}.skip:focus{top:8px}
 .wrap{max-width:1180px;margin:0 auto;display:flex;flex-direction:column;gap:18px}
 .top{position:sticky;top:0;z-index:5;background:var(--bg);border-bottom:1px solid var(--line);padding:12px 0 0;margin:0 -4px}
 .top .row{max-width:1180px;margin:0 auto;display:flex;gap:16px;align-items:center;flex-wrap:wrap;padding:0 4px}
@@ -21,10 +22,11 @@ a{color:var(--accent)}
 .tabs a{text-decoration:none;color:var(--muted);padding:8px 12px;border-bottom:2px solid transparent;white-space:nowrap;font-weight:500}
 .tabs a[aria-current="page"]{color:var(--fg);border-color:var(--accent)}
 .badge{display:inline-block;min-width:20px;padding:0 6px;border-radius:999px;background:var(--warn);color:var(--bg);font:600 12px/20px var(--mono);text-align:center;margin-left:6px}
-.theme{margin-left:auto;all:unset;cursor:pointer;color:var(--muted);font-size:13px;padding:4px 8px;border:1px solid var(--line);border-radius:6px}
+.theme{all:unset;margin-left:auto;cursor:pointer;color:var(--muted);font-size:13px;padding:4px 8px;border:1px solid var(--line);border-radius:6px}
 h1{font:600 26px/1.15 var(--display);margin:18px 0 0;text-wrap:balance}
-h2{font:600 19px/1.2 var(--display);margin:8px 0 0}
-h3{font:600 12px var(--body);letter-spacing:.07em;text-transform:uppercase;color:var(--muted);margin:14px 0 4px}
+h1,h2,h3,.lede,.status,.note,.gate .q,.gate .ctx,.refline,.refline code,.opts label,.timeline>div,li{overflow-wrap:anywhere}
+h2,h3.title{font:600 19px/1.2 var(--display);margin:8px 0 0;letter-spacing:normal;text-transform:none;color:inherit}
+h3,h2.sec{font:600 12px var(--body);letter-spacing:.07em;text-transform:uppercase;color:var(--muted);margin:14px 0 4px}
 .lede{color:var(--muted);max-width:72ch;margin:4px 0 0}
 .facts{display:flex;flex-wrap:wrap;gap:10px 28px;font-variant-numeric:tabular-nums}
 .facts div b{font:600 22px var(--display);display:block}
@@ -33,22 +35,29 @@ h3{font:600 12px var(--body);letter-spacing:.07em;text-transform:uppercase;color
 .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}
 .tools{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
 input,select,textarea,button{font:inherit;color:var(--fg)}
-.tools input,.tools select,textarea{background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:8px 10px;min-width:0}
+.field{background:var(--surface);border:1px solid var(--field);border-radius:6px;padding:8px 10px;min-width:0}
 .tools input{flex:1 1 240px}
 textarea{width:100%;min-height:72px;resize:vertical}
+input[type=radio]{accent-color:var(--accent)}
 button.btn{cursor:pointer;background:var(--accent);color:var(--bg);border:0;border-radius:6px;padding:8px 14px;font-weight:600}
 button.btn.ghost{background:transparent;color:var(--accent);border:1px solid var(--line)}
 button.btn:disabled{opacity:.5;cursor:default}
 :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+h1:focus{outline:none}
 table{border-collapse:collapse;width:100%;font-size:14px}
 th{text-align:left;font:600 12px var(--body);color:var(--muted);text-transform:uppercase;letter-spacing:.05em;padding:6px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
 td{padding:7px 8px;border-bottom:1px solid var(--line);vertical-align:top;overflow-wrap:break-word;min-width:4ch}
 .grid td{white-space:nowrap;max-width:360px;overflow:hidden;text-overflow:ellipsis}
-td:first-child{white-space:nowrap}tr.link{cursor:pointer}tr.link:hover td{background:var(--accent-soft)}
+td:first-child{white-space:nowrap}tr.link{cursor:pointer}tr.link:hover td{background:var(--accent-soft)}tr.link a{text-decoration:none}tr.link a:hover,tr.link a:focus-visible{text-decoration:underline}
 .scroll{overflow-x:auto}
 .num{font-variant-numeric:tabular-nums;text-align:right}
 .mono,code{font:500 12.5px var(--mono)}
 .muted{color:var(--muted)}
+.visually-hidden{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip-path:inset(50%);white-space:nowrap;border:0}
+.stack{display:flex;flex-direction:column;gap:8px;min-width:0}.stack.loose{gap:10px}
+.card-link{margin:10px 0}
+.progress{display:flex;flex-direction:column;gap:4px;margin-top:4px}
+.card.grid{padding:0}
 .tag{display:inline-block;font:500 11px/1.6 var(--mono);padding:0 7px;border-radius:999px;background:var(--line);color:var(--fg);white-space:nowrap;margin:0 4px 2px 0}
 .tag.H,.tag.crit{background:var(--crit-soft);color:var(--crit)}.tag.M,.tag.warn{background:var(--warn-soft);color:var(--warn)}
 .tag.info{background:var(--info-soft);color:var(--info)}.tag.ok{background:var(--accent-soft);color:var(--accent)}.tag.solid{background:var(--accent);color:var(--bg)}.tag.you{background:var(--warn);color:var(--bg)}
@@ -56,26 +65,28 @@ details.item{background:var(--surface);border:1px solid var(--line);border-radiu
 details.item>summary{cursor:pointer;list-style:none;display:grid;grid-template-columns:minmax(90px,auto) minmax(0,1fr) auto;gap:10px;padding:10px 12px;align-items:baseline}
 details.item>summary::-webkit-details-marker{display:none}
 details.item>summary .n{font:500 13px var(--mono);color:var(--muted)}
-details.item>summary .t{font-weight:500}
+details.item>summary .n::before{content:"▸ ";content:"▸ " / ""}details.item[open]>summary .n::before{content:"▾ ";content:"▾ " / ""}
+details.item>summary .t{font-weight:500;overflow-wrap:anywhere}
 details.item>summary .tags{display:flex;flex-wrap:wrap;justify-content:flex-end}
 .body{padding:2px 14px 14px;display:flex;flex-direction:column;gap:10px}
 dl.kv{margin:0;display:grid;grid-template-columns:150px minmax(0,1fr);gap:6px 14px}
 dl.kv dt{color:var(--muted);font-size:13px}dl.kv dd{margin:0;overflow-wrap:anywhere;white-space:pre-wrap}
 .ref{border-top:1px solid var(--line);padding-top:8px;display:flex;flex-direction:column;gap:6px}
-.refline{display:flex;flex-wrap:wrap;gap:6px 12px;align-items:baseline;font-size:13px}
+.refline{display:flex;flex-wrap:wrap;gap:6px 12px;align-items:baseline;font-size:13px}.refline>*{min-width:0}
 .code{background:var(--bg);border:1px solid var(--line);border-radius:6px;overflow:auto;max-height:420px}
 .code table{font:12.5px/1.45 var(--mono)}
 .code td{border:0;padding:0 10px;white-space:pre;overflow-wrap:normal}
 .code td.ln{color:var(--muted);text-align:right;user-select:none;width:1%}
-.code tr.hit td{background:var(--warn-soft)}
+.code tr.hit td{background:var(--warn-soft)}.code tr.hit td.ln{box-shadow:inset 3px 0 var(--warn);color:var(--fg)}
 .note{font-size:13px;color:var(--muted)}
 .mdtext{white-space:pre-wrap;overflow-wrap:anywhere;max-height:480px;overflow:auto;font-size:14px}
 .status{padding:10px 12px;border-radius:6px;background:var(--accent-soft);color:var(--accent)}
 .status.err{background:var(--crit-soft);color:var(--crit)}
 .cols{display:grid;grid-template-columns:270px minmax(0,1fr);gap:24px;align-items:start}
-nav.rail{display:flex;flex-direction:column;gap:2px;position:sticky;top:110px}
+nav.rail{display:flex;flex-direction:column;gap:2px;position:sticky;top:var(--top,110px)}
 nav.rail button{all:unset;cursor:pointer;display:grid;grid-template-columns:24px 1fr auto;gap:8px;padding:7px 10px;border-radius:6px;font-size:14px;align-items:baseline}
 nav.rail button:hover{background:var(--accent-soft)}
+nav.rail button:focus-visible,.tlist button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 nav.rail button[aria-current="true"]{background:var(--accent);color:var(--bg)}
 nav.rail .i,nav.rail .c{font:500 12px var(--mono);opacity:.8}
 .bar{height:8px;border-radius:999px;background:var(--line);overflow:hidden;display:flex;max-width:520px}.bar i{display:block;height:100%}
@@ -84,7 +95,7 @@ nav.rail .i,nav.rail .c{font:500 12px var(--mono);opacity:.8}
 .gate .q{font-weight:500;white-space:pre-wrap}
 .gate .ctx{white-space:pre-wrap;color:var(--muted);font-size:14px;max-height:260px;overflow:auto}
 .opts{display:flex;flex-direction:column;gap:6px}
-.opts label{display:grid;grid-template-columns:20px 1fr;gap:6px;padding:8px 10px;border:1px solid var(--line);border-radius:6px;cursor:pointer}
+.opts label{display:grid;grid-template-columns:20px 1fr;gap:6px;padding:8px 10px;border:1px solid var(--field);border-radius:6px;cursor:pointer}
 .opts label:has(input:checked){border-color:var(--accent);background:var(--accent-soft)}
 .opts small{display:block;color:var(--muted)}
 .timeline{display:flex;flex-direction:column;gap:0;border-left:2px solid var(--line);margin-left:6px}
@@ -93,19 +104,22 @@ nav.rail .i,nav.rail .c{font:500 12px var(--mono);opacity:.8}
 .empty{color:var(--muted);padding:18px 0}
 .chart svg{width:100%;height:auto;display:block}
 .split{display:grid;grid-template-columns:260px minmax(0,1fr);gap:20px;align-items:start}
-.tlist{display:flex;flex-direction:column;gap:1px;max-height:70vh;overflow:auto}
+.tlist{display:flex;flex-direction:column;gap:1px;max-height:70vh;overflow:auto;padding:4px}
 .tlist button{all:unset;cursor:pointer;display:flex;justify-content:space-between;gap:8px;padding:5px 8px;border-radius:5px;font:13px var(--mono)}
 .tlist button:hover{background:var(--accent-soft)}.tlist button[aria-current="true"]{background:var(--accent);color:var(--bg)}
-@media (max-width:820px){.cols,.split{grid-template-columns:minmax(0,1fr)}nav.rail{position:static;flex-direction:row;overflow-x:auto}nav.rail button{grid-template-columns:auto auto auto;white-space:nowrap;border:1px solid var(--line)}
+@media (max-width:600px){.tabs{flex-wrap:wrap;overflow-x:visible}.top{position:static}}
+@media (max-width:820px){.cols,.split{grid-template-columns:minmax(0,1fr)}nav.rail{position:static;flex-direction:row;overflow-x:auto;padding:4px}nav.rail button{grid-template-columns:auto auto auto;white-space:nowrap;border:1px solid var(--line)}
  details.item>summary{grid-template-columns:auto minmax(0,1fr)}details.item>summary .tags{grid-column:1/-1;justify-content:flex-start}dl.kv{grid-template-columns:minmax(0,1fr)}dl.kv dt{margin-top:6px}.tlist{max-height:220px}}
 </style>
 </head>
 <body>
+<a class="skip" id="skip" href="#app">Skip to content</a>
 <header class="top">
-  <div class="row"><span class="brand" id="brand">Review ledger</span><button class="theme" id="theme" type="button">Theme: auto</button></div>
+  <div class="row"><span class="brand" id="brand">Review ledger</span><button class="theme" id="theme" type="button">Theme: Automatic</button></div>
   <nav class="tabs" id="tabs" aria-label="Sections"></nav>
 </header>
-<div class="wrap" id="app" aria-live="polite"></div>
+<main class="wrap" id="app"></main>
+<div class="visually-hidden" id="live" role="status"></div>
 <script>
 "use strict";
 // The token arrives once, in the launch URL's fragment (#k=<token>, optionally followed by #/route); it is kept in
@@ -123,6 +137,121 @@ function takeToken(){
 }
 takeToken();
 let LABELS = {domains:{}, themes:{}}, OVERVIEW = null;
+
+// ---------- the shared copy
+// `ledger.py progress-page` writes this page as one file with every API answer embedded (window.LEDGER_SNAPSHOT).
+// STATIC is that data; in the viewer it is null. With it the page answers api() from the data, routes on hash names
+// an artifact allows (#issue-ISS-0019), shows the How it works tab, and saves gate answers in the artifact's
+// database (collection "answers", one document per gate code) for `ledger.py import-answers`.
+const STATIC = (s => s && typeof s === "object" && s.responses ? s : null)(window.LEDGER_SNAPSHOT);
+let CUR_PATH = null;
+const ACTIVE = STATIC ? STATIC.active : [];
+const slugOf = p => (p || "").split("?")[0].replace(/^#\/?/, "").replace(/[\/_]/g, "-").replace(/[^A-Za-z0-9-]/g, "") || "home";
+function pathFromSlug(s){
+  s = (s || "").replace(/^#/, "");
+  if (!s || s === "home") return STATIC && STATIC.start && CUR_PATH === null ? STATIC.start : "";
+  const m = s.match(/^([a-z]+)(?:-(.*))?$/); if (!m) return "";
+  const [, view, rest] = m;
+  if (!rest) return view;
+  if (view === "plan") { const p = rest.match(/^(P-\d+)(?:-phase-(\d+))?$/); return p ? `plan/${p[1]}` + (p[2] ? `/phase/${p[2]}` : "") : "plans"; }
+  if (view === "explore") { const t = (STATIC.responses.tables || []).find(t => t.name.replace(/_/g, "-") === rest); return t ? `explore/${t.name}` : "explore"; }
+  return `${view}/${rest}`;
+}
+function nav(hash){ CUR_PATH = hash.replace(/^#\/?/, ""); const s = slugOf(CUR_PATH); if (location.hash.slice(1) === s) route(); else location.hash = s; }
+function setPath(hash){ if (!STATIC) { history.replaceState(null, "", hash); return; } CUR_PATH = hash.replace(/^#\/?/, ""); try { history.replaceState(null, "", "#" + slugOf(CUR_PATH)); } catch {} }
+function currentPath(){
+  if (!STATIC) return location.hash.replace(/^#\/?/, "");
+  const s = location.hash.slice(1);
+  if (CUR_PATH === null || slugOf(CUR_PATH) !== (s || "home")) CUR_PATH = pathFromSlug(s);
+  return CUR_PATH;
+}
+function staticApi(path, body){
+  if (body !== undefined) return Promise.reject(new Error("This shared copy is read-only. Answer in the chat with Claude, or run the local viewer."));
+  const S = STATIC.responses, [p, q] = path.split("?"), qs = new URLSearchParams(q || "");
+  const copy = v => JSON.parse(JSON.stringify(v));
+  if (p === "issues") {
+    const st = qs.get("status"), sv = qs.get("severity"), dm = qs.get("domain_code"), t = (qs.get("q") || "").toLowerCase();
+    return Promise.resolve(copy(S.issues.filter(i => (!st || (st === "active" ? ACTIVE.includes(i.status) : i.status === st))
+      && (!sv || i.severity === sv) && (!dm || i.domain_code === dm) && (!t || i.search.toLowerCase().includes(t)))));
+  }
+  if (p === "gates") return Promise.resolve(copy(S["gates?status=" + (qs.get("status") || "pending")] || S["gates?status=all"]));
+  if (p.startsWith("table/")) {
+    const t = S[p]; if (!t) return Promise.reject(new Error("That table is not in this snapshot."));
+    const off = Number(qs.get("offset")) || 0, lim = Number(qs.get("limit")) || 100;
+    return Promise.resolve({columns: t.columns, rows: copy(t.rows.slice(off, off + lim)), count: t.count, offset: off, limit: lim});
+  }
+  if (S[p] === undefined) return Promise.reject(new Error("This view is not in the snapshot."));
+  return Promise.resolve(copy(S[p]));
+}
+
+const HUB = {db: null, answers: {}, error: null};
+const OPEN_GATES = () => STATIC ? (STATIC.responses["gates?status=pending"].gates || []).filter(g => g.status === "open").map(g => g.code) : [];
+const hubAnsweredOpen = () => OPEN_GATES().filter(c => HUB.answers[c]).length;
+async function hubInit(){
+  if (!STATIC || !window.claude || typeof window.claude.use !== "function") return;
+  try {
+    const db = await window.claude.use("db"); if (!db) return;
+    HUB.db = db;
+    db.collection("answers").onSnapshot(snap => {
+      HUB.answers = Object.fromEntries(snap.docs.map(d => [d.id, d.data()]));
+      const cur = document.querySelector('#tabs a[aria-current="page"]');
+      if (OVERVIEW) drawTabs(cur ? (cur.dataset.k || "") : "");
+    }, e => { HUB.error = e && e.code; });
+  } catch (e) { HUB.error = String(e); }
+}
+function md(text){
+  const lines = String(text || "").split("\n"), out = []; let i = 0;
+  const inline = str => { const parts = []; const re = /(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\(https?:\/\/[^)\s]+\))/g; let last = 0, m;
+    while ((m = re.exec(str))) { if (m.index > last) parts.push(str.slice(last, m.index)); const t = m[0];
+      if (t.startsWith("**")) parts.push(h("b", null, t.slice(2, -2)));
+      else if (t.startsWith("`")) parts.push(h("code", null, t.slice(1, -1)));
+      else { const mm = t.match(/^\[([^\]]+)\]\((.+)\)$/); parts.push(h("a", {href: mm[2], target: "_blank", rel: "noopener noreferrer"}, mm[1])); }
+      last = re.lastIndex; }
+    if (last < str.length) parts.push(str.slice(last)); return parts; };
+  const cells = r => r.replace(/^\|/, "").replace(/\|\s*$/, "").split("|").map(c => c.trim());
+  while (i < lines.length) {
+    const l = lines[i]; let m;
+    if (!l.trim()) { i++; continue; }
+    if ((m = l.match(/^(#{1,4})\s+(.*)/))) { out.push(h("h" + Math.min(m[1].length + 1, 4), null, inline(m[2]))); i++; continue; }
+    if (l.startsWith("|")) { const rows = []; while (i < lines.length && lines[i].startsWith("|")) rows.push(lines[i++]);
+      out.push(h("div", {class: "scroll"}, h("table", null, h("thead", null, h("tr", null, cells(rows[0]).map(c => h("th", null, inline(c))))),
+        h("tbody", null, rows.slice(2).map(r => h("tr", null, cells(r).map(c => h("td", null, inline(c))))))))); continue; }
+    if (/^(\d+\.|-)\s/.test(l)) { const ordered = /^\d+\./.test(l), items = []; while (i < lines.length && /^(\d+\.|-)\s/.test(lines[i])) items.push(lines[i++].replace(/^(\d+\.|-)\s+/, ""));
+      out.push(h(ordered ? "ol" : "ul", null, items.map(t => h("li", null, inline(t))))); continue; }
+    const para = []; while (i < lines.length && lines[i].trim() && !/^(#{1,4}\s|\||\d+\.\s|-\s)/.test(lines[i])) para.push(lines[i++]);
+    out.push(h("p", null, inline(para.join(" "))));
+  }
+  return h("div", {class: "md"}, out);
+}
+function hubGateBody(card, g, hid){
+  const saved = HUB.answers[g.code];
+  if (saved) { add(card, h("p", {class: "status"}, "You answered: ", answerText({options: g.options, ...saved}, true), ". Claude records it the next time it checks (or tell Claude in the chat to check now).")); return card; }
+  if (!HUB.db) { add(card, h("p", {class: "note"}, "Answer in the chat with Claude; answering here needs you signed in to claude.ai as this page's owner.")); return card; }
+  const nm = "opt-" + g.code;
+  const opts = (g.options || []).length ? h("div", {class: "opts", role: "radiogroup", "aria-labelledby": hid},
+    g.options.map(o => h("label", null, h("input", {type: "radio", name: nm, value: o.value}), h("span", null, o.label, o.description ? h("small", null, o.description) : null)))) : null;
+  const ta = g.allow_text ? h("textarea", {class: "field", placeholder: opts ? "Add a note or a different answer (optional)" : "Your answer", id: hid + "-text", "aria-label": "Your answer", "aria-labelledby": `${hid}-text ${hid}`}) : null;
+  const msg = h("div"), form = h("div", {class: "gate"});
+  const send = h("button", {class: "btn", type: "button", id: hid + "-send", "aria-labelledby": `${hid}-send ${hid}`, onclick: async () => {
+    const picked = card.querySelector(`input[name="${nm}"]:checked`), val = picked ? picked.value : null, txt = ta ? ta.value.trim() : "";
+    if (!val && !txt) { put(msg, errorBox("Choose an option or write an answer.")); return; }
+    send.disabled = true;
+    try {
+      await HUB.db.doc("answers/" + g.code).set({gate: g.code, answer_value: val, answer_text: txt || null, answered_at: new Date().toISOString()});
+      HUB.answers[g.code] = {answer_value: val, answer_text: txt || null};
+      put(form, h("p", {class: "status"}, "Saved. Claude records it the next time it checks (or tell Claude in the chat to check now)."));
+      say("Answer saved.");
+      drawTabs("inbox");
+    } catch (e) { put(msg, errorBox("Your answer could not be saved here" + (e && e.code === "invalid_argument" ? ": only this page's owner can answer." : ". Try again, or answer in the chat."))); send.disabled = false; }
+  }}, "Send answer");
+  add(form, opts, ta, h("div", null, send), msg); add(card, form); return card;
+}
+
+if (STATIC) document.addEventListener("click", e => {
+  const a = e.target.closest && e.target.closest('a[href^="#/"]');
+  if (!a || e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey) return;
+  e.preventDefault(); nav(a.getAttribute("href"));
+});
 
 // ---------- helpers
 function h(tag, attrs, ...kids){
@@ -147,6 +276,7 @@ function extLink(u, text){
 function put(el, ...kids){ el.replaceChildren(...kids.flat(Infinity).filter(k => k != null && k !== false && k !== "").map(k => k instanceof Node ? k : document.createTextNode(String(k)))); return el; }
 function add(el, ...kids){ for (const k of kids.flat(Infinity)) if (k != null && k !== false && k !== "") el.append(k instanceof Node ? k : String(k)); return el; }
 async function api(path, body){
+  if (STATIC) return staticApi(path, body);
   const opt = {headers:{"X-Ledger-Token":TOKEN}};
   if (body !== undefined) { opt.method = "POST"; opt.headers["Content-Type"] = "application/json"; opt.body = JSON.stringify(body); }
   const r = await fetch("/api/" + path, opt);
@@ -170,40 +300,125 @@ setLabels({});
 const lab = (map, v) => (L[map] && L[map][v] !== undefined) ? L[map][v] : words(v);
 const domainName = c => c ? (LABELS.domains[c] || words(c)) : "";
 const themeName = c => c ? (LABELS.themes[c] || words(c)) : "";
-const sevTag = s => h("span", {class:"tag " + s, title:"Severity"}, lab("sev", s));
-const issueTone = s => ({open:"warn","needs-decision":"you",regressed:"crit",planned:"info","in-progress":"info",fixed:"ok",verified:"solid"})[s] || "";
-const issueTag = s => h("span", {class:"tag " + issueTone(s)}, lab("issue", s));
-function when(iso, withTime=true){
-  if (!iso) return "";
-  const d = new Date(iso); if (isNaN(d)) return iso;
+// The colour of a tag, by label map and stored value: the one place a value gets its tone.
+const TONE = {
+  issue:{open:"warn", "needs-decision":"you", regressed:"crit", planned:"info", "in-progress":"info", fixed:"ok", verified:"solid"},
+  match:{recurrence:"crit", regression:"crit", new:"info"},
+  verif:{confirmed:"ok"},
+  gate:{"production-action":"crit"}, gstat:{open:"you"},
+  goal:{approved:"ok", proposed:"you"},
+  step:{done:"solid", doing:"ok", "waiting-owner":"you"},
+  need:{production:"crit", decision:"warn", confirm:"info", review:"info"},
+  area:{included:"ok"},
+};
+const tone = (map, v) => (TONE[map] && TONE[map][v]) || "";
+const tag = (text, cls, title) => h("span", {class:"tag" + (cls ? " " + cls : ""), title}, text);
+const labTag = (map, v) => tag(lab(map, v), tone(map, v));
+const sevTag = s => tag(lab("sev", s), s, "Severity");
+const issueTag = s => labTag("issue", s);
+const plural = (n, one, many) => `${n} ${n === 1 ? one : (many || one + "s")}`;
+// A stored time in the reader's own words and time zone. Stored times are UTC: "2026-01-02T03:04:05.000Z", also
+// with a space for the T, without the Z, or with an offset. A date alone is shown as that day. Nothing gives "",
+// and text that is not a time gives "date unknown".
+const NO_DATE = "date unknown";
+function when(stored, withTime=true){
+  if (stored == null || stored === "") return "";
+  const text = String(stored).trim(), valid = d => !isNaN(d) && d.toISOString().slice(0, 10);
+  let m = /^(\d{4})-(\d\d)-(\d\d)$/.exec(text);
+  if (m) {
+    const d = new Date(Date.UTC(+m[1], m[2] - 1, +m[3]));
+    return valid(d) === text ? d.toLocaleDateString(undefined, {dateStyle:"medium", timeZone:"UTC"}) : NO_DATE;
+  }
+  m = /^(\d{4}-\d\d-\d\d)[T ](\d\d:\d\d)(:\d\d)?(\.\d{1,3})?\d*\s*(Z|[+-]\d\d:?\d\d)?$/i.exec(text);
+  if (!m) return NO_DATE;
+  const zone = (m[5] || "Z").replace(/^([+-]\d\d)(\d\d)$/, "$1:$2").toUpperCase();
+  const d = new Date(`${m[1]}T${m[2]}${m[3] || ":00"}${m[4] || ""}${zone}`);
+  if (!valid(d) || valid(new Date(m[1] + "T00:00:00Z")) !== m[1]) return NO_DATE;
   return d.toLocaleString(undefined, withTime ? {dateStyle:"medium", timeStyle:"short"} : {dateStyle:"medium"});
+}
+// The same, for a table cell or a value shown on its own: text that is not a time keeps what was stored as a tooltip.
+function whenCell(stored, withTime){
+  const t = when(stored, withTime);
+  return t === NO_DATE ? h("span", {title:String(stored)}, t) : t;
 }
 const short = sha => sha ? sha.slice(0, 10) : "";
 const kv = pairs => h("dl", {class:"kv"}, pairs.filter(p => p[1] != null && p[1] !== "" && !(Array.isArray(p[1]) && !p[1].length)).map(([k,v]) => [h("dt", null, k), h("dd", null, v)]));
 const empty = t => h("p", {class:"empty"}, t);
-function table(cols, data, onRow){
-  if (!data.length) return empty("Nothing here yet.");
+const sect = title => h("h2", {class:"sec"}, title);   // a section of a page: second level, in the small style
+// Words for a screen reader about something that just happened (a count after filtering, an answer saved, an error).
+const say = text => { document.getElementById("live").textContent = text || ""; };
+function errorBox(e, quiet){
+  const text = e && e.message ? e.message : String(e);
+  if (!quiet) say(text);
+  return h("p", {class:"status err"}, text);
+}
+const fact = (n, label) => h("div", null, h("b", null, n), h("span", null, label));
+// One expandable row: number, title, tags, and the body shown when it is opened.
+function item(n, title, tags, body){
+  return h("details", {class:"item"},
+    h("summary", null, h("span", {class:"n"}, n), h("span", {class:"t"}, title), h("span", {class:"tags"}, tags)),
+    h("div", {class:"body"}, body));
+}
+const select = (label, options, attrs) => h("select", {class:"field", "aria-label":label, ...attrs}, options.map(([v, t]) => h("option", {value:v}, t)));
+// A row of filters. onChange(true) runs when a select changes and as a search box is typed in (after `wait` ms of quiet).
+function filterBar(controls, onChange, wait=0){
+  let timer;
+  const now = () => onChange(true), typed = wait ? () => { clearTimeout(timer); timer = setTimeout(now, wait); } : now;
+  for (const c of controls) c.addEventListener(c.tagName === "SELECT" ? "change" : "input", c.tagName === "SELECT" ? now : typed);
+  return h("div", {class:"tools"}, controls);
+}
+// A gate's answer as the owner gave it: the chosen option's label, then the note.
+function answerText(g, strong){
+  const label = g.answer_value ? optLabel(g) : "", note = g.answer_text || "";
+  if (!strong) return [label, note].filter(Boolean).join(" — ");
+  return [label ? h("b", null, label) : null, note ? (label ? " — " : "") + note : null];
+}
+// A table. href(row) gives the page a row opens ("#/issue/ISS-0001"), or nothing for a row that opens none: the row's
+// first cell (or the column marked link) is then a real link, and a click anywhere on the row follows it.
+function table(cols, data, href, none="Nothing here yet."){
+  if (!data.length) return empty(none);
+  const at = Math.max(0, cols.findIndex(c => c.link));
+  const row = r => {
+    const to = href && href(r);
+    const cell = (c, i) => { const v = c.get ? c.get(r) : (r[c.key] ?? ""); return h("td", {class:c.num ? "num" : null}, to && i === at ? h("a", {href:to}, v) : v); };
+    const open = e => { if (!e.target.closest("a, button") && !String(getSelection())) go(to); };
+    return h("tr", to ? {class:"link", onclick:open} : null, cols.map(cell));
+  };
   return h("div", {class:"scroll"}, h("table", null,
     h("thead", null, h("tr", null, cols.map(c => h("th", {class:c.num ? "num" : null}, c.label)))),
-    h("tbody", null, data.map(r => h("tr", onRow ? {class:"link", tabindex:"0", onclick:() => onRow(r), onkeydown:e => { if (e.key === "Enter") onRow(r); }} : null,
-      cols.map(c => h("td", {class:c.num ? "num" : null}, c.get ? c.get(r) : (r[c.key] ?? ""))))))));
+    h("tbody", null, data.map(row))));
 }
-function copyBtn(text, label="Copy"){
-  return h("button", {class:"btn ghost", type:"button", onclick:async e => {
+// name: what a screen reader calls the button when the page has several with the same label.
+function copyBtn(text, label="Copy", name){
+  return h("button", {class:"btn ghost", type:"button", "aria-label":name, onclick:async e => {
     try { await navigator.clipboard.writeText(text); e.target.textContent = "Copied"; } catch { e.target.textContent = "Select and copy by hand"; }
+    say(e.target.textContent);
   }}, label);
 }
-function go(hash){ location.hash = hash; }
-function setView(...kids){ put(document.getElementById("app"), kids); window.scrollTo(0,0); }
-function failed(err){ setView(h("h1", null, "Could not load this view"), h("p", {class:"status err"}, err.message), h("p", {class:"lede"}, "Make sure the viewer is still running in your terminal, then reload the page.")); }
+function go(hash){ if (STATIC) return nav(hash); location.hash = hash; }
+// Draws a view. After the first one, focus moves to the new page's heading, so the keyboard and a screen reader
+// start where the page starts.
+let DRAWN = false;
+function focusHeading(){ const t = document.querySelector("#app h1") || document.getElementById("app"); t.tabIndex = -1; t.focus({preventScroll:true}); }
+function setView(...kids){
+  put(document.getElementById("app"), kids); window.scrollTo(0,0);
+  if (DRAWN) focusHeading();
+  DRAWN = true;
+}
+function failed(err){ setView(h("h1", null, "Could not load this view"), errorBox(err), h("p", {class:"lede"}, STATIC ? "This is a read-only snapshot; reload the page to start again." : "Make sure the viewer is still running in your terminal, then reload the page.")); }
 
 // ---------- code at a commit
-function codeRef(loc){
+// point: the id of the point citing these lines (it tells this reference's buttons from another's).
+function codeRef(loc, point){
   const box = h("div");
   const range = loc.line_start ? (loc.line_end && loc.line_end !== loc.line_start ? `lines ${loc.line_start}–${loc.line_end}` : `line ${loc.line_start}`) : "";
+  const where = `${point}, ${loc.path}${range ? ", " + range : ""}, commit ${short(loc.commit_sha)}`;
+  const label = t => { btn.textContent = t; btn.setAttribute("aria-label", `${t}: ${where}`); };
+  let busy = false;   // not `disabled`: a disabled button drops the keyboard focus
   const btn = h("button", {class:"btn ghost", type:"button", onclick:async () => {
-    if (box.childElementCount) { put(box, ); btn.textContent = "Show code at this commit"; return; }
-    btn.disabled = true;
+    if (busy) return;
+    if (box.childElementCount) { put(box, ); label("Show code at this commit"); return; }
+    busy = true; btn.setAttribute("aria-busy", "true");
     try {
       const s = await api("source/" + loc.id);
       const hi = [s.line_start, s.line_end || s.line_start];
@@ -213,35 +428,36 @@ function codeRef(loc){
       if (s.excerpt_matches === false) notes.push("The saved copy of these lines differs from the file at this commit; the line numbers may have been recorded wrong.");
       put(box, 
         notes.length ? h("p", {class:"note"}, notes.join(" ")) : null,
-        s.lines && s.lines.length ? h("div", {class:"code"}, h("table", null, h("tbody", null, s.lines.map(l =>
-          h("tr", {class: hi[0] && l.n >= hi[0] && l.n <= hi[1] ? "hit" : null}, h("td", {class:"ln"}, l.n), h("td", null, l.text)))))) : null,
-        h("div", {class:"refline"}, h("code", null, s.git_command), copyBtn(s.git_command, "Copy git command"),
+        s.lines && s.lines.length ? h("div", {class:"code"}, h("table", null, h("tbody", null, s.lines.map(l => {
+            const cited = hi[0] && l.n >= hi[0] && l.n <= hi[1];
+            return h("tr", {class: cited ? "hit" : null}, h("td", {class:"ln"}, l.n, cited ? h("span", {class:"visually-hidden"}, " cited") : null), h("td", null, l.text)); })))) : null,
+        h("div", {class:"refline"}, h("code", null, s.git_command), copyBtn(s.git_command, "Copy git command", "Copy git command: " + where),
           s.permalink ? extLink(s.permalink, "Open on the code host") : null));
-      btn.textContent = "Hide code";
-    } catch (e) { put(box, h("p", {class:"status err"}, e.message)); }
-    btn.disabled = false;
-  }}, "Show code at this commit");
+      label("Hide code");
+    } catch (e) { put(box, errorBox(e)); }
+    busy = false; btn.removeAttribute("aria-busy");
+  }});
+  label("Show code at this commit");
   return h("div", {class:"ref"},
     h("div", {class:"refline"},
-      h("span", {class:"tag"}, words(loc.role)), h("b", null, loc.repo), h("code", null, loc.path), range ? h("span", null, range) : null,
+      tag(words(loc.role)), h("b", null, loc.repo), h("code", null, loc.path), range ? h("span", null, range) : null,
       loc.symbol ? h("code", {class:"muted"}, loc.symbol) : null,
       h("span", {class:"muted"}, "at commit ", h("code", null, short(loc.commit_sha))), btn),
     box);
 }
 
 function findingItem(f, opts={}){
-  return h("details", {class:"item"},
-    h("summary", null, h("span", {class:"n"}, opts.showReview ? `${f.review_code} · ${f.point_id}` : f.point_id), h("span", {class:"t"}, f.summary),
-      h("span", {class:"tags"}, sevTag(f.severity), f.match_type ? h("span", {class:"tag " + (["recurrence","regression"].includes(f.match_type) ? "crit" : f.match_type === "new" ? "info" : "")}, lab("match", f.match_type)) : null,
-        f.verification === "false" ? h("span", {class:"tag"}, "False finding") : f.verification === "confirmed" ? h("span", {class:"tag ok"}, "Confirmed") : null)),
-    h("div", {class:"body"},
-      kv([["Area", domainName(f.domain_code)], ["Theme", themeName(f.theme_code)], ["Kind", lab("kind", f.kind)],
+  const id = opts.showReview ? `${f.review_code} · ${f.point_id}` : f.point_id;
+  return item(id, f.summary,
+    [sevTag(f.severity), f.match_type ? labTag("match", f.match_type) : null,
+     f.verification === "false" ? tag("False finding") : f.verification === "confirmed" ? tag("Confirmed", tone("verif", "confirmed")) : null],
+    [ kv([["Area", domainName(f.domain_code)], ["Theme", themeName(f.theme_code)], ["Kind", lab("kind", f.kind)],
           ["Issue", f.issue_code && !opts.hideIssue ? h("a", {href:"#/issue/" + f.issue_code}, f.issue_code) : null],
           ["How it was matched", f.match_rationale], ["What it does now", f.before_state], ["Detail", f.detail],
           ["Recommended fix", f.recommendation], ["Test to add", f.recommended_test], ["Evidence", f.evidence],
           ["Checked by the manager", f.verification ? lab("verif", f.verification) + (f.verification_note ? " — " + f.verification_note : "") : null],
           ["Reviewer", f.run_label], ["In the report", f.where_report]]),
-      (f.locations || []).map(codeRef)));
+      (f.locations || []).map(loc => codeRef(loc, id))]);
 }
 
 // ---------- views
@@ -256,29 +472,26 @@ VIEWS.home = async () => {
     h("h1", null, o.project),
     h("p", {class:"lede"}, "Every review of this project, every point it raised, how those points carried over between reviews, the fix plans, and anything waiting on you."),
     h("div", {class:"facts"},
-      h("div", null, h("b", null, o.queue), h("span", null, "waiting on you")),
-      h("div", null, h("b", null, openTotal), h("span", null, "open issues")),
-      h("div", null, h("b", null, sev.H || 0), h("span", null, "open and high")),
-      h("div", null, h("b", null, o.recurring), h("span", null, "came back or seen again"))),
-    o.queue ? h("p", {class:"status"}, h("a", {href:"#/inbox"}, `${o.queue} ${o.queue === 1 ? "thing needs" : "things need"} your input or approval →`)) : null,
+      fact(o.queue, "waiting on you"), fact(openTotal, "open issues"), fact(sev.H || 0, "open and high"), fact(o.recurring, "came back or seen again")),
+    o.queue ? h("p", {class:"status"}, h("a", {href:"#/inbox"}, plural(o.queue, "thing needs", "things need") + " your input or approval →")) : null,
     h("div", {class:"grid2"},
       h("div", {class:"card"}, h("h2", null, "Latest reviews"),
         table([{label:"Review", get:r => r.code}, {label:"Title", key:"title"}, {label:"Status", get:r => lab("review", r.status)},
-               {label:"Started", get:r => when(r.started_at, false)}, {label:"High", key:"high", num:1}, {label:"Points", key:"points", num:1}],
-              o.reviews, r => go("#/review/" + r.code))),
+               {label:"Started", get:r => whenCell(r.started_at, false)}, {label:"High", key:"high", num:1}, {label:"Points", key:"points", num:1}],
+              o.reviews, r => "#/review/" + r.code)),
       h("div", {class:"card"}, h("h2", null, "Fix plans"),
-        o.plans.length ? o.plans.map(p => h("div", {style:"margin:10px 0"},
+        o.plans.length ? o.plans.map(p => h("div", {class:"card-link"},
           h("a", {href:"#/plan/" + p.code}, `${p.code} · ${p.title}`), h("span", {class:"muted"}, " — " + lab("plan", p.status)),
           progressBar(p.done || 0, 0, p.waiting || 0, p.steps || 0))) : empty("No fix plan yet."))),
     h("div", {class:"card"}, h("h2", null, "Ledger checks"),
       h("p", {class:"note"}, "These should all be zero once a review has been indexed and matched."),
-      table([{label:"Check", key:"label"}, {label:"Count", key:"n", num:1}], o.checks, c => c.n && go("#/explore/" + c.view)),
-      failing.length ? h("p", {class:"status err"}, `${failing.length} ${failing.length === 1 ? "check needs" : "checks need"} attention.`) : null));
+      table([{label:"Check", key:"label"}, {label:"Count", key:"n", num:1}], o.checks, c => c.n ? "#/explore/" + c.view : null),
+      failing.length ? errorBox(plural(failing.length, "check needs", "checks need") + " attention.", true) : null));
 };
 
 function progressBar(done, doing, waiting, total){
   const pct = n => total ? (100 * n / total).toFixed(2) + "%" : "0";
-  return h("div", {style:"display:flex;flex-direction:column;gap:4px;margin-top:4px"},
+  return h("div", {class:"progress"},
     h("div", {class:"bar", role:"img", "aria-label":`${done} of ${total} done`},
       h("i", {class:"d", style:`width:${pct(done)}`}), h("i", {class:"g", style:`width:${pct(doing)}`}), h("i", {class:"y", style:`width:${pct(waiting)}`})),
     h("span", {class:"note"}, `${done} of ${total} done` + (doing ? ` · ${doing} in progress` : "") + (waiting ? ` · ${waiting} waiting on you` : "")));
@@ -289,10 +502,11 @@ VIEWS.inbox = async () => {
   const open = d.gates.filter(g => g.status === "open"), answered = d.gates.filter(g => g.status === "answered");
   setView(
     h("h1", null, "Waiting on you"),
-    h("p", {class:"lede"}, "Questions and approvals the agent cannot get past without you. Answer here or in the chat; the agent picks answers up the next time it checks the ledger."),
-    open.length ? open.map(gateCard) : empty("Nothing is waiting on you right now."),
-    answered.length ? [h("h3", null, "Answered, waiting for the agent to act"), answered.map(gateCard)] : null,
-    d.other.length ? [h("h3", null, "Also waiting on you (answer in the chat)"),
+    h("p", {class:"lede"}, STATIC ? "Questions and approvals the agent cannot get past without you. Answer here: your answer is saved with this page, and Claude records it the next time it checks."
+      : "Questions and approvals the agent cannot get past without you. Answer here or in the chat; the agent picks answers up the next time it checks the ledger."),
+    open.length ? open.map(g => gateCard(g)) : empty("Nothing is waiting on you right now."),
+    answered.length ? [sect("Answered, waiting for the agent to act"), answered.map(g => gateCard(g, "h3"))] : null,
+    d.other.length ? [sect("Also waiting on you (answer in the chat)"),
       table([{label:"What", get:r => (r.kind === "step" ? "Plan step " : r.kind === "goal" ? "Design goal " : "Decision ") + r.ref}, {label:"Needs", get:r => lab("need", r.need) || "Your input"},
              {label:"Title", key:"title"}, {label:"Question", key:"question"}], d.other)] : null,
     h("p", null, h("a", {href:"#/history"}, "See every question and answer so far")));
@@ -301,41 +515,44 @@ VIEWS.inbox = async () => {
 VIEWS.history = async () => {
   const d = await api("gates?status=all");
   setView(h("h1", null, "Questions and answers"),
-    table([{label:"Asked", get:g => when(g.created_at)}, {label:"About", get:g => lab("gate", g.kind)}, {label:"Title", key:"title"},
+    table([{label:"Asked", get:g => whenCell(g.created_at)}, {label:"About", get:g => lab("gate", g.kind)}, {label:"Title", key:"title"},
            {label:"Status", get:g => lab("gstat", g.status)}, {label:"Answer", get:g => [g.answer_value ? optLabel(g) : "", g.answer_text ? " " + g.answer_text : ""]},
            {label:"What the agent did", key:"applied_note"}], d.gates));
 };
 const optLabel = g => ((g.options || []).find(o => o.value === g.answer_value) || {}).label || words(g.answer_value);
 
-function gateCard(g){
+// level: "h3" for a gate listed under a section heading.
+function gateCard(g, level){
+  const hid = "gate-" + g.code;   // the title's id: it names this gate's choices, text box and button
   const refs = [g.review_code && h("a", {href:"#/review/" + g.review_code}, "Review " + g.review_code),
                 g.plan_code && h("a", {href:"#/plan/" + g.plan_code}, "Plan " + g.plan_code + (g.step_number ? " step " + g.step_number : "")),
                 g.issue_code && h("a", {href:"#/issue/" + g.issue_code}, "Issue " + g.issue_code)].filter(Boolean);
   const card = h("div", {class:"card gate"},
-    h("div", null, h("span", {class:"tag " + (g.kind === "production-action" ? "crit" : g.status === "open" ? "you" : "info")}, lab("gate", g.kind)),
-      g.blocking && g.status === "open" ? h("span", {class:"tag warn"}, "Work is paused until you answer") : null,
+    h("div", null, tag(lab("gate", g.kind), tone("gate", g.kind) || tone("gstat", g.status) || "info"),
+      g.blocking && g.status === "open" ? tag("Work is paused until you answer", "warn") : null,
       h("span", {class:"note"}, " Asked " + when(g.created_at))),
-    h("h2", null, g.title), h("div", {class:"q"}, g.question),
+    h(level || "h2", {id:hid, class: level ? "title" : null}, g.title), h("div", {class:"q"}, g.question),
     g.context ? h("div", {class:"ctx"}, g.context) : null,
     refs.length ? h("div", {class:"refline"}, refs) : null);
   if (g.status === "answered") {
-    add(card, h("p", {class:"status"}, "You answered: ", g.answer_value ? h("b", null, optLabel(g)) : null, g.answer_text ? (g.answer_value ? " — " : "") + g.answer_text : "",
-      ` (${when(g.answered_at)})`));
+    add(card, h("p", {class:"status"}, "You answered: ", answerText(g, true), ` (${when(g.answered_at)})`));
     return card;
   }
+  if (STATIC) return hubGateBody(card, g, hid);
   const name = "opt-" + g.code;
-  const opts = (g.options || []).length ? h("div", {class:"opts", role:"radiogroup", "aria-label":"Choices"},
+  const opts = (g.options || []).length ? h("div", {class:"opts", role:"radiogroup", "aria-labelledby":hid},
     g.options.map(o => h("label", null, h("input", {type:"radio", name, value:o.value}), h("span", null, o.label, o.description ? h("small", null, o.description) : null)))) : null;
-  const ta = g.allow_text ? h("textarea", {placeholder: opts ? "Add a note or a different answer (optional)" : "Your answer", "aria-label":"Your answer"}) : null;
+  const ta = g.allow_text ? h("textarea", {class:"field", placeholder: opts ? "Add a note or a different answer (optional)" : "Your answer", id:hid + "-text", "aria-label":"Your answer", "aria-labelledby":`${hid}-text ${hid}`}) : null;
   const msg = h("div");
-  const send = h("button", {class:"btn", type:"button", onclick:async () => {
+  const send = h("button", {class:"btn", type:"button", id:hid + "-send", "aria-labelledby":`${hid}-send ${hid}`, onclick:async () => {
     const picked = card.querySelector(`input[name="${name}"]:checked`);
     send.disabled = true;
     try {
       await api(`gates/${encodeURIComponent(g.code)}/answer`, {answer_value: picked ? picked.value : null, answer_text: ta ? ta.value : null});
       put(msg, h("p", {class:"status"}, "Answer saved. The agent will act on it the next time it checks."));
+      say("Answer saved.");
       setTimeout(() => route(), 1200);
-    } catch (e) { put(msg, h("p", {class:"status err"}, e.message)); send.disabled = false; }
+    } catch (e) { put(msg, errorBox(e)); send.disabled = false; }
   }}, "Send answer");
   add(card, opts, ta, h("div", null, send), msg);
   return card;
@@ -345,66 +562,69 @@ VIEWS.reviews = async () => {
   const list = await api("reviews");
   setView(h("h1", null, "Reviews"), h("p", {class:"lede"}, "Every review run on this project, newest first."),
     table([{label:"Review", key:"code"}, {label:"Title", key:"title"}, {label:"Kind", get:r => lab("scope", r.scope)},
-           {label:"Status", get:r => lab("review", r.status)}, {label:"Started", get:r => when(r.started_at)}, {label:"Code reviewed", get:r => h("span", {class:"mono"}, r.commits || "")},
+           {label:"Status", get:r => lab("review", r.status)}, {label:"Started", get:r => whenCell(r.started_at)}, {label:"Code reviewed", get:r => h("span", {class:"mono"}, r.commits || "")},
            {label:"High", key:"high", num:1}, {label:"Medium", key:"medium", num:1}, {label:"Low", key:"low", num:1}, {label:"New", key:"new_issues", num:1}, {label:"Came back", key:"came_back", num:1}],
-          list, r => go("#/review/" + r.code)));
+          list, r => "#/review/" + r.code));
 };
 
 const REQ_VERDICT = {matches:"matches", differs:"differs", partly:"partly matches", missing:"missing", untested:"not tested"};
 VIEWS.review = async ([code]) => {
   const d = await api("review/" + encodeURIComponent(code)); const r = d.review;
   const fs = d.findings;
-  const sel = (id, label, values, fmt) => h("select", {id, "aria-label":label}, h("option", {value:""}, label), [...new Set(values)].filter(v => v != null).map(v => h("option", {value:v}, fmt(v))));
-  const q = h("input", {type:"search", placeholder:"Search points, ids, files", "aria-label":"Search points"});
-  const fd = sel("fd", "All areas", fs.map(f => f.domain_code), domainName), fsv = sel("fs", "All severities", ["H","M","L","T"].filter(s => fs.some(f => f.severity === s)), v => lab("sev", v));
-  const fm = sel("fm", "Any match", fs.map(f => f.match_type), v => lab("match", v)), fv = sel("fv", "Any check", fs.map(f => f.verification), v => lab("verif", v));
-  const listBox = h("div", {style:"display:flex;flex-direction:column;gap:8px"});
+  const sel = (id, label, all, values, fmt) => select(label, [["", all], ...[...new Set(values)].filter(v => v != null).map(v => [v, fmt(v)])], {id});
+  const q = h("input", {class:"field", type:"search", placeholder:"Search points, ids, files", "aria-label":"Search points"});
+  const fd = sel("fd", "Area", "All areas", fs.map(f => f.domain_code), domainName), fsv = sel("fs", "Severity", "All severities", ["H","M","L","T"].filter(s => fs.some(f => f.severity === s)), v => lab("sev", v));
+  const fm = sel("fm", "Match", "Any match", fs.map(f => f.match_type), v => lab("match", v)), fv = sel("fv", "Check", "Any check", fs.map(f => f.verification), v => lab("verif", v));
+  const listBox = h("div", {class:"stack"});
   let shown = 100;
   const draw = () => {
     const t = q.value.trim().toLowerCase();
     const hit = fs.filter(f => (!fd.value || f.domain_code === fd.value) && (!fsv.value || f.severity === fsv.value) && (!fm.value || f.match_type === fm.value) && (!fv.value || f.verification === fv.value)
       && (!t || [f.point_id, f.summary, f.detail, f.issue_code, ...(f.locations||[]).map(l => l.path)].join(" ").toLowerCase().includes(t)));
-    put(listBox, h("p", {class:"note"}, `${hit.length} of ${fs.length} points`), hit.slice(0, shown).map(f => findingItem(f)),
-      hit.length > shown ? h("button", {class:"btn ghost", type:"button", onclick:() => { shown += 200; draw(); }}, `Show more (${hit.length - shown} left)`) : null);
+    const count = `${hit.length} of ${fs.length} points`;
+    const more = () => { const first = shown; shown += 200; draw(); listBox.querySelectorAll("details.item > summary")[first].focus(); };
+    put(listBox, h("p", {class:"note"}, count), hit.slice(0, shown).map(f => findingItem(f)),
+      hit.length > shown ? h("button", {class:"btn ghost", type:"button", onclick:more}, `Show more (${hit.length - shown} left)`) : null);
+    return count;
   };
-  [q, fd, fsv, fm, fv].forEach(e => e.addEventListener("input", () => { shown = 100; draw(); }));
+  const filters = filterBar([q, fd, fsv, fm, fv], () => { shown = 100; say(draw()); });
   const sumBy = k => fs.filter(f => f.severity === k).length;
   setView(
     h("h1", null, `${r.code} · ${r.title}`),
     h("p", {class:"lede"}, `${lab("scope", r.scope)} · ${lab("review", r.status)} · started ${when(r.started_at)}` + (r.completed_at ? ` · finished ${when(r.completed_at)}` : "")),
-    h("div", {class:"facts"}, h("div", null, h("b", null, fs.length), h("span", null, "points")), ["H","M","L","T"].map(s => h("div", null, h("b", null, sumBy(s)), h("span", null, lab("sev", s)))),
-      h("div", null, h("b", null, fs.filter(f => ["new","continuation"].includes(f.match_type)).length), h("span", null, "new issues")),
-      h("div", null, h("b", null, fs.filter(f => ["recurrence","regression"].includes(f.match_type)).length), h("span", null, "came back"))),
-    d.gates.length ? h("div", {class:"card"}, h("h2", null, "Questions asked during this review"), table([{label:"About", get:g => lab("gate", g.kind)}, {label:"Title", key:"title"}, {label:"Status", get:g => lab("gstat", g.status)}, {label:"Answer", get:g => [g.answer_value || "", " ", g.answer_text || ""]}], d.gates, () => go("#/inbox"))) : null,
+    h("div", {class:"facts"}, fact(fs.length, "points"), ["H","M","L","T"].map(s => fact(sumBy(s), lab("sev", s))),
+      fact(fs.filter(f => ["new","continuation"].includes(f.match_type)).length, "new issues"),
+      fact(fs.filter(f => ["recurrence","regression"].includes(f.match_type)).length, "came back")),
+    d.gates.length ? h("div", {class:"card"}, h("h2", null, "Questions asked during this review"), table([{label:"About", get:g => lab("gate", g.kind)}, {label:"Title", key:"title"}, {label:"Status", get:g => lab("gstat", g.status)}, {label:"Answer", get:g => [g.answer_value || "", " ", g.answer_text || ""]}], d.gates, () => "#/inbox")) : null,
     h("div", {class:"card"}, kv([["Verdict", r.verdict], ["Summary", r.summary], ["What was asked", r.request_text], ["Run by", r.manager ? `${r.manager}${r.manager_model ? " (" + r.manager_model + ")" : ""}` : null],
       ["Domains approved by", r.approved_by ? `${r.approved_by}, ${when(r.approved_at)}` : null], ["Follows", r.previous_code ? h("a", {href:"#/review/" + r.previous_code}, r.previous_code) : null],
       ["Write-up", r.summary_doc_url ? extLink(r.summary_doc_url, "Open the review document") : null]])),
-    r.report_md ? h("div", {class:"card"}, h("h2", null, "The review document"), h("div", {class:"mdtext"}, r.report_md)) : null,
-    h("h3", null, "Code reviewed"),
-    table([{label:"Repository", key:"name"}, {label:"Branch", key:"branch"}, {label:"Commit", get:x => [h("code", null, short(x.commit_sha)), " ", copyBtn(x.commit_sha, "Copy")]},
+    r.report_md ? h("div", {class:"card"}, h("h2", null, "The review document"), (STATIC ? md(r.report_md) : h("div", {class:"mdtext"}, r.report_md))) : null,
+    sect("Code reviewed"),
+    table([{label:"Repository", key:"name"}, {label:"Branch", key:"branch"}, {label:"Commit", get:x => [h("code", null, short(x.commit_sha)), " ", copyBtn(x.commit_sha, "Copy", "Copy commit " + short(x.commit_sha))]},
            {label:"Commit message", key:"commit_subject"}, {label:"Kept by tag", get:x => x.tag_name ? x.tag_name + (x.tag_pushed ? "" : " (not pushed)") : "Not tagged"},
            {label:"Uncommitted changes", get:x => x.is_dirty ? (x.dirty_note || "Yes") : "None"}], d.repos),
-    d.goals.length ? [h("h3", null, "Design goals used"), h("ul", null, d.goals.map(g => h("li", null, g.text)))] : null,
+    d.goals.length ? [sect("Design goals used"), h("ul", null, d.goals.map(g => h("li", null, g.text)))] : null,
     (d.interview || []).length ? interviewSection(d.interview) : null,
-    (d.review_goals || []).length ? [h("h3", null, "Design goals from this interview"), goalsTable(d.review_goals)] : null,
-    h("h3", null, "Areas reviewed and skipped"),
-    table([{label:"Area", get:x => x.name}, {label:"", get:x => x.decision === "included" ? h("span", {class:"tag ok"}, "Reviewed") : h("span", {class:"tag"}, "Skipped")},
+    (d.review_goals || []).length ? [sect("Design goals from this interview"), goalsTable(d.review_goals)] : null,
+    sect("Areas reviewed and skipped"),
+    table([{label:"Area", get:x => x.name}, {label:"Reviewed?", get:x => tag(x.decision === "included" ? "Reviewed" : "Skipped", tone("area", x.decision))},
            {label:"Why", key:"reason"}, {label:"Your change", get:x => x.owner_change === "none" ? "" : words(x.owner_change)}, {label:"Reviewers", key:"reviewers_planned", num:1}], d.domains),
-    h("h3", null, "Reviewers"),
+    sect("Reviewers"),
     table([{label:"Reviewer", key:"label"}, {label:"Area", get:x => domainName(x.domain_code)}, {label:"Agent", get:x => x.model ? `${x.actor} (${x.model})` : x.actor},
            {label:"Status", get:x => lab("run", x.status)}, {label:"Items", key:"items_reviewed", num:1}, {label:"High", key:"high_count", num:1}, {label:"Medium", key:"medium_count", num:1}, {label:"Low", key:"low_count", num:1}], d.runs),
-    d.agents.length ? [h("h3", null, "Agents"),
+    d.agents.length ? [sect("Agents"),
       table([{label:"Agent", key:"name"}, {label:"Did", key:"role"}, {label:"Kind", get:x => words(x.kind)}, {label:"Model", key:"model"}, {label:"Run in", key:"harness"}, {label:"Started by", key:"parent"}], d.agents)] : null,
-    d.requirements.length ? [h("h3", null, "Requirements"),
+    d.requirements.length ? [sect("Requirements"),
       h("p", {class:"note"}, [...new Map(d.requirements.map(x => [x.verdict, x.verdict_count]))].map(([v, n]) => `${n} ${REQ_VERDICT[v] || words(v)}`).join(" · ")),
       table([{label:"Requirement", key:"requirement"}, {label:"Says", key:"text"}, {label:"Found", get:x => REQ_VERDICT[x.verdict] || words(x.verdict)}, {label:"Where", key:"where_implemented"},
              {label:"Tested", get:x => words(x.tested)}, {label:"Point", key:"point_id"}, {label:"Evidence", key:"evidence"}], d.requirements)] : null,
-    d.checks.length ? [h("h3", null, "Earlier issues this review looked for"),
+    d.checks.length ? [sect("Earlier issues this review looked for"),
       table([{label:"Issue", key:"issue_code"}, {label:"Title", key:"title"}, {label:"Found", get:x => lab("check", x.outcome)}, {label:"Evidence", key:"evidence"}, {label:"Now", get:x => issueTag(x.status)}],
-            d.checks, x => go("#/issue/" + x.issue_code))] : null,
-    d.metrics.length ? [h("h3", null, "Measurements"), table([{label:"Measure", get:m => m.label || words(m.name)}, {label:"Of", key:"scope"}, {label:"Value", get:m => `${m.value}${m.unit ? " " + m.unit : ""}`, num:1}, {label:"How", get:m => words(m.method)}, {label:"Note", key:"note"}], d.metrics)] : null,
-    h("h3", null, "Points raised"),
-    h("div", {class:"tools"}, q, fd, fsv, fm, fv), listBox);
+            d.checks, x => "#/issue/" + x.issue_code)] : null,
+    d.metrics.length ? [sect("Measurements"), table([{label:"Measure", get:m => m.label || words(m.name)}, {label:"Of", key:"scope"}, {label:"Value", get:m => `${m.value}${m.unit ? " " + m.unit : ""}`, num:1}, {label:"How", get:m => words(m.method)}, {label:"Note", key:"note"}], d.metrics)] : null,
+    sect("Points raised"),
+    filters, listBox);
   draw();
 };
 
@@ -427,7 +647,7 @@ function interviewSection(qs){
 }
 function goalsTable(goals){
   return table([{label:"Goal", key:"code"}, {label:"Area", get:g => areaName(g.domain)}, {label:"Statement", key:"text"},
-    {label:"Status", get:g => h("span", {class:"tag " + (g.status === "approved" ? "ok" : g.status === "proposed" ? "you" : "")}, lab("goal", g.status))},
+    {label:"Status", get:g => labTag("goal", g.status)},
     {label:"From your answers to", get:g => g.sources.map(q => q.code + ": " + q.question).join("; ")},
     {label:"Note", get:g => g.note || (g.status === "approved" && g.approved_at ? "Approved " + when(g.approved_at) : "")}], goals);
 }
@@ -435,31 +655,30 @@ VIEWS.goals = async () => {
   const d = await api("goals");
   setView(h("h1", null, "Design goals"),
     h("p", {class:"lede"}, "What you want the code to be, by area, written from your interview answers. Reviewers, fix plans and every agent work to the approved ones."),
-    d.goals.length ? byDomain(d.goals).map(([dom, list]) => [h("h3", null, areaName(dom)), goalsTable(list)])
+    d.goals.length ? byDomain(d.goals).map(([dom, list]) => [sect(areaName(dom)), goalsTable(list)])
       : empty("No design goals yet."),
     d.goals.some(g => g.status === "proposed") ? h("p", {class:"status"}, h("a", {href:"#/inbox"}, "Goals are waiting for your approval →")) : null);
 };
 
 VIEWS.issues = async (_, params) => {
   const o = OVERVIEW || await api("overview");
-  const q = h("input", {type:"search", placeholder:"Search titles, ids, point ids", "aria-label":"Search issues", value:params.get("q") || ""});
-  const st = h("select", {"aria-label":"Status"}, [["active","Still to fix"],["","Any status"], ...Object.entries(L.issue)].map(([v,t]) => h("option", {value:v}, t)));
-  const sv = h("select", {"aria-label":"Severity"}, [["","Any severity"], ...Object.entries(L.sev)].map(([v,t]) => h("option", {value:v}, t)));
-  const dm = h("select", {"aria-label":"Area"}, [["","All areas"], ...Object.entries(o.labels.domains)].map(([v,t]) => h("option", {value:v}, t)));
+  const q = h("input", {class:"field", type:"search", placeholder:"Search titles, ids, point ids", "aria-label":"Search issues", value:params.get("q") || ""});
+  const st = select("Status", [["active","Still to fix"],["","Any status"], ...Object.entries(L.issue)]);
+  const sv = select("Severity", [["","Any severity"], ...Object.entries(L.sev)]);
+  const dm = select("Area", [["","All areas"], ...Object.entries(o.labels.domains)]);
   st.value = params.has("status") ? params.get("status") : "active"; sv.value = params.get("severity") || ""; dm.value = params.get("domain") || "";
   const box = h("div");
-  let timer;
-  const load = async () => {
+  const load = async announce => {
     const p = new URLSearchParams(); if (st.value) p.set("status", st.value); if (sv.value) p.set("severity", sv.value); if (dm.value) p.set("domain_code", dm.value); if (q.value.trim()) p.set("q", q.value.trim());
     try {
       const list = await api("issues?" + p);
+      if (announce) say(`${list.length} issues`);
       put(box, h("p", {class:"note"}, `${list.length} issues`), table([{label:"Issue", key:"code"}, {label:"Title", key:"title"}, {label:"Severity", get:i => sevTag(i.severity)},
         {label:"Status", get:i => issueTag(i.status)}, {label:"Area", get:i => domainName(i.domain_code)}, {label:"First seen", key:"first_seen"}, {label:"Last seen", key:"last_seen"}, {label:"Reviews", key:"times_seen", num:1}],
-        list, i => go("#/issue/" + i.code)));
-    } catch (e) { put(box, h("p", {class:"status err"}, e.message)); }
+        list, i => "#/issue/" + i.code));
+    } catch (e) { put(box, errorBox(e)); }
   };
-  [st, sv, dm].forEach(e => e.addEventListener("change", load)); q.addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(load, 250); });
-  setView(h("h1", null, "Issues"), h("p", {class:"lede"}, "An issue is one underlying problem, followed across every review that raised it or looked for it."), h("div", {class:"tools"}, q, st, sv, dm), box);
+  setView(h("h1", null, "Issues"), h("p", {class:"lede"}, "An issue is one underlying problem, followed across every review that raised it or looked for it."), filterBar([q, st, sv, dm], load, 250), box);
   load();
 };
 
@@ -469,37 +688,37 @@ VIEWS.issue = async ([code]) => {
   const continues = "Raised as a new issue that continues " + (cont ? cont.other : "an earlier issue");
   setView(
     h("h1", null, `${i.code} · ${i.title}`),
-    h("div", null, sevTag(i.severity), issueTag(i.status), h("span", {class:"tag"}, domainName(i.domain_code)), i.theme_code ? h("span", {class:"tag"}, themeName(i.theme_code)) : null),
+    h("div", null, sevTag(i.severity), issueTag(i.status), tag(domainName(i.domain_code)), i.theme_code ? tag(themeName(i.theme_code)) : null),
     h("div", {class:"card"}, kv([["First found", h("span", null, h("a", {href:"#/review/" + i.first_seen}, i.first_seen), " · " + when(i.opened_at))],
       ["Last raised", i.last_seen ? h("a", {href:"#/review/" + i.last_seen}, i.last_seen) : null], ["Last looked for", i.last_checked ? h("a", {href:"#/review/" + i.last_checked}, i.last_checked) : null],
-      ["Raised in", `${i.times_seen} ${i.times_seen === 1 ? "review" : "reviews"}`],
+      ["Raised in", plural(i.times_seen, "review")],
       ["Before", i.before_state], ["Now", i.current_state], ["After the fix", i.after_state], ["Agreed fix", i.recommendation], ["Resolution", i.resolution],
-      ["Fixed", when(i.resolved_at)], ["Fix confirmed", when(i.verified_at)]])),
-    d.relations.length ? [h("h3", null, "Related issues"), table([{label:"", get:x => x.dir === "out" ? lab("rel", x.relation) : lab("relIn", x.relation)},
-      {label:"Issue", key:"other"}, {label:"Title", key:"other_title"}, {label:"Status", get:x => issueTag(x.other_status)}, {label:"How sure", get:x => words(x.confidence)}, {label:"Why", key:"rationale"}, {label:"Linked in", key:"review"}],
-      d.relations, x => go("#/issue/" + x.other))] : null,
-    d.decisions.length ? [h("h3", null, "Your decisions about it"), table([{label:"Decision", key:"code"}, {label:"Question", key:"question"}, {label:"Answer", key:"answer"}, {label:"Why", key:"rationale"}, {label:"When", get:x => when(x.decided_at)}], d.decisions)] : null,
-    d.steps.length ? [h("h3", null, "Fix plan steps"), table([{label:"Plan", key:"plan"}, {label:"Step", key:"number", num:1}, {label:"Title", key:"title"}, {label:"Status", get:x => lab("step", x.status)},
-      {label:"Commits", get:x => h("span", {class:"mono"}, x.commits || "")}, {label:"Note", key:"progress_note"}], d.steps, x => go(`#/plan/${x.plan}`))] : null,
-    d.guard_tests.length ? [h("h3", null, "Tests that guard the fix"), table([{label:"Test", get:t => h("code", null, `${t.test_path} › ${t.test_name}`)},
+      ["Fixed", whenCell(i.resolved_at)], ["Fix confirmed", whenCell(i.verified_at)]])),
+    d.relations.length ? [sect("Related issues"), table([{label:"Link", get:x => x.dir === "out" ? lab("rel", x.relation) : lab("relIn", x.relation)},
+      {label:"Issue", key:"other", link:true}, {label:"Title", key:"other_title"}, {label:"Status", get:x => issueTag(x.other_status)}, {label:"How sure", get:x => words(x.confidence)}, {label:"Why", key:"rationale"}, {label:"Linked in", key:"review"}],
+      d.relations, x => "#/issue/" + x.other)] : null,
+    d.decisions.length ? [sect("Your decisions about it"), table([{label:"Decision", key:"code"}, {label:"Question", key:"question"}, {label:"Answer", key:"answer"}, {label:"Why", key:"rationale"}, {label:"When", get:x => whenCell(x.decided_at)}], d.decisions)] : null,
+    d.steps.length ? [sect("Fix plan steps"), table([{label:"Plan", key:"plan"}, {label:"Step", key:"number", num:1}, {label:"Title", key:"title"}, {label:"Status", get:x => lab("step", x.status)},
+      {label:"Commits", get:x => h("span", {class:"mono"}, x.commits || "")}, {label:"Note", key:"progress_note"}], d.steps, x => `#/plan/${x.plan}`)] : null,
+    d.guard_tests.length ? [sect("Tests that guard the fix"), table([{label:"Test", get:t => h("code", null, `${t.test_path} › ${t.test_name}`)},
       {label:"Failed before the fix", get:t => t.failed_before_fix == null ? "Not recorded" : t.failed_before_fix ? "Yes" : "No"}, {label:"Still in the code", get:t => t.still_exists ? "Yes" : "Removed"},
       {label:"Added in", get:t => h("code", null, short(t.added_commit_sha))}], d.guard_tests)] : null,
-    d.checks.length ? [h("h3", null, "What each review found"), table([{label:"Review", key:"review"}, {label:"When", get:x => when(x.started_at, false)}, {label:"Found", get:x => lab("check", x.outcome)}, {label:"Evidence", key:"evidence"}], d.checks, x => go("#/review/" + x.review))] : null,
-    h("h3", null, "Every time it was raised, with the code at that commit"),
+    d.checks.length ? [sect("What each review found"), table([{label:"Review", key:"review"}, {label:"When", get:x => whenCell(x.started_at, false)}, {label:"Found", get:x => lab("check", x.outcome)}, {label:"Evidence", key:"evidence"}], d.checks, x => "#/review/" + x.review)] : null,
+    sect("Every time it was raised, with the code at that commit"),
     d.findings.map(f => findingItem(f, {showReview:true, hideIssue:true})),
-    h("h3", null, "History"),
-    d.timeline.length ? h("div", {class:"timeline"}, d.timeline.map(e => h("div", null, h("b", null, when(e.at)), " — ",
+    sect("History"),
+    d.timeline.length ? h("div", {class:"timeline"}, d.timeline.map(e => h("div", null, h("b", null, whenCell(e.at)), " — ",
       e.event === "status-changed" ? `${lab("issue", e.from_value)} → ${lab("issue", e.to_value)}` : e.event === "severity-changed" ? `Severity ${lab("sev", e.from_value)} → ${lab("sev", e.to_value)}`
       : e.event === "seen" ? (e.to_value === "new" ? "Raised as a new issue" : e.to_value === "continuation" ? continues : `Raised again (${lab("match", e.to_value)})`) : e.event === "opened" ? "Opened" : words(e.event),
       e.review ? ` · ${e.review}` : "", e.step ? ` · step ${e.step}` : "", e.commit_sha ? [" · ", h("code", null, short(e.commit_sha))] : "", e.actor ? ` · ${e.actor}` : "",
-      e.note ? h("div", {class:"note", style:"padding:0;border:0"}, e.note) : null))) : empty("No history recorded."));
+      e.note ? h("div", {class:"note"}, e.note) : null))) : empty("No history recorded."));
 };
 
 VIEWS.plans = async () => {
   const list = await api("plans");
   setView(h("h1", null, "Fix plans"),
     table([{label:"Plan", key:"code"}, {label:"Title", key:"title"}, {label:"From reviews", key:"reviews"}, {label:"Status", get:p => lab("plan", p.status)},
-           {label:"Progress", get:p => progressBar(p.done || 0, p.doing || 0, p.waiting || 0, p.steps || 0)}], list, p => go("#/plan/" + p.code)));
+           {label:"Progress", get:p => progressBar(p.done || 0, p.doing || 0, p.waiting || 0, p.steps || 0)}], list, p => "#/plan/" + p.code));
 };
 
 VIEWS.plan = async ([code, , phaseArg]) => {
@@ -507,10 +726,10 @@ VIEWS.plan = async ([code, , phaseArg]) => {
   const steps = d.steps, phases = d.phase_rows, prog = Object.fromEntries(d.phases.map(p => [p.phase, p]));
   let phase = Number(phaseArg) || (phases[0] && phases[0].number) || 1;
   const count = s => steps.filter(x => x.status === s).length;
-  const q = h("input", {type:"search", placeholder:"Search steps, or a point id", "aria-label":"Search steps or point ids"});
-  const f = h("select", {"aria-label":"Filter steps"}, [["","All steps"],["st-done","Done"],["st-doing","In progress"],["st-waiting-owner","Waiting on you"],["st-not-started","Not started"],
-    ["any","Needs you (any)"],["decision","Needs your decision"],["confirm","Needs you to confirm"],["review","Needs your review"],["production","Production action"],["behavior","Changes behaviour on purpose"]].map(([v,t]) => h("option", {value:v}, t)));
-  const nav = h("nav", {class:"rail", "aria-label":"Phases"}), main = h("main", {style:"min-width:0;display:flex;flex-direction:column;gap:8px"});
+  const q = h("input", {class:"field", type:"search", placeholder:"Search steps, or a point id", "aria-label":"Search steps or point ids"});
+  const f = select("Filter steps", [["","All steps"],["st-done","Done"],["st-doing","In progress"],["st-waiting-owner","Waiting on you"],["st-not-started","Not started"],
+    ["any","Needs you (any)"],["decision","Needs your decision"],["confirm","Needs you to confirm"],["review","Needs your review"],["production","Production action"],["behavior","Changes behaviour on purpose"]]);
+  const nav = h("nav", {class:"rail", "aria-label":"Phases"}), main = h("div", {class:"stack steps"});
   const match = s => {
     const t = q.value.trim().toLowerCase(), v = f.value;
     if (v.startsWith("st-") && s.status !== v.slice(3)) return false;
@@ -519,23 +738,31 @@ VIEWS.plan = async ([code, , phaseArg]) => {
     if (v === "behavior" && !s.behavior_change) return false;
     return !t || [s.number, s.title, s.change, s.proof, ...s.closes.map(c => c.point_id + " " + (c.issue || ""))].join(" ").toLowerCase().includes(t);
   };
-  const stepItem = s => h("details", {class:"item"},
-    h("summary", null, h("span", {class:"n"}, s.number), h("span", {class:"t"}, s.title),
-      h("span", {class:"tags"}, s.status !== "not-started" ? h("span", {class:"tag " + ({done:"solid",doing:"ok","waiting-owner":"you"}[s.status] || "")}, lab("step", s.status)) : null,
-        s.owner_need !== "none" ? h("span", {class:"tag " + (s.owner_need === "production" ? "crit" : s.owner_need === "decision" ? "warn" : "info")}, lab("need", s.owner_need)) : null,
-        s.behavior_change ? h("span", {class:"tag"}, "Changes behaviour") : null)),
-    h("div", {class:"body"}, kv([["Change", s.change], ["Proof", s.proof], ["Depends on", s.depends.length ? (s.depends.length === 1 ? "Step " : "Steps ") + s.depends.join(", ") : null], ["Behaviour change", s.behavior_note],
+  const stepItem = s => item(s.number, s.title,
+    [s.status !== "not-started" ? labTag("step", s.status) : null,
+     s.owner_need !== "none" ? tag(lab("need", s.owner_need), tone("need", s.owner_need) || "info") : null,
+     s.behavior_change ? tag("Changes behaviour") : null],
+    [ kv([["Change", s.change], ["Proof", s.proof], ["Depends on", s.depends.length ? (s.depends.length === 1 ? "Step " : "Steps ") + s.depends.join(", ") : null], ["Behaviour change", s.behavior_note],
       ["Needs from you", s.owner_question], ["Progress", s.progress_note], ["Commits", s.commits.length ? s.commits.map(c => h("div", null, h("code", null, short(c.commit_sha)), c.summary ? " " + c.summary : "", c.pr_url ? [" ", extLink(c.pr_url, "pull request")] : "")) : null]]),
-      s.closes.length ? h("div", {class:"ref"}, h("span", {class:"note"}, `Closes ${s.closes.length} ${s.closes.length === 1 ? "point" : "points"}`),
-        s.closes.map(c => h("div", {class:"refline"}, h("code", null, `${c.review} · ${c.point_id}`), sevTag(c.severity), c.issue ? h("a", {href:"#/issue/" + c.issue}, c.issue) : null, h("span", null, c.summary)))) : null));
+      s.closes.length ? h("div", {class:"ref"}, h("span", {class:"note"}, "Closes " + plural(s.closes.length, "point")),
+        s.closes.map(c => h("div", {class:"refline"}, h("code", null, `${c.review} · ${c.point_id}`), sevTag(c.severity), c.issue ? h("a", {href:"#/issue/" + c.issue}, c.issue) : null, h("span", null, c.summary)))) : null]);
+  // The phase buttons are built once and marked in place, so the one just pressed keeps the keyboard focus.
+  const rail = phases.map(p => { const pr = prog[p.number] || {}; return h("button", {type:"button",
+    onclick:() => { phase = p.number; q.value = ""; f.value = ""; shown = PAGE_OF; setPath(`#/plan/${code}/phase/${phase}`); draw(); }},
+    h("span", {class:"i"}, p.number), h("span", null, p.title), h("span", {class:"c"}, `${pr.done || 0}/${pr.steps || 0}`)); });
+  add(nav, rail);
+  const PAGE_OF = 300;   // matching steps drawn at a time
+  let shown = PAGE_OF;
   const draw = () => {
     const filtering = q.value.trim() || f.value;
-    put(nav, ...phases.map(p => { const pr = prog[p.number] || {}; return h("button", {type:"button", "aria-current": String(!filtering && p.number === phase),
-      onclick:() => { phase = p.number; q.value = ""; f.value = ""; history.replaceState(null, "", `#/plan/${code}/phase/${phase}`); draw(); }},
-      h("span", {class:"i"}, p.number), h("span", null, p.title), h("span", {class:"c"}, `${pr.done || 0}/${pr.steps || 0}`)); }));
+    rail.forEach((b, i) => b.setAttribute("aria-current", String(!filtering && phases[i].number === phase)));
     if (filtering) {
-      const hit = steps.filter(match);
-      put(main, h("h2", null, `${hit.length} matching ${hit.length === 1 ? "step" : "steps"} across all phases`), hit.length ? hit.slice(0, 300).map(stepItem) : empty("No step matches."));
+      const hit = steps.filter(match), count = plural(hit.length, "matching step") + " across all phases";
+      const more = () => { const first = shown; shown += PAGE_OF; draw(); main.querySelectorAll("details.item > summary")[first].focus(); };
+      put(main, h("h2", null, count), hit.length > shown ? h("p", {class:"note"}, `Showing the first ${shown}.`) : null,
+        hit.length ? hit.slice(0, shown).map(stepItem) : empty("No step matches."),
+        hit.length > shown ? h("button", {class:"btn ghost", type:"button", onclick:more}, `Show more (${hit.length - shown} left)`) : null);
+      return count;
     } else {
       const p = phases.find(x => x.number === phase) || phases[0];
       const ps = steps.filter(s => s.phase === p.number);
@@ -544,33 +771,50 @@ VIEWS.plan = async ([code, , phaseArg]) => {
         sections.map(sec => [sec ? h("h3", null, sec) : null, ps.filter(s => (s.section || "") === sec).map(stepItem)]));
     }
   };
-  q.addEventListener("input", draw); f.addEventListener("change", draw);
+  const filters = filterBar([q, f], () => { shown = PAGE_OF; say(draw()); });
   const pl = d.plan;
-  setView(h("h1", null, `${pl.code} · ${pl.title}`),
+  const head = [h("h1", null, `${pl.code} · ${pl.title}`),
     h("p", {class:"lede"}, lab("plan", pl.status) + (pl.approved_at ? ` · approved ${when(pl.approved_at)}` : "")),
-    h("div", {class:"facts"}, h("div", null, h("b", null, steps.length), h("span", null, "steps")), h("div", null, h("b", null, phases.length), h("span", null, "phases")),
-      h("div", null, h("b", null, new Set(steps.flatMap(s => s.closes.map(c => c.review + c.point_id))).size), h("span", null, "points closed"))),
+    h("div", {class:"facts"}, fact(steps.length, "steps"), fact(phases.length, "phases"),
+      fact(new Set(steps.flatMap(s => s.closes.map(c => c.review + c.point_id))).size, "points closed")),
     progressBar(count("done"), count("doing"), count("waiting-owner"), steps.length),
-    pl.narrative_md ? h("div", {class:"card"}, h("h2", null, "About this plan"), h("div", {class:"mdtext"}, pl.narrative_md)) : null,
-    h("div", {class:"tools"}, q, f), h("div", {class:"cols"}, nav, main));
+    pl.narrative_md ? h("div", {class:"card"}, h("h2", null, "About this plan"), (STATIC ? md(pl.narrative_md) : h("div", {class:"mdtext"}, pl.narrative_md))) : null];
+  if (!phases.length) return setView(head, empty("This plan has no phases yet."), add(main, steps.map(stepItem)));
+  setView(head, filters, h("div", {class:"cols"}, nav, main));
   draw();
 };
 
+// A line of values over reviews. The drawing is as wide as its box (one unit is one pixel, so the 11 px labels stay
+// readable on a phone); labels that would run into each other are left out, the latest always shown. The same
+// values are in a table for screen readers.
 function lineChart(points, unit){
-  const W = 520, H = 160, P = 30;
+  const H = 160, P = 30;
   if (!points.length) return empty("No values.");
-  const vs = points.map(p => p.value), lo = Math.min(...vs), hi = Math.max(...vs), span = hi - lo || 1;
-  const x = i => P + (points.length === 1 ? (W - 2*P) / 2 : i * (W - 2*P) / (points.length - 1)), y = v => H - P - (v - lo) * (H - 2*P) / span;
+  const vs = points.map(p => p.value), lo = Math.min(...vs), hi = Math.max(...vs), span = hi - lo || 1, last = points.length - 1;
+  const value = p => `${+p.value.toFixed(2)}${unit ? " " + unit : ""}`;
   const ns = "http://www.w3.org/2000/svg", el = (t, a) => { const e = document.createElementNS(ns, t); for (const k in a) e.setAttribute(k, a[k]); return e; };
-  const svg = el("svg", {viewBox:`0 0 ${W} ${H}`, role:"img", "aria-label":"Values over reviews"});
-  svg.append(el("line", {x1:P, x2:W-P, y1:H-P, y2:H-P, stroke:"var(--line)"}));
-  svg.append(el("polyline", {points:points.map((p,i) => `${x(i)},${y(p.value)}`).join(" "), fill:"none", stroke:"var(--accent)", "stroke-width":2}));
-  points.forEach((p,i) => {
-    svg.append(el("circle", {cx:x(i), cy:y(p.value), r:3.5, fill:"var(--accent)"}));
-    const t1 = el("text", {x:x(i), y:y(p.value) - 8, "text-anchor":"middle", "font-size":11, fill:"var(--fg)"}); t1.textContent = `${+p.value.toFixed(2)}${unit ? " " + unit : ""}`; svg.append(t1);
-    const t2 = el("text", {x:x(i), y:H - 10, "text-anchor":"middle", "font-size":11, fill:"var(--muted)"}); t2.textContent = p.review; svg.append(t2);
-  });
-  return h("div", {class:"chart"}, svg);
+  const svg = el("svg", {role:"img", "aria-label":"Values over reviews"});
+  let width = 0;
+  const draw = W => {
+    width = W;
+    const x = i => P + (points.length === 1 ? (W - 2*P) / 2 : i * (W - 2*P) / last), y = v => H - P - (v - lo) * (H - 2*P) / span;
+    const every = Math.max(1, Math.ceil(points.length * 56 / (W - 2*P)));   // a label needs about 56 px
+    svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+    svg.replaceChildren(el("line", {x1:P, x2:W-P, y1:H-P, y2:H-P, stroke:"var(--line)"}),
+      el("polyline", {points:points.map((p,i) => `${x(i)},${y(p.value)}`).join(" "), fill:"none", stroke:"var(--accent)", "stroke-width":2}));
+    points.forEach((p,i) => {
+      svg.append(el("circle", {cx:x(i), cy:y(p.value), r:3.5, fill:"var(--accent)"}));
+      if ((last - i) % every) return;
+      const t1 = el("text", {x:x(i), y:y(p.value) - 8, "text-anchor":"middle", "font-size":11, fill:"var(--fg)"}); t1.textContent = value(p); svg.append(t1);
+      const t2 = el("text", {x:x(i), y:H - 10, "text-anchor":"middle", "font-size":11, fill:"var(--muted)"}); t2.textContent = p.review; svg.append(t2);
+    });
+  };
+  draw(520);
+  const box = h("div", {class:"chart"}, svg, h("table", {class:"visually-hidden"},
+    h("thead", null, h("tr", null, h("th", null, "Review"), h("th", null, "Value"))),
+    h("tbody", null, points.map(p => h("tr", null, h("td", null, p.review), h("td", null, value(p)))))));
+  new ResizeObserver(() => { const w = Math.max(200, Math.round(box.clientWidth)); if (box.clientWidth && w !== width) draw(w); }).observe(box);
+  return box;
 }
 
 VIEWS.trends = async () => {
@@ -578,65 +822,90 @@ VIEWS.trends = async () => {
   const groups = {};
   for (const m of d.metrics) (groups[`${m.name}|${m.scope}|${m.repository}`] ||= []).push(m);
   setView(h("h1", null, "Over time"), h("p", {class:"lede"}, "How the project has moved between reviews."),
-    h("h3", null, "Points per review"),
-    table([{label:"Review", key:"review"}, {label:"Started", get:r => when(r.started_at, false)}, {label:"Points", key:"points", num:1}, {label:"High", key:"high", num:1}, {label:"Medium", key:"medium", num:1}, {label:"Low", key:"low", num:1},
-           {label:"New", key:"new_issues", num:1}, {label:"Carried over", key:"carried_over", num:1}, {label:"Came back", key:"came_back", num:1}, {label:"False", key:"false_findings", num:1}], d.reviews, r => go("#/review/" + r.review)),
-    h("h3", null, "Measurements"),
+    sect("Points per review"),
+    table([{label:"Review", key:"review"}, {label:"Started", get:r => whenCell(r.started_at, false)}, {label:"Points", key:"points", num:1}, {label:"High", key:"high", num:1}, {label:"Medium", key:"medium", num:1}, {label:"Low", key:"low", num:1},
+           {label:"New", key:"new_issues", num:1}, {label:"Carried over", key:"carried_over", num:1}, {label:"Came back", key:"came_back", num:1}, {label:"False", key:"false_findings", num:1}], d.reviews, r => "#/review/" + r.review),
+    sect("Measurements"),
     Object.keys(groups).length ? h("div", {class:"grid2"}, Object.entries(groups).map(([k, pts]) => { const [n, sc, repo] = k.split("|");
       const better = {higher:"higher is better", lower:"lower is better"}[pts[0].better];
       return h("div", {class:"card"}, h("b", null, pts[0].label || words(n)), h("div", {class:"note"}, [[sc !== "all" ? sc : "", repo !== "all" ? repo : ""].filter(Boolean).join(" · ") || "Whole system", better].filter(Boolean).join(" · ")), lineChart(pts, pts[0].unit)); }))
       : empty("No measurements recorded yet."),
-    h("h3", null, "Issues that keep coming back"),
+    sect("Issues that keep coming back"),
     table([{label:"Issue", key:"code"}, {label:"Title", key:"title"}, {label:"Severity", get:i => sevTag(i.severity)}, {label:"Status", get:i => issueTag(i.status)}, {label:"Reviews", key:"times_seen", num:1}, {label:"Came back after a fix", key:"regressions", num:1}, {label:"Raised in", key:"reviews"}],
-          d.recurring, i => go("#/issue/" + i.code)),
-    h("h3", null, "Files that keep producing issues"),
+          d.recurring, i => "#/issue/" + i.code),
+    sect("Files that keep producing issues"),
     table([{label:"File", get:r => h("code", null, r.path)}, {label:"Issues", key:"issues", num:1}, {label:"Reviews", key:"reviews", num:1}, {label:"High points", key:"high_points", num:1}], d.hotspots,
-          r => go("#/issues?q=" + encodeURIComponent(r.path))));
+          r => "#/issues?q=" + encodeURIComponent(r.path)));
 };
 
 const cellText = v => v && typeof v === "object" && "blob_bytes" in v ? `<${v.blob_bytes} bytes>` : String(v);
 VIEWS.explore = async ([name]) => {
   const tables = await api("tables");
-  const list = h("div", {class:"tlist"}), right = h("div", {style:"min-width:0;display:flex;flex-direction:column;gap:10px"});
-  const grid = (cols, data) => data.length ? h("div", {class:"scroll card grid", style:"padding:0"}, h("table", null, h("thead", null, h("tr", null, cols.map(c => h("th", null, c)))),
+  const list = h("div", {class:"tlist"}), right = h("div", {class:"stack loose"});
+  const grid = (cols, data) => data.length ? h("div", {class:"scroll card grid"}, h("table", null, h("thead", null, h("tr", null, cols.map(c => h("th", null, c)))),
     h("tbody", null, data.map(r => h("tr", null, r.map(v => h("td", {class: typeof v === "number" ? "num mono" : null, title: v == null ? null : cellText(v).slice(0, 2000)}, v == null ? h("span", {class:"muted"}, "—") : cellText(v)))))))) : empty("No rows.");
-  const showTable = async (t, offset=0) => {
+  const showTable = async (t, offset=0, paged=false) => {
     list.querySelectorAll("button").forEach(b => b.setAttribute("aria-current", String(b.dataset.n === t)));
-    history.replaceState(null, "", "#/explore/" + t);
+    setPath("#/explore/" + t);
     try {
       const d = await api(`table/${t}?limit=100&offset=${offset}`);
       put(right, h("h2", null, t), h("p", {class:"note"}, `${d.count} rows` + (d.count > d.limit ? ` · showing ${offset + 1}–${Math.min(d.count, offset + d.limit)}` : "")),
-        h("div", {class:"tools"}, offset > 0 ? h("button", {class:"btn ghost", type:"button", onclick:() => showTable(t, Math.max(0, offset - 100))}, "Previous") : null,
-          offset + d.limit < d.count ? h("button", {class:"btn ghost", type:"button", onclick:() => showTable(t, offset + 100)}, "Next") : null,
+        h("div", {class:"tools"}, offset > 0 ? h("button", {class:"btn ghost", type:"button", onclick:() => showTable(t, Math.max(0, offset - 100), true)}, "Previous") : null,
+          offset + d.limit < d.count ? h("button", {class:"btn ghost", type:"button", onclick:() => showTable(t, offset + 100, true)}, "Next") : null,
           h("button", {class:"btn ghost", type:"button", onclick:() => { sql.value = `SELECT * FROM ${t} LIMIT 50`; sql.focus(); }}, "Query this")),
         grid(d.columns, d.rows));
-    } catch (e) { put(right, h("p", {class:"status err"}, e.message)); }
+      if (paged) right.querySelector("button").focus();   // the pressed button was redrawn: Previous, or Next on the first page
+    } catch (e) { put(right, errorBox(e)); }
   };
-  const sec = (title, type) => [h("h3", null, title), tables.filter(t => t.type === type).map(t => h("button", {type:"button", "data-n":t.name, onclick:() => showTable(t.name)}, h("span", null, t.name), h("span", {class:"muted"}, t.count)))];
+  const sec = (title, type) => [sect(title), tables.filter(t => t.type === type).map(t => h("button", {type:"button", "data-n":t.name, onclick:() => showTable(t.name)}, h("span", null, t.name), h("span", {class:"muted"}, t.count)))];
   add(list, sec("Saved views", "view"), sec("Tables", "table"));
-  const sql = h("textarea", {class:"mono", "aria-label":"SQL query", placeholder:"SELECT code, title, status FROM issues WHERE severity = 'H'"});
+  const sql = h("textarea", {class:"field mono", "aria-label":"SQL query", placeholder:"SELECT code, title, status FROM issues WHERE severity = 'H'"});
   const out = h("div");
   const run = async () => {
     try { const d = await api("sql", {sql: sql.value}); put(out, h("p", {class:"note"}, `${d.rows.length} rows${d.truncated ? ` (first ${d.rows.length.toLocaleString("en")} shown)` : ""}`), grid(d.columns, d.rows)); }
-    catch (e) { put(out, h("p", {class:"status err"}, e.message)); }
+    catch (e) { put(out, errorBox(e)); }
   };
   sql.addEventListener("keydown", e => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") run(); });
   setView(h("h1", null, "Explore the ledger"),
-    h("p", {class:"lede"}, "Browse every table and saved view, or run your own read-only query. Nothing here can change the ledger."),
-    h("div", {class:"card", style:"display:flex;flex-direction:column;gap:8px"}, h("b", null, "Query"), sql, h("div", {class:"tools"}, h("button", {class:"btn", type:"button", onclick:run}, "Run query"), h("span", {class:"note"}, "Ctrl or ⌘ + Enter runs it")), out),
+    h("p", {class:"lede"}, STATIC ? "Browse every table and saved view as they were when this snapshot was taken."
+      : "Browse every table and saved view, or run your own read-only query. Nothing here can change the ledger."),
+    STATIC ? h("p", {class:"note"}, "The query box needs the local viewer (python3 ledger.py serve). Here each table and view shows up to 500 rows, and long values are shortened.")
+    : h("div", {class:"card stack"}, h("b", null, "Query"), sql, h("div", {class:"tools"}, h("button", {class:"btn", type:"button", onclick:run}, "Run query"), h("span", {class:"note"}, "Ctrl or ⌘ + Enter runs it")), out),
     h("div", {class:"split"}, list, right));
   if (name && tables.some(t => t.name === name)) showTable(name); else add(right, empty("Choose a table or view on the left."));
 };
 
+// ---------- How it works (the shared copy)
+if (STATIC) VIEWS.guide = async () => {
+  const o = OVERVIEW || await api("overview");
+  const plans = await api("plans"), revs = await api("reviews");
+  const r = revs[0], p = plans[0], waiting = Math.max(0, o.queue - (STATIC ? hubAnsweredOpen() : 0));
+  setView(
+    h("h1", null, "How it works"),
+    h("p", {class:"lede"}, "What this site is, how a review runs, what the words mean, and where things stand right now."),
+    h("div", {class:"card"}, h("h2", null, "Where things stand"),
+      kv([["Latest review", r ? h("a", {href:"#/review/" + r.code}, `${r.code} · ${lab("review", r.status)} · ${r.points} points`) : "None yet"],
+          ["Fix plan", p ? h("a", {href:"#/plan/" + p.code}, `${p.code} · ${lab("plan", p.status)} · ${p.done || 0} of ${p.steps || 0} steps done`) : "None yet"],
+          ["Waiting on you", waiting ? h("a", {href:"#/inbox"}, plural(waiting, "question")) : "Nothing right now"],
+          ["Updated", whenCell(STATIC ? STATIC.taken : null)]])),
+    md(STATIC ? STATIC.guide : ""));
+};
+
 // ---------- routing
-const TABS = [["home","#/","Overview"],["inbox","#/inbox","Waiting on you"],["reviews","#/reviews","Reviews"],["goals","#/goals","Design goals"],["issues","#/issues","Issues"],["plans","#/plans","Fix plans"],["trends","#/trends","Over time"],["explore","#/explore","Explore"]];
+const GUIDE_TAB = ["guide","#/guide","How it works"];
+const TABS = [["home","#/","Overview"], ...(STATIC ? [GUIDE_TAB] : []),["inbox","#/inbox","Waiting on you"],["reviews","#/reviews","Reviews"],["goals","#/goals","Design goals"],["issues","#/issues","Issues"],["plans","#/plans","Fix plans"],["trends","#/trends","Over time"],["explore","#/explore","Explore"]];
 function drawTabs(active){
-  const n = OVERVIEW ? OVERVIEW.queue : 0;
-  put(document.getElementById("tabs"), ...TABS.map(([k, href, t]) => h("a", {href, "aria-current": active === k ? "page" : null}, t, k === "inbox" && n ? h("span", {class:"badge"}, n) : null)));
+  const n = Math.max(0, (OVERVIEW ? OVERVIEW.queue : 0) - (STATIC ? hubAnsweredOpen() : 0));
+  put(document.getElementById("tabs"), ...TABS.map(([k, href, t]) => {
+    const badge = k === "inbox" && n;
+    return h("a", {href, "data-k": k, "aria-current": active === k ? "page" : null, "aria-label": badge ? `${t}, ${n} waiting` : null}, t, badge ? h("span", {class:"badge"}, n) : null); }));
+  // Where the tabs scroll sideways, bring the current one into view (not scrollIntoView: Chrome then starts Tab from it).
+  const tabs = document.getElementById("tabs"), cur = tabs.querySelector('a[aria-current="page"]');
+  if (cur && tabs.scrollWidth > tabs.clientWidth) tabs.scrollLeft = cur.offsetLeft - tabs.offsetLeft - (tabs.clientWidth - cur.offsetWidth) / 2;
 }
 async function route(){
   takeToken();
-  const raw = location.hash.replace(/^#\/?/, "");
+  const raw = currentPath();
   const [pathPart, query] = raw.split("?");
   const parts = pathPart.split("/").filter(Boolean).map(decodeURIComponent);
   const name = parts[0] || "home";
@@ -644,22 +913,35 @@ async function route(){
   const tab = {review:"reviews", issue:"issues", plan:"plans", history:"inbox"}[name] || (VIEWS[name] ? name : "home");
   try {
     if (!OVERVIEW || name === "home" || name === "inbox") { OVERVIEW = await api("overview"); LABELS = OVERVIEW.labels; setLabels(LABELS.enums);
-      put(document.getElementById("brand"), OVERVIEW.project, h("small", null, "review ledger")); document.title = OVERVIEW.project + " · review ledger"; }
+      put(document.getElementById("brand"), OVERVIEW.project, h("small", null, STATIC ? "review ledger · updated " + when(STATIC.taken) : "review ledger")); document.title = OVERVIEW.project + " · review ledger"; }
     drawTabs(tab);
     await view(parts.slice(1), new URLSearchParams(query || ""));
   } catch (e) { drawTabs(tab); failed(e); }
 }
 window.addEventListener("hashchange", route);
+document.getElementById("skip").addEventListener("click", e => { e.preventDefault(); focusHeading(); });
+// --top: the sticky header's height, which scrolling to a focused control and the plan's phase list stay clear of.
+(() => {
+  const top = document.querySelector("header.top");
+  const set = () => document.documentElement.style.setProperty("--top", (getComputedStyle(top).position === "sticky" ? top.offsetHeight : 0) + 8 + "px");
+  new ResizeObserver(set).observe(top); set();
+})();
 
 // ---------- theme
 (() => {
-  const btn = document.getElementById("theme"), order = ["auto","light","dark"];
+  const btn = document.getElementById("theme"), order = ["auto","light","dark"], dark = matchMedia("(prefers-color-scheme:dark)");
+  const name = {auto:"Automatic", light:"Light", dark:"Dark"}, next = () => order[(order.indexOf(t) + 1) % 3];
   let t = "auto"; try { t = localStorage.getItem("ledger-theme") || "auto"; } catch {}
-  const apply = () => { if (t === "auto") document.documentElement.removeAttribute("data-theme"); else document.documentElement.setAttribute("data-theme", t); btn.textContent = "Theme: " + t; };
-  btn.addEventListener("click", () => { t = order[(order.indexOf(t) + 1) % 3]; try { localStorage.setItem("ledger-theme", t); } catch {} apply(); });
+  if (!order.includes(t)) t = "auto";
+  // data-theme is always the palette in use; "auto" follows the system setting, also when it changes.
+  const apply = () => { document.documentElement.setAttribute("data-theme", t === "auto" ? (dark.matches ? "dark" : "light") : t);
+    btn.textContent = "Theme: " + name[t]; btn.setAttribute("aria-label", `Theme: ${name[t]}. Switch to ${name[next()]}.`); };
+  dark.addEventListener("change", apply);
+  btn.addEventListener("click", () => { t = next(); try { localStorage.setItem("ledger-theme", t); } catch {} apply(); });
   apply();
 })();
 route();
+hubInit();
 </script>
 </body>
 </html>

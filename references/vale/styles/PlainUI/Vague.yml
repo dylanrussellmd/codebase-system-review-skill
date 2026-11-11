@@ -1,0 +1,12 @@
+extends: existence
+message: "Say what failed and what the user can do ('%s')."
+level: error
+ignorecase: true
+tokens:
+  - an error (?:has )?occurred
+  - something went wrong
+  - oops
+  - whoops
+  - uh[- ]oh
+  - invalid input
+  - try again later

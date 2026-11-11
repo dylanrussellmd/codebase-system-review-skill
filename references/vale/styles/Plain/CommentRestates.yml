@@ -1,0 +1,14 @@
+# Comments that label the code under them. Unverified: the comment scopes.
+extends: existence
+message: "This comment restates the code ('%s'); say why, or delete it."
+level: warning
+ignorecase: true
+scope:
+  - comment.line
+  - comment.block
+tokens:
+  - (?:default )?constructor
+  - (?:getter|setter)s? for
+  - (?:imports?|variables|constants|helper functions|main function|end of (?:function|class|loop|if))
+  - (?:initiali[sz]e|declare|define|set|create|return|loop (?:over|through)|iterate (?:over|through)|check if|increment|decrement) (?:the |a |an )?\w+\.?$
+  - this (?:function|method|class) (?:is used to|is responsible for|will)

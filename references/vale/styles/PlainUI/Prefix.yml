@@ -1,0 +1,8 @@
+extends: existence
+message: "The styling already says it ('%s')."
+level: error
+ignorecase: true
+scope: raw
+nonword: true
+tokens:
+  - '^(?:Error|Warning|Success|Info|Notice):'

@@ -6,6 +6,8 @@ test_recipes_run          every block runs and check still exits 0
 test_sql_only_for_corrections  SQL blocks sit under "Correcting the ledger" only, and the intro says so
 test_redaction_logged     the redaction recipe replaces the secret and leaves a 'redacted' event naming no value
 test_tag_pushed_recorded  the tag recipe sets tag_pushed and writes an event
+test_every_check_has_anchor  "A failing check" has one heading per check view and per integrity or foreign-key failure,
+                          each followed by what to do
 """
 import re
 import shlex
@@ -113,7 +115,7 @@ class Recipes(unittest.TestCase):
         intro = " ".join(text[:text.index("## Setting up a review")].split())
         self.assertIn('Raw SQL is only for the corrections under "Correcting the ledger"', intro)
         self.assertNotRegex(text, r"(?i)drop-review|none yet|planned for")
-        help_line = [l for l in text.splitlines() if l.startswith("- `v_unguarded_fixes`")][0]
+        help_line = text[text.index("#### `v_unguarded_fixes`"):].split("\n\n")[1]
         self.assertIn("record one with `add-guard`", help_line)
         false = " ".join(text[text.index("### Mark a false finding"):text.index("### Retire a goal")].split())
         self.assertRegex(false, r"ledger\.py verify R-0002:SEC-M1 false --note")
@@ -136,6 +138,19 @@ class Recipes(unittest.TestCase):
         self.assertEqual(L.scalar("SELECT min(tag_pushed) FROM review_repositories WHERE review_id = "
                                   "(SELECT id FROM reviews WHERE code = 'R-0001')"), 1)
         self.assertEqual(L.count("events", "event = 'tag-pushed'"), 1)
+
+    def test_every_check_has_anchor(self):
+        text = self.text
+        part = text[text.index("### A failing check"):text.index("### Merge conflicts and backups")]
+        entries = dict(re.findall(r"^#### `([a-z_]+)`[^\n]*\n\n(\S[^\n]*)", part, re.M))
+        views = [r["view"] for r in self.L.all("SELECT view FROM ledger_checks")]
+        self.assertGreaterEqual(len(views), 14)
+        for name in views + ["quick_check", "integrity_check", "foreign_key_check", "check_schema"]:
+            with self.subTest(check=name):
+                self.assertIn(name, entries, f"recipes.md 'A failing check' has no heading for {name}")
+        self.assertEqual(sorted(set(entries) - set(views)),
+                         ["check_schema", "foreign_key_check", "integrity_check", "quick_check"],
+                         "a heading for a view that check does not run")
 
 
 if __name__ == "__main__":

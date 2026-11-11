@@ -39,6 +39,57 @@ class Helpers(browser.ViewerTestCase):
         self.assertEqual(got["html"], "&lt;b&gt;bold&lt;/b&gt;0xy<i>z</i>")
         self.assertEqual(got["nodes"], 6)
 
+    def test_page_shared_helpers(self):
+        page = self.open("#/")
+        got = page.js("""() => {
+          const g = {options: [{value: "a", label: "Option A"}], answer_value: "a", answer_text: "because"};
+          const calls = [];
+          const q = h("input", {type: "search"}), s = select("Status", [["", "Any"], ["x", "X"]]);
+          const bar = filterBar([q, s], () => calls.push(q.value + "|" + s.value));
+          s.value = "x"; s.dispatchEvent(new Event("change"));
+          q.value = "t"; q.dispatchEvent(new Event("input"));
+          const it = item("N-1", "Title", [tag("High", "H")], ["body text"]);
+          return {plural: [plural(1, "issue"), plural(2, "issue"), plural(0, "issue"), plural(1, "check needs", "checks need"),
+                           plural(3, "check needs", "checks need")],
+                  err: errorBox(new Error("It broke.")).outerHTML,
+                  answers: [answerText(g), answerText({...g, answer_text: null}), answerText({...g, answer_value: null}),
+                            answerText({answer_value: "not-listed"}), answerText({})],
+                  strong: h("p", null, answerText(g, true)).innerHTML,
+                  fact: fact(3, "points").outerHTML,
+                  item: it.outerHTML, tones: [tone("issue", "open"), tone("step", "done"), tone("need", "production"),
+                                              tone("issue", "no-such"), tone("no-map", "x")],
+                  bar: [bar.className, bar.children.length], calls, sel: [s.getAttribute("aria-label"), s.options.length]};
+        }""")
+        self.assertEqual(got["plural"], ["1 issue", "2 issues", "0 issues", "1 check needs", "3 checks need"])
+        self.assertEqual(got["err"], '<p class="status err">It broke.</p>')
+        self.assertEqual(got["answers"], ["Option A — because", "Option A", "because", "Not listed", ""])
+        self.assertEqual(got["strong"], "<b>Option A</b> — because")
+        self.assertEqual(got["fact"], "<div><b>3</b><span>points</span></div>")
+        self.assertEqual(got["item"], '<details class="item"><summary><span class="n">N-1</span><span class="t">Title'
+                         '</span><span class="tags"><span class="tag H">High</span></span></summary>'
+                         '<div class="body">body text</div></details>')
+        self.assertEqual(got["tones"], ["warn", "solid", "crit", "", ""])
+        self.assertEqual(got["bar"], ["tools", 2])
+        self.assertEqual(got["calls"], ["|x", "t|x"])
+        self.assertEqual(got["sel"], ["Status", 2])
+
+    def test_page_when(self):
+        # Stored times are UTC. Shown in Los Angeles (UTC-8 in January), in US English.
+        page = self.open("#/", timezone_id="America/Los_Angeles", locale="en-US")
+        got = page.js("""() => { const cell = v => { const c = whenCell(v); return c instanceof Node ? [c.tagName, c.textContent, c.title] : c; };
+          return {none: [when(null), when(""), when(undefined), whenCell(null)],
+            same: ["2026-01-02 03:04:05", "2026-01-02T03:04:05Z", "2026-01-02T03:04:05.000Z", "2026-01-02T03:04:05",
+                   "2026-01-02 03:04:05.123456", "2026-01-02T05:04:05+02:00", "2026-01-01T19:04:05-0800", "2026-01-02 03:04"].map(v => when(v)),
+            dateOnly: [when("2026-01-02"), when("2026-01-02", false)], noTime: when("2026-01-02 03:04:05", false),
+            bad: ["yesterday", "2026-13-45", "2026-01-02 25:99:00", "12345", "2026-02-30"].map(v => when(v)),
+            cells: [cell("2026-01-02 03:04:05"), cell("soon"), cell(null)]}; }""")
+        self.assertEqual(got["none"], ["", "", "", ""])
+        self.assertEqual(set(got["same"]), {"Jan 1, 2026, 7:04 PM"})             # one moment, however it was written
+        self.assertEqual(got["dateOnly"], ["Jan 2, 2026", "Jan 2, 2026"])         # a day stays the day that was written
+        self.assertEqual(got["noTime"], "Jan 1, 2026")
+        self.assertEqual(set(got["bad"]), {"date unknown"})
+        self.assertEqual(got["cells"], ["Jan 1, 2026, 7:04 PM", ["SPAN", "date unknown", "soon"], ""])
+
     def test_page_put_add_filter(self):
         page = self.open("#/")
         got = page.js("""() => {
@@ -135,7 +186,7 @@ class Helpers(browser.ViewerTestCase):
             self.assertEqual(row.locator("td").nth(1).inner_text(), "1")
             page.after(row.click)
             self.assertEqual(page.location_hash(), "#/explore/v_unmatched_findings")
-            self.assertEqual(page.text("#app h2"), "v_unmatched_findings")
+            self.assertEqual(page.text("#app h2:not(.sec)"), "v_unmatched_findings")
         finally:
             # findings are append-only (schema 3): lift the guard for this cleanup only, then put it back as it was
             con = self.ledger.con
@@ -236,7 +287,7 @@ class EmptyLedger(browser.ViewerTestCase):
     def test_page_empty_views(self):
         page = self.open("#/inbox")
         self.assertEqual(page.texts("p.empty"), ["Nothing is waiting on you right now."])
-        self.assertEqual(page.count("#app h3"), 0)                 # no answered or other section
+        self.assertEqual(page.count("#app h2.sec"), 0)                 # no answered or other section
         for hash_, want in (("#/reviews", ["Nothing here yet."]), ("#/plans", ["Nothing here yet."]),
                             ("#/history", ["Nothing here yet."])):
             with self.subTest(hash_):

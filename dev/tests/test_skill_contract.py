@@ -292,7 +292,7 @@ class Structure(unittest.TestCase):
 
     def test_reference_anchors_exist(self):
         for f in doc_files():
-            for ref in set(re.findall(r"references/[A-Za-z0-9_./-]+\.md#[a-z0-9-]+", f.read_text(encoding="utf-8"))):
+            for ref in set(re.findall(r"references/[A-Za-z0-9_./-]+\.md#[a-z0-9_-]+", f.read_text(encoding="utf-8"))):
                 path, anchor = ref.split("#")
                 heads = [slug(h) for h in re.findall(r"^#+ (.+)$", (REPO / path).read_text(encoding="utf-8"), re.M)]
                 self.assertIn(anchor, heads, f"{f.name} links {ref}")
@@ -332,6 +332,23 @@ class Structure(unittest.TestCase):
         catalog = " ".join((REFS / "domains.md").read_text(encoding="utf-8").split())
         self.assertIn("settings forms generated from the settings schema", catalog)
         self.assertIn("handle every response the callee can give", catalog)
+
+    def test_domains_cite_the_writing_standard(self):
+        entries = (REFS / "domains.md").read_text(encoding="utf-8").split("\n\n")
+        for name in ("Front end / UI", "Developer documentation", "End-user documentation"):
+            entry = " ".join([e for e in entries if e.startswith(f"**{name}")][0].split())
+            with self.subTest(domain=name):
+                self.assertIn("references/writing.md", entry)
+                self.assertIn("the shorter version", entry)
+                if "documentation" in name:
+                    self.assertIn("stale against the current code", entry)
+        for name in ("brief.md", "implementer-brief.md"):
+            self.assertIn("references/writing.md", (REFS / name).read_text(encoding="utf-8"), name)
+        standard = (REFS / "writing.md").read_text(encoding="utf-8")
+        for rule in ("Show, don't tell", "Don't label the obvious", "Current state only", "Short and plain",
+                     "Only what the reader needs to act", "One word per thing"):
+            self.assertIn(f"**{rule}", standard)
+        self.assertIn("Explore is the one page that shows stored names", standard)
 
     def test_no_scheduling_terms(self):
         for f in doc_files():

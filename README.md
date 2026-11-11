@@ -6,7 +6,8 @@ A skill for a managed, multi-reviewer code review, with a per-project SQLite led
     ├── SKILL.md               the instructions the agent follows (read in full on every use)
     ├── scripts/ledger.py      ledger tool + viewer (Python 3.9+, no dependencies)
     └── references/            read when SKILL.md says: domains.md, brief.md, indexing.md, fix-plan.md,
-                               recipes.md, implementer-brief.md, formats/ (file formats), schema.sql
+                               recipes.md, implementer-brief.md, writing.md, formats/ (file formats), schema.sql,
+                               vale/ (optional Vale rules for writing.md; untested)
 
 ## Install
 
@@ -17,33 +18,32 @@ A skill for a managed, multi-reviewer code review, with a per-project SQLite led
 | Claude Code (OpenCode reads it too) | `~/.claude/skills/` |
 | others | the harness's skills folder |
 
-The folder name must stay `codebase-system-review` (it must match `name:` in SKILL.md).
-Restart the harness, then ask the agent to "run the comprehensive system review".
+Keep the folder name `codebase-system-review`: it must match `name:` in SKILL.md. Restart the harness, then ask the
+agent to "run the comprehensive system review".
 
-Each project keeps a copy of the tool at `.code-review/ledger.py`. Treat a change to that copy, or to the ledger's
-schema, in someone else's pull request like any other code change you must review: `ledger.py check` fails when the
-ledger's tables, views or triggers differ from the shipped schema, and the skill tells agents to run the skill's own
-`scripts/ledger.py` and the project copy only right after `init` refreshed it.
+Each project keeps a copy of the tool at `.code-review/ledger.py`. Review a pull request that changes that copy or the
+ledger's schema like any other code change. `ledger.py check` fails when the ledger's tables, views or triggers differ
+from the shipped schema. Agents run the skill's own `scripts/ledger.py`, and the project copy only right after `init`
+refreshed it.
 
 ## Use the viewer
 
-After every review step and fix batch the agent writes the hub, the viewer as one file
-(`.code-review/hub.html`, `ledger.py progress-page`). Publishing it elsewhere is optional; answers given in a
-published copy come back with `ledger.py import-answers`. The live viewer, from the project root, with the skill's
-copy (or the project copy right after `init`):
+After every review step and fix batch the agent writes the hub: the viewer as one file (`.code-review/hub.html`,
+`ledger.py progress-page`). Publishing it elsewhere is optional; answers given in a published copy come back with
+`ledger.py import-answers`. The live viewer, from the project root, with the skill's copy (or the project copy right
+after `init`):
 
     python3 <skill folder>/scripts/ledger.py --root . serve
 
 ## Where the ledger lives
 
-By default `<project root>/.code-review/` (owner-only: the folder 0700, the files 0600), holding the ledger, the copy
-of the tool, the dump, the hub page, saved patches and each review's brief, reports and indexes. Nothing in it is
-committed until the owner decides at the first review (keep it out, commit only `ledger.sql`, or commit only
-`ledger.sqlite`; about 7 MB of ledger and 5 MB of dump per 1,000 findings); until then the agent lists `.code-review/`
-in `.git/info/exclude`. Review tags (`review/R-0001`) stay local unless that decision says to push them. To keep
-review data out of the repository altogether, set `CODE_REVIEW_DIR=/some/folder` for every command (or pass
-`--db FILE`): nothing is then written inside the repository. This repository keeps its own ledger out (decision
-D-0001: `.code-review/` is in `.gitignore`).
+In `<project root>/.code-review/` (owner-only: the folder 0700, the files 0600): the ledger, the copy of the tool, the
+dump, the hub page, saved patches and each review's brief, reports and indexes. The owner decides at the first review
+what is committed: nothing, only `ledger.sql`, or only `ledger.sqlite` (about 9 MB of ledger and 7 MB of dump per
+1,000 findings). Until then the agent lists `.code-review/` in `.git/info/exclude` and commits nothing. Review tags
+(`review/R-0001`) stay local unless that decision says to push them. `CODE_REVIEW_DIR=/some/folder` for every command
+(or `--db FILE`) writes nothing inside the repository. This repository keeps its own ledger out (decision D-0001:
+`.code-review/` is in `.gitignore`).
 
 The ledger runs in SQLite's WAL mode (`init` sets it; `migrate` switches an existing ledger once), so the viewer's
 reads never block the agent's writes. While it is open, `ledger.sqlite-wal` and `ledger.sqlite-shm` sit beside it
@@ -62,8 +62,7 @@ reads never block the agent's writes. While it is open, `ledger.sqlite-wal` and 
     dev/page.html            the viewer page
     references/schema.sql    the schema (also embedded in ledger.py)
 
-From the repository root, rebuild, confirm the build is current, and try it on a demo project (`DEMO` is a new or
-empty folder of your choice; leave it out to get a temporary one):
+From the repository root (`DEMO` is a new or empty folder; leave it out to get a temporary one):
 
     python3 dev/build.py                          regenerate scripts/ledger.py
     python3 dev/build.py --check                  exit 1 if scripts/ledger.py is stale
@@ -72,9 +71,13 @@ empty folder of your choice; leave it out to get a temporary one):
     python3 scripts/ledger.py --root DEMO check   the demo ledger passes every check
     python3 scripts/ledger.py --root DEMO serve   open the viewer on it (Ctrl+C to stop)
 
-Scale tests build large generated ledgers (`dev/tests/scale.py`; run it with `--help` for a standalone build) and are
-skipped unless `LEDGER_SLOW_TESTS=1`. The README's Developing commands and every `ledger.py` command SKILL.md names
-are checked by `dev/tests/test_docs.py`.
+`seed_demo.py` prints FAIL and exits 1 when the demo ledger is not what it expects. `dev/tests/test_docs.py` runs these commands and
+checks every `ledger.py` command SKILL.md names.
+
+Write SKILL.md, this file and `references/` to `references/writing.md`; `dev/tests/test_writing_lint.py` refuses its
+banned phrases (CHANGELOG.md is exempt). `SKILL.md` and `references/*.md` never put an exclamation mark right before a
+code span or a code fence's language: some harnesses run such a block when they load the skill. `SKILL.md` stays
+within 375 lines; longer material goes in `references/`.
 
 ## Testing
 
@@ -83,38 +86,29 @@ SQLite 3.31 to 3.53):
 
     python3 -m unittest discover -s dev/tests -t . -v
 
-The tests build `scripts/ledger.py` from the sources into a temporary folder and test that build, so they always run
-the code that ships. Everything they create (scratch git repositories, ledgers, viewer servers on free ports) lives in
-a temporary folder that is removed when the run ends. Slow scale tests are skipped unless `LEDGER_SLOW_TESTS=1`,
-and browser tests unless `LEDGER_BROWSER_TESTS=1` with Playwright and Chrome or Chromium installed
-(`pip install playwright && python3 -m playwright install chromium`). CI runs both in their own jobs. Measuring helpers
-for performance work are in `dev/tests/helpers.py`; baseline numbers are in `dev/tests/perf_baseline.json`.
+The tests build `scripts/ledger.py` from the sources into a temporary folder and test that build. Everything they
+create (scratch git repositories, ledgers, viewer servers on free ports) lives in a temporary folder removed when the
+run ends. Skipped by default:
 
-Before committing a change to `dev/core.py`, `dev/page.html` or `references/schema.sql`, rebuild and commit
-`scripts/ledger.py` with it:
+- scale tests on large generated ledgers (`dev/tests/scale.py`; `--help` for a standalone build): `LEDGER_SLOW_TESTS=1`;
+- browser tests: `LEDGER_BROWSER_TESTS=1`, with Playwright and Chrome or Chromium
+  (`pip install playwright && python3 -m playwright install chromium`).
 
-    python3 dev/build.py           regenerate scripts/ledger.py
-    python3 dev/build.py --check   exit 1, with a short diff, if scripts/ledger.py is stale (CI runs this)
+CI (`.github/workflows/ci.yml`) runs `python3 dev/build.py --check` and the suite on Python 3.9 and 3.12 for every
+push and pull request, and the slow and browser tests in their own jobs.
 
-The build pastes the schema and the page into raw triple-quoted strings in core.py, so neither may contain three
-double quotes in a row or end with a backslash or a double quote, and each placeholder (`@@SCHEMA@@`, `@@PAGE@@`)
-must appear exactly once in core.py and nowhere else; the build refuses otherwise and writes nothing.
+Shared test builders (scratch repositories, ledgers, the demo data, a viewer server) are in `dev/tests/fixtures.py`,
+measuring helpers in `dev/tests/helpers.py`, baseline numbers in `dev/tests/perf_baseline.json`.
 
-`python3 dev/tests/seed_demo.py [DIR]` creates a demo project (a small git repository with a filled ledger, refs
-filled and reviews tagged) to try the viewer; it exits 1 if any of the ledger behaviour it relies on has changed.
-Shared test builders (scratch repositories, ledgers, the demo data, a viewer server) are in `dev/tests/fixtures.py`.
-
-`SKILL.md` and `references/*.md` never put an exclamation mark right before a code span or a code fence's language:
-some harnesses run such a block when they load the skill. `SKILL.md` stays within 375 lines; longer material goes in
-`references/`.
-
-CI (`.github/workflows/ci.yml`) runs the build check and the suite on Python 3.9 and 3.12 for every push and pull
-request.
+Commit `scripts/ledger.py` with every change to `dev/core.py`, `dev/page.html` or `references/schema.sql`. The build
+pastes the schema and the page into raw triple-quoted strings in core.py. It refuses, writing nothing, when either
+contains three double quotes in a row or ends with a backslash or a double quote, or when a placeholder
+(`@@SCHEMA@@`, `@@PAGE@@`) does not appear exactly once in core.py and nowhere else.
 
 ## Changing the schema
 
-Every ledger already in use is schema 1 (`references/schema.sql` as it was at commit ea00196, frozen in
-`dev/tests/data/schema-v1.sql`). A schema change ships as a numbered migration, never as an edit alone:
+A schema change ships as a numbered migration, never as an edit alone. `migrate` upgrades a ledger from any schema
+since 1 (frozen in `dev/tests/data/schema-v1.sql`):
 
 1. Add `references/migrations/NNNN-<slug>.sql` (the next number; lowercase slug). Its first line is
    `-- <description>`. It holds only what changes tables, indexes and data, from schema NNNN-1 to NNNN. Views and

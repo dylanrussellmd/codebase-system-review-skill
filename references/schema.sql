@@ -1,5 +1,5 @@
 -- =====================================================================
--- Code review ledger — schema version 9
+-- Code review ledger — schema version 10
 -- One SQLite file per project: <project root>/.code-review/ledger.sqlite
 -- Every connection must run:  PRAGMA foreign_keys = ON;
 -- Times are UTC ISO-8601 text with milliseconds (strftime('%Y-%m-%dT%H:%M:%fZ','now')); the tr_time_*
@@ -14,17 +14,21 @@
 
 -- ---------- Housekeeping ----------------------------------------------
 
+-- Facts about this ledger file, one per row.
 CREATE TABLE meta (
-  key   TEXT PRIMARY KEY,                -- schema_version, project_name, created_at, created_by_skill
+  key   TEXT PRIMARY KEY,                -- schema_version, project_name, created_at, ledger_location,
+                                         -- created_by_skill, written_by_tool, schema_hash
   value TEXT NOT NULL
 );
 
+-- The schema upgrades this ledger has been through.
 CREATE TABLE schema_migrations (
   version     INTEGER PRIMARY KEY,
   description TEXT NOT NULL,
   applied_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
+-- The checks that say whether the ledger is complete and consistent.
 -- The checks `ledger.py check` and the viewer's home page run, in position order: each view must be empty (tier
 -- 'error': check exits 1 when it is not) or should be (tier 'warning': listed, check still exits 0). Seeded at the
 -- end of this file; a schema that adds a check inserts its row in its migration.
@@ -42,6 +46,7 @@ CREATE TABLE ledger_checks (
 -- column keeps its CHECK list, with its labels in enum_labels (a test keeps the two equal). Seeded at the end of
 -- this file.
 
+-- The statuses an issue can have, with the label shown for each.
 CREATE TABLE issue_statuses (
   value    TEXT PRIMARY KEY,
   label    TEXT NOT NULL,
@@ -56,12 +61,18 @@ CREATE TABLE issue_statuses (
   CHECK (reopens = 0 OR (resolved = 1 AND fixed = 0))
 );
 
+-- How serious a point is: high, medium, low, or a missing test.
 CREATE TABLE severities (
   value    TEXT PRIMARY KEY,                 -- H, M, L, T
   label    TEXT NOT NULL,
   position INTEGER NOT NULL UNIQUE           -- most severe first
 );
 
+-- How a point relates to the issue it was matched to.
+-- new: this review opened the issue. still-present, changed: an open issue seen again, as before or differently.
+-- recurrence: an issue closed without a fix was raised again. regression: a fixed issue came back. continuation: a
+-- new issue that continues an earlier one (with a continuation-of relation). references/indexing.md says how to
+-- choose.
 CREATE TABLE match_types (
   value     TEXT PRIMARY KEY,
   label     TEXT NOT NULL,
@@ -69,6 +80,7 @@ CREATE TABLE match_types (
   came_back INTEGER NOT NULL CHECK (came_back IN (0,1))  -- the issue was closed and was raised again
 );
 
+-- The ways two issues can be related.
 CREATE TABLE relation_types (
   value         TEXT PRIMARY KEY,
   label         TEXT NOT NULL,              -- read from the issue the relation starts at ("Duplicate of")
@@ -77,15 +89,17 @@ CREATE TABLE relation_types (
   closes        INTEGER NOT NULL CHECK (closes IN (0,1))  -- recording it closes the active issue as duplicate
 );
 
+-- The kinds of question the owner is asked.
 CREATE TABLE gate_kinds (
   value    TEXT PRIMARY KEY,
   label    TEXT NOT NULL,
   position INTEGER NOT NULL UNIQUE
 );
 
--- The statuses of a design goal (schema 9): proposed from the owner interview, approved or rejected by the owner,
--- retired once it no longer applies. served = given to reviewers, drafters and implementers (`ledger.py goals`,
--- v_goals_for_brief, the goals a plan step may serve).
+-- The statuses a design goal can have.
+-- Proposed from the owner interview, approved or rejected by the owner, retired once it no longer applies. served =
+-- given to reviewers, drafters and implementers (`ledger.py goals`, v_goals_for_brief, the goals a plan step may
+-- serve).
 CREATE TABLE goal_statuses (
   value    TEXT PRIMARY KEY,
   label    TEXT NOT NULL,
@@ -93,6 +107,7 @@ CREATE TABLE goal_statuses (
   served   INTEGER NOT NULL CHECK (served IN (0,1))    -- given to reviewers, drafters and implementers (`goals`)
 );
 
+-- The labels shown for the words of every other fixed list.
 -- Labels of the words of every other word column (whose CHECK lists the allowed words). enum names the list:
 -- issue_kind is issues.kind and findings.kind, confidence is issue_relations.confidence and
 -- findings.match_confidence, verdict is the verdict of finding_requirements and review_requirement_checks.
@@ -107,6 +122,9 @@ CREATE TABLE enum_labels (
 
 -- ---------- Who and what ----------------------------------------------
 
+-- The git repositories the project is made of.
+-- permalink_template builds the web link to cited lines: {sha} is the commit, {path} the file, {start} and {end}
+-- the first and last line. A whole-file reference drops the #fragment that holds {start} or {end}.
 CREATE TABLE repositories (
   id             INTEGER PRIMARY KEY,
   name           TEXT NOT NULL UNIQUE,   -- short name used in the brief
@@ -129,8 +147,8 @@ CREATE TABLE repositories (
               AND path NOT GLOB '../*' AND path NOT GLOB '*/../*' AND path NOT GLOB '*/..'))))
 );
 
--- People and agents. One row per agent instance (each subagent run gets
--- its own row), so "who said this" is always answerable.
+-- The people and agents who did or decided something.
+-- One row per agent instance (each subagent run gets its own row), so "who said this" is always answerable.
 CREATE TABLE actors (
   id              INTEGER PRIMARY KEY,
   kind            TEXT NOT NULL CHECK (kind IN
@@ -146,6 +164,11 @@ CREATE TABLE actors (
 
 -- ---------- Catalogs ----------------------------------------------------
 
+-- The review domains: the angles a codebase is reviewed from.
+-- report_file is the default report name; <module> in it stands for the part of the code one reviewer of a split
+-- domain covers (tests-<module>.md gives tests-api.md). description is optional and empty for the built-in domains,
+-- which references/domains.md describes. A domain with retired_at set takes no new reviews, findings, issues,
+-- metrics or goals (the tr_*_domain_active triggers); rows that already use it stay.
 CREATE TABLE domains (
   code        TEXT PRIMARY KEY,          -- 'security', 'logging', 'docs-developer' ...
   name        TEXT NOT NULL,
@@ -157,6 +180,8 @@ CREATE TABLE domains (
   retired_at  TEXT
 );
 
+-- The topics a point can be filed under, whatever its domain.
+-- A theme with retired_at set is not accepted for new findings; rows that already use it stay.
 CREATE TABLE themes (
   code       TEXT PRIMARY KEY,           -- 'authorization', 'logging-audit' ...
   name       TEXT NOT NULL,
@@ -165,13 +190,14 @@ CREATE TABLE themes (
 
 -- ---------- Standards the code is judged against ----------------------
 
--- Design goals (schema 9, plan step 129): what the owner wants the code to be, by approved domain (domain_code;
--- NULL = the whole project). Written from the owner interview as 'proposed' (`ledger.py propose-goal`, citing the
--- interview questions it summarizes in goal_sources) and given to agents only once the owner approved it
--- (`approve-goals`, or the confirm gate gate_id answered 'approve' in the viewer or hub; approved_by_actor_id and
--- approved_at say who and when). A rejected goal keeps the owner's reason in note; an approved goal is never edited:
--- it is retired (setting status 'retired' or retired_at sets the other) and a new one proposed (superseded_by).
--- Goals recorded before schema 9 became approved whole-project goals.
+-- What the owner wants the code to be, one statement per goal.
+-- Each goal belongs to an approved domain (domain_code; NULL = the whole project). Written from the owner interview
+-- as 'proposed' (`ledger.py propose-goal`, citing the interview questions it summarizes in goal_sources) and given
+-- to agents only once the owner approved it (`approve-goals`, or the confirm gate gate_id answered 'approve' in the
+-- viewer or hub; approved_by_actor_id and approved_at say who and when). A rejected goal keeps the owner's reason
+-- in note; an approved goal is never edited: it is retired (setting status 'retired' or retired_at sets the other)
+-- and a new one proposed (superseded_by). Goals recorded before schema 9 became approved whole-project goals.
+-- retired_at alone means the goal no longer applies; with superseded_by, that another goal replaced it.
 CREATE TABLE design_goals (
   id            INTEGER PRIMARY KEY,
   code          TEXT NOT NULL UNIQUE     -- G-01
@@ -206,6 +232,10 @@ CREATE TABLE design_goals (
 -- only parents nothing protects (a plan with no steps, for instance). Abandon a review (status 'abandoned')
 -- instead of deleting it.
 
+-- One row for each review of the project.
+-- status runs planning <-> awaiting-approval -> approved -> running -> verifying -> indexing -> consolidating ->
+-- handed-off, or abandoned from any status (tr_review_transition has the exact moves). skill_version is the version
+-- of the skill that started the review, as `ledger.py --version` prints it.
 CREATE TABLE reviews (
   id                    INTEGER PRIMARY KEY,
   code                  TEXT NOT NULL UNIQUE    -- R-0001
@@ -241,7 +271,7 @@ CREATE TABLE reviews (
                                                 -- viewer; written in Step 6 with `ledger.py set-report`
 );
 
--- The exact code state each review looked at.
+-- The exact commit of each repository that a review looked at.
 CREATE TABLE review_repositories (
   review_id     INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
   repository_id INTEGER NOT NULL REFERENCES repositories(id),
@@ -259,13 +289,15 @@ CREATE TABLE review_repositories (
   PRIMARY KEY (review_id, repository_id)
 );
 
+-- The design goals each review judged the code against.
 CREATE TABLE review_goals (
   review_id INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
   goal_id   INTEGER NOT NULL REFERENCES design_goals(id),
   PRIMARY KEY (review_id, goal_id)
 );
 
--- Which domains were proposed, approved, skipped, and why.
+-- The domains proposed for each review, and whether each was reviewed or skipped.
+-- reason says why; owner_change records what the owner changed in the proposal.
 CREATE TABLE review_domains (
   review_id         INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
   domain_code       TEXT NOT NULL REFERENCES domains(code),
@@ -278,13 +310,15 @@ CREATE TABLE review_domains (
   PRIMARY KEY (review_id, domain_code)
 );
 
--- One row per reviewer (subagent) run.
+-- One row for each reviewer that ran in a review.
+-- label names the run within its review. items_reviewed and the high, medium, low and test counts are what the
+-- reviewer reported in its final message; v_review_summary counts the findings that were indexed.
 CREATE TABLE reviewer_runs (
   id             INTEGER PRIMARY KEY,
   review_id      INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
   domain_code    TEXT NOT NULL REFERENCES domains(code),
   actor_id       INTEGER NOT NULL REFERENCES actors(id),
-  label          TEXT NOT NULL,           -- 'tests-engine-A'
+  label          TEXT NOT NULL,           -- names the run within its review: 'tests-api'
   scope          TEXT NOT NULL,
   prompt         TEXT,
   report_path    TEXT,
@@ -302,8 +336,9 @@ CREATE TABLE reviewer_runs (
   UNIQUE (review_id, label)
 );
 
--- Every other agent that worked on a review (verifiers, indexers, matchers, drafters, fixers ...): reviewers are
--- tied to it by reviewer_runs and the manager by reviews.manager_actor_id. v_review_agents lists all of them.
+-- The other agents that worked on each review.
+-- Verifiers, indexers, matchers, drafters and fixers: reviewers are tied to it by reviewer_runs and the manager by
+-- reviews.manager_actor_id. v_review_agents lists all of them.
 CREATE TABLE review_actors (
   review_id  INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
   actor_id   INTEGER NOT NULL REFERENCES actors(id),
@@ -313,6 +348,10 @@ CREATE TABLE review_actors (
 
 -- ---------- Requirements (for spec conformance over time) -------------
 
+-- What the code is required to do, and where each requirement was stated.
+-- source is the document, issue or conversation, source_location the place in it, stated_at when it was stated. A
+-- requirement replaced by another is superseded (superseded_by names the new one); one that no longer applies is
+-- withdrawn. first_review_id is the review that recorded it.
 CREATE TABLE requirements (
   id              INTEGER PRIMARY KEY,
   code            TEXT NOT NULL UNIQUE    -- REQ-0001
@@ -330,6 +369,9 @@ CREATE TABLE requirements (
 
 -- ---------- Issues: the longitudinal record ----------------------------
 
+-- A problem in the code, followed from review to review until it is closed.
+-- severity is H, M or L (high, medium, low), or T for a missing test and nothing else. fingerprint is
+-- domain:theme:sub, what findings are matched on.
 CREATE TABLE issues (
   id                     INTEGER PRIMARY KEY,
   code                   TEXT NOT NULL UNIQUE    -- ISS-0001, never reused
@@ -343,7 +385,7 @@ CREATE TABLE issues (
                             'logging','perf','security','ops','verify')),
   severity               TEXT NOT NULL REFERENCES severities(value),             -- current
   status                 TEXT NOT NULL DEFAULT 'open' REFERENCES issue_statuses(value),
-  fingerprint            TEXT,                   -- domain:theme:sub[:symbol], for matching
+  fingerprint            TEXT,                   -- domain:theme:sub, for matching
   before_state           TEXT,                   -- what the system did when first found
   current_state          TEXT,                   -- what the latest review observed
   after_state            TEXT,                   -- what it does once fixed
@@ -369,7 +411,9 @@ CREATE TABLE issues (
   change_note            TEXT
 );
 
--- How issues relate across time and across reviews.
+-- How one issue is related to another.
+-- Read it from left to right: from_issue_id is a duplicate of, continues, is caused by, blocks ... to_issue_id
+-- (relation_types has the label for each reading). A relation is stored once, in that direction.
 CREATE TABLE issue_relations (
   id                       INTEGER PRIMARY KEY,
   from_issue_id            INTEGER NOT NULL REFERENCES issues(id),
@@ -386,6 +430,8 @@ CREATE TABLE issue_relations (
 
 -- ---------- Findings: every point from every review ---------------------
 
+-- Every point a review raised, as the reviewer reported it.
+-- match_type says how the point relates to its issue (match_types lists the values and what each means).
 CREATE TABLE findings (
   id                   INTEGER PRIMARY KEY,
   review_id            INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
@@ -423,7 +469,7 @@ CREATE TABLE findings (
   UNIQUE (review_id, point_id)
 );
 
--- Where in the code a finding points, pinned to the exact commit reviewed.
+-- Where in the code each point is, pinned to the commit that was reviewed.
 -- Three ways back to the lines, strongest first:
 --   1. git: `git -C <repo path> show <commit_sha>:<path>`, lines line_start..line_end
 --      (the review's commit is protected by the tag in review_repositories.tag_name,
@@ -471,12 +517,16 @@ CREATE TABLE finding_locations (
          AND (path NOT GLOB '*[' || char(1) || '-' || char(31) || char(127) || ']*'))
 );
 
+-- The design goals each point goes against.
 CREATE TABLE finding_goals (
   finding_id INTEGER NOT NULL REFERENCES findings(id) ON DELETE RESTRICT,
   goal_id    INTEGER NOT NULL REFERENCES design_goals(id),
   PRIMARY KEY (finding_id, goal_id)
 );
 
+-- The requirements each point is about, and how the code compares.
+-- verdict: matches (the code does what is required), differs (it does something else), partly, missing (not
+-- implemented), untested (implemented, but no test asserts it).
 CREATE TABLE finding_requirements (
   finding_id     INTEGER NOT NULL REFERENCES findings(id) ON DELETE RESTRICT,
   requirement_id INTEGER NOT NULL REFERENCES requirements(id),
@@ -484,8 +534,9 @@ CREATE TABLE finding_requirements (
   PRIMARY KEY (finding_id, requirement_id)
 );
 
--- The spec reviewer's verdict on every requirement a review traced, findings or not (a 'matches' or 'untested'
--- row has no finding). One row per review and requirement; v_requirement_trace lists them with counts.
+-- A review's verdict on each requirement it traced.
+-- Recorded by the spec reviewer whether or not a finding was raised (a 'matches' or 'untested' row has no finding).
+-- One row per review and requirement; v_requirement_trace lists them with counts.
 CREATE TABLE review_requirement_checks (
   id                INTEGER PRIMARY KEY,
   review_id         INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
@@ -498,7 +549,7 @@ CREATE TABLE review_requirement_checks (
   UNIQUE (review_id, requirement_id)
 );
 
--- What each review concluded about each issue already known when it started.
+-- What each review concluded about each issue that was already known.
 -- Absence of a finding is NOT evidence of a fix; only a row here is.
 CREATE TABLE review_issue_checks (
   review_id  INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
@@ -514,6 +565,10 @@ CREATE TABLE review_issue_checks (
 
 -- ---------- Owner decisions -------------------------------------------
 
+-- The owner's rulings: each question, the answer and the reason.
+-- status: open (asked), decided (the answer is set and decided_at filled), revisit (to be asked again; revisit_when
+-- says what reopens it). options is a JSON array of the choices offered. review_id and step_id say where the
+-- question came up; decision_issues lists the issues it settles.
 CREATE TABLE decisions (
   id                  INTEGER PRIMARY KEY,
   code                TEXT NOT NULL UNIQUE    -- D-0001
@@ -533,16 +588,17 @@ CREATE TABLE decisions (
   decided_at          TEXT
 );
 
+-- The issues each decision settles.
 CREATE TABLE decision_issues (
   decision_id INTEGER NOT NULL REFERENCES decisions(id) ON DELETE CASCADE,
   issue_id    INTEGER NOT NULL REFERENCES issues(id),
   PRIMARY KEY (decision_id, issue_id)
 );
 
--- Gates: anything waiting on the owner. The agent opens a gate and does not
--- pass it until it is answered (in chat or in the viewer). When the agent
--- acts on the answer it sets status = 'applied'. Decisions are the durable
--- rulings; a gate of kind 'decision' records its answer in decisions too.
+-- Questions waiting for the owner's answer.
+-- The agent opens a gate and does not pass it until it is answered (in chat or in the viewer). When the agent acts
+-- on the answer it sets status = 'applied'. Decisions are the durable rulings; a gate of kind 'decision' records
+-- its answer in decisions too.
 CREATE TABLE gates (
   id              INTEGER PRIMARY KEY,
   code            TEXT NOT NULL UNIQUE      -- GATE-0001
@@ -589,6 +645,7 @@ CREATE TABLE gates (
 -- earlier one). A question asked in the hub as well has gate_id: the owner's answer to that gate is recorded here
 -- (via 'viewer') by tr_gate_answers_question. `ledger.py interview` lists them.
 
+-- The questions the owner was asked about the codebase and what they want from it.
 CREATE TABLE interview_questions (
   id                INTEGER PRIMARY KEY,
   code              TEXT NOT NULL UNIQUE    -- IQ-0001
@@ -602,6 +659,7 @@ CREATE TABLE interview_questions (
   asked_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
+-- The owner's answers to the interview questions, in their own words.
 CREATE TABLE interview_answers (
   id                   INTEGER PRIMARY KEY,
   question_id          INTEGER NOT NULL REFERENCES interview_questions(id) ON DELETE RESTRICT,
@@ -611,7 +669,7 @@ CREATE TABLE interview_answers (
   answered_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
--- Which interview questions a design goal summarizes.
+-- The interview questions each design goal was drawn from.
 CREATE TABLE goal_sources (
   goal_id     INTEGER NOT NULL REFERENCES design_goals(id) ON DELETE RESTRICT,
   question_id INTEGER NOT NULL REFERENCES interview_questions(id) ON DELETE RESTRICT,
@@ -620,6 +678,9 @@ CREATE TABLE goal_sources (
 
 -- ---------- Fix plans -----------------------------------------------------
 
+-- A fix plan: the ordered work that closes the points of one or more reviews.
+-- page_url is the address of the plan's hub page (set when `add-artifact` records a progress-page with a URL);
+-- doc_url is a document the owner keeps elsewhere, if any. superseded_by names the plan that replaced this one.
 CREATE TABLE plans (
   id                   INTEGER PRIMARY KEY,
   code                 TEXT NOT NULL UNIQUE    -- P-0001
@@ -646,12 +707,15 @@ CREATE TABLE plans (
                                                -- why this order), shown in the viewer; `ledger.py set-narrative`
 );
 
+-- The reviews each fix plan covers.
 CREATE TABLE plan_reviews (
   plan_id   INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
   review_id INTEGER NOT NULL REFERENCES reviews(id),
   PRIMARY KEY (plan_id, review_id)
 );
 
+-- The phases of a fix plan, in order.
+-- goal is one sentence saying what the phase achieves; why says why it sits where it does.
 CREATE TABLE phases (
   id      INTEGER PRIMARY KEY,
   plan_id INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
@@ -662,6 +726,10 @@ CREATE TABLE phases (
   UNIQUE (plan_id, number)
 );
 
+-- One change of a fix plan, with the test that proves it.
+-- number is the step's place in the whole plan, not in its phase. drafter_key is the key the plan's drafter gave
+-- the step, unique in the plan; `step-status` accepts it in place of the number. A status change sets change_note,
+-- and change_actor_id and change_commit_sha where they apply, in the same UPDATE, as for issues.
 -- A step waiting on the owner asks through a gate of the kind its owner_need maps to (a test checks the map):
 --   owner_need decision -> gate kind decision
 --   owner_need confirm -> gate kind confirm
@@ -698,6 +766,8 @@ CREATE TABLE steps (
   UNIQUE (plan_id, number)
 );
 
+-- The earlier steps each step has to wait for.
+-- A step depends only on earlier steps of its own plan (tr_dep_order).
 CREATE TABLE step_dependencies (
   step_id            INTEGER NOT NULL REFERENCES steps(id) ON DELETE CASCADE,
   depends_on_step_id INTEGER NOT NULL REFERENCES steps(id),
@@ -705,7 +775,7 @@ CREATE TABLE step_dependencies (
   CHECK (step_id <> depends_on_step_id)
 );
 
--- The coverage link: which step closes which finding.
+-- The points each plan step closes.
 CREATE TABLE step_findings (
   step_id      INTEGER NOT NULL REFERENCES steps(id) ON DELETE CASCADE,
   finding_id   INTEGER NOT NULL REFERENCES findings(id),
@@ -713,13 +783,15 @@ CREATE TABLE step_findings (
   PRIMARY KEY (step_id, finding_id)
 );
 
--- Which approved design goals a plan step serves (schema 9): the plan is built against the owner's goals.
+-- The approved design goals each plan step serves.
 CREATE TABLE step_goals (
   step_id INTEGER NOT NULL REFERENCES steps(id) ON DELETE CASCADE,
   goal_id INTEGER NOT NULL REFERENCES design_goals(id),
   PRIMARY KEY (step_id, goal_id)
 );
 
+-- The commits that carried out each plan step.
+-- One row per step and commit (`ledger.py add-commit`); pr_url when it went through a pull request.
 CREATE TABLE step_commits (
   id            INTEGER PRIMARY KEY,
   step_id       INTEGER NOT NULL REFERENCES steps(id) ON DELETE CASCADE,
@@ -733,7 +805,10 @@ CREATE TABLE step_commits (
   UNIQUE (step_id, commit_sha)
 );
 
--- Tests that guard a fixed issue. Future reviews check they still exist.
+-- The tests that keep a fixed issue fixed.
+-- failed_before_fix and passes_after_fix record the proof. A later review checks that each test is still there:
+-- `confirm-guard` sets still_exists and last_confirmed_review_id. A fixed issue whose guard tests are all gone is
+-- listed by v_unguarded_fixes.
 CREATE TABLE guard_tests (
   id                      INTEGER PRIMARY KEY,
   issue_id                INTEGER NOT NULL REFERENCES issues(id),
@@ -752,6 +827,10 @@ CREATE TABLE guard_tests (
 
 -- ---------- Measurements over time ------------------------------------
 
+-- Test runs recorded as evidence, with their results.
+-- purpose: baseline (the suite before a review or a plan starts), targeted (chosen tests), flake-check (repeated
+-- runs to find unstable tests), mutation (a mutation run), before-fix (the proof test failing), after-fix (the same
+-- test passing), ci (a run by CI).
 CREATE TABLE test_runs (
   id            INTEGER PRIMARY KEY,
   review_id     INTEGER REFERENCES reviews(id),
@@ -772,9 +851,10 @@ CREATE TABLE test_runs (
   started_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
--- The catalog of metric names: what the viewer shows for each (label, default unit) and which way is better.
--- Seeded with the names the domains ask for; a metric recorded under a new name gets a row here from
--- tr_metric_defined (label = the name with spaces, capitalized), which can then be given a better label.
+-- The names of the numbers a review measures, with the label shown for each.
+-- unit is the default unit; better says which way is an improvement. Seeded with the names the domains ask for; a
+-- metric recorded under a new name gets a row here from tr_metric_defined (label = the name with spaces,
+-- capitalized), which can then be given a better label.
 CREATE TABLE metric_defs (
   name   TEXT PRIMARY KEY,                 -- the stable key used in metrics.name
   label  TEXT NOT NULL,
@@ -782,8 +862,9 @@ CREATE TABLE metric_defs (
   better TEXT NOT NULL DEFAULT 'none' CHECK (better IN ('higher','lower','none'))
 );
 
--- Numbers worth trending: mutation score, coverage %, cases asserted,
--- page weight, queries per page, p95 job time, dependency count ...
+-- Numbers measured in a review, kept to follow them over time.
+-- For example mutation score, coverage %, cases asserted, page weight, queries per page, p95 job time, dependency
+-- count ...
 CREATE TABLE metrics (
   id            INTEGER PRIMARY KEY,
   review_id     INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
@@ -805,6 +886,7 @@ CREATE TRIGGER tr_metric_defined AFTER INSERT ON metrics BEGIN
     VALUES (NEW.name, upper(substr(NEW.name, 1, 1)) || replace(substr(NEW.name, 2), '_', ' '), NEW.unit);
 END;
 
+-- The same when a metric is renamed.
 CREATE TRIGGER tr_metric_renamed AFTER UPDATE OF name ON metrics BEGIN
   INSERT OR IGNORE INTO metric_defs(name, label, unit)
     VALUES (NEW.name, upper(substr(NEW.name, 1, 1)) || replace(substr(NEW.name, 2), '_', ' '), NEW.unit);
@@ -812,6 +894,10 @@ END;
 
 -- ---------- Files and links produced ---------------------------------
 
+-- Files and links a review or plan produced.
+-- kind: brief, report (one reviewer's), index, summary-doc, plan-file, progress-page (the hub; its url is copied to
+-- plans.page_url), probe-script or other. sha256 is the file's hash when it was recorded. At least one of path and
+-- url is set.
 CREATE TABLE artifacts (
   id              INTEGER PRIMARY KEY,
   review_id       INTEGER REFERENCES reviews(id),
@@ -829,6 +915,7 @@ CREATE TABLE artifacts (
 
 -- ---------- History of everything that changes state ------------------
 
+-- The history: every status change and every other tracked change, in order.
 -- Append-only (G-04): triggers refuse every UPDATE and DELETE on events (tr_events_no_update/no_delete).
 -- Which tables write events (plan step 73; a test keeps these two lists equal to the triggers and the tables):
 -- Logged: reviews, reviewer_runs, issues, issue_relations, findings, review_issue_checks, decisions, gates, plans,
@@ -997,15 +1084,19 @@ WHEN NEW.code GLOB 'ISS-[0-9][0-9][0-9][0-9]*' AND NEW.code NOT GLOB 'ISS-*[^0-9
   SELECT RAISE(ABORT, 'issue codes are sequential: ISS- and the next number (ISS-0001, ISS-0002 ...)');
 END;
 
+-- A code never changes.
 CREATE TRIGGER tr_issue_code_fixed BEFORE UPDATE OF code ON issues WHEN OLD.code IS NOT NEW.code BEGIN
   SELECT RAISE(ABORT, 'codes never change');
 END;
 
+-- A retired domain takes no new issues.
 CREATE TRIGGER tr_issue_domain_active BEFORE INSERT ON issues
 WHEN EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL) BEGIN
   SELECT RAISE(ABORT, 'that domain is retired; use a current one');
 END;
 
+-- Logs 'opened'. The INSERT may carry change_actor_id, change_step_id, change_commit_sha and change_note: they go
+-- into the event and are then cleared (tr_issue_context_cleared_ins).
 CREATE TRIGGER tr_issue_opened AFTER INSERT ON issues BEGIN
   INSERT INTO events(entity_type, entity_id, event, to_value, actor_id, review_id, step_id, commit_sha, note)
   VALUES ('issue', NEW.id, 'opened', NEW.status, NEW.change_actor_id,
@@ -1032,6 +1123,7 @@ WHEN NEW.status IN ('accepted-risk','wont-fix') AND NULLIF(trim(NEW.resolution),
   SELECT RAISE(ABORT, 'an issue closed as accepted-risk or wont-fix needs a resolution (the reason)');
 END;
 
+-- The same for an issue inserted already closed.
 CREATE TRIGGER tr_issue_closed_needs_reason_ins BEFORE INSERT ON issues
 WHEN NEW.status IN ('accepted-risk','wont-fix') AND NULLIF(trim(NEW.resolution), '') IS NULL BEGIN
   SELECT RAISE(ABORT, 'an issue closed as accepted-risk or wont-fix needs a resolution (the reason)');
@@ -1073,6 +1165,7 @@ WHEN OLD.status IS NOT NEW.status BEGIN
   WHERE id = NEW.id;
 END;
 
+-- Logs 'severity-changed' with the change context (change_note is required: tr_issue_change_needs_note).
 CREATE TRIGGER tr_issue_severity AFTER UPDATE OF severity ON issues
 WHEN OLD.severity IS NOT NEW.severity BEGIN
   INSERT INTO events(entity_type, entity_id, event, from_value, to_value,
@@ -1089,6 +1182,7 @@ CREATE TRIGGER tr_issue_title_changed AFTER UPDATE OF title ON issues WHEN OLD.t
           NEW.change_step_id, NEW.change_note);
 END;
 
+-- Logs 'before-state-changed'.
 CREATE TRIGGER tr_issue_before_changed AFTER UPDATE OF before_state ON issues
 WHEN OLD.before_state IS NOT NEW.before_state BEGIN
   INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id, step_id, note)
@@ -1096,6 +1190,7 @@ WHEN OLD.before_state IS NOT NEW.before_state BEGIN
           NEW.change_review_id, NEW.change_step_id, NEW.change_note);
 END;
 
+-- Logs 'current-state-changed'.
 CREATE TRIGGER tr_issue_current_changed AFTER UPDATE OF current_state ON issues
 WHEN OLD.current_state IS NOT NEW.current_state BEGIN
   INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id, step_id, note)
@@ -1103,6 +1198,7 @@ WHEN OLD.current_state IS NOT NEW.current_state BEGIN
           NEW.change_review_id, NEW.change_step_id, NEW.change_note);
 END;
 
+-- Logs 'after-state-changed'.
 CREATE TRIGGER tr_issue_after_changed AFTER UPDATE OF after_state ON issues
 WHEN OLD.after_state IS NOT NEW.after_state BEGIN
   INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id, step_id, note)
@@ -1110,6 +1206,7 @@ WHEN OLD.after_state IS NOT NEW.after_state BEGIN
           NEW.change_review_id, NEW.change_step_id, NEW.change_note);
 END;
 
+-- Logs 'recommendation-changed'.
 CREATE TRIGGER tr_issue_recommendation_changed AFTER UPDATE OF recommendation ON issues
 WHEN OLD.recommendation IS NOT NEW.recommendation BEGIN
   INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id, step_id, note)
@@ -1117,6 +1214,7 @@ WHEN OLD.recommendation IS NOT NEW.recommendation BEGIN
           NEW.change_review_id, NEW.change_step_id, NEW.change_note);
 END;
 
+-- Logs 'resolution-changed'.
 CREATE TRIGGER tr_issue_resolution_changed AFTER UPDATE OF resolution ON issues
 WHEN OLD.resolution IS NOT NEW.resolution BEGIN
   INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id, step_id, note)
@@ -1124,6 +1222,8 @@ WHEN OLD.resolution IS NOT NEW.resolution BEGIN
           NEW.change_review_id, NEW.change_step_id, NEW.change_note);
 END;
 
+-- An update that leaves updated_at alone sets it to now. The trigger's own UPDATE does not fire it again only
+-- because recursive triggers are off (SQLite's default; ledger.py never turns them on).
 CREATE TRIGGER tr_issue_touch AFTER UPDATE ON issues
 WHEN NEW.updated_at IS OLD.updated_at BEGIN
   UPDATE issues SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = NEW.id;
@@ -1138,6 +1238,7 @@ WHEN NEW.change_actor_id IS NOT NULL OR NEW.change_review_id IS NOT NULL OR NEW.
                     change_commit_sha = NULL, change_note = NULL WHERE id = NEW.id;
 END;
 
+-- The same after an INSERT that carried context (tr_issue_opened has logged it).
 CREATE TRIGGER tr_issue_context_cleared_ins AFTER INSERT ON issues
 WHEN NEW.change_actor_id IS NOT NULL OR NEW.change_review_id IS NOT NULL OR NEW.change_step_id IS NOT NULL
   OR NEW.change_commit_sha IS NOT NULL OR NEW.change_note IS NOT NULL BEGIN
@@ -1145,6 +1246,7 @@ WHEN NEW.change_actor_id IS NOT NULL OR NEW.change_review_id IS NOT NULL OR NEW.
                     change_commit_sha = NULL, change_note = NULL WHERE id = NEW.id;
 END;
 
+-- Refuses DELETE: an issue is closed with a status.
 CREATE TRIGGER tr_issue_no_delete BEFORE DELETE ON issues BEGIN
   SELECT RAISE(ABORT, 'history is append-only: issues cannot be deleted; close one with a status instead');
 END;
@@ -1163,12 +1265,14 @@ WHEN (SELECT status IN ('planning','awaiting-approval','abandoned') OR approved_
   SELECT RAISE(ABORT, 'findings need an approved review (approved_at set, status past awaiting-approval)');
 END;
 
+-- A finding's reviewer run is a run of the finding's own review.
 CREATE TRIGGER tr_finding_run_same_review BEFORE INSERT ON findings
 WHEN NEW.reviewer_run_id IS NOT NULL
  AND (SELECT review_id FROM reviewer_runs WHERE id = NEW.reviewer_run_id) IS NOT NEW.review_id BEGIN
   SELECT RAISE(ABORT, 'the reviewer run belongs to another review');
 END;
 
+-- A retired domain takes no new findings.
 CREATE TRIGGER tr_finding_domain_active BEFORE INSERT ON findings
 WHEN EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL) BEGIN
   SELECT RAISE(ABORT, 'that domain is retired; use a current one');
@@ -1180,6 +1284,7 @@ WHEN NEW.severity = 'T' AND NEW.kind IS NOT 'test' BEGIN
   SELECT RAISE(ABORT, 'severity T is for a missing test: give the finding kind test, or another severity');
 END;
 
+-- Logs 'created' with the point id and the summary.
 CREATE TRIGGER tr_finding_created AFTER INSERT ON findings BEGIN
   INSERT INTO events(entity_type, entity_id, event, to_value, actor_id, review_id, note)
   VALUES ('finding', NEW.id, 'created', NEW.point_id, NULL, NEW.review_id, NEW.summary);
@@ -1199,6 +1304,7 @@ WHEN OLD.review_id IS NOT NEW.review_id OR OLD.reviewer_run_id IS NOT NEW.review
   SELECT RAISE(ABORT, 'history is append-only: only issue_id, match_* and verification* of a finding can change');
 END;
 
+-- Refuses DELETE: a wrong finding is marked verification = 'false'.
 CREATE TRIGGER tr_finding_no_delete BEFORE DELETE ON findings BEGIN
   SELECT RAISE(ABORT, 'history is append-only: findings cannot be deleted; mark a wrong one verification = false');
 END;
@@ -1325,13 +1431,16 @@ WHEN OLD.finding_id IS NOT NEW.finding_id OR OLD.repository_id IS NOT NEW.reposi
   SELECT RAISE(ABORT, 'history is append-only: a location''s finding, repository, commit, path, symbol and role cannot change');
 END;
 
+-- Refuses DELETE: where a point was found is history.
 CREATE TRIGGER tr_location_no_delete BEFORE DELETE ON finding_locations BEGIN
   SELECT RAISE(ABORT, 'history is append-only: finding locations cannot be deleted');
 END;
 
 -- ----- Relations
 
--- No relation stored both ways: directional ones and related-to (which is symmetric).
+-- No relation is stored both ways: with A duplicate-of B recorded, B duplicate-of A is refused, and related-to is
+-- symmetric, so one row says it. blocks is not in the list because a blocks pair both ways is a cycle, which
+-- tr_relation_no_cycle refuses.
 CREATE TRIGGER tr_relation_noreverse_dup BEFORE INSERT ON issue_relations
 WHEN NEW.relation IN ('duplicate-of','continuation-of','regression-of','supersedes','merged-into','split-from',
                       'caused-by','related-to')
@@ -1342,6 +1451,7 @@ BEGIN
                   AND relation = NEW.relation);
 END;
 
+-- The same when a relation is edited.
 CREATE TRIGGER tr_relation_noreverse_dup_upd BEFORE UPDATE OF from_issue_id, to_issue_id, relation ON issue_relations
 WHEN NEW.relation IN ('duplicate-of','continuation-of','regression-of','supersedes','merged-into','split-from',
                       'caused-by','related-to')
@@ -1364,6 +1474,7 @@ WHEN NEW.relation IN ('blocks','duplicate-of','merged-into') BEGIN
                 SELECT 1 FROM reach WHERE n = NEW.from_issue_id);
 END;
 
+-- The same when a relation is edited.
 CREATE TRIGGER tr_relation_no_cycle_upd BEFORE UPDATE OF from_issue_id, to_issue_id, relation ON issue_relations
 WHEN NEW.relation IN ('blocks','duplicate-of','merged-into') BEGIN
   SELECT RAISE(ABORT, 'that relation would make a cycle')
@@ -1375,6 +1486,7 @@ WHEN NEW.relation IN ('blocks','duplicate-of','merged-into') BEGIN
                 SELECT 1 FROM reach WHERE n = NEW.from_issue_id);
 END;
 
+-- Logs 'created' on the relation: the two issue codes, the relation and the rationale.
 CREATE TRIGGER tr_relation_created AFTER INSERT ON issue_relations BEGIN
   INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id, note)
   VALUES ('relation', NEW.id, 'created', (SELECT code FROM issues WHERE id = NEW.from_issue_id),
@@ -1396,6 +1508,7 @@ WHEN NEW.relation IN (SELECT value FROM relation_types WHERE closes = 1) BEGIN
   WHERE id = NEW.from_issue_id AND status IN (SELECT value FROM issue_statuses WHERE active = 1);
 END;
 
+-- Refuses DELETE: relations are history.
 CREATE TRIGGER tr_relation_no_delete BEFORE DELETE ON issue_relations BEGIN
   SELECT RAISE(ABORT, 'history is append-only: relations cannot be deleted');
 END;
@@ -1410,6 +1523,7 @@ WHEN NEW.outcome IN ('fixed','regressed','changed') AND NULLIF(trim(NEW.evidence
   SELECT RAISE(ABORT, 'a fixed, regressed or changed check needs evidence (what the review saw)');
 END;
 
+-- The rules above, each with its own message.
 CREATE TRIGGER tr_check_guard BEFORE INSERT ON review_issue_checks BEGIN
   SELECT RAISE(ABORT, 'checks are history: this review already recorded a check of this issue')
   WHERE EXISTS (SELECT 1 FROM review_issue_checks WHERE review_id = NEW.review_id AND issue_id = NEW.issue_id);
@@ -1424,10 +1538,12 @@ CREATE TRIGGER tr_check_guard BEFORE INSERT ON review_issue_checks BEGIN
                   AND f.verification <> 'false');
 END;
 
+-- A recorded check is never changed.
 CREATE TRIGGER tr_check_no_update BEFORE UPDATE ON review_issue_checks BEGIN
   SELECT RAISE(ABORT, 'history is append-only: review checks cannot be changed');
 END;
 
+-- Refuses DELETE: checks are history.
 CREATE TRIGGER tr_check_no_delete BEFORE DELETE ON review_issue_checks BEGIN
   SELECT RAISE(ABORT, 'history is append-only: review checks cannot be deleted');
 END;
@@ -1481,6 +1597,7 @@ END;
 
 -- ----- Reviews
 
+-- Codes: R- and the next number, zero-padded to 4 digits (R-0001 ...); never reused.
 CREATE TRIGGER tr_review_code BEFORE INSERT ON reviews
 -- (a malformed code is left to the code CHECK, which names it)
 WHEN NEW.code GLOB 'R-[0-9][0-9][0-9][0-9]*' AND NEW.code NOT GLOB 'R-*[^0-9]*' AND (
@@ -1491,16 +1608,19 @@ WHEN NEW.code GLOB 'R-[0-9][0-9][0-9][0-9]*' AND NEW.code NOT GLOB 'R-*[^0-9]*' 
   SELECT RAISE(ABORT, 'review codes are sequential: R- and the next number (R-0001, R-0002 ...)');
 END;
 
+-- A code never changes.
 CREATE TRIGGER tr_review_code_fixed BEFORE UPDATE OF code ON reviews WHEN OLD.code IS NOT NEW.code BEGIN
   SELECT RAISE(ABORT, 'codes never change');
 END;
 
+-- A review's manager is an actor of kind manager.
 CREATE TRIGGER tr_review_manager_kind BEFORE INSERT ON reviews
 WHEN NEW.manager_actor_id IS NOT NULL
  AND (SELECT kind FROM actors WHERE id = NEW.manager_actor_id) IS NOT 'manager' BEGIN
   SELECT RAISE(ABORT, 'manager_actor_id must be an actor of kind manager');
 END;
 
+-- The same when the manager is changed.
 CREATE TRIGGER tr_review_manager_kind_upd BEFORE UPDATE OF manager_actor_id ON reviews
 WHEN NEW.manager_actor_id IS NOT NULL
  AND (SELECT kind FROM actors WHERE id = NEW.manager_actor_id) IS NOT 'manager' BEGIN
@@ -1531,6 +1651,8 @@ WHEN OLD.status IS NOT NEW.status BEGIN
                   AND g.status IN ('open','answered'));
 END;
 
+-- Logs 'status-changed' with change_actor_id and change_note, sets updated_at, and sets completed_at on handed-off
+-- or abandoned (cleared when the review leaves them).
 CREATE TRIGGER tr_review_status AFTER UPDATE OF status ON reviews
 WHEN OLD.status IS NOT NEW.status BEGIN
   INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id, note)
@@ -1541,16 +1663,19 @@ WHEN OLD.status IS NOT NEW.status BEGIN
   WHERE id = NEW.id;
 END;
 
+-- Once logged, the change context is cleared: a later change gives its own.
 CREATE TRIGGER tr_review_context_cleared AFTER UPDATE ON reviews
 WHEN NEW.change_actor_id IS NOT NULL OR NEW.change_note IS NOT NULL BEGIN
   UPDATE reviews SET change_actor_id = NULL, change_note = NULL WHERE id = NEW.id;
 END;
 
+-- The same after an INSERT that carried context.
 CREATE TRIGGER tr_review_context_cleared_ins AFTER INSERT ON reviews
 WHEN NEW.change_actor_id IS NOT NULL OR NEW.change_note IS NOT NULL BEGIN
   UPDATE reviews SET change_actor_id = NULL, change_note = NULL WHERE id = NEW.id;
 END;
 
+-- Refuses DELETE: a review is abandoned with a status.
 CREATE TRIGGER tr_review_no_delete BEFORE DELETE ON reviews BEGIN
   SELECT RAISE(ABORT, 'history is append-only: reviews cannot be deleted; set status abandoned instead');
 END;
@@ -1567,22 +1692,26 @@ CREATE TRIGGER tr_run_review_approved BEFORE INSERT ON reviewer_runs BEGIN
   WHERE EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL);
 END;
 
+-- Logs 'reviewer-run-created' on the review, with the run's label, domain and scope.
 CREATE TRIGGER tr_run_created AFTER INSERT ON reviewer_runs BEGIN
   INSERT INTO events(entity_type, entity_id, event, to_value, actor_id, review_id, note)
   VALUES ('review', NEW.review_id, 'reviewer-run-created', NEW.label, NEW.actor_id, NEW.review_id,
           NEW.domain_code || ': ' || NEW.scope);
 END;
 
+-- A retired domain takes no new reviews.
 CREATE TRIGGER tr_review_domain_active BEFORE INSERT ON review_domains
 WHEN EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL) BEGIN
   SELECT RAISE(ABORT, 'that domain is retired; use a current one');
 END;
 
+-- A retired domain takes no new metrics.
 CREATE TRIGGER tr_metric_domain_active BEFORE INSERT ON metrics
 WHEN EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL) BEGIN
   SELECT RAISE(ABORT, 'that domain is retired; use a current one');
 END;
 
+-- Logs 'metric-recorded' on the review, with the value, name and scope.
 CREATE TRIGGER tr_metric_created AFTER INSERT ON metrics BEGIN
   INSERT INTO events(entity_type, entity_id, event, to_value, review_id, note)
   VALUES ('review', NEW.review_id, 'metric-recorded', CAST(NEW.value AS TEXT), NEW.review_id,
@@ -1591,11 +1720,13 @@ END;
 
 -- ----- Actors, catalogs and standards
 
+-- An actor is not its own parent.
 CREATE TRIGGER tr_actor_parent_self BEFORE INSERT ON actors
 WHEN NEW.parent_actor_id IS NOT NULL AND NEW.parent_actor_id = NEW.id BEGIN
   SELECT RAISE(ABORT, 'an actor cannot be its own parent');
 END;
 
+-- Nor its own ancestor: changing a parent may not close a loop.
 CREATE TRIGGER tr_actor_parent_cycle BEFORE UPDATE OF parent_actor_id ON actors
 WHEN NEW.parent_actor_id IS NOT NULL BEGIN
   SELECT RAISE(ABORT, 'that parent would make a cycle of actors')
@@ -1606,6 +1737,7 @@ WHEN NEW.parent_actor_id IS NOT NULL BEGIN
                 SELECT 1 FROM up WHERE n = NEW.id);
 END;
 
+-- Codes: G- and the next number, zero-padded to 2 digits (G-01 ...); never reused.
 CREATE TRIGGER tr_design_goal_code BEFORE INSERT ON design_goals
 -- (a malformed code is left to the code CHECK, which names it)
 WHEN NEW.code GLOB 'G-[0-9][0-9]*' AND NEW.code NOT GLOB 'G-*[^0-9]*' AND (
@@ -1616,10 +1748,12 @@ WHEN NEW.code GLOB 'G-[0-9][0-9]*' AND NEW.code NOT GLOB 'G-*[^0-9]*' AND (
   SELECT RAISE(ABORT, 'design goal codes are sequential: G- and the next number (G-01, G-02 ...)');
 END;
 
+-- A code never changes.
 CREATE TRIGGER tr_design_goal_code_fixed BEFORE UPDATE OF code ON design_goals WHEN OLD.code IS NOT NEW.code BEGIN
   SELECT RAISE(ABORT, 'codes never change');
 END;
 
+-- Codes: REQ- and the next number, zero-padded to 4 digits (REQ-0001 ...); never reused.
 CREATE TRIGGER tr_requirement_code BEFORE INSERT ON requirements
 -- (a malformed code is left to the code CHECK, which names it)
 WHEN NEW.code GLOB 'REQ-[0-9][0-9][0-9][0-9]*' AND NEW.code NOT GLOB 'REQ-*[^0-9]*' AND (
@@ -1630,6 +1764,7 @@ WHEN NEW.code GLOB 'REQ-[0-9][0-9][0-9][0-9]*' AND NEW.code NOT GLOB 'REQ-*[^0-9
   SELECT RAISE(ABORT, 'requirement codes are sequential: REQ- and the next number (REQ-0001, REQ-0002 ...)');
 END;
 
+-- A code never changes.
 CREATE TRIGGER tr_requirement_code_fixed BEFORE UPDATE OF code ON requirements WHEN OLD.code IS NOT NEW.code BEGIN
   SELECT RAISE(ABORT, 'codes never change');
 END;
@@ -1645,23 +1780,27 @@ WHEN NEW.status NOT IN ('proposed','approved') BEGIN
   SELECT RAISE(ABORT, 'a design goal starts proposed (or approved, with its approver)');
 END;
 
+-- A retired domain takes no new design goals.
 CREATE TRIGGER tr_goal_domain_active BEFORE INSERT ON design_goals
 WHEN EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL) BEGIN
   SELECT RAISE(ABORT, 'that domain is retired; use a current one');
 END;
 
+-- An approved goal's approver is an actor of kind owner or human.
 CREATE TRIGGER tr_goal_approver BEFORE INSERT ON design_goals
 WHEN NEW.status = 'approved'
  AND NOT EXISTS (SELECT 1 FROM actors WHERE id = NEW.approved_by_actor_id AND kind IN ('owner','human')) BEGIN
   SELECT RAISE(ABORT, 'a design goal is approved by the owner: its approver (approved_by_actor_id) must be an actor of kind owner or human');
 END;
 
+-- The same when a goal is approved later, or its approver changed.
 CREATE TRIGGER tr_goal_approver_upd BEFORE UPDATE OF status, approved_by_actor_id ON design_goals
 WHEN NEW.status = 'approved'
  AND NOT EXISTS (SELECT 1 FROM actors WHERE id = NEW.approved_by_actor_id AND kind IN ('owner','human')) BEGIN
   SELECT RAISE(ABORT, 'a design goal is approved by the owner: its approver (approved_by_actor_id) must be an actor of kind owner or human');
 END;
 
+-- The moves a goal's status may make.
 CREATE TRIGGER tr_goal_transition BEFORE UPDATE OF status ON design_goals
 WHEN OLD.status IS NOT NEW.status
  AND NOT ((OLD.status = 'proposed' AND NEW.status IN ('approved','rejected','retired'))
@@ -1669,6 +1808,7 @@ WHEN OLD.status IS NOT NEW.status
   SELECT RAISE(ABORT, 'a design goal moves proposed -> approved, rejected or retired, and approved -> retired; propose a new goal instead');
 END;
 
+-- Once a goal is no longer proposed, its text, domain, review and approval are fixed.
 CREATE TRIGGER tr_goal_fixed BEFORE UPDATE OF text, domain_code, review_id, approved_by_actor_id, approved_at ON design_goals
 WHEN OLD.status <> 'proposed'
  AND (OLD.text IS NOT NEW.text OR OLD.domain_code IS NOT NEW.domain_code OR OLD.review_id IS NOT NEW.review_id
@@ -1676,6 +1816,8 @@ WHEN OLD.status <> 'proposed'
   SELECT RAISE(ABORT, 'an approved, rejected or retired design goal is not edited: retire it and propose a new one');
 END;
 
+-- Logs 'proposed' (or 'recorded' for a goal inserted approved); a goal inserted approved for a review is also
+-- listed in review_goals.
 CREATE TRIGGER tr_goal_created AFTER INSERT ON design_goals BEGIN
   INSERT INTO events(entity_type, entity_id, event, to_value, actor_id, review_id, note)
   VALUES ('goal', NEW.id, CASE NEW.status WHEN 'proposed' THEN 'proposed' ELSE 'recorded' END, NEW.status,
@@ -1685,6 +1827,8 @@ CREATE TRIGGER tr_goal_created AFTER INSERT ON design_goals BEGIN
     SELECT NEW.review_id, NEW.id WHERE NEW.status = 'approved' AND NEW.review_id IS NOT NULL;
 END;
 
+-- Logs 'status-changed' (who approved, or the note of a rejection or retirement) and keeps retired_at in step with
+-- the status.
 CREATE TRIGGER tr_goal_status AFTER UPDATE OF status ON design_goals
 WHEN OLD.status IS NOT NEW.status BEGIN
   INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id, note)
@@ -1704,20 +1848,24 @@ WHEN NEW.retired_at IS NOT NULL AND NEW.status <> 'retired' BEGIN
   UPDATE design_goals SET status = 'retired' WHERE id = NEW.id;
 END;
 
+-- Logs 'text-changed' with the old and new text (possible only while the goal is proposed).
 CREATE TRIGGER tr_goal_text_changed AFTER UPDATE OF text ON design_goals WHEN OLD.text IS NOT NEW.text BEGIN
   INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id)
   VALUES ('goal', NEW.id, 'text-changed', OLD.text, NEW.text, NEW.change_actor_id, NEW.review_id);
 END;
 
+-- Once logged, change_actor_id is cleared.
 CREATE TRIGGER tr_goal_context_cleared AFTER UPDATE ON design_goals WHEN NEW.change_actor_id IS NOT NULL BEGIN
   UPDATE design_goals SET change_actor_id = NULL WHERE id = NEW.id;
 END;
 
+-- The same after an INSERT that carried it.
 CREATE TRIGGER tr_goal_context_cleared_ins AFTER INSERT ON design_goals
 WHEN NEW.change_actor_id IS NOT NULL BEGIN
   UPDATE design_goals SET change_actor_id = NULL WHERE id = NEW.id;
 END;
 
+-- Refuses DELETE: a goal is retired.
 CREATE TRIGGER tr_goal_no_delete BEFORE DELETE ON design_goals BEGIN
   SELECT RAISE(ABORT, 'history is append-only: design goals cannot be deleted; retire it instead');
 END;
@@ -1760,6 +1908,7 @@ WHEN (SELECT approved_at FROM reviews WHERE id = NEW.review_id) IS NULL BEGIN
   SELECT RAISE(ABORT, 'the interview comes after the owner approves the review''s domains (review-status <review> approved)');
 END;
 
+-- A question about a domain names a domain the review included.
 CREATE TRIGGER tr_question_domain_in_review BEFORE INSERT ON interview_questions
 WHEN NEW.domain_code IS NOT NULL
  AND NOT EXISTS (SELECT 1 FROM review_domains WHERE review_id = NEW.review_id AND domain_code = NEW.domain_code
@@ -1767,29 +1916,35 @@ WHEN NEW.domain_code IS NOT NULL
   SELECT RAISE(ABORT, 'the review did not include that domain; ask about an approved domain, or leave the domain out for a whole-project question');
 END;
 
+-- Logs 'asked' with the question.
 CREATE TRIGGER tr_question_asked AFTER INSERT ON interview_questions BEGIN
   INSERT INTO events(entity_type, entity_id, event, to_value, actor_id, review_id, note)
   VALUES ('question', NEW.id, 'asked', NEW.code, NEW.asked_by_actor_id, NEW.review_id, NEW.question);
 END;
 
+-- A question is kept as asked.
 CREATE TRIGGER tr_question_no_update BEFORE UPDATE ON interview_questions BEGIN
   SELECT RAISE(ABORT, 'history is append-only: an interview question is kept as asked; ask a new one');
 END;
 
+-- Refuses DELETE: questions are history.
 CREATE TRIGGER tr_question_no_delete BEFORE DELETE ON interview_questions BEGIN
   SELECT RAISE(ABORT, 'history is append-only: interview questions cannot be deleted');
 END;
 
+-- Logs 'answered' on the question, with the answer and how it was given.
 CREATE TRIGGER tr_answer_recorded AFTER INSERT ON interview_answers BEGIN
   INSERT INTO events(entity_type, entity_id, event, to_value, actor_id, review_id, note)
   VALUES ('question', NEW.question_id, 'answered', NEW.answered_via, NEW.answered_by_actor_id,
           (SELECT review_id FROM interview_questions WHERE id = NEW.question_id), NEW.answer);
 END;
 
+-- An answer is kept as given; a correction is a new answer.
 CREATE TRIGGER tr_answer_no_update BEFORE UPDATE ON interview_answers BEGIN
   SELECT RAISE(ABORT, 'history is append-only: an answer is kept as given; record a new answer instead');
 END;
 
+-- Refuses DELETE: answers are history.
 CREATE TRIGGER tr_answer_no_delete BEFORE DELETE ON interview_answers BEGIN
   SELECT RAISE(ABORT, 'history is append-only: interview answers cannot be deleted');
 END;
@@ -1805,16 +1960,19 @@ CREATE TRIGGER tr_goal_source_rules BEFORE INSERT ON goal_sources BEGIN
                   AND q.domain_code <> g.domain_code);
 END;
 
+-- Logs 'source-linked' on the goal, with the question.
 CREATE TRIGGER tr_goal_source_linked AFTER INSERT ON goal_sources BEGIN
   INSERT INTO events(entity_type, entity_id, event, to_value, review_id, note)
   SELECT 'goal', NEW.goal_id, 'source-linked', q.code, q.review_id, q.question
   FROM interview_questions q WHERE q.id = NEW.question_id;
 END;
 
+-- A goal's sources are kept as recorded.
 CREATE TRIGGER tr_goal_source_no_update BEFORE UPDATE ON goal_sources BEGIN
   SELECT RAISE(ABORT, 'history is append-only: a goal''s sources are kept as recorded');
 END;
 
+-- Refuses DELETE: a goal's sources are history.
 CREATE TRIGGER tr_goal_source_no_delete BEFORE DELETE ON goal_sources BEGIN
   SELECT RAISE(ABORT, 'history is append-only: a goal''s sources cannot be deleted');
 END;
@@ -1826,22 +1984,26 @@ WHEN NOT EXISTS (SELECT 1 FROM design_goals g JOIN goal_statuses s ON s.value = 
   SELECT RAISE(ABORT, 'a plan step serves approved design goals only; ask the owner to approve the goal first');
 END;
 
+-- Logs 'step-linked' on the goal, with the plan and step number.
 CREATE TRIGGER tr_step_goal_linked AFTER INSERT ON step_goals BEGIN
   INSERT INTO events(entity_type, entity_id, event, to_value, step_id)
   SELECT 'goal', NEW.goal_id, 'step-linked', p.code || ' #' || s.number, NEW.step_id
   FROM steps s JOIN plans p ON p.id = s.plan_id WHERE s.id = NEW.step_id;
 END;
 
+-- A link is not moved to another goal: add the other link.
 CREATE TRIGGER tr_step_goal_no_update BEFORE UPDATE ON step_goals BEGIN
   SELECT RAISE(ABORT, 'history is append-only: link the step to another goal instead');
 END;
 
+-- Refuses DELETE: a step's goals stay linked.
 CREATE TRIGGER tr_step_goal_no_delete BEFORE DELETE ON step_goals BEGIN
   SELECT RAISE(ABORT, 'history is append-only: a step''s goals cannot be unlinked');
 END;
 
 -- ----- Decisions
 
+-- Codes: D- and the next number, zero-padded to 4 digits (D-0001 ...); never reused.
 CREATE TRIGGER tr_decision_code BEFORE INSERT ON decisions
 -- (a malformed code is left to the code CHECK, which names it)
 WHEN NEW.code GLOB 'D-[0-9][0-9][0-9][0-9]*' AND NEW.code NOT GLOB 'D-*[^0-9]*' AND (
@@ -1852,6 +2014,7 @@ WHEN NEW.code GLOB 'D-[0-9][0-9][0-9][0-9]*' AND NEW.code NOT GLOB 'D-*[^0-9]*' 
   SELECT RAISE(ABORT, 'decision codes are sequential: D- and the next number (D-0001, D-0002 ...)');
 END;
 
+-- A code never changes.
 CREATE TRIGGER tr_decision_code_fixed BEFORE UPDATE OF code ON decisions WHEN OLD.code IS NOT NEW.code BEGIN
   SELECT RAISE(ABORT, 'codes never change');
 END;
@@ -1867,6 +2030,8 @@ CREATE TRIGGER tr_decision_created AFTER INSERT ON decisions BEGIN
   WHERE id = NEW.id AND NEW.status = 'decided' AND NEW.decided_at IS NULL;
 END;
 
+-- Logs 'status-changed' with decided_by_actor_id and the answer as the note, and fills decided_at when the decision
+-- is decided.
 CREATE TRIGGER tr_decision_status AFTER UPDATE OF status ON decisions
 WHEN OLD.status IS NOT NEW.status BEGIN
   INSERT INTO events(entity_type, entity_id, event, from_value, to_value,
@@ -1885,12 +2050,14 @@ WHEN OLD.answer IS NOT NULL AND OLD.answer IS NOT NEW.answer BEGIN
           NEW.step_id, NEW.rationale);
 END;
 
+-- Refuses DELETE: a decision to reconsider is set to revisit.
 CREATE TRIGGER tr_decision_no_delete BEFORE DELETE ON decisions BEGIN
   SELECT RAISE(ABORT, 'history is append-only: decisions cannot be deleted; set status revisit instead');
 END;
 
 -- ----- Gates
 
+-- Codes: GATE- and the next number, zero-padded to 4 digits (GATE-0001 ...); never reused.
 CREATE TRIGGER tr_gate_code BEFORE INSERT ON gates
 -- (a malformed code is left to the code CHECK, which names it)
 WHEN NEW.code GLOB 'GATE-[0-9][0-9][0-9][0-9]*' AND NEW.code NOT GLOB 'GATE-*[^0-9]*' AND (
@@ -1901,6 +2068,7 @@ WHEN NEW.code GLOB 'GATE-[0-9][0-9][0-9][0-9]*' AND NEW.code NOT GLOB 'GATE-*[^0
   SELECT RAISE(ABORT, 'gate codes are sequential: GATE- and the next number (GATE-0001, GATE-0002 ...)');
 END;
 
+-- A code never changes.
 CREATE TRIGGER tr_gate_code_fixed BEFORE UPDATE OF code ON gates WHEN OLD.code IS NOT NEW.code BEGIN
   SELECT RAISE(ABORT, 'codes never change');
 END;
@@ -1915,6 +2083,7 @@ WHEN NEW.options IS NOT NULL AND json_valid(NEW.options) AND json_type(NEW.optio
   SELECT RAISE(ABORT, 'gate options must be objects with a text value and label (and an optional description)');
 END;
 
+-- The same when the options are changed.
 CREATE TRIGGER tr_gate_options_shape_upd BEFORE UPDATE OF options ON gates
 WHEN NEW.options IS NOT NULL AND json_valid(NEW.options) AND json_type(NEW.options) = 'array'
  AND EXISTS (SELECT 1 FROM json_each(NEW.options) j
@@ -1946,6 +2115,7 @@ WHEN OLD.status IS NOT NEW.status AND NEW.status <> 'open'
   SELECT RAISE(ABORT, 'a gate moves open -> answered -> applied (or withdrawn); answer it before applying it');
 END;
 
+-- Logs 'opened' with the gate's title and who opened it.
 CREATE TRIGGER tr_gate_created AFTER INSERT ON gates BEGIN
   INSERT INTO events(entity_type, entity_id, event, to_value, actor_id, review_id, step_id, note)
   VALUES ('gate', NEW.id, 'opened', NEW.status, NEW.opened_by_actor_id, NEW.review_id, NEW.step_id, NEW.title);
@@ -1987,6 +2157,7 @@ WHEN OLD.status <> 'open' AND NEW.status <> 'open'
   SELECT RAISE(ABORT, 'who answered a gate, how and when cannot be changed once it is answered');
 END;
 
+-- Logs 'answer-cleared', with the answer it held, when a gate is reopened.
 CREATE TRIGGER tr_gate_answer_cleared AFTER UPDATE OF answer_value, answer_text ON gates
 WHEN OLD.status <> 'open' AND NEW.status = 'open'
  AND (OLD.answer_value IS NOT NULL OR OLD.answer_text IS NOT NULL) BEGIN
@@ -2004,21 +2175,25 @@ WHEN OLD.status = 'open' AND (OLD.answer_value IS NOT NULL OR OLD.answer_text IS
           NEW.step_id, 'was: ' || COALESCE(OLD.answer_text, '') || '; now: ' || COALESCE(NEW.answer_text, ''));
 END;
 
+-- Once logged, change_actor_id is cleared.
 CREATE TRIGGER tr_gate_context_cleared AFTER UPDATE ON gates WHEN NEW.change_actor_id IS NOT NULL BEGIN
   UPDATE gates SET change_actor_id = NULL WHERE id = NEW.id;
 END;
 
+-- The same after an INSERT that carried it.
 CREATE TRIGGER tr_gate_context_cleared_ins AFTER INSERT ON gates
 WHEN NEW.change_actor_id IS NOT NULL BEGIN
   UPDATE gates SET change_actor_id = NULL WHERE id = NEW.id;
 END;
 
+-- Refuses DELETE: a gate no longer needed is withdrawn.
 CREATE TRIGGER tr_gate_no_delete BEFORE DELETE ON gates BEGIN
   SELECT RAISE(ABORT, 'history is append-only: gates cannot be deleted; set status withdrawn instead');
 END;
 
 -- ----- Plans
 
+-- Codes: P- and the next number, zero-padded to 4 digits (P-0001 ...); never reused.
 CREATE TRIGGER tr_plan_code BEFORE INSERT ON plans
 -- (a malformed code is left to the code CHECK, which names it)
 WHEN NEW.code GLOB 'P-[0-9][0-9][0-9][0-9]*' AND NEW.code NOT GLOB 'P-*[^0-9]*' AND (
@@ -2029,10 +2204,12 @@ WHEN NEW.code GLOB 'P-[0-9][0-9][0-9][0-9]*' AND NEW.code NOT GLOB 'P-*[^0-9]*' 
   SELECT RAISE(ABORT, 'plan codes are sequential: P- and the next number (P-0001, P-0002 ...)');
 END;
 
+-- A code never changes.
 CREATE TRIGGER tr_plan_code_fixed BEFORE UPDATE OF code ON plans WHEN OLD.code IS NOT NEW.code BEGIN
   SELECT RAISE(ABORT, 'codes never change');
 END;
 
+-- Logs 'created' with the plan's title and change_actor_id.
 CREATE TRIGGER tr_plan_created AFTER INSERT ON plans BEGIN
   INSERT INTO events(entity_type, entity_id, event, to_value, actor_id, note)
   VALUES ('plan', NEW.id, 'created', NEW.status, NEW.change_actor_id, NEW.title);
@@ -2059,6 +2236,7 @@ WHEN OLD.status IS NOT NEW.status BEGIN
                   AND g.status IN ('open','answered'));
 END;
 
+-- Logs 'status-changed' with change_actor_id and change_note, and sets updated_at.
 CREATE TRIGGER tr_plan_status AFTER UPDATE OF status ON plans
 WHEN OLD.status IS NOT NEW.status BEGIN
   INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, note)
@@ -2066,21 +2244,26 @@ WHEN OLD.status IS NOT NEW.status BEGIN
   UPDATE plans SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = NEW.id;
 END;
 
+-- Logs 'title-changed' with the old and new title.
 CREATE TRIGGER tr_plan_title_changed AFTER UPDATE OF title ON plans WHEN OLD.title IS NOT NEW.title BEGIN
   INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, note)
   VALUES ('plan', NEW.id, 'title-changed', OLD.title, NEW.title, NEW.change_actor_id, NEW.change_note);
 END;
 
+-- An update that leaves updated_at alone sets it to now (relies on recursive triggers being off, like
+-- tr_issue_touch).
 CREATE TRIGGER tr_plan_touch AFTER UPDATE ON plans
 WHEN NEW.updated_at IS OLD.updated_at BEGIN
   UPDATE plans SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = NEW.id;
 END;
 
+-- Once logged, the change context is cleared: a later change gives its own.
 CREATE TRIGGER tr_plan_context_cleared AFTER UPDATE ON plans
 WHEN NEW.change_actor_id IS NOT NULL OR NEW.change_note IS NOT NULL BEGIN
   UPDATE plans SET change_actor_id = NULL, change_note = NULL WHERE id = NEW.id;
 END;
 
+-- The same after an INSERT that carried context.
 CREATE TRIGGER tr_plan_context_cleared_ins AFTER INSERT ON plans
 WHEN NEW.change_actor_id IS NOT NULL OR NEW.change_note IS NOT NULL BEGIN
   UPDATE plans SET change_actor_id = NULL, change_note = NULL WHERE id = NEW.id;
@@ -2096,6 +2279,7 @@ CREATE TRIGGER tr_dep_order BEFORE INSERT ON step_dependencies BEGIN
     WHERE a.id = NEW.step_id AND b.id = NEW.depends_on_step_id AND b.number < a.number);
 END;
 
+-- The same when a dependency is edited.
 CREATE TRIGGER tr_dep_order_upd BEFORE UPDATE ON step_dependencies BEGIN
   SELECT RAISE(ABORT, 'a step may only depend on an earlier step of the same plan')
   WHERE NOT EXISTS (
@@ -2103,6 +2287,7 @@ CREATE TRIGGER tr_dep_order_upd BEFORE UPDATE ON step_dependencies BEGIN
     WHERE a.id = NEW.step_id AND b.id = NEW.depends_on_step_id AND b.number < a.number);
 END;
 
+-- Logs 'dependency-added' on the step, with the number of the step it depends on.
 CREATE TRIGGER tr_dep_created AFTER INSERT ON step_dependencies BEGIN
   INSERT INTO events(entity_type, entity_id, event, to_value, step_id, note)
   VALUES ('step', NEW.step_id, 'dependency-added',
@@ -2110,16 +2295,20 @@ CREATE TRIGGER tr_dep_created AFTER INSERT ON step_dependencies BEGIN
           'depends on step ' || (SELECT number FROM steps WHERE id = NEW.depends_on_step_id));
 END;
 
+-- A step's phase is a phase of the step's own plan. The foreign keys cannot say this: phase_id and plan_id each
+-- point at a valid row on their own.
 CREATE TRIGGER tr_step_phase_plan BEFORE INSERT ON steps BEGIN
   SELECT RAISE(ABORT, 'step phase belongs to another plan')
   WHERE (SELECT plan_id FROM phases WHERE id = NEW.phase_id) IS NOT NEW.plan_id;
 END;
 
+-- The same when a step is moved to another phase or plan.
 CREATE TRIGGER tr_step_phase_plan_upd BEFORE UPDATE OF phase_id, plan_id ON steps BEGIN
   SELECT RAISE(ABORT, 'step phase belongs to another plan')
   WHERE (SELECT plan_id FROM phases WHERE id = NEW.phase_id) IS NOT NEW.plan_id;
 END;
 
+-- And when a phase with steps is moved to another plan.
 CREATE TRIGGER tr_phase_plan_upd BEFORE UPDATE OF plan_id ON phases
 WHEN OLD.plan_id IS NOT NEW.plan_id BEGIN
   SELECT RAISE(ABORT, 'step phase belongs to another plan')
@@ -2145,12 +2334,14 @@ WHEN OLD.status IS NOT NEW.status AND NEW.change_note IS NULL
   SELECT RAISE(ABORT, 'give change_note with a step status change');
 END;
 
+-- The second rule above: a blocking gate that is open or answered holds the step.
 CREATE TRIGGER tr_step_gate_blocks BEFORE UPDATE OF status ON steps
 WHEN OLD.status IS NOT NEW.status AND NEW.status IN ('doing','done')
  AND EXISTS (SELECT 1 FROM gates g WHERE g.step_id = NEW.id AND g.blocking = 1 AND g.status IN ('open','answered')) BEGIN
   SELECT RAISE(ABORT, 'a blocking gate on this step is not applied yet');
 END;
 
+-- Logs 'created' with the step's title and change_actor_id.
 CREATE TRIGGER tr_step_created AFTER INSERT ON steps BEGIN
   INSERT INTO events(entity_type, entity_id, event, to_value, actor_id, step_id, note)
   VALUES ('step', NEW.id, 'created', NEW.status, NEW.change_actor_id, NEW.id, NEW.title);
@@ -2171,37 +2362,45 @@ WHEN OLD.status IS NOT NEW.status BEGIN
   WHERE id = NEW.id;
 END;
 
+-- Logs 'title-changed' with the old and new title.
 CREATE TRIGGER tr_step_title_changed AFTER UPDATE OF title ON steps WHEN OLD.title IS NOT NEW.title BEGIN
   INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, step_id, note)
   VALUES ('step', NEW.id, 'title-changed', OLD.title, NEW.title, NEW.change_actor_id, NEW.id, NEW.change_note);
 END;
 
+-- Logs 'change-text-changed' with the old and new text.
 CREATE TRIGGER tr_step_change_changed AFTER UPDATE OF change ON steps WHEN OLD.change IS NOT NEW.change BEGIN
   INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, step_id, note)
   VALUES ('step', NEW.id, 'change-text-changed', OLD.change, NEW.change, NEW.change_actor_id, NEW.id,
           NEW.change_note);
 END;
 
+-- Logs 'proof-changed' with the old and new text.
 CREATE TRIGGER tr_step_proof_changed AFTER UPDATE OF proof ON steps WHEN OLD.proof IS NOT NEW.proof BEGIN
   INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, step_id, note)
   VALUES ('step', NEW.id, 'proof-changed', OLD.proof, NEW.proof, NEW.change_actor_id, NEW.id, NEW.change_note);
 END;
 
+-- An update that leaves updated_at alone sets it to now (relies on recursive triggers being off, like
+-- tr_issue_touch).
 CREATE TRIGGER tr_step_touch AFTER UPDATE ON steps
 WHEN NEW.updated_at IS OLD.updated_at BEGIN
   UPDATE steps SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = NEW.id;
 END;
 
+-- Once logged, the change context is cleared: a later change gives its own.
 CREATE TRIGGER tr_step_context_cleared AFTER UPDATE ON steps
 WHEN NEW.change_actor_id IS NOT NULL OR NEW.change_commit_sha IS NOT NULL OR NEW.change_note IS NOT NULL BEGIN
   UPDATE steps SET change_actor_id = NULL, change_commit_sha = NULL, change_note = NULL WHERE id = NEW.id;
 END;
 
+-- The same after an INSERT that carried context.
 CREATE TRIGGER tr_step_context_cleared_ins AFTER INSERT ON steps
 WHEN NEW.change_actor_id IS NOT NULL OR NEW.change_commit_sha IS NOT NULL OR NEW.change_note IS NOT NULL BEGIN
   UPDATE steps SET change_actor_id = NULL, change_commit_sha = NULL, change_note = NULL WHERE id = NEW.id;
 END;
 
+-- Refuses DELETE: a step not to be done is dropped.
 CREATE TRIGGER tr_step_no_delete BEFORE DELETE ON steps BEGIN
   SELECT RAISE(ABORT, 'history is append-only: steps cannot be deleted; set status dropped instead');
 END;
@@ -2214,6 +2413,7 @@ WHEN NOT EXISTS (SELECT 1 FROM steps s JOIN findings f ON f.id = NEW.finding_id
   SELECT RAISE(ABORT, 'the finding''s review is not one of the step''s plan reviews (plan_reviews)');
 END;
 
+-- Logs 'linked' on the finding, with the step that closes it.
 CREATE TRIGGER tr_step_finding_created AFTER INSERT ON step_findings BEGIN
   INSERT INTO events(entity_type, entity_id, event, to_value, step_id, review_id, note)
   VALUES ('step-finding', NEW.finding_id, 'linked', (SELECT point_id FROM findings WHERE id = NEW.finding_id),
@@ -2223,10 +2423,12 @@ END;
 
 -- ----- Events
 
+-- An event is never changed.
 CREATE TRIGGER tr_events_no_update BEFORE UPDATE ON events BEGIN
   SELECT RAISE(ABORT, 'history is append-only: events cannot be changed');
 END;
 
+-- Refuses DELETE: events are the history.
 CREATE TRIGGER tr_events_no_delete BEFORE DELETE ON events BEGIN
   SELECT RAISE(ABORT, 'history is append-only: events cannot be deleted');
 END;
@@ -2533,9 +2735,9 @@ END;
 
 -- ---------- Views ---------------------------------------------------------
 
--- Issues not yet closed, oldest and most severe first. locations: the primary locations of the issue's real
--- findings (v_real_findings), each prefixed with its repository name when the ledger has more than one, so the
--- same path in two repositories stays two places.
+-- Issues still to fix, most severe first, then oldest.
+-- locations: the primary locations of the issue's real findings (v_real_findings), each prefixed with its
+-- repository name when the ledger has more than one, so the same path in two repositories stays two places.
 CREATE VIEW v_open_issues AS
 SELECT i.code, i.title, i.severity, i.status, i.domain_code, i.theme_code, i.sub,
        i.times_seen, fr.code AS first_seen, fr.started_at AS first_seen_at,
@@ -2553,8 +2755,9 @@ WHERE i.status IN (SELECT value FROM issue_statuses WHERE active = 1)
 ORDER BY CASE i.severity WHEN 'H' THEN 0 WHEN 'M' THEN 1 WHEN 'L' THEN 2 ELSE 3 END,
          fr.started_at;
 
--- Known issues to hand each reviewer in the brief, by domain: with where they were seen (primary locations, as in
--- v_open_issues) and the owner's standing decisions on them (decided or to revisit).
+-- The known issues each reviewer is told about before it starts, by domain.
+-- Each comes with where it was seen (primary locations, as in v_open_issues) and the owner's standing decisions on
+-- it (decided or to revisit).
 CREATE VIEW v_known_issues_for_brief AS
 SELECT i.domain_code, i.code, i.title, i.severity, i.status, i.current_state,
        i.recommendation, i.resolution,
@@ -2571,8 +2774,9 @@ FROM issues i
 WHERE i.status IN (SELECT value FROM issue_statuses WHERE briefed = 1)
 ORDER BY i.domain_code, i.id;   -- by id, so ISS-9999 comes before ISS-10000
 
--- Issues raised by more than one review, or that came back after a fix. Only real findings count (v_real_findings;
--- times_seen counts them too): a false re-raise does not make an issue recurring.
+-- Issues raised by more than one review, or that came back after a fix.
+-- Only real findings count (v_real_findings; times_seen counts them too): a false re-raise does not make an issue
+-- recurring.
 CREATE VIEW v_recurring_issues AS
 SELECT i.code, i.title, i.severity, i.status, i.times_seen,
        (SELECT count(*) FROM events e WHERE e.entity_type = 'issue' AND e.entity_id = i.id
@@ -2585,7 +2789,8 @@ WHERE i.times_seen > 1 OR EXISTS (SELECT 1 FROM events e WHERE e.entity_type = '
         AND e.entity_id = i.id AND e.to_value = 'regressed')
 ORDER BY regressions DESC, i.times_seen DESC;
 
--- Full life of one issue: filter by code.
+-- The full history of each issue, oldest event first.
+-- Filter by code.
 CREATE VIEW v_issue_timeline AS
 SELECT i.code, e.at, e.event, e.from_value, e.to_value, r.code AS review,
        s.number AS step, e.commit_sha, a.name AS actor, e.note
@@ -2596,7 +2801,8 @@ LEFT JOIN steps s ON s.id = e.step_id
 LEFT JOIN actors a ON a.id = e.actor_id
 ORDER BY i.code, e.at, e.id;
 
--- Every relation in both directions, with codes.
+-- How issues are related to each other.
+-- Each relation once, in its stored direction (from_issue is a duplicate of, blocks ... to_issue), with codes.
 CREATE VIEW v_issue_graph AS
 SELECT a.code AS from_issue, r.relation, b.code AS to_issue, r.confidence, r.rationale,
        rv.code AS established_in
@@ -2605,11 +2811,12 @@ JOIN issues a ON a.id = r.from_issue_id
 JOIN issues b ON b.id = r.to_issue_id
 LEFT JOIN reviews rv ON rv.id = r.established_in_review_id;
 
--- Per review and domain: counts by severity, verified and false. Every count but false_findings is of real
--- findings (the v_real_findings rule, verification <> 'false'); false_findings counts the rest. came_back counts
--- the issues of this review's real findings that this review sent back, from their events (the trigger's own
--- record): regressed, reopened from a closed status, or raised again while accepted. r.code is a GROUP BY term so
--- that a WHERE review = ? filter is pushed into the findings scan (one review's findings, not every review's).
+-- The number of points each review raised, by domain and severity.
+-- Also counts the verified and the false ones. Every count but false_findings is of real findings (the
+-- v_real_findings rule, verification <> 'false'); false_findings counts the rest. came_back counts the issues of
+-- this review's real findings that this review sent back, from their events (the trigger's own record): regressed,
+-- reopened from a closed status, or raised again while accepted. r.code is a GROUP BY term so that a WHERE review =
+-- ? filter is pushed into the findings scan (one review's findings, not every review's).
 CREATE VIEW v_review_summary AS
 SELECT r.code AS review, r.started_at, f.domain_code,
        sum(f.verification <> 'false') AS points,
@@ -2632,23 +2839,39 @@ FROM findings f JOIN reviews r ON r.id = f.review_id
 GROUP BY r.id, r.code, f.domain_code
 ORDER BY r.started_at, f.domain_code;
 
--- Findings not yet matched to an issue (must be empty before consolidating). False findings too: a false finding
--- is matched to an issue closed as obsolete, so the ledger keeps what was claimed and why it was wrong. An
--- abandoned review's findings are not required to be matched.
+-- Each review with its point counts.
+-- One row per review (0, not NULL, for a review with no findings): its real findings (v_real_findings) by
+-- severity, those that opened an issue, and those whose match type says the issue came back
+-- (match_types.came_back). The viewer's review lists read this view. r.code is a GROUP BY term so that a
+-- WHERE review = ? filter is pushed into the findings scan.
+CREATE VIEW v_review_totals AS
+SELECT r.code AS review, r.started_at, count(f.id) AS points,
+       COALESCE(sum(f.severity = 'H'), 0) AS high, COALESCE(sum(f.severity = 'M'), 0) AS medium,
+       COALESCE(sum(f.severity = 'L'), 0) AS low, COALESCE(sum(f.severity = 'T'), 0) AS tests,
+       COALESCE(sum(f.match_type IN ('new','continuation')), 0) AS new_issues,
+       COALESCE(sum(f.match_type IN (SELECT value FROM match_types WHERE came_back = 1)), 0) AS came_back
+FROM reviews r LEFT JOIN v_real_findings f ON f.review_id = r.id
+GROUP BY r.id, r.code;
+
+-- Points not yet matched to an issue.
+-- Must be empty before consolidating. False findings too: a false finding is matched to an issue closed as
+-- obsolete, so the ledger keeps what was claimed and why it was wrong. An abandoned review's findings are not
+-- required to be matched.
 CREATE VIEW v_unmatched_findings AS
 SELECT r.code AS review, f.point_id, f.severity, f.summary
 FROM findings f JOIN reviews r ON r.id = f.review_id
 WHERE f.issue_id IS NULL AND r.status <> 'abandoned';
 
--- Every finding but the false ones: the one definition of a real finding. Counts (times_seen, v_recurring_issues,
--- v_review_summary, v_file_hotspots, v_open_issues' locations) use it; the must-be-empty checks do not, since a
--- false finding must still be matched (to an issue closed as obsolete) and closed by a plan step.
+-- Every point except those found to be false.
+-- The one definition of a real finding. Counts (times_seen, v_recurring_issues, v_review_summary, v_file_hotspots,
+-- v_open_issues' locations) use it; the must-be-empty checks do not, since a false finding must still be matched
+-- (to an issue closed as obsolete) and closed by a plan step.
 CREATE VIEW v_real_findings AS
 SELECT * FROM findings WHERE verification <> 'false';
 
--- Known issues in domains that ran, with no check recorded (must be empty). Known = first seen in another review
--- and opened before this one started, compared as julianday() values (an instant, not text). An abandoned review
--- needs no checks.
+-- Known issues a review should have looked for and did not.
+-- Must be empty. Counted in the domains that ran. Known = first seen in another review and opened before this one
+-- started, compared as julianday() values (an instant, not text). An abandoned review needs no checks.
 CREATE VIEW v_unchecked_known_issues AS
 SELECT r.code AS review, i.code AS issue, i.domain_code, i.title
 FROM reviews r
@@ -2660,12 +2883,13 @@ WHERE r.status <> 'abandoned'
   AND i.status IN (SELECT value FROM issue_statuses WHERE briefed = 1)
   AND NOT EXISTS (SELECT 1 FROM review_issue_checks c WHERE c.review_id = r.id AND c.issue_id = i.id);
 
--- Coverage: findings of a plan's reviews closed by no step (must be empty). A finding is covered by a step of
--- this plan, or by a done step of a plan this plan supersedes (work already finished under the old plan). The
--- probe goes from the finding to its steps (ix_step_findings_find), never over a whole plan's steps per finding.
--- False findings count too (the plan's 'record false findings' step closes them). A dropped step covers nothing
--- unless a decided decision is linked to it (the owner chose not to do it). Superseded and abandoned plans, and
--- abandoned reviews, are not checked.
+-- Points that no step of the fix plan closes.
+-- Must be empty. Counted over the reviews a plan covers. A finding is covered by a step of this plan, or by a done
+-- step of a plan this plan supersedes (work already finished under the old plan). The probe goes from the finding
+-- to its steps (ix_step_findings_find), never over a whole plan's steps per finding. False findings count too (the
+-- plan's 'record false findings' step closes them). A dropped step covers nothing unless a decided decision is
+-- linked to it (the owner chose not to do it). Superseded and abandoned plans, and abandoned reviews, are not
+-- checked.
 CREATE VIEW v_uncovered_findings AS
 SELECT p.code AS plan, r.code AS review, f.point_id, f.severity, f.summary
 FROM plans p
@@ -2680,10 +2904,10 @@ WHERE p.status NOT IN ('superseded','abandoned') AND r.status <> 'abandoned'
                     AND (s.status <> 'dropped'
                          OR EXISTS (SELECT 1 FROM decisions d WHERE d.step_id = s.id AND d.status = 'decided')));
 
--- Coverage (must be empty): steps that close nothing, and findings closed by several steps without a reason. A
--- dropped step, or one whose no_findings_reason says why it closes nothing by design (the follow-up review that
--- verifies the plan), is not a problem; dropped steps do not count towards closing a finding twice. Superseded
--- and abandoned plans are not checked.
+-- Plan steps that close nothing, and points closed by several steps without a reason.
+-- Must be empty. A dropped step, or one whose no_findings_reason says why it closes nothing by design (the
+-- follow-up review that verifies the plan), is not a problem; dropped steps do not count towards closing a finding
+-- twice. Superseded and abandoned plans are not checked.
 CREATE VIEW v_coverage_problems AS
 SELECT p.code AS plan, 'step closes nothing' AS problem, CAST(s.number AS TEXT) AS item
 FROM steps s JOIN plans p ON p.id = s.plan_id
@@ -2698,7 +2922,7 @@ WHERE p.status NOT IN ('superseded','abandoned') AND s.status <> 'dropped'
 GROUP BY p.id, sf.finding_id
 HAVING count(*) > 1 AND sum(sf.multi_reason IS NULL) > 0;
 
--- Progress per phase.
+-- How far each phase of a fix plan has come.
 CREATE VIEW v_plan_progress AS
 SELECT p.code AS plan, ph.number AS phase, ph.title,
        min(s.number) AS first_step, max(s.number) AS last_step, count(s.id) AS steps,
@@ -2710,12 +2934,41 @@ FROM phases ph JOIN plans p ON p.id = ph.plan_id
 LEFT JOIN steps s ON s.phase_id = ph.id
 GROUP BY ph.id ORDER BY p.code, ph.number;
 
--- The owner's to-do list: open gates, answered gates the agent has not
--- acted on yet, and anything else waiting on the owner without a gate (steps, decisions, and design goals proposed
--- for a review and not on an open approval gate).
--- Each thing once: a step or decision with an open or answered gate (on it, or for a decision on its step) is
--- listed as that gate. A step's question falls back to its progress note, then to its change text, so it is never
--- blank; it is blocking when an unfinished step depends on it.
+-- Each fix plan with its step counts.
+-- One row per plan (0, not NULL, for a plan with no steps), with the reviews it covers. The viewer's plan lists
+-- read this view.
+CREATE VIEW v_plan_totals AS
+SELECT p.code AS plan, p.title, p.status, p.created_at, p.approved_at, count(s.id) AS steps,
+       COALESCE(sum(s.status = 'done'), 0) AS done, COALESCE(sum(s.status = 'doing'), 0) AS doing,
+       COALESCE(sum(s.status = 'waiting-owner'), 0) AS waiting_owner,
+       COALESCE(sum(s.status = 'not-started'), 0) AS not_started,
+       COALESCE(sum(s.status = 'dropped'), 0) AS dropped,
+       (SELECT group_concat(r.code, ', ') FROM plan_reviews pr JOIN reviews r ON r.id = pr.review_id
+         WHERE pr.plan_id = p.id) AS reviews
+FROM plans p LEFT JOIN steps s ON s.plan_id = p.id
+GROUP BY p.id, p.code;
+
+-- Gates still on the owner's list.
+-- Open gates (to answer) and answered ones the agent has not acted on yet: the ones to answer first, blocking
+-- before the rest, then oldest, each with the codes of what it is about. The viewer's inbox and its count of
+-- questions read this view.
+CREATE VIEW v_pending_gates AS
+SELECT g.id, g.code, g.kind, g.title, g.question, g.status, g.blocking, g.created_at,
+       r.code AS review_code, pl.code AS plan_code, s.number AS step_number, i.code AS issue_code,
+       d.code AS decision_code
+FROM gates g
+LEFT JOIN reviews r ON r.id = g.review_id LEFT JOIN plans pl ON pl.id = g.plan_id
+LEFT JOIN steps s ON s.id = g.step_id LEFT JOIN issues i ON i.id = g.issue_id
+LEFT JOIN decisions d ON d.id = g.decision_id
+WHERE g.status IN ('open','answered')
+ORDER BY g.status = 'answered', g.blocking DESC, g.created_at;
+
+-- Everything waiting on the owner.
+-- Open gates, answered gates the agent has not acted on yet, and anything else waiting on the owner without a gate
+-- (steps, decisions, and design goals proposed for a review and not on an open approval gate). Each thing once: a
+-- step or decision with an open or answered gate (on it, or for a decision on its step) is listed as that gate. A
+-- step's question falls back to its progress note, then to its change text, so it is never blank; it is blocking
+-- when an unfinished step depends on it.
 CREATE VIEW v_owner_queue AS
 SELECT 'gate' AS kind, g.code AS ref, g.kind AS need, g.title, g.question,
        g.status, g.blocking, g.created_at
@@ -2738,9 +2991,10 @@ SELECT 'goal', g.code, 'confirm', 'Approve a design goal', g.text, g.status, 1, 
 FROM design_goals g WHERE g.status = 'proposed' AND g.review_id IS NOT NULL
   AND NOT EXISTS (SELECT 1 FROM gates x WHERE x.id = g.gate_id AND x.status IN ('open','answered'));
 
--- Every code reference with what is needed to get back to the exact lines. commit_sha is the location's own
--- commit, else its review's commit for that repository (commit_from says which: 'location', 'review', or NULL
--- when neither is known; git_command is then NULL and v_untraceable_refs lists the row as 'no commit').
+-- Every place in the code a point cites, with how to get back to the exact lines.
+-- commit_sha is the location's own commit, else its review's commit for that repository (commit_from says which:
+-- 'location', 'review', or NULL when neither is known; git_command is then NULL and v_untraceable_refs lists the
+-- row as 'no commit').
 CREATE VIEW v_code_refs AS
 SELECT r.code AS review, f.point_id, i.code AS issue, fl.id AS location_id, fl.role,
        rp.name AS repository, rp.path AS repo_path, COALESCE(fl.commit_sha, rr.commit_sha) AS commit_sha,
@@ -2763,13 +3017,13 @@ JOIN repositories rp ON rp.id = fl.repository_id
 LEFT JOIN review_repositories rr ON rr.review_id = f.review_id AND rr.repository_id = fl.repository_id
 LEFT JOIN issues i ON i.id = f.issue_id;
 
--- References that could not be traced back (must be empty after indexing). A whole-file reference (whole_file = 1)
--- needs no symbol; a not-text one (binary or not UTF-8) needs no excerpt. An excerpt whose line count differs from
--- its line range (lines past the end of the file, or a hand-written excerpt) is a problem, except a whole-file
--- excerpt cut at 200 lines (excerpt_status 'truncated'). An empty excerpt is no excerpt; a location whose commit
--- differs from the commit its review looked at is a problem (unless the finding was discovered during fix work,
--- at a later commit: discovered_in_step_id); a finding with no location at all is one too. An
--- abandoned review's findings are not checked.
+-- Cited code that cannot be traced back to its lines.
+-- Must be empty after indexing. A whole-file reference (whole_file = 1) needs no symbol; a not-text one (binary or
+-- not UTF-8) needs no excerpt. An excerpt whose line count differs from its line range (lines past the end of the
+-- file, or a hand-written excerpt) is a problem, except a whole-file excerpt cut at 200 lines (excerpt_status
+-- 'truncated'). An empty excerpt is no excerpt; a location whose commit differs from the commit its review looked
+-- at is a problem (unless the finding was discovered during fix work, at a later commit: discovered_in_step_id); a
+-- finding with no location at all is one too. An abandoned review's findings are not checked.
 CREATE VIEW v_untraceable_refs AS
 SELECT review, point_id, path, problem FROM (
   SELECT r.code AS review, f.point_id, fl.path,
@@ -2800,9 +3054,10 @@ SELECT review, point_id, path, problem FROM (
     AND NOT EXISTS (SELECT 1 FROM finding_locations fl WHERE fl.finding_id = f.id)
 ) WHERE problem IS NOT NULL;
 
--- Defects found during fix work (findings.discovered_in_step_id) that no plan step closes yet while their issue is
--- still open (must be empty): a discovery goes through the same process as a review finding. A step closes it when
--- it is linked (step_findings, step not dropped) to the finding itself or to another finding of the same issue.
+-- Defects found during fix work that no plan step closes yet.
+-- Must be empty while the issue is still open (findings.discovered_in_step_id marks a discovery): a discovery goes
+-- through the same process as a review finding. A step closes it when it is linked (step_findings, step not
+-- dropped) to the finding itself or to another finding of the same issue.
 CREATE VIEW v_unplanned_discoveries AS
 SELECT p.code AS plan, s.number AS found_in_step, r.code AS review, f.point_id, i.code AS issue,
        i.status AS issue_status, f.summary
@@ -2819,7 +3074,8 @@ WHERE f.verification <> 'false'
                   JOIN steps cs ON cs.id = sf.step_id
                   WHERE f.issue_id IS NOT NULL AND f2.issue_id = f.issue_id AND cs.status <> 'dropped');
 
--- Fixed issues with no guard test, or whose guard test has disappeared.
+-- Fixed issues with no test guarding the fix, or whose guard test is gone.
+-- Issues of kind docs or design need no guard test.
 CREATE VIEW v_unguarded_fixes AS
 SELECT i.code, i.title, i.status,
        CASE WHEN NOT EXISTS (SELECT 1 FROM guard_tests g WHERE g.issue_id = i.id)
@@ -2828,8 +3084,8 @@ FROM issues i
 WHERE i.status IN (SELECT value FROM issue_statuses WHERE fixed = 1) AND COALESCE(i.kind, '') NOT IN ('docs','design')
   AND NOT EXISTS (SELECT 1 FROM guard_tests g WHERE g.issue_id = i.id AND g.still_exists = 1);
 
--- Trend of each metric across reviews, with its label and direction from metric_defs (the unit falls back to the
--- catalog's).
+-- How each measured number changed from review to review.
+-- Label and direction come from metric_defs; a metric without a unit takes the catalog's.
 CREATE VIEW v_metric_trends AS
 SELECT m.name, m.scope, COALESCE(rp.name, 'all') AS repository, r.code AS review,
        r.started_at, m.value, COALESCE(m.unit, md.unit) AS unit, m.method,
@@ -2840,8 +3096,8 @@ LEFT JOIN repositories rp ON rp.id = m.repository_id
 LEFT JOIN metric_defs md ON md.name = m.name
 ORDER BY m.name, m.scope, r.started_at;
 
--- Hotspot memory: files that keep producing issues, per repository (the same path in two repositories is two
--- files), from real findings only (v_real_findings).
+-- Files that keep producing issues.
+-- Per repository (the same path in two repositories is two files), from real findings only (v_real_findings).
 CREATE VIEW v_file_hotspots AS
 SELECT rp.name AS repository, fl.path, count(DISTINCT f.issue_id) AS issues,
        count(DISTINCT f.review_id) AS reviews, sum(f.severity = 'H') AS high_points
@@ -2849,14 +3105,15 @@ FROM finding_locations fl JOIN v_real_findings f ON f.id = fl.finding_id
 JOIN repositories rp ON rp.id = fl.repository_id
 GROUP BY fl.repository_id, fl.path ORDER BY issues DESC, high_points DESC, rp.name, fl.path;
 
--- Decisions the owner has already made, so future reviews don't re-raise them blindly.
+-- Decisions the owner has already made, so a later review does not raise them again.
 CREATE VIEW v_standing_decisions AS
 SELECT d.code, d.question, d.answer, d.rationale, d.revisit_when, d.decided_at,
        (SELECT group_concat(i.code, ', ') FROM decision_issues di
           JOIN issues i ON i.id = di.issue_id WHERE di.decision_id = d.id) AS issues
 FROM decisions d WHERE d.status = 'decided';
 
--- What a plan step closes: each finding it closes and that finding's issue with its status (Step 9 "its issues").
+-- What each plan step closes: its points and their issues.
+-- Each finding the step closes and that finding's issue with its status.
 CREATE VIEW v_step_issues AS
 SELECT p.code AS plan, s.number AS step, s.title AS step_title, s.status AS step_status,
        r.code AS review, f.point_id, i.code AS issue, i.title AS issue_title, i.status AS issue_status
@@ -2868,8 +3125,9 @@ JOIN reviews r ON r.id = f.review_id
 LEFT JOIN issues i ON i.id = f.issue_id
 ORDER BY p.code, s.number, r.code, f.point_id;
 
--- The next code of each coded table (plan step 98): the highest number + 1, zero-padded like the code triggers
--- require (ISS-0001 ... ; G-01 ...; IQ-0001 ...). Write commands take codes from here (ledger.py next-code ISS), never by hand.
+-- The next free code for each kind of record.
+-- The highest number + 1, zero-padded as the code triggers require (ISS-0001 ..., G-01 ..., IQ-0001 ...). Write
+-- commands take codes from here (`ledger.py next-code ISS`), never by hand.
 CREATE VIEW v_next_codes AS
 SELECT 'ISS' AS prefix, 'ISS-' || printf('%04d', COALESCE(max(CAST(substr(code, 5) AS INTEGER)), 0) + 1) AS next_code
 FROM issues
@@ -2883,8 +3141,9 @@ UNION ALL SELECT 'G', 'G-' || printf('%02d', COALESCE(max(CAST(substr(code, 3) A
 UNION ALL SELECT 'IQ', 'IQ-' || printf('%04d', COALESCE(max(CAST(substr(code, 4) AS INTEGER)), 0) + 1)
 FROM interview_questions;
 
--- Steps still to do (in a plan that is not superseded or abandoned) whose issues are all closed already, e.g. by a
--- review's check of 'fixed': mark the step done or dropped. Listed by `ledger.py gates`; not a must-be-empty check.
+-- Plan steps still to do whose issues are already closed.
+-- Closed for example by a review's check of 'fixed': mark the step done or dropped. Superseded and abandoned plans
+-- are left out. Listed by `ledger.py gates`; not one of the checks.
 CREATE VIEW v_stale_steps AS
 SELECT p.code AS plan, s.number AS step, s.title, s.status,
        (SELECT group_concat(x.issue, ', ') FROM
@@ -2901,8 +3160,8 @@ WHERE s.status NOT IN ('done','dropped')
                     AND (i.id IS NULL OR i.status IN
                          (SELECT value FROM issue_statuses WHERE active = 1)));
 
--- Per repository, the commit the latest finished (handed-off) review looked at: the start of the next review's
--- `git log <commit>..HEAD`.
+-- The commit the latest finished review looked at, per repository.
+-- Finished means handed-off. It is the start of the next review's `git log <commit>..HEAD`.
 CREATE VIEW v_last_reviewed_commit AS
 SELECT rp.name AS repository, rp.path AS repo_path, r.code AS review, rr.commit_sha, rr.branch, rr.tag_name,
        r.completed_at
@@ -2914,7 +3173,8 @@ WHERE r.id = (SELECT r2.id FROM review_repositories rr2 JOIN reviews r2 ON r2.id
               ORDER BY COALESCE(r2.completed_at, r2.started_at) DESC, r2.id DESC LIMIT 1)
 ORDER BY rp.name;
 
--- The requirement trace of each review: every verdict, with the count of that verdict in that review.
+-- Whether the code does what each requirement says, per review.
+-- Every verdict, with the count of that verdict in that review.
 CREATE VIEW v_requirement_trace AS
 SELECT r.code AS review, q.code AS requirement, q.text, c.verdict, c.where_implemented, c.tested,
        f.point_id, c.evidence,
@@ -2926,7 +3186,8 @@ JOIN requirements q ON q.id = c.requirement_id
 LEFT JOIN findings f ON f.id = c.finding_id
 ORDER BY r.code, q.code;
 
--- Every agent that worked on a review: its manager, each reviewer run's agent and the agents in review_actors.
+-- Every agent that worked on a review.
+-- Its manager, each reviewer run's agent and the agents in review_actors.
 CREATE VIEW v_review_agents AS
 SELECT r.code AS review, x.role, a.id AS actor_id, a.kind, a.name, a.model, a.harness, a.session_ref,
        pa.name AS parent
@@ -2939,9 +3200,10 @@ JOIN actors a ON a.id = x.actor_id
 LEFT JOIN actors pa ON pa.id = a.parent_actor_id
 ORDER BY r.code, CASE a.kind WHEN 'manager' THEN 0 WHEN 'reviewer' THEN 1 ELSE 2 END, x.role, a.id;
 
--- History gaps (must be empty): an issue with no 'opened' event, an issue whose status is not the last status
--- its events logged, and a gate answered or applied with no event reaching that status. The triggers write
--- these events, so a gap means a row was written with the triggers bypassed.
+-- Records whose history is missing an entry.
+-- Must be empty. A gap is an issue with no 'opened' event, an issue whose status is not the last status its events
+-- logged, and a gate answered or applied with no event reaching that status. The triggers write these events, so a
+-- gap means a row was written with the triggers bypassed.
 CREATE VIEW v_history_gaps AS
 SELECT 'issue' AS kind, i.code AS ref, 'no opened event' AS problem
 FROM issues i
@@ -2960,11 +3222,12 @@ WHERE g.status IN ('answered','applied')
   AND NOT EXISTS (SELECT 1 FROM events e WHERE e.entity_type = 'gate' AND e.entity_id = g.id
                     AND e.to_value = g.status);
 
--- Matches whose type disagrees with the issue (must be empty): a continuation needs a continuation-of relation
--- from its new issue; 'new' (or 'continuation') is for an issue this review opened; 'still-present', 'changed',
--- 'recurrence' and 'regression' are for an issue an earlier review opened; a recurrence is of an issue that was
--- closed at some point; a real finding still present on an issue fixed before this review started is a
--- regression (match it so: it then regresses the issue). Abandoned reviews are not checked.
+-- Points matched to an issue in a way the issue's history contradicts.
+-- Must be empty. The rules: a continuation needs a continuation-of relation from its new issue; 'new' (or
+-- 'continuation') is for an issue this review opened; 'still-present', 'changed', 'recurrence' and 'regression' are
+-- for an issue an earlier review opened; a recurrence is of an issue that was closed at some point; a real finding
+-- still present on an issue fixed before this review started is a regression (match it so: it then regresses the
+-- issue). Abandoned reviews are not checked.
 CREATE VIEW v_match_problems AS
 SELECT review, point_id, issue, match_type, problem FROM (
   SELECT r.code AS review, f.point_id, i.code AS issue, f.match_type,
@@ -2993,9 +3256,10 @@ SELECT review, point_id, issue, match_type, problem FROM (
   WHERE r.status <> 'abandoned'
 ) WHERE problem IS NOT NULL;
 
--- Steps closing a finding of a review their plan does not cover (must be empty): add the review back to
--- plan_reviews or close the finding in its own plan. tr_step_finding_in_plan refuses such a link when it is made;
--- this lists links made before it, or left behind when a plan_reviews row was removed.
+-- Plan steps that close a point from a review the plan does not cover.
+-- Must be empty: add the review back to plan_reviews or close the finding in its own plan. tr_step_finding_in_plan
+-- refuses such a link when it is made; this lists links made before it, or left behind when a plan_reviews row was
+-- removed.
 CREATE VIEW v_off_plan_coverage AS
 SELECT p.code AS plan, s.number AS step, r.code AS review, f.point_id
 FROM step_findings sf
@@ -3006,9 +3270,10 @@ JOIN reviews r ON r.id = f.review_id
 WHERE p.status NOT IN ('superseded','abandoned')
   AND NOT EXISTS (SELECT 1 FROM plan_reviews pr WHERE pr.plan_id = p.id AND pr.review_id = f.review_id);
 
--- Done steps whose issues are still to do (must be empty): when a step is done, its issues move on (fixed with
--- after_state, or another closing status), unless another unfinished step still works on them. Regressed issues
--- are left to the next plan. Superseded and abandoned plans are not checked.
+-- Finished plan steps whose issues are still to fix.
+-- Must be empty: when a step is done, its issues move on (fixed with after_state, or another closing status),
+-- unless another unfinished step still works on them. Regressed issues are left to the next plan. Superseded and
+-- abandoned plans are not checked.
 CREATE VIEW v_done_steps_open_issues AS
 SELECT DISTINCT p.code AS plan, s.number AS step, i.code AS issue, i.status AS issue_status
 FROM steps s
@@ -3024,14 +3289,16 @@ WHERE s.status = 'done' AND p.status NOT IN ('superseded','abandoned') AND f.ver
                     AND p2.status NOT IN ('superseded','abandoned'))
 ORDER BY p.code, s.number, i.id;
 
--- Issues closed as accepted-risk or wont-fix with no resolution (must be empty): the reason is the record. New
--- closings are refused by tr_issue_closed_needs_reason; this lists rows written before it.
+-- Issues closed as an accepted risk or as not to be fixed, with no reason given.
+-- Must be empty: the reason is the record. New closings are refused by tr_issue_closed_needs_reason; this lists
+-- rows written before it.
 CREATE VIEW v_closed_without_reason AS
 SELECT code, title, status FROM issues
 WHERE status IN ('accepted-risk','wont-fix') AND NULLIF(trim(resolution), '') IS NULL;
 
--- Relation problems (must be empty): a related-to pair stored in both directions (related-to is symmetric, so one
--- row says it; tr_relation_noreverse_dup refuses the second for new rows). The later row is listed.
+-- Pairs of issues recorded as related twice, once in each direction.
+-- Must be empty. A related-to pair stored in both directions (related-to is symmetric, so one row says it;
+-- tr_relation_noreverse_dup refuses the second for new rows). The later row is listed.
 CREATE VIEW v_relation_problems AS
 SELECT a.code AS from_issue, b.code AS to_issue, ir.relation, 'related-to stored in both directions' AS problem
 FROM issue_relations ir
@@ -3041,8 +3308,8 @@ WHERE ir.relation = 'related-to'
   AND EXISTS (SELECT 1 FROM issue_relations rv WHERE rv.relation = 'related-to'
                 AND rv.from_issue_id = ir.to_issue_id AND rv.to_issue_id = ir.from_issue_id AND rv.id < ir.id);
 
--- Review checks citing a finding matched to another issue (must be empty): a check's finding is the evidence for
--- that issue.
+-- Checks of a known issue that cite a point belonging to another issue.
+-- Must be empty: a check's finding is the evidence for that issue.
 CREATE VIEW v_check_finding_owner AS
 SELECT r.code AS review, i.code AS issue, f.point_id, fi.code AS finding_issue
 FROM review_issue_checks c
@@ -3052,9 +3319,9 @@ JOIN findings f ON f.id = c.finding_id
 JOIN issues fi ON fi.id = f.issue_id
 WHERE f.issue_id <> c.issue_id;
 
--- The owner's approved design goals for the brief and the reviewer prompts (schema 9, plan step 129), whole-project
--- goals (domain_code NULL) first, then by domain: a reviewer of domain D gets the rows of D and the whole-project
--- ones (`ledger.py goals --domain D`). sources: the interview questions each goal summarizes.
+-- The owner's approved design goals, as given to reviewers.
+-- Whole-project goals (domain_code NULL) first, then by domain: a reviewer of domain D gets the rows of D and the
+-- whole-project ones (`ledger.py goals --domain D`). sources: the interview questions each goal summarizes.
 CREATE VIEW v_goals_for_brief AS
 SELECT g.domain_code, g.code, g.text,
        (SELECT group_concat(x.code, ', ') FROM
@@ -3299,7 +3566,7 @@ INSERT INTO ledger_checks(view, label, tier, position) VALUES
  ('v_closed_without_reason','Issues accepted or declined with no reason recorded','error',78),
  ('v_relation_problems','Related-to pairs stored in both directions','error',80),
  ('v_check_finding_owner','Review checks citing a finding of another issue','error',82);
-INSERT INTO meta(key, value) VALUES ('schema_version','9');
+INSERT INTO meta(key, value) VALUES ('schema_version','10');
 INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger schema'),
   (2, 'url, path, hash and code checks; repositories.allow_outside_root; finding_locations.excerpt_redacted'),
   (3, 'integrity rules: codes, hashes, checks, append-only history, owner actor on gate answers'),
@@ -3308,4 +3575,5 @@ INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger s
   (6, 'lookup tables for the ledger''s words and labels; RESTRICT keys under reviews and findings; metrics.name catalogued'),
   (7, 'must-be-empty checks for history gaps, matches, off-plan and done-step coverage, closings, relations and checks; steps.no_findings_reason'),
   (8, 'finding_locations.source (the reviewed text of a dirty working tree); v_next_codes for the write commands'),
-  (9, 'owner interview (interview_questions, interview_answers) and per-domain design goals the owner approves');
+  (9, 'owner interview (interview_questions, interview_answers) and per-domain design goals the owner approves'),
+  (10, 'v_plan_totals, v_review_totals and v_pending_gates: the counts the viewer''s lists show');

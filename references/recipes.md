@@ -184,7 +184,7 @@ The branch and the summary come from git. If a step's own commit cannot name its
 
 ### Record a guard test
 
-The test that would fail if the fixed issue came back; `--failed-before` when you saw it fail before the fix.
+The test that would fail if the fixed issue came back; `--failed-before` when you saw it fail without the fix.
 `step-status 2 done --guard PATH::NAME` records one for each issue of the step.
 
 ```sh
@@ -204,8 +204,8 @@ A document the owner keeps elsewhere and asks to link is an artifact too:
 
 ## Correcting the ledger
 
-History is never deleted; every correction is a new row or a change with its reason. The SQL blocks here are the
-only hand-written SQL the skill uses.
+History is never deleted; every correction is a new row or a change with its reason. The skill uses hand-written SQL
+only in these blocks.
 
 ### Re-match a finding
 
@@ -285,34 +285,81 @@ the secret: one that reached git stays in its history until the history is rewri
 
 ### A failing check
 
-`ledger.py check` names each failing view with its rows; read them with `ledger.py query "SELECT * FROM <view>"`.
+`ledger.py check` names each failing check with its rows; read a view with `ledger.py query "SELECT * FROM <view>"`.
 
-- `v_unmatched_findings`: findings with no issue: match them (Step 5d), false ones included.
-- `v_unchecked_known_issues`: a known issue of a domain that ran has no check: add it to the report's `known.tsv`
-  (`not-checked` if nobody looked) and run `import-checks`.
-- `v_untraceable_refs`: a location without its commit, tag or excerpt: run `tag-review` and `fill-refs`; give lines to
-  a symbol it could not place (a new point with the right location, or report-finding for a discovery).
-- `v_uncovered_findings`: a finding of the plan's reviews that no step closes: add it to a step's `closes`.
-- `v_coverage_problems`: a step that closes nothing (give it `no_findings_reason`) or a finding closed twice without a
-  `multi_reason`.
-- `v_unplanned_discoveries`: a discovery whose issue is open and no step closes: `report-finding --into-step` or a new
-  step, or the owner's gate.
-- `v_history_gaps`: an issue or gate change without its event: it was written around the triggers; tell the owner.
-- `v_match_problems`: a match type that disagrees with its issue: re-match the finding.
-- `v_off_plan_coverage`: a step closing a finding of a review the plan does not cover: add the review to
-  `plan_reviews` or move the point.
-- `v_done_steps_open_issues`: a done step whose issues are still open: `issue-status ... fixed`, or the step's note
-  says why not.
-- `v_closed_without_reason`: an `accepted-risk` or `wont-fix` issue without a resolution: `issue-status` again with
-  `--resolution`.
-- `v_relation_problems`: a relation that contradicts its issues: add the right relation and close or reopen with a
-  note.
-- `v_check_finding_owner`: a check's finding belongs to another review: re-record the check in its own review.
-- `v_unguarded_fixes` (warning): a fixed issue with no guard test: record one with `add-guard`.
-- `quick_check` / `integrity_check` or `foreign_key_check` failures: stop writing; `ledger.py restore
-  .code-review/ledger.sql --to /tmp/check.sqlite` from the last dump, compare, and ask the owner before replacing.
-- A schema difference (a table, view or trigger that is not the shipped one): someone changed the ledger's schema;
-  open a gate, and do not run the project copy of `ledger.py`.
+#### `v_unmatched_findings`
+
+Match each finding (Step 5d), false ones included.
+
+#### `v_unchecked_known_issues`
+
+Add the known issue to its report's `known.tsv` (`not-checked` if nobody looked) and run `import-checks`.
+
+#### `v_untraceable_refs`
+
+Run `tag-review` and `fill-refs`. A symbol they could not place needs lines: a new point with the right location,
+or `report-finding` for a discovery.
+
+#### `v_uncovered_findings`
+
+Add the finding to the `closes` of a step in its plan.
+
+#### `v_coverage_problems`
+
+Give a step that closes nothing a `no_findings_reason`; give a finding closed by several steps a `multi_reason`.
+
+#### `v_unplanned_discoveries`
+
+Plan the discovery: `report-finding --into-step`, a new step, or the owner's gate.
+
+#### `v_history_gaps`
+
+An issue or gate changed without its event, so something wrote around the triggers: tell the owner.
+
+#### `v_match_problems`
+
+Re-match the finding: its match type disagrees with its issue.
+
+#### `v_off_plan_coverage`
+
+Add the finding's review to `plan_reviews`, or move the point to a step of a plan that covers it.
+
+#### `v_done_steps_open_issues`
+
+Run `issue-status ... fixed` for each issue of the done step, or say in the step's note why it stays open.
+
+#### `v_closed_without_reason`
+
+Run `issue-status` again with `--resolution` on the `accepted-risk` or `wont-fix` issue.
+
+#### `v_relation_problems`
+
+Add the right relation, and close or reopen the issue with a note.
+
+#### `v_check_finding_owner`
+
+Record the check again in the review its finding belongs to.
+
+#### `v_unguarded_fixes`
+
+A warning: record one with `add-guard` for each fixed issue listed.
+
+#### `quick_check`
+
+The file is damaged. Stop writing. `ledger.py restore .code-review/ledger.sql --to /tmp/check.sqlite` rebuilds the last
+dump; compare the two, and ask the owner before replacing the ledger.
+
+#### `integrity_check`
+
+`check --full` runs it. Act as for `quick_check`.
+
+#### `foreign_key_check`
+
+A row points at a row that is missing. Act as for `quick_check`.
+
+#### `check_schema`
+
+A table, view or trigger differs from the shipped schema. Open a gate, and do not run the project copy of `ledger.py`.
 
 ### Merge conflicts and backups
 
@@ -326,5 +373,5 @@ other and merge it in; then dump.
 
 `merge` prints codes it renumbered; text that mentions them (notes, tags) is not rewritten. Back up by running `dump`
 after each writing session, and copy `ledger.sqlite` before `migrate` or `merge` (both
-also keep their own backups). Expect about 7 MB of ledger and 5 MB of dump per 1,000 findings (measured at 10,000
-findings: 72 MB and 50 MB).
+also keep their own backups). Expect about 9 MB of ledger and 7 MB of dump per 1,000 findings (measured at 10,000
+findings: 94 MB and 66 MB).

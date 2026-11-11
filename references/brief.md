@@ -13,17 +13,16 @@ Write `.code-review/reviews/R-0001/BRIEF.md` (in the ledger's folder; with `CODE
 - **The design goals the owner approved** in the interview (Step 2c), per domain and for the whole project, with
   their `G-` codes, and the line to read them again: `python3 <skill folder>/scripts/ledger.py --root <project root>
   goals --domain <D>`. Reviewers judge against these goals, cite the goal a finding violates, and run `goals` rather
-  than rely on the brief or their memory. A finding that conflicts with an approved goal (the goal itself looks wrong
-  for the code) is reported as such; the manager raises it with the owner.
-- **The approved domains** and who covers what, with each domain's entry from `references/domains.md`, so reviewers
-  know where their scope ends and hand off what belongs to another domain (in a "for other reviewers" section rather
-  than reviewing it).
+  than rely on the brief or their memory. A reviewer who thinks a goal is wrong for the code says so in a finding;
+  the manager raises it with the owner.
+- **The approved domains** and who covers what, with each domain's entry from `references/domains.md`. A reviewer
+  hands off what belongs to another domain in a "for other reviewers" section and does not review it.
 - **Requirements** with their `REQ-` codes, for the spec reviewer (`ledger.py query "SELECT code, text, source FROM
   requirements WHERE status='active'"`).
 - **Known issues** for each domain, from `ledger.py query "SELECT * FROM v_known_issues_for_brief WHERE domain_code =
   'security'"`: code, title, status, last known state, where (paths, symbols), guard tests, and any standing decision.
   Each reviewer reports on every known issue of its domain in a "Known issues" table with one outcome the ledger
-  records: `still-present`, `changed`, `fixed`, `regressed` (came back), `obsolete` (no longer applies) or
+  records: `still-present`, `changed`, `fixed`, `regressed` (came back), `obsolete` (does not apply now) or
   `not-checked`, with evidence for each but `not-checked`. A new finding that continues, repeats or relates to a known
   issue names that issue's code.
 - **Guard tests** recorded for fixed issues of the domain (from `guard_tests`): the reviewer says whether each still
@@ -45,6 +44,8 @@ Write `.code-review/reviews/R-0001/BRIEF.md` (in the ledger's folder; with `CODE
 - A test "covers" a behavior only if it would fail when the behavior breaks. A test that merely runs with the default
   value does not count for other values. Flag vacuous, flaky, clock-dependent and order-dependent tests.
 - Be exhaustive within scope: every item in the inventory gets a row; no sampling.
+- Write to the standard in `references/writing.md` (copy it into the brief): the point first, current state only, no
+  filler.
 - Write the full report as Markdown to the named file in the review folder: scope and method; known issues; findings
   tables; gaps ranked High / Medium / Low, each with evidence, what the code does now, and a concrete fix or test (name
   the test and what it must assert); what is solid; measurements under stable metric names, each saying whether it was
@@ -57,9 +58,9 @@ Write `.code-review/reviews/R-0001/BRIEF.md` (in the ledger's folder; with `CODE
 
 ## The review report
 
-Write `.code-review/reviews/R-0001/review.md` for the owner, sized to be read, and store it with `ledger.py
+Write `.code-review/reviews/R-0001/review.md` for the owner, to `references/writing.md`, and store it with `ledger.py
 set-report R-0001 .code-review/reviews/R-0001/review.md` (the hub shows it on the review page; there is no separate
-document). Every number comes from the ledger (`ledger.py query`), and is checked against it before you store it.
+document). Check every number against the ledger (`ledger.py query`) before you store it.
 Sections (skip any whose domain did not run):
 
 1. **Summary:** the verdict, total high-severity findings (say that counts overlap between domains), and the few root

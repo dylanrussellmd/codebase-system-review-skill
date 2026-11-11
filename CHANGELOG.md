@@ -2,6 +2,14 @@
 
 The tool version is `version:` in SKILL.md's frontmatter; `ledger.py --version` prints it with the schema version.
 
+## 1.7.0 (schema 10)
+
+- Viewer: one JSON error shape with accurate statuses; a route table with method routing; totals views (migration
+  0010); the page carries its own static-snapshot branch, so `progress-page` only embeds data; focus, headings,
+  contrast, phone width and row links.
+- `references/writing.md` (the writing standard) with a lint test and an optional Vale config.
+- `set-doc-url`, `plan-add-review`; a note on SQLite older than 3.34; one plain sentence above every table and view.
+
 ## 1.6.0 (schema 9)
 
 - Owner interview and design goals by domain: `interview-ask`, `interview-answer`, `propose-goal`, `approve-goals`,

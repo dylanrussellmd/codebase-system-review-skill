@@ -1,7 +1,7 @@
 ---
 name: codebase-system-review
 description: Run a managed, read-only, multi-reviewer audit of any codebase (tests, security, performance, architecture, UI, API, DB, docs, logging), verify findings, record every point in a per-project SQLite ledger tracked across reviews, then turn every point into a tracked fix plan.
-version: 1.6.0
+version: 1.7.0
 ---
 
 # Comprehensive review of a software system
@@ -70,7 +70,7 @@ Everything sits in `.code-review/` at the project root: `ledger.sqlite`, the cop
 At the first review open a `decision` gate "Where does the review ledger live?" with options `outside` (nothing in
 the repository: `CODE_REVIEW_DIR`, or `.code-review/` in `.gitignore`), `commit-dump` (commit `ledger.sql` only; the
 binary is ignored and rebuilt with `ledger.py restore .code-review/ledger.sql --to <new file>`) and `commit-binary`
-(commit `ledger.sqlite` only); each costs about 7 MB of ledger and 5 MB of dump per 1,000 findings. Until it is
+(commit `ledger.sqlite` only); each costs about 9 MB of ledger and 7 MB of dump per 1,000 findings. Until it is
 decided, list `.code-review/` in `.git/info/exclude` (local, never committed) and commit nothing. Later reviews read
 the answer in `v_standing_decisions`. Only as it says, commit the chosen file after `dump`, in its own commit, and
 push tags (`git push origin review/R-0001`, then `ledger.py tag-review R-0001 --pushed`); otherwise tags stay local.
@@ -197,8 +197,7 @@ changes; a dirty tree's patch goes to `.code-review/patches/`, or ask the owner 
 ledger.py new-review --title '<title>' --scope full --request "<the owner's request, verbatim>" --manager A-0002 --domain security='<why it applies>' --domain tests='<why>' --skip ui='<why not>' --actor A-0002
 ```
 
-`--scope` is `full`, `partial`, `targeted`, `second` (a plan's follow-up review) or `fix-verification`; on a rerun add
-`--previous R-0001`.
+`--scope`: `full`, `partial`, `targeted`, `second` (after a plan) or `fix-verification`; a rerun adds `--previous R-0001`.
 
 Index (code: applies when): `spec` stated requirements; `tests`, `abstraction`, `security`, `logging`,
 `dependencies`, `docs-developer` almost always; `test-quality` a real suite; `time-concurrency` dates or several
@@ -307,16 +306,16 @@ Every point of every report goes into the ledger, not only those in the summary.
 
 ## Step 6: Consolidate
 
-`ledger.py review-status R-0001 consolidating --note '...'`. Write the review report with the sections of
-`references/brief.md#the-review-report`; every number comes from the ledger and is checked against it. Store it with
-`ledger.py set-report R-0001 .code-review/reviews/R-0001/review.md`, record the verdict
+`ledger.py review-status R-0001 consolidating --note '...'`. Write the review report (sections:
+`references/brief.md#the-review-report`; style: `references/writing.md`) and check every number against the ledger.
+Store it with `ledger.py set-report R-0001 .code-review/reviews/R-0001/review.md`, record the verdict
 (`ledger.py set-verdict R-0001 --verdict '<one line>' --summary '<a short paragraph>'`) and publish the hub.
 
 ## Step 7: Hand off
 
 `ledger.py check` (must pass), `ledger.py dump`, `ledger.py review-status R-0001 handed-off --note '...'`, publish the
 hub, and open a `review-handoff` gate for anything the owner must decide. Tell the owner where the hub is, that tags
-are local, and that nothing was fixed; start no fixes unless asked. A review given up:
+are local, and that the code is unchanged; start no fixes unless asked. A review given up:
 `ledger.py review-status R-0001 abandoned --note '<why>'`.
 
 ## Step 8: The fix plan (when asked for a plan that addresses every point)
@@ -344,7 +343,7 @@ Brief every implementer with `references/implementer-brief.md` (it runs `ledger.
 `in-progress` at the first step and `complete` when every step is done or dropped (`plan-status`). For every step:
 
 - **Start:** `ledger.py step-status 12 doing --note '...'`; each issue it closes `issue-status ISS-0001 in-progress`
-  (`v_step_issues`). **Proof first:** a test that fails before the fix (`record-test-run --purpose before-fix --step 12`).
+  (`v_step_issues`). **Proof first:** a test that fails without the fix (`record-test-run --purpose before-fix --step 12`).
 - **Discoveries (mandatory):** a defect found while fixing, by you or an implementer, is reported at once, before the
   batch is committed, with `report-finding` (below; add `--issue ISS-0001` or `--new-issue`, and `--into-step N`,
   `--new-step '<title>'` or `--gate`). Cite lines as they are at a commit (`git show <commit>:<path>`), never from an
@@ -352,9 +351,9 @@ Brief every implementer with `references/implementer-brief.md` (it runs `ledger.
   (`--commit`). It is verified, matched and planned like a review finding, and the next review lists it as a known
   issue. `v_unplanned_discoveries` must be empty before each commit and before hand-off.
 - **Commit**, then record it: `--commit` on `step-status`, or `ledger.py add-commit 12 <sha> --pr <URL>`.
-- **Done:** `step-status 12 done` with a progress note for the owner (what a user now sees or what is now refused,
-  what turned out different and why, what to do on deploy) and its guard tests (`--guard`, or `add-guard` for one
-  issue), and each issue `issue-status ISS-0001 fixed` (below).
+- **Done:** `step-status 12 done` with a progress note for the owner, to `references/writing.md` (what a user sees or
+  what is refused, what turned out different and why, what to do on deploy) and its guard tests (`--guard`, or
+  `add-guard` for one issue), and each issue `issue-status ISS-0001 fixed` (below).
 - **Blocked on the owner:** `step-status 12 waiting-owner --question '...'` and a gate of its `owner_need`'s kind.
 - **After each step or small batch:** `ledger.py check`, `ledger.py dump`, `ledger.py progress-md P-0001` (to a file
   only where the ledger-location decision commits review data), publish the hub, import answers, and tell the owner how
@@ -371,5 +370,6 @@ ledger.py issue-status ISS-0001 fixed --note '...' --after '<what it does now>' 
 
 `references/domains.md` (2a, each brief); `references/brief.md` (2d, 6); `references/indexing.md` (5a, 5d);
 `references/formats/index.md` and `references/formats/plan-steps.md` (files for `load-index`, `match`, `import-steps`);
-`references/fix-plan.md` (8); `references/implementer-brief.md` (9); `references/recipes.md` (an example of each
-write, corrections, a failing check); `references/schema.sql` or `ledger.py schema` (every table, column and view).
+`references/fix-plan.md` (8); `references/implementer-brief.md` (9); `references/writing.md` (before you write for the
+owner or a reviewer: briefs, reports, notes, questions); `references/recipes.md` (an example of each write,
+corrections, a failing check); `references/schema.sql` or `ledger.py schema` (every table, column and view).

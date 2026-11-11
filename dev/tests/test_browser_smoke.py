@@ -67,7 +67,7 @@ class GateFormSuccess(browser.ViewerTestCase):
         card.locator("button", has_text="Send answer").click()
         page.page.wait_for_selector("text=Answer saved. The agent will act on it the next time it checks.")
         # route() runs again after 1.2 s; the gate is then listed as answered.
-        page.page.wait_for_selector("h3:has-text('Answered, waiting for the agent to act')", timeout=5000)
+        page.page.wait_for_selector("h2:has-text('Answered, waiting for the agent to act')", timeout=5000)
         page.settle()
         answered = page.page.locator(".card.gate", has_text="Default notice period")
         self.assertIn("You answered: Keep 14 days — Keep it for now.", answered.inner_text())

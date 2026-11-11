@@ -3,7 +3,7 @@
 test_progress_md_matches_plan_progress  the phase rows and totals equal v_plan_progress; every step is listed
 test_progress_page_is_self_contained    one file, no outside resource, every view the page can ask for embedded
                                         (every review, issue, plan, table and code reference), every step title in it
-test_hub_patches_apply                  each text the hub changes in page.html is there exactly once
+test_hub_patches_apply                  the hub is page.html as it is, plus one data script
 test_hub_data_cannot_close_its_script   ledger text holding </script> or <!-- stays inside the data
 test_import_answers_marks_gates_answered answers from the hub's database are recorded through answer_gate()
 test_hub_answers_round_trip             answer in the hub's database -> import-answers -> applied -> republished hub
@@ -113,10 +113,13 @@ class ProgressPage(HubBase):
 
     def test_hub_patches_apply(self):
         m = self.L.module
-        for old, new in m.HUB_PATCHES:
-            self.assertEqual(m.PAGE.count(old), 1, old[:80])
+        (marker, script), = m.HUB_PATCHES  # the data script is the only change to the page
+        self.assertEqual(m.PAGE.count(marker), 1)
+        html, _ = m.hub_page(self.L.root, self.L.db)
+        page = re.sub(r"<script>window\.LEDGER_SNAPSHOT = .*?;</script>\n", "", html, flags=re.S)
+        self.assertEqual(page, m.PAGE.replace("<title>Review ledger</title>", "<title>Review ledger: proj</title>"))
         with self.assertRaises(m.LedgerError):
-            m.hub_page(self.L.root, self.L.db, page=m.PAGE.replace("const TABS = [", "const TABS2 = ["))
+            m.hub_page(self.L.root, self.L.db, page=m.PAGE.replace(marker, "<script>"))
 
 
 class HubEscaping(unittest.TestCase):

@@ -275,8 +275,10 @@ class HostCorsHeaders(unittest.TestCase):
             r = self.req("OPTIONS", path, headers=dict(origin, **{"Access-Control-Request-Method": "POST"}))
             self.assertFalse(200 <= r.status < 300, f"OPTIONS {path} -> {r.status}")
             self.assertIsNone(r.headers.get("Access-Control-Allow-Origin"))
-            # characterization: today OPTIONS falls to BaseHTTPRequestHandler's 501 (no do_OPTIONS)
-            self.assertEqual(r.status, 501, f"OPTIONS {path}")
+            # OPTIONS is 405 JSON naming the methods the address takes (was the HTTP library's 501 HTML page)
+            self.assertEqual(r.status, 405, f"OPTIONS {path}")
+            self.assertEqual(r.headers.get("Allow"), "GET" if path in ("/", "/api/overview") else "POST")
+            self.assertTrue(r.headers["Content-Type"].startswith("application/json"))
 
     test_no_cors_headers = test_no_cors_and_options_refused
 

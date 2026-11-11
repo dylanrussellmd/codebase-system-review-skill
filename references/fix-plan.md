@@ -1,16 +1,15 @@
 # The fix plan
 
-Read this before Step 8. Standard: every point of the plan's reviews is closed by a step. The points are already in
-the ledger (Step 5), so plan from the ledger and prove coverage with its views. For a small review (under ~150 points)
-skip the parallel drafting and write `steps.jsonl` yourself.
+Read this before Step 8. Every point of the plan's reviews is closed by a step: plan from the ledger and prove
+coverage with its views. Under ~150 points, skip the parallel drafting and write `steps.jsonl` yourself.
 
 ## Create the plan (8a)
 
 Create the plan over its reviews with `ledger.py new-plan --title '...' --review R-0001` (status `drafting`). A plan
 may cover several reviews (one `--review` each) and may take over still-open steps of an older plan; that plan then
 becomes `superseded` (`ledger.py plan-status P-0001 superseded --superseded-by P-0002 --note '...'`). Write the
-plan's narrative (how to read it, why this order, what needs the owner, how it was built, what was not checked) in
-`.code-review/plans/P-0001.md` and store it with
+plan's narrative (how to read it, why this order, what needs the owner, how it was built, what was not checked) to
+`references/writing.md`, in `.code-review/plans/P-0001.md`, and store it with
 `ledger.py set-narrative P-0001 .code-review/plans/P-0001.md`, again whenever it changes. The hub shows it on the plan
 page; there is no separate plan document.
 

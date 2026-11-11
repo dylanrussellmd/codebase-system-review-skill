@@ -623,6 +623,41 @@ def set_wal(db):
         print(f"note: could not switch {db} to WAL ({e}); it keeps its journal mode", file=sys.stderr)
 
 
+MIN_SQLITE = (3, 31, 0)  # the oldest SQLite the tests run on
+NAMED_CHECK_SQLITE = (3, 34, 0)  # from here a refused CHECK quotes the rule; older ones name only the table
+
+
+def _dotted(version):
+    return ".".join(str(n) for n in version[:2])
+
+
+def sqlite_problem():
+    """Why this Python's SQLite cannot hold a ledger (too old, or built without the JSON functions the schema's
+    CHECKs use), in one line; None when it can."""
+    if sqlite3.sqlite_version_info < MIN_SQLITE:
+        return (f"this Python's SQLite is {sqlite3.sqlite_version}; the ledger needs {_dotted(MIN_SQLITE)} or newer "
+                f"(run ledger.py with a newer Python)")
+    try:
+        con = sqlite3.connect(":memory:")
+        try:
+            con.execute("SELECT json_valid('[]')")
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return (f"this Python's SQLite ({sqlite3.sqlite_version}) has no JSON functions, which the ledger needs "
+                f"(run ledger.py with a Python whose SQLite is 3.38 or newer)")
+    return None
+
+
+def old_sqlite_note():
+    """The one line init and check print, once they have done their work, on a SQLite older than
+    NAMED_CHECK_SQLITE; None on a newer one."""
+    if sqlite3.sqlite_version_info >= NAMED_CHECK_SQLITE:
+        return None
+    return (f"note: SQLite {sqlite3.sqlite_version} is older than {_dotted(NAMED_CHECK_SQLITE)}: when the ledger "
+            f"refuses a value, the message names the table but not the rule (the schema's CHECK on that table has it)")
+
+
 def init(root, db, force=False, copy_tool=True, gitignore=True):
     """Create the ledger (or check and refresh an existing one), copy this ledger.py beside it and write its
     .gitignore. copy_tool / gitignore are off for a ledger file that is not in a ledger folder (--db elsewhere).
@@ -635,6 +670,9 @@ def init(root, db, force=False, copy_tool=True, gitignore=True):
 
 
 def _init(root, db, force, copy_tool, gitignore):
+    problem = sqlite_problem()
+    if problem:  # before anything is written
+        sys.exit(f"init: {problem}")
     home = db.parent / "ledger.py"
     if copy_tool and home.exists() and db.parent.name != ".code-review" and not looks_like_tool(home):
         sys.exit(f"{home} is not a ledger.py made by this tool; left it unchanged. Choose another folder for the "
@@ -654,12 +692,14 @@ def _init(root, db, force, copy_tool, gitignore):
         try:
             if keep:
                 write_atomic(home.with_name("ledger.py.bak"), home.read_bytes())
-            write_atomic(home, Path(__file__).resolve().read_bytes())
+            tool = Path(__file__).resolve().read_bytes()
+            write_atomic(home, tool)
         except OSError as e:
             sys.exit(f"init: could not copy ledger.py to {home} ({e}); nothing else was changed")
         if note:
             print(note)
-        print(f"copied ledger.py to {home}")
+        # the hash lets the owner compare the project's copy with the skill's (sha256sum scripts/ledger.py)
+        print(f"copied ledger.py to {home} (sha256 {hashlib.sha256(tool).hexdigest()})")
     if fresh:
         build_ledger(root, db)
         set_wal(db)
@@ -1021,12 +1061,24 @@ class BlobReader:
     """Files at commits of one repository folder, read through one `git cat-file --batch` process (started on the
     first read, stopped by close()), with a cache per (commit, path): fill-refs reads each file once however many
     references cite it. read() returns (blob sha, bytes) or raises RuntimeError with a one-line reason; a file over
-    MAX_BLOB_BYTES is skipped unread (its bytes are discarded as they arrive, never held)."""
+    MAX_BLOB_BYTES is skipped unread (its bytes are discarded as they arrive, never held). has_commit() says whether
+    the repository has a commit, asked once per commit. hung is True once git gave no answer within BLOB_SECONDS."""
 
     def __init__(self, d):
         self.d = d
         self.p = None
         self.cache = {}
+        self.hung = False
+
+    def has_commit(self, sha):
+        key = (sha, None)
+        if key not in self.cache:
+            self.cache[key] = self._object(sha, None)
+        return self.cache[key]
+
+    def _expire(self, p):
+        self.hung = True
+        p.kill()
 
     def read(self, sha, path):
         key = (sha, path)
@@ -1071,12 +1123,17 @@ class BlobReader:
         return b"".join(out)
 
     def _fetch(self, sha, path):
+        return self._object(sha, path)
+
+    def _object(self, sha, path):
+        """One question to git: the file at sha:path as (blob sha, bytes), or with path None whether commit sha
+        exists."""
         self._start()
-        guard = threading.Timer(BLOB_SECONDS, lambda p=self.p: p.kill())
+        guard = threading.Timer(BLOB_SECONDS, self._expire, (self.p,))
         guard.start()
         try:
             try:
-                self.p.stdin.write(f"{sha}:{path}\n".encode("utf-8"))
+                self.p.stdin.write((f"{sha}^{{commit}}\n" if path is None else f"{sha}:{path}\n").encode("utf-8"))
                 self.p.stdin.flush()
             except OSError:
                 raise self._dead()
@@ -1085,8 +1142,13 @@ class BlobReader:
                 raise self._dead()
             parts = head.decode("utf-8", "replace").rstrip("\n").rsplit(" ", 2)
             if len(parts) != 3 or not parts[2].isdigit():  # "<name> missing" / "<name> ambiguous"
+                if path is None:
+                    return False
                 raise RuntimeError(f"{path} is not in commit {sha[:10]}")
             blob, kind, size = parts[0], parts[1], int(parts[2])
+            if path is None:
+                self._exact(size + 1, keep=False)  # the commit's text and the newline after it
+                return True
             too_big = size > MAX_BLOB_BYTES
             data = self._exact(size, keep=kind == "blob" and not too_big)
             self._exact(1, keep=False)  # the newline after the content
@@ -1261,7 +1323,9 @@ def fill_refs(root, con, review_code=None):
     Idempotent: a reference is selected only when something can still be filled (a missing permalink only when its
     repository has a permalink template), only columns whose value changes are written, and 'filled N' counts the
     references that changed. Files are read through one `git cat-file --batch` per repository (BlobReader), each
-    (commit, path) once."""
+    (commit, path) once; a commit the repository lacks is reported as 'commit ... not found' for each reference that
+    cites it. When git gives no answer within BLOB_SECONDS the run stops: the references not yet read count as failed
+    and what was read is still written. With nothing to fill it prints 'already complete'."""
     sql = """SELECT fl.id FROM finding_locations fl JOIN findings f ON f.id = fl.finding_id
              JOIN reviews r ON r.id = f.review_id JOIN repositories rp ON rp.id = fl.repository_id
              WHERE fl.commit_sha IS NOT NULL
@@ -1274,11 +1338,16 @@ def fill_refs(root, con, review_code=None):
     failed = 0
     updates = []  # every git read happens first; the writes then go in one short transaction (DB-M8)
     readers = {}  # one BlobReader per repository folder
+    todo = [r[0] for r in con.execute(sql, args).fetchall()]
+    if not todo:
+        print("already complete: filled 0 references, 0 could not be read from git")
+        return 0
     try:
-        for (lid,) in con.execute(sql, args).fetchall():
+        for n, lid in enumerate(todo):
             loc = location(con, lid)
             where = f"ref {lid} {loc['path']}@{loc['commit_sha'][:10]}"
             outside = bool(loc["allow_outside_root"])
+            reader = None
             try:
                 if not HEX.match(loc["commit_sha"] or ""):
                     raise RuntimeError("commit is not a hex hash")
@@ -1286,8 +1355,16 @@ def fill_refs(root, con, review_code=None):
                     raise RuntimeError("bad path")
                 d = repo_dir(root, loc["repo_path"], outside)
                 reader = readers.get(d) or readers.setdefault(d, BlobReader(d))
+                if not reader.has_commit(loc["commit_sha"]):
+                    raise RuntimeError(f"commit {loc['commit_sha'][:10]} not found")
                 blob, data = reader.read(loc["commit_sha"], loc["path"])
             except Exception as e:
+                if reader is not None and reader.hung:
+                    left = len(todo) - n
+                    print(f"{where}: git is not responding (no answer in {BLOB_SECONDS:g} s); stopped, {left} "
+                          f"reference{'s' if left != 1 else ''} not read")
+                    failed += left
+                    break
                 print(f"{where}: {e}"); failed += 1; continue
             seen = working_tree_bytes(root, con, loc, data)  # a dirty review: the text its reviewers saw (D-14)
             if seen is not None and loc["excerpt"] is None:
@@ -1577,6 +1654,47 @@ def with_deadline(con, seconds):
     return lambda: monotonic() > end
 
 
+BUSY = "The ledger is busy (the agent is writing to it); try again in a moment."
+FAILED = "Something went wrong; see the terminal where ledger.py serve is running."
+
+
+class ApiError(Exception):
+    """A viewer request that is refused: the HTTP status, the sentence the page shows and any headers to send."""
+
+    def __init__(self, status, message, headers=None):
+        super().__init__(message)
+        self.status, self.message, self.headers = status, message, headers
+
+
+def error(status, message, headers=None):
+    """The one shape of a viewer API failure: ({"error": sentence}, status), with the headers third when any."""
+    return ({"error": message}, status, headers) if headers else ({"error": message}, status)
+
+
+def is_busy(e):
+    return isinstance(e, sqlite3.OperationalError) and ("locked" in str(e) or "busy" in str(e))
+
+
+def api_failure(e, what):
+    """The answer to a request that raised e: a refusal's own status and sentence, 503 while another writer holds
+    the ledger, else 500 with a fixed sentence. The request, the exception and its traceback go to stderr (the
+    terminal `ledger.py serve` runs in), never to the page."""
+    if isinstance(e, ApiError):
+        return error(e.status, e.message, e.headers)
+    if is_busy(e):
+        return error(503, BUSY)
+    import traceback
+    sys.stderr.write(f"viewer: {what} failed:\n" + "".join(traceback.format_exception(type(e), e, e.__traceback__)))
+    sys.stderr.flush()
+    return error(500, FAILED)
+
+
+def whole_number(text, what):
+    if not isinstance(text, str) or not re.fullmatch(r"-?[0-9]{1,18}", text):
+        raise ApiError(400, f"{what} must be a whole number.")
+    return int(text)
+
+
 def api(root, db, path, qs, body):
     """One viewer API request. Each request opens its own connection and closes it when the answer is built:
     sqlite3 connections are not shared between the server's threads, and a fresh one always sees the agent's latest
@@ -1584,14 +1702,14 @@ def api(root, db, path, qs, body):
     the gate answer route opens a second, writable connection of its own. A missing ledger is a 503 and is never
     created."""
     if not Path(db).exists():
-        return {"error": "ledger not found"}, 503
+        return error(503, "ledger not found")
     con = connect(db, readonly=True)
     timed_out = with_deadline(con, ROUTE_SECONDS)
     try:
         return route(root, db, con, path, qs, body)
     except sqlite3.OperationalError as e:
         if "interrupted" in str(e) and timed_out():
-            return {"error": TOO_LONG.format(ROUTE_SECONDS)}, 400
+            return error(400, TOO_LONG.format(ROUTE_SECONDS))
         raise
     finally:
         con.close()
@@ -1603,20 +1721,19 @@ def gate_answer_request(db, code, body, via="viewer"):
     answers cannot both be reported saved: the loser, or an answer to a gate answered meanwhile (in chat, say), gets
     409. If another writer holds the ledger past ANSWER_BUSY_MS the answer is not saved and the owner is told to try
     again (503); the page keeps what they typed. Returns {"ok": True} or (error, status)."""
-    busy = {"error": "The ledger is busy; your answer was not saved, try again."}, 503
     try:
         w = connect(db)
     except sqlite3.OperationalError:
-        return {"error": "ledger not found"}, 503
+        return error(503, "ledger not found")
     w.isolation_level = None
     try:
         w.execute(f"PRAGMA busy_timeout = {int(ANSWER_BUSY_MS)}")
         return answer_gate(w, code, body.get("answer_value"), body.get("answer_text"), via)
     except GateRefused as e:
-        return {"error": str(e)}, e.status
+        return error(e.status, str(e))
     except sqlite3.OperationalError as e:
-        if "locked" in str(e) or "busy" in str(e):
-            return busy
+        if is_busy(e):
+            return error(503, "The ledger is busy; your answer was not saved, try again.")
         raise
     finally:
         w.close()
@@ -1630,238 +1747,345 @@ def quote_name(name):
     return '"' + str(name).replace('"', '""') + '"'
 
 
-def route(root, db, con, path, qs, body):
+class Request:
+    """What a route handler is given: the project root, the ledger's path, this request's read-only connection, the
+    path's '*' segments in order (args), the query string and, for a POST, the JSON body."""
+
+    def __init__(self, root, db, con, args, qs, body):
+        self.root, self.db, self.con, self.args, self.qs, self.body = root, db, con, args, qs, body
+
+    def arg(self, name, default=None):
+        return self.qs.get(name, [default])[0]
+
+
+class Route:
+    """One row of ROUTES: an HTTP method, a path under /api/ ('*' is one segment of any text, handed to the handler
+    in Request.args) and its handler. hub, for a GET: the paths of this route the published hub embeds for this
+    ledger (hub(con) -> ["review/R-0001", ...]); the hub is read-only, so a POST has none."""
+
+    def __init__(self, method, path, handler, hub=None):
+        self.method, self.pattern, self.handler, self.hub = method, tuple(path.split("/")), handler, hub
+
+
+def get_overview(rq):
+    con = rq.con
+    meta = {r["key"]: r["value"] for r in rows(con, "SELECT key, value FROM meta")}
+    return {
+        "project": meta.get("project_name", rq.root.name),
+        "schema_version": meta.get("schema_version"),
+        "open_by_severity": rows(con, f"SELECT severity, count(*) n FROM issues WHERE status IN {ACTIVE} GROUP BY severity"),
+        "issues_by_status": rows(con, "SELECT status, count(*) n FROM issues GROUP BY status"),
+        "gates_open": one(con, "SELECT count(*) n FROM v_pending_gates WHERE status = 'open'")["n"],
+        "queue": one(con, "SELECT count(*) n FROM v_owner_queue")["n"],
+        "reviews": rows(con, """SELECT r.code, r.title, r.scope, r.status, r.started_at, r.completed_at, r.verdict,
+            t.points, t.high FROM v_review_totals t JOIN reviews r ON r.code = t.review
+            WHERE t.review IN (SELECT code FROM reviews ORDER BY started_at DESC LIMIT 5)
+            ORDER BY r.started_at DESC"""),
+        "plans": rows(con, """SELECT plan code, title, status, steps, done, waiting_owner waiting
+            FROM v_plan_totals ORDER BY created_at DESC"""),
+        "recurring": one(con, "SELECT count(*) n FROM v_recurring_issues")["n"],
+        "checks": [{"label": label, "view": v, "tier": tier, "n": count_view(con, v)}
+                   for v, label, tier in (ledger_checks(con) or [])],
+        "labels": {**{t: {r["code"]: r["name"] for r in rows(con, f"SELECT code, name FROM {t}")} for t in LABEL_TABLES},
+                   "enums": enum_labels(con)},
+    }
+
+
+def get_gates(rq):
+    """?status=pending (the default: v_pending_gates), all, or one gate status."""
+    con, st = rq.con, rq.arg("status", "pending")
+    where = {"pending": "g.id IN (SELECT id FROM v_pending_gates)", "all": "1"}.get(st, "g.status = ?")
+    args = () if st in ("pending", "all") else (st,)
+    gates = rows(con, f"""SELECT g.*, r.code review_code, pl.code plan_code, s.number step_number,
+            i.code issue_code, d.code decision_code FROM gates g
+            LEFT JOIN reviews r ON r.id=g.review_id LEFT JOIN plans pl ON pl.id=g.plan_id
+            LEFT JOIN steps s ON s.id=g.step_id LEFT JOIN issues i ON i.id=g.issue_id
+            LEFT JOIN decisions d ON d.id=g.decision_id
+            WHERE {where} ORDER BY g.status='answered', g.blocking DESC, g.created_at""", args)
+    for g in gates:
+        g["options"] = json.loads(g["options"]) if g["options"] else []
+    other = rows(con, "SELECT * FROM v_owner_queue WHERE kind <> 'gate'")
+    return {"gates": gates, "other": other}
+
+
+def post_gate_answer(rq):
+    return gate_answer_request(rq.db, rq.args[0], rq.body)
+
+
+def get_reviews(rq):
+    return rows(rq.con, """SELECT r.code, r.title, r.scope, r.status, r.started_at, r.completed_at, r.verdict,
+        (SELECT group_concat(rp.name || ' ' || substr(rr.commit_sha,1,10) || COALESCE(' on ' || rr.branch, ''), ' · ')
+           FROM review_repositories rr JOIN repositories rp ON rp.id=rr.repository_id WHERE rr.review_id=r.id) commits,
+        t.points, t.high, t.medium, t.low, t.new_issues, t.came_back
+        FROM v_review_totals t JOIN reviews r ON r.code = t.review ORDER BY r.started_at DESC""")
+
+
+def get_review(rq):
+    con, code = rq.con, rq.args[0]
+    r = one(con, """SELECT r.*, m.name manager, m.model manager_model, a.name approved_by,
+                    pr.code previous_code FROM reviews r
+                    LEFT JOIN actors m ON m.id=r.manager_actor_id LEFT JOIN actors a ON a.id=r.approved_by_actor_id
+                    LEFT JOIN reviews pr ON pr.id=r.previous_review_id WHERE r.code=?""", (code,))
+    if not r:
+        return error(404, "no such review")
+    rid = r["id"]
+    findings = rows(con, """SELECT f.*, i.code issue_code, i.status issue_status, rr.label run_label
+        FROM findings f LEFT JOIN issues i ON i.id=f.issue_id LEFT JOIN reviewer_runs rr ON rr.id=f.reviewer_run_id
+        WHERE f.review_id=? ORDER BY CASE f.severity WHEN 'H' THEN 0 WHEN 'M' THEN 1 WHEN 'L' THEN 2 ELSE 3 END, length(f.point_id), f.point_id""", (rid,))
+    locs = rows(con, """SELECT fl.id, fl.finding_id, fl.path, fl.line_start, fl.line_end, fl.symbol, fl.role,
+        fl.commit_sha, fl.permalink, rp.name repo FROM finding_locations fl
+        JOIN findings f ON f.id=fl.finding_id JOIN repositories rp ON rp.id=fl.repository_id WHERE f.review_id=?""", (rid,))
+    by = {}
+    for l in locs:
+        by.setdefault(l["finding_id"], []).append(l)
+    for f in findings:
+        f["locations"] = by.get(f["id"], [])
+    return {
+        "review": r,
+        "repos": rows(con, """SELECT rp.name, rr.* FROM review_repositories rr JOIN repositories rp
+                              ON rp.id=rr.repository_id WHERE rr.review_id=?""", (rid,)),
+        "goals": rows(con, """SELECT g.code, g.text FROM review_goals rg JOIN design_goals g ON g.id=rg.goal_id
+                              WHERE rg.review_id=? ORDER BY g.code""", (rid,)),
+        "domains": rows(con, """SELECT rd.*, d.name, d.category FROM review_domains rd JOIN domains d ON d.code=rd.domain_code
+                                WHERE rd.review_id=? ORDER BY rd.decision, d.category, d.name""", (rid,)),
+        "runs": rows(con, """SELECT rr.*, a.name actor, a.model FROM reviewer_runs rr JOIN actors a ON a.id=rr.actor_id
+                             WHERE rr.review_id=? ORDER BY rr.domain_code, rr.label""", (rid,)),
+        "checks": rows(con, """SELECT c.outcome, c.evidence, i.code issue_code, i.title, i.status
+                               FROM review_issue_checks c JOIN issues i ON i.id=c.issue_id WHERE c.review_id=?
+                               ORDER BY c.outcome, i.code""", (rid,)),
+        "summary": rows(con, "SELECT * FROM v_review_summary WHERE review=?", (code,)),
+        "agents": rows(con, "SELECT * FROM v_review_agents WHERE review=?", (code,)),
+        "requirements": rows(con, "SELECT * FROM v_requirement_trace WHERE review=?", (code,)),
+        "metrics": rows(con, """SELECT m.name, m.scope, m.value, COALESCE(m.unit, md.unit) unit, m.method, m.note,
+            COALESCE(md.label, upper(substr(m.name, 1, 1)) || replace(substr(m.name, 2), '_', ' ')) label,
+            COALESCE(md.better, 'none') better
+            FROM metrics m LEFT JOIN metric_defs md ON md.name=m.name WHERE m.review_id=? ORDER BY m.name, m.scope""", (rid,)),
+        "artifacts": rows(con, "SELECT kind, path, url FROM artifacts WHERE review_id=? ORDER BY kind", (rid,)),
+        "gates": rows(con, "SELECT code, kind, title, status, answer_value, answer_text FROM gates WHERE review_id=? ORDER BY created_at", (rid,)),
+        "interview": interview_list(con, code) if has_table(con, "interview_questions") else [],
+        "review_goals": goals_list(con, include_all=True, review=code) if has_table(con, "goal_statuses") else [],
+        "findings": findings,
+    }
+
+
+def get_issues(rq):
+    """?status= (active: the statuses still to fix; else one status), severity=, domain_code= (exact) and q= (text in
+    the code, title, sub, a finding's point id or summary, or a location's path), all ANDed."""
+    where, args = ["1"], []
+    for k in ("status", "severity", "domain_code"):
+        v = rq.arg(k)
+        if v == "active" and k == "status":
+            where.append(f"i.status IN {ACTIVE}")
+        elif v:
+            where.append(f"i.{k} = ?"); args.append(v)
+    q = rq.arg("q")
+    if q:
+        where.append("(i.code LIKE ? OR i.title LIKE ? OR i.sub LIKE ? OR EXISTS (SELECT 1 FROM findings f LEFT JOIN finding_locations fl ON fl.finding_id=f.id WHERE f.issue_id=i.id AND (f.point_id LIKE ? OR f.summary LIKE ? OR fl.path LIKE ?)))")
+        args += [f"%{q}%"] * 6
+    return rows(rq.con, f"""SELECT i.code, i.title, i.severity, i.status, i.domain_code, i.theme_code, i.times_seen,
+        i.opened_at, i.updated_at, fr.code first_seen, lr.code last_seen
+        FROM issues i JOIN reviews fr ON fr.id=i.first_seen_review_id LEFT JOIN reviews lr ON lr.id=i.last_seen_review_id
+        WHERE {' AND '.join(where)}
+        ORDER BY CASE i.severity WHEN 'H' THEN 0 WHEN 'M' THEN 1 WHEN 'L' THEN 2 ELSE 3 END, i.id LIMIT 2000""", args)
+
+
+def get_issue(rq):
+    con, code = rq.con, rq.args[0]
+    i = one(con, """SELECT i.*, fr.code first_seen, lr.code last_seen, cr.code last_checked FROM issues i
+                    JOIN reviews fr ON fr.id=i.first_seen_review_id LEFT JOIN reviews lr ON lr.id=i.last_seen_review_id
+                    LEFT JOIN reviews cr ON cr.id=i.last_checked_review_id WHERE i.code=?""", (code,))
+    if not i:
+        return error(404, "no such issue")
+    iid = i["id"]
+    findings = rows(con, """SELECT f.*, r.code review_code, r.started_at review_at FROM findings f
+                            JOIN reviews r ON r.id=f.review_id WHERE f.issue_id=? ORDER BY r.started_at""", (iid,))
+    for f in findings:
+        f["locations"] = rows(con, """SELECT fl.id, fl.path, fl.line_start, fl.line_end, fl.symbol, fl.role, fl.commit_sha,
+            fl.permalink, rp.name repo FROM finding_locations fl JOIN repositories rp ON rp.id=fl.repository_id
+            WHERE fl.finding_id=?""", (f["id"],))
+    return {
+        "issue": i,
+        "findings": findings,
+        "relations": rows(con, """SELECT 'out' dir, r.relation, b.code other, b.title other_title, b.status other_status,
+                r.confidence, r.rationale, rv.code review FROM issue_relations r JOIN issues b ON b.id=r.to_issue_id
+                LEFT JOIN reviews rv ON rv.id=r.established_in_review_id WHERE r.from_issue_id=?
+            UNION ALL SELECT 'in', r.relation, a.code, a.title, a.status, r.confidence, r.rationale, rv.code
+                FROM issue_relations r JOIN issues a ON a.id=r.from_issue_id
+                LEFT JOIN reviews rv ON rv.id=r.established_in_review_id WHERE r.to_issue_id=?""", (iid, iid)),
+        "checks": rows(con, """SELECT r.code review, r.started_at, c.outcome, c.evidence FROM review_issue_checks c
+                               JOIN reviews r ON r.id=c.review_id WHERE c.issue_id=? ORDER BY r.started_at""", (iid,)),
+        "timeline": rows(con, "SELECT * FROM v_issue_timeline WHERE code=?", (code,)),
+        "guard_tests": rows(con, "SELECT * FROM guard_tests WHERE issue_id=?", (iid,)),
+        "decisions": rows(con, """SELECT d.code, d.question, d.answer, d.rationale, d.status, d.decided_at
+                                  FROM decision_issues di JOIN decisions d ON d.id=di.decision_id WHERE di.issue_id=?""", (iid,)),
+        "steps": rows(con, """SELECT DISTINCT p.code plan, s.number, s.title, s.status, s.progress_note,
+                (SELECT group_concat(substr(sc.commit_sha,1,10), ', ') FROM step_commits sc WHERE sc.step_id=s.id) commits
+                FROM step_findings sf JOIN steps s ON s.id=sf.step_id JOIN plans p ON p.id=s.plan_id
+                JOIN findings f ON f.id=sf.finding_id WHERE f.issue_id=? ORDER BY p.code, s.number""", (iid,)),
+    }
+
+
+def get_plans(rq):
+    return rows(rq.con, """SELECT plan code, title, status, created_at, approved_at, steps, done, doing,
+        waiting_owner waiting, reviews FROM v_plan_totals ORDER BY created_at DESC""")
+
+
+def get_plan(rq):
+    con, code = rq.con, rq.args[0]
+    pl = one(con, "SELECT * FROM plans WHERE code=?", (code,))
+    if not pl:
+        return error(404, "no such plan")
+    pid = pl["id"]
+    steps = rows(con, """SELECT s.*, ph.number phase FROM steps s JOIN phases ph ON ph.id=s.phase_id
+                         WHERE s.plan_id=? ORDER BY s.number""", (pid,))
+    deps, closes, commits = {}, {}, {}
+    for d in rows(con, """SELECT sd.step_id, s.number FROM step_dependencies sd JOIN steps s ON s.id=sd.depends_on_step_id
+                          WHERE s.plan_id=?""", (pid,)):
+        deps.setdefault(d["step_id"], []).append(d["number"])
+    for c in rows(con, """SELECT sf.step_id, f.point_id, f.severity, f.summary, r.code review, i.code issue
+                          FROM step_findings sf JOIN steps s ON s.id=sf.step_id JOIN findings f ON f.id=sf.finding_id
+                          JOIN reviews r ON r.id=f.review_id LEFT JOIN issues i ON i.id=f.issue_id WHERE s.plan_id=?""", (pid,)):
+        closes.setdefault(c["step_id"], []).append(c)
+    for c in rows(con, """SELECT sc.step_id, sc.commit_sha, sc.branch, sc.pr_url, sc.summary FROM step_commits sc
+                          JOIN steps s ON s.id=sc.step_id WHERE s.plan_id=?""", (pid,)):
+        commits.setdefault(c["step_id"], []).append(c)
+    for s in steps:
+        s["depends"] = sorted(deps.get(s["id"], []))
+        s["closes"] = closes.get(s["id"], [])
+        s["commits"] = commits.get(s["id"], [])
+    return {"plan": pl,
+            "phases": rows(con, "SELECT * FROM v_plan_progress WHERE plan=?", (code,)),
+            "phase_rows": rows(con, "SELECT number, title, goal, why FROM phases WHERE plan_id=? ORDER BY number", (pid,)),
+            "steps": steps}
+
+
+def get_goals(rq):
+    """Every design goal by domain, with its status and sources (schema 9)."""
+    if not has_table(rq.con, "goal_statuses"):
+        return {"goals": []}
+    return {"goals": goals_list(rq.con, include_all=True)}
+
+
+def get_trends(rq):
+    con = rq.con
+    return {"metrics": rows(con, "SELECT * FROM v_metric_trends"),
+            "reviews": rows(con, """SELECT review, min(started_at) started_at, sum(points) points, sum(high) high,
+                sum(medium) medium, sum(low) low, sum(new_issues) new_issues, sum(carried_over) carried_over,
+                sum(came_back) came_back, sum(false_findings) false_findings
+                FROM v_review_summary GROUP BY review ORDER BY started_at"""),
+            "recurring": rows(con, "SELECT * FROM v_recurring_issues LIMIT 50"),
+            "hotspots": rows(con, "SELECT * FROM v_file_hotspots LIMIT 30")}
+
+
+def tables_and_views(con):
+    """The ledger's tables and views, by type then name."""
+    return rows(con, """SELECT name, type FROM sqlite_master WHERE type IN ('table','view')
+                        AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY type, name""")
+
+
+def get_tables(rq):
+    con, out = rq.con, []
+    for t in tables_and_views(con):
+        cols = [c["name"] for c in rows(con, "SELECT name FROM pragma_table_info(?)", (t["name"],))]
+        n = con.execute(f"SELECT count(*) FROM {quote_name(t['name'])}").fetchone()[0]
+        out.append({**t, "columns": cols, "count": n})
+    return out
+
+
+def get_table(rq):
+    """?limit= (1 to 500, default 100) and offset= rows of one table or view."""
+    con, name = rq.con, rq.args[0]
+    if not NAME.match(name) or not one(con, "SELECT 1 x FROM sqlite_master WHERE name=? AND type IN ('table','view')", (name,)):
+        return error(404, "no such table")
+    limit = max(1, min(500, whole_number(rq.arg("limit", "100"), "limit")))
+    offset = max(0, whole_number(rq.arg("offset", "0"), "offset"))
+    cur = con.execute(f'SELECT * FROM "{name}" LIMIT ? OFFSET ?', (limit, offset))
+    return {"columns": [d[0] for d in cur.description], "rows": [list(r) for r in cur.fetchall()],
+            "count": con.execute(f'SELECT count(*) FROM "{name}"').fetchone()[0], "offset": offset, "limit": limit}
+
+
+def post_sql(rq):
+    sql = rq.body.get("sql", "")
+    if not isinstance(sql, str):
+        return error(400, "sql must be text.")
+    return run_readonly(rq.db, sql)
+
+
+def get_source(rq):
+    res = source(rq.root, rq.con, whole_number(rq.args[0], "The reference id"))
+    if "error" in res and "path" not in res:
+        return error(404, res["error"])
+    return res
+
+
+def _hub(*paths):
+    return lambda con: list(paths)
+
+
+def _hub_each(prefix, sql):
+    return lambda con: [f"{prefix}/{r[0]}" for r in con.execute(sql)]
+
+
+# Every address under /api/. A path no row matches is 404; a path that matches under another method only is 405
+# with Allow. The published hub embeds the answers of every GET row (hub_snapshot).
+ROUTES = (
+    Route("GET", "overview", get_overview, _hub("overview")),
+    Route("GET", "gates", get_gates, _hub("gates?status=pending", "gates?status=all")),
+    Route("POST", "gates/*/answer", post_gate_answer),
+    Route("GET", "reviews", get_reviews, _hub("reviews")),
+    Route("GET", "review/*", get_review, _hub_each("review", "SELECT code FROM reviews ORDER BY code")),
+    Route("GET", "issues", get_issues, _hub("issues")),
+    Route("GET", "issue/*", get_issue, _hub_each("issue", "SELECT code FROM issues ORDER BY code")),
+    Route("GET", "plans", get_plans, _hub("plans")),
+    Route("GET", "plan/*", get_plan, _hub_each("plan", "SELECT code FROM plans ORDER BY code")),
+    Route("GET", "goals", get_goals, _hub("goals")),
+    Route("GET", "trends", get_trends, _hub("trends")),
+    Route("GET", "tables", get_tables, _hub("tables")),
+    Route("GET", "table/*", get_table,
+          lambda con: [f"table/{t['name']}?limit={HUB_MAX_ROWS}&offset=0" for t in tables_and_views(con)
+                       if NAME.match(t["name"])]),
+    Route("POST", "sql", post_sql),
+    Route("GET", "source/*", get_source, _hub_each("source", "SELECT id FROM finding_locations ORDER BY id")),
+)
+
+
+def api_segments(path):
+    """The segments after /api of a URL path, or None for a path that is not under /api."""
     parts = [x for x in path.split("/") if x]
-    if not parts or parts[0] != "api":
-        return {"error": "not found"}, 404
-    p = parts[1:]
-    arg = lambda k, d=None: qs.get(k, [d])[0]
+    return parts[1:] if parts and parts[0] == "api" else None
 
-    if p == ["overview"]:
-        meta = {r["key"]: r["value"] for r in rows(con, "SELECT key, value FROM meta")}
-        return {
-            "project": meta.get("project_name", root.name),
-            "schema_version": meta.get("schema_version"),
-            "open_by_severity": rows(con, """SELECT severity, count(*) n FROM issues
-                WHERE status IN {ACTIVE} GROUP BY severity""".format(ACTIVE=ACTIVE)),
-            "issues_by_status": rows(con, "SELECT status, count(*) n FROM issues GROUP BY status"),
-            "gates_open": one(con, "SELECT count(*) n FROM gates WHERE status='open'")["n"],
-            "queue": one(con, "SELECT count(*) n FROM v_owner_queue")["n"],
-            "reviews": rows(con, """SELECT r.code, r.title, r.scope, r.status, r.started_at, r.completed_at, r.verdict,
-                (SELECT count(*) FROM findings f WHERE f.review_id=r.id) points,
-                (SELECT count(*) FROM findings f WHERE f.review_id=r.id AND f.severity='H') high
-                FROM reviews r ORDER BY r.started_at DESC LIMIT 5"""),
-            "plans": rows(con, """SELECT p.code, p.title, p.status, count(s.id) steps,
-                sum(s.status='done') done, sum(s.status='waiting-owner') waiting
-                FROM plans p LEFT JOIN steps s ON s.plan_id=p.id GROUP BY p.id ORDER BY p.created_at DESC"""),
-            "recurring": one(con, "SELECT count(*) n FROM v_recurring_issues")["n"],
-            "checks": [{"label": label, "view": v, "tier": tier, "n": count_view(con, v)}
-                       for v, label, tier in (ledger_checks(con) or [])],
-            "labels": {**{t: {r["code"]: r["name"] for r in rows(con, f"SELECT code, name FROM {t}")} for t in LABEL_TABLES},
-                       "enums": enum_labels(con)},
-        }
 
-    if p == ["gates"]:
-        st = arg("status", "pending")
-        where = {"pending": "g.status IN ('open','answered')", "all": "1"}.get(st, "g.status = ?")
-        args = () if st in ("pending", "all") else (st,)
-        gates = rows(con, f"""SELECT g.*, r.code review_code, pl.code plan_code, s.number step_number,
-                i.code issue_code, d.code decision_code FROM gates g
-                LEFT JOIN reviews r ON r.id=g.review_id LEFT JOIN plans pl ON pl.id=g.plan_id
-                LEFT JOIN steps s ON s.id=g.step_id LEFT JOIN issues i ON i.id=g.issue_id
-                LEFT JOIN decisions d ON d.id=g.decision_id
-                WHERE {where} ORDER BY g.status='answered', g.blocking DESC, g.created_at""", args)
-        for g in gates:
-            g["options"] = json.loads(g["options"]) if g["options"] else []
-        other = rows(con, "SELECT * FROM v_owner_queue WHERE kind <> 'gate'")
-        return {"gates": gates, "other": other}
+def _matches(r, parts):
+    return len(r.pattern) == len(parts) and all(a == "*" or a == b for a, b in zip(r.pattern, parts))
 
-    if len(p) == 3 and p[0] == "gates" and p[2] == "answer" and body is not None:
-        return gate_answer_request(db, p[1], body)
 
-    if p == ["reviews"]:
-        return rows(con, """SELECT r.code, r.title, r.scope, r.status, r.started_at, r.completed_at, r.verdict,
-            (SELECT group_concat(rp.name || ' ' || substr(rr.commit_sha,1,10) || COALESCE(' on ' || rr.branch, ''), ' · ')
-               FROM review_repositories rr JOIN repositories rp ON rp.id=rr.repository_id WHERE rr.review_id=r.id) commits,
-            (SELECT count(*) FROM findings f WHERE f.review_id=r.id) points,
-            (SELECT count(*) FROM findings f WHERE f.review_id=r.id AND f.severity='H') high,
-            (SELECT count(*) FROM findings f WHERE f.review_id=r.id AND f.severity='M') medium,
-            (SELECT count(*) FROM findings f WHERE f.review_id=r.id AND f.severity='L') low,
-            (SELECT count(*) FROM findings f WHERE f.review_id=r.id AND f.match_type IN ('new','continuation')) new_issues,
-            (SELECT count(*) FROM findings f WHERE f.review_id=r.id AND f.match_type IN (SELECT value FROM match_types WHERE came_back = 1)) came_back
-            FROM reviews r ORDER BY r.started_at DESC""")
+def allowed_methods(path):
+    """The methods a URL path answers: GET for the page, its routes' methods under /api/, none for anything else."""
+    if path == "/":
+        return ["GET"]
+    parts = api_segments(path)
+    return [] if parts is None else [r.method for r in ROUTES if _matches(r, parts)]
 
-    if len(p) == 2 and p[0] == "review":
-        r = one(con, """SELECT r.*, m.name manager, m.model manager_model, a.name approved_by,
-                        pr.code previous_code FROM reviews r
-                        LEFT JOIN actors m ON m.id=r.manager_actor_id LEFT JOIN actors a ON a.id=r.approved_by_actor_id
-                        LEFT JOIN reviews pr ON pr.id=r.previous_review_id WHERE r.code=?""", (p[1],))
-        if not r:
-            return {"error": "no such review"}, 404
-        rid = r["id"]
-        findings = rows(con, """SELECT f.*, i.code issue_code, i.status issue_status, rr.label run_label
-            FROM findings f LEFT JOIN issues i ON i.id=f.issue_id LEFT JOIN reviewer_runs rr ON rr.id=f.reviewer_run_id
-            WHERE f.review_id=? ORDER BY CASE f.severity WHEN 'H' THEN 0 WHEN 'M' THEN 1 WHEN 'L' THEN 2 ELSE 3 END, length(f.point_id), f.point_id""", (rid,))
-        locs = rows(con, """SELECT fl.id, fl.finding_id, fl.path, fl.line_start, fl.line_end, fl.symbol, fl.role,
-            fl.commit_sha, fl.permalink, rp.name repo FROM finding_locations fl
-            JOIN findings f ON f.id=fl.finding_id JOIN repositories rp ON rp.id=fl.repository_id WHERE f.review_id=?""", (rid,))
-        by = {}
-        for l in locs:
-            by.setdefault(l["finding_id"], []).append(l)
-        for f in findings:
-            f["locations"] = by.get(f["id"], [])
-        return {
-            "review": r,
-            "repos": rows(con, """SELECT rp.name, rr.* FROM review_repositories rr JOIN repositories rp
-                                  ON rp.id=rr.repository_id WHERE rr.review_id=?""", (rid,)),
-            "goals": rows(con, """SELECT g.code, g.text FROM review_goals rg JOIN design_goals g ON g.id=rg.goal_id
-                                  WHERE rg.review_id=? ORDER BY g.code""", (rid,)),
-            "domains": rows(con, """SELECT rd.*, d.name, d.category FROM review_domains rd JOIN domains d ON d.code=rd.domain_code
-                                    WHERE rd.review_id=? ORDER BY rd.decision, d.category, d.name""", (rid,)),
-            "runs": rows(con, """SELECT rr.*, a.name actor, a.model FROM reviewer_runs rr JOIN actors a ON a.id=rr.actor_id
-                                 WHERE rr.review_id=? ORDER BY rr.domain_code, rr.label""", (rid,)),
-            "checks": rows(con, """SELECT c.outcome, c.evidence, i.code issue_code, i.title, i.status
-                                   FROM review_issue_checks c JOIN issues i ON i.id=c.issue_id WHERE c.review_id=?
-                                   ORDER BY c.outcome, i.code""", (rid,)),
-            "summary": rows(con, "SELECT * FROM v_review_summary WHERE review=?", (p[1],)),
-            "agents": rows(con, "SELECT * FROM v_review_agents WHERE review=?", (p[1],)),
-            "requirements": rows(con, "SELECT * FROM v_requirement_trace WHERE review=?", (p[1],)),
-            "metrics": rows(con, """SELECT m.name, m.scope, m.value, COALESCE(m.unit, md.unit) unit, m.method, m.note,
-                COALESCE(md.label, upper(substr(m.name, 1, 1)) || replace(substr(m.name, 2), '_', ' ')) label,
-                COALESCE(md.better, 'none') better
-                FROM metrics m LEFT JOIN metric_defs md ON md.name=m.name WHERE m.review_id=? ORDER BY m.name, m.scope""", (rid,)),
-            "artifacts": rows(con, "SELECT kind, path, url FROM artifacts WHERE review_id=? ORDER BY kind", (rid,)),
-            "gates": rows(con, "SELECT code, kind, title, status, answer_value, answer_text FROM gates WHERE review_id=? ORDER BY created_at", (rid,)),
-            "interview": interview_list(con, p[1]) if has_table(con, "interview_questions") else [],
-            "review_goals": goals_list(con, include_all=True, review=p[1]) if has_table(con, "goal_statuses") else [],
-            "findings": findings,
-        }
 
-    if p == ["issues"]:
-        where, args = ["1"], []
-        for k in ("status", "severity", "domain_code"):
-            v = arg(k)
-            if v == "active" and k == "status":
-                where.append(f"i.status IN {ACTIVE}")
-            elif v:
-                where.append(f"i.{k} = ?"); args.append(v)
-        q = arg("q")
-        if q:
-            where.append("(i.code LIKE ? OR i.title LIKE ? OR i.sub LIKE ? OR EXISTS (SELECT 1 FROM findings f LEFT JOIN finding_locations fl ON fl.finding_id=f.id WHERE f.issue_id=i.id AND (f.point_id LIKE ? OR f.summary LIKE ? OR fl.path LIKE ?)))")
-            args += [f"%{q}%"] * 6
-        return rows(con, f"""SELECT i.code, i.title, i.severity, i.status, i.domain_code, i.theme_code, i.times_seen,
-            i.opened_at, i.updated_at, fr.code first_seen, lr.code last_seen
-            FROM issues i JOIN reviews fr ON fr.id=i.first_seen_review_id LEFT JOIN reviews lr ON lr.id=i.last_seen_review_id
-            WHERE {' AND '.join(where)}
-            ORDER BY CASE i.severity WHEN 'H' THEN 0 WHEN 'M' THEN 1 WHEN 'L' THEN 2 ELSE 3 END, i.id LIMIT 2000""", args)
+def wrong_method(method, allowed):
+    return error(405, f"This address takes {' or '.join(allowed)}, not {method}.", {"Allow": ", ".join(allowed)})
 
-    if len(p) == 2 and p[0] == "issue":
-        i = one(con, """SELECT i.*, fr.code first_seen, lr.code last_seen, cr.code last_checked FROM issues i
-                        JOIN reviews fr ON fr.id=i.first_seen_review_id LEFT JOIN reviews lr ON lr.id=i.last_seen_review_id
-                        LEFT JOIN reviews cr ON cr.id=i.last_checked_review_id WHERE i.code=?""", (p[1],))
-        if not i:
-            return {"error": "no such issue"}, 404
-        iid = i["id"]
-        findings = rows(con, """SELECT f.*, r.code review_code, r.started_at review_at FROM findings f
-                                JOIN reviews r ON r.id=f.review_id WHERE f.issue_id=? ORDER BY r.started_at""", (iid,))
-        for f in findings:
-            f["locations"] = rows(con, """SELECT fl.id, fl.path, fl.line_start, fl.line_end, fl.symbol, fl.role, fl.commit_sha,
-                fl.permalink, rp.name repo FROM finding_locations fl JOIN repositories rp ON rp.id=fl.repository_id
-                WHERE fl.finding_id=?""", (f["id"],))
-        return {
-            "issue": i,
-            "findings": findings,
-            "relations": rows(con, """SELECT 'out' dir, r.relation, b.code other, b.title other_title, b.status other_status,
-                    r.confidence, r.rationale, rv.code review FROM issue_relations r JOIN issues b ON b.id=r.to_issue_id
-                    LEFT JOIN reviews rv ON rv.id=r.established_in_review_id WHERE r.from_issue_id=?
-                UNION ALL SELECT 'in', r.relation, a.code, a.title, a.status, r.confidence, r.rationale, rv.code
-                    FROM issue_relations r JOIN issues a ON a.id=r.from_issue_id
-                    LEFT JOIN reviews rv ON rv.id=r.established_in_review_id WHERE r.to_issue_id=?""", (iid, iid)),
-            "checks": rows(con, """SELECT r.code review, r.started_at, c.outcome, c.evidence FROM review_issue_checks c
-                                   JOIN reviews r ON r.id=c.review_id WHERE c.issue_id=? ORDER BY r.started_at""", (iid,)),
-            "timeline": rows(con, "SELECT * FROM v_issue_timeline WHERE code=?", (p[1],)),
-            "guard_tests": rows(con, "SELECT * FROM guard_tests WHERE issue_id=?", (iid,)),
-            "decisions": rows(con, """SELECT d.code, d.question, d.answer, d.rationale, d.status, d.decided_at
-                                      FROM decision_issues di JOIN decisions d ON d.id=di.decision_id WHERE di.issue_id=?""", (iid,)),
-            "steps": rows(con, """SELECT DISTINCT p.code plan, s.number, s.title, s.status, s.progress_note,
-                    (SELECT group_concat(substr(sc.commit_sha,1,10), ', ') FROM step_commits sc WHERE sc.step_id=s.id) commits
-                    FROM step_findings sf JOIN steps s ON s.id=sf.step_id JOIN plans p ON p.id=s.plan_id
-                    JOIN findings f ON f.id=sf.finding_id WHERE f.issue_id=? ORDER BY p.code, s.number""", (iid,)),
-        }
 
-    if p == ["plans"]:
-        return rows(con, """SELECT p.code, p.title, p.status, p.created_at, p.approved_at, count(s.id) steps,
-            sum(s.status='done') done, sum(s.status='doing') doing, sum(s.status='waiting-owner') waiting,
-            (SELECT group_concat(r.code, ', ') FROM plan_reviews pr JOIN reviews r ON r.id=pr.review_id WHERE pr.plan_id=p.id) reviews
-            FROM plans p LEFT JOIN steps s ON s.plan_id=p.id GROUP BY p.id ORDER BY p.created_at DESC""")
-
-    if len(p) == 2 and p[0] == "plan":
-        pl = one(con, "SELECT * FROM plans WHERE code=?", (p[1],))
-        if not pl:
-            return {"error": "no such plan"}, 404
-        pid = pl["id"]
-        steps = rows(con, """SELECT s.*, ph.number phase FROM steps s JOIN phases ph ON ph.id=s.phase_id
-                             WHERE s.plan_id=? ORDER BY s.number""", (pid,))
-        deps, closes, commits = {}, {}, {}
-        for d in rows(con, """SELECT sd.step_id, s.number FROM step_dependencies sd JOIN steps s ON s.id=sd.depends_on_step_id
-                              WHERE s.plan_id=?""", (pid,)):
-            deps.setdefault(d["step_id"], []).append(d["number"])
-        for c in rows(con, """SELECT sf.step_id, f.point_id, f.severity, f.summary, r.code review, i.code issue
-                              FROM step_findings sf JOIN steps s ON s.id=sf.step_id JOIN findings f ON f.id=sf.finding_id
-                              JOIN reviews r ON r.id=f.review_id LEFT JOIN issues i ON i.id=f.issue_id WHERE s.plan_id=?""", (pid,)):
-            closes.setdefault(c["step_id"], []).append(c)
-        for c in rows(con, """SELECT sc.step_id, sc.commit_sha, sc.branch, sc.pr_url, sc.summary FROM step_commits sc
-                              JOIN steps s ON s.id=sc.step_id WHERE s.plan_id=?""", (pid,)):
-            commits.setdefault(c["step_id"], []).append(c)
-        for s in steps:
-            s["depends"] = sorted(deps.get(s["id"], []))
-            s["closes"] = closes.get(s["id"], [])
-            s["commits"] = commits.get(s["id"], [])
-        return {"plan": pl,
-                "phases": rows(con, "SELECT * FROM v_plan_progress WHERE plan=?", (p[1],)),
-                "phase_rows": rows(con, "SELECT number, title, goal, why FROM phases WHERE plan_id=? ORDER BY number", (pid,)),
-                "steps": steps}
-
-    if p == ["goals"]:  # every design goal by domain, with its status and sources (schema 9)
-        if not has_table(con, "goal_statuses"):
-            return {"goals": []}
-        return {"goals": goals_list(con, include_all=True)}
-
-    if p == ["trends"]:
-        return {"metrics": rows(con, "SELECT * FROM v_metric_trends"),
-                "reviews": rows(con, """SELECT review, min(started_at) started_at, sum(points) points, sum(high) high,
-                    sum(medium) medium, sum(low) low, sum(new_issues) new_issues, sum(carried_over) carried_over,
-                    sum(came_back) came_back, sum(false_findings) false_findings
-                    FROM v_review_summary GROUP BY review ORDER BY started_at"""),
-                "recurring": rows(con, "SELECT * FROM v_recurring_issues LIMIT 50"),
-                "hotspots": rows(con, "SELECT * FROM v_file_hotspots LIMIT 30")}
-
-    if p == ["tables"]:
-        out = []
-        for t in rows(con, """SELECT name, type FROM sqlite_master WHERE type IN ('table','view')
-                              AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY type, name"""):
-            cols = [c["name"] for c in rows(con, "SELECT name FROM pragma_table_info(?)", (t["name"],))]
-            n = con.execute(f"SELECT count(*) FROM {quote_name(t['name'])}").fetchone()[0]
-            out.append({**t, "columns": cols, "count": n})
-        return out
-
-    if len(p) == 2 and p[0] == "table":
-        name = p[1]
-        if not NAME.match(name) or not one(con, "SELECT 1 x FROM sqlite_master WHERE name=? AND type IN ('table','view')", (name,)):
-            return {"error": "no such table"}, 404
-        limit = max(1, min(500, int(arg("limit", "100"))))
-        offset = max(0, int(arg("offset", "0")))
-        cur = con.execute(f'SELECT * FROM "{name}" LIMIT ? OFFSET ?', (limit, offset))
-        return {"columns": [d[0] for d in cur.description], "rows": [list(r) for r in cur.fetchall()],
-                "count": con.execute(f'SELECT count(*) FROM "{name}"').fetchone()[0], "offset": offset, "limit": limit}
-
-    if p == ["sql"] and body is not None:
-        return run_readonly(db, body.get("sql", ""))
-
-    if len(p) == 2 and p[0] == "source":
-        return source(root, con, int(p[1]))
-
-    return {"error": "not found"}, 404
+def route(root, db, con, path, qs, body):
+    """Answer one API request from ROUTES: the handler's result (a dict or list: 200) or error(...). body is None
+    for a GET and the JSON object for a POST."""
+    method = "GET" if body is None else "POST"
+    parts = api_segments(path)
+    allowed = [] if parts is None else allowed_methods(path)
+    if not allowed:
+        return error(404, "not found")
+    if method not in allowed:
+        return wrong_method(method, allowed)
+    r = next(r for r in ROUTES if r.method == method and _matches(r, parts))
+    try:
+        return r.handler(Request(root, db, con, [b for a, b in zip(r.pattern, parts) if a == "*"], qs, body))
+    except ApiError as e:
+        return error(e.status, e.message, e.headers)
 
 
 SQL_SECONDS = 4  # the SQL box stops a query after this long
@@ -1951,9 +2175,11 @@ def make_server(root, db, port=0):
         def log_message(self, *a):
             pass
 
-        def send(self, code, body, ctype="application/json; charset=utf-8"):
+        def send(self, code, body, ctype="application/json; charset=utf-8", headers=None):
             data = body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=False, default=str).encode()
             self.send_response(code)
+            for k, v in (headers or {}).items():
+                self.send_header(k, v)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Cache-Control", "no-store")
@@ -1966,7 +2192,25 @@ def make_server(root, db, port=0):
                 self.send_header("Connection", "close")
                 self.close_connection = True
             self.end_headers()
-            self.wfile.write(data)
+            if self.command != "HEAD":  # a HEAD answer is headers only
+                self.wfile.write(data)
+
+        def send_error(self, code, message=None, explain=None):
+            """Errors the HTTP library raises itself (a malformed request line, an unknown method, an address or
+            header that is too long) in the viewer's own shape: JSON with the security headers."""
+            self.send(code, {"error": message or self.responses.get(code, ("error",))[0]})
+
+        def refuse_method(self):
+            """Any method but GET and POST: 405 naming the methods the address takes, 404 for an unknown address."""
+            if not self.host_ok():
+                return
+            allowed = allowed_methods(urlparse(self.path).path)
+            if not allowed:
+                return self.send(404, {"error": "not found"})
+            res = wrong_method(self.command, allowed)
+            self.send(res[1], res[0], headers=res[2])
+
+        do_HEAD = do_PUT = do_DELETE = do_OPTIONS = do_PATCH = refuse_method
 
         def host_ok(self):
             if self.headers.get("Host") not in hosts:
@@ -1988,9 +2232,9 @@ def make_server(root, db, port=0):
             try:
                 res = api(root, db, u.path, parse_qs(u.query), body)
             except Exception as e:
-                res = ({"error": f"Something went wrong reading the ledger: {e}"}, 500)
-            code, res = (res[1], res[0]) if isinstance(res, tuple) else (200, res)
-            self.send(code, res)
+                res = api_failure(e, f"{self.command} {u.path}")
+            res = res if isinstance(res, tuple) else (res, 200)
+            self.send(res[1], res[0], headers=res[2] if len(res) > 2 else None)
 
         def do_GET(self):
             if not self.host_ok():
@@ -2008,10 +2252,16 @@ def make_server(root, db, port=0):
             if not self.host_ok():
                 return
             u = urlparse(self.path)  # the guard below and the dispatch use this one parsed path
+            if u.path == "/":
+                return self.refuse_method()
             if not u.path.startswith("/api/"):
                 return self.send(404, {"error": "not found"})
             if not self.token_ok():
                 return
+            allowed = allowed_methods(u.path)
+            if allowed and "POST" not in allowed:  # before the body is read
+                res = wrong_method("POST", allowed)
+                return self.send(res[1], res[0], headers=res[2])
             if self.headers.get("Content-Type", "").split(";")[0] != "application/json":
                 return self.send(415, {"error": "JSON only"})
             raw_n = self.headers.get("Content-Length")
@@ -2179,136 +2429,6 @@ def progress_md(con, plan_code):
 # a Claude artifact with a db capability, saves the owner's gate answers in that artifact's database (collection
 # "answers", one document per gate code). The agent exports those answers and runs `ledger.py import-answers`.
 # Nothing in the page makes an outside request; publishing it is the agent's job, outside this tool.
-HUB_JS = r'''
-const STATIC = window.LEDGER_SNAPSHOT || null;
-let CUR_PATH = null;
-const ACTIVE = STATIC ? STATIC.active : [];
-const slugOf = p => (p || "").split("?")[0].replace(/^#\/?/, "").replace(/[\/_]/g, "-").replace(/[^A-Za-z0-9-]/g, "") || "home";
-function pathFromSlug(s){
-  s = (s || "").replace(/^#/, "");
-  if (!s || s === "home") return STATIC && STATIC.start && CUR_PATH === null ? STATIC.start : "";
-  const m = s.match(/^([a-z]+)(?:-(.*))?$/); if (!m) return "";
-  const [, view, rest] = m;
-  if (!rest) return view;
-  if (view === "plan") { const p = rest.match(/^(P-\d+)(?:-phase-(\d+))?$/); return p ? `plan/${p[1]}` + (p[2] ? `/phase/${p[2]}` : "") : "plans"; }
-  if (view === "explore") { const t = (STATIC.responses.tables || []).find(t => t.name.replace(/_/g, "-") === rest); return t ? `explore/${t.name}` : "explore"; }
-  return `${view}/${rest}`;
-}
-function nav(hash){ CUR_PATH = hash.replace(/^#\/?/, ""); const s = slugOf(CUR_PATH); if (location.hash.slice(1) === s) route(); else location.hash = s; }
-function setPath(hash){ if (!STATIC) { history.replaceState(null, "", hash); return; } CUR_PATH = hash.replace(/^#\/?/, ""); try { history.replaceState(null, "", "#" + slugOf(CUR_PATH)); } catch {} }
-function currentPath(){
-  if (!STATIC) return location.hash.replace(/^#\/?/, "");
-  const s = location.hash.slice(1);
-  if (CUR_PATH === null || slugOf(CUR_PATH) !== (s || "home")) CUR_PATH = pathFromSlug(s);
-  return CUR_PATH;
-}
-function staticApi(path, body){
-  if (body !== undefined) return Promise.reject(new Error("This shared copy is read-only. Answer in the chat with Claude, or run the local viewer."));
-  const S = STATIC.responses, [p, q] = path.split("?"), qs = new URLSearchParams(q || "");
-  const copy = v => JSON.parse(JSON.stringify(v));
-  if (p === "issues") {
-    const st = qs.get("status"), sv = qs.get("severity"), dm = qs.get("domain_code"), t = (qs.get("q") || "").toLowerCase();
-    return Promise.resolve(copy(S.issues.filter(i => (!st || (st === "active" ? ACTIVE.includes(i.status) : i.status === st))
-      && (!sv || i.severity === sv) && (!dm || i.domain_code === dm) && (!t || i.search.toLowerCase().includes(t)))));
-  }
-  if (p === "gates") return Promise.resolve(copy(S["gates?status=" + (qs.get("status") || "pending")] || S["gates?status=all"]));
-  if (p.startsWith("table/")) {
-    const t = S[p]; if (!t) return Promise.reject(new Error("That table is not in this snapshot."));
-    const off = Number(qs.get("offset")) || 0, lim = Number(qs.get("limit")) || 100;
-    return Promise.resolve({columns: t.columns, rows: copy(t.rows.slice(off, off + lim)), count: t.count, offset: off, limit: lim});
-  }
-  if (S[p] === undefined) return Promise.reject(new Error("This view is not in the snapshot."));
-  return Promise.resolve(copy(S[p]));
-}
-
-const HUB = {db: null, answers: {}, error: null};
-const OPEN_GATES = () => STATIC ? (STATIC.responses["gates?status=pending"].gates || []).filter(g => g.status === "open").map(g => g.code) : [];
-const hubAnsweredOpen = () => OPEN_GATES().filter(c => HUB.answers[c]).length;
-async function hubInit(){
-  if (!STATIC || !window.claude || typeof window.claude.use !== "function") return;
-  try {
-    const db = await window.claude.use("db"); if (!db) return;
-    HUB.db = db;
-    db.collection("answers").onSnapshot(snap => {
-      HUB.answers = Object.fromEntries(snap.docs.map(d => [d.id, d.data()]));
-      const cur = document.querySelector('#tabs a[aria-current="page"]');
-      if (OVERVIEW) drawTabs(cur ? (cur.dataset.k || "") : "");
-    }, e => { HUB.error = e && e.code; });
-  } catch (e) { HUB.error = String(e); }
-}
-function md(text){
-  const lines = String(text || "").split("\n"), out = []; let i = 0;
-  const inline = str => { const parts = []; const re = /(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\(https?:\/\/[^)\s]+\))/g; let last = 0, m;
-    while ((m = re.exec(str))) { if (m.index > last) parts.push(str.slice(last, m.index)); const t = m[0];
-      if (t.startsWith("**")) parts.push(h("b", null, t.slice(2, -2)));
-      else if (t.startsWith("`")) parts.push(h("code", null, t.slice(1, -1)));
-      else { const mm = t.match(/^\[([^\]]+)\]\((.+)\)$/); parts.push(h("a", {href: mm[2], target: "_blank", rel: "noopener noreferrer"}, mm[1])); }
-      last = re.lastIndex; }
-    if (last < str.length) parts.push(str.slice(last)); return parts; };
-  const cells = r => r.replace(/^\|/, "").replace(/\|\s*$/, "").split("|").map(c => c.trim());
-  while (i < lines.length) {
-    const l = lines[i]; let m;
-    if (!l.trim()) { i++; continue; }
-    if ((m = l.match(/^(#{1,4})\s+(.*)/))) { out.push(h("h" + Math.min(m[1].length + 1, 4), null, inline(m[2]))); i++; continue; }
-    if (l.startsWith("|")) { const rows = []; while (i < lines.length && lines[i].startsWith("|")) rows.push(lines[i++]);
-      out.push(h("div", {class: "scroll"}, h("table", null, h("thead", null, h("tr", null, cells(rows[0]).map(c => h("th", null, inline(c))))),
-        h("tbody", null, rows.slice(2).map(r => h("tr", null, cells(r).map(c => h("td", null, inline(c))))))))); continue; }
-    if (/^(\d+\.|-)\s/.test(l)) { const ordered = /^\d+\./.test(l), items = []; while (i < lines.length && /^(\d+\.|-)\s/.test(lines[i])) items.push(lines[i++].replace(/^(\d+\.|-)\s+/, ""));
-      out.push(h(ordered ? "ol" : "ul", null, items.map(t => h("li", null, inline(t))))); continue; }
-    const para = []; while (i < lines.length && lines[i].trim() && !/^(#{1,4}\s|\||\d+\.\s|-\s)/.test(lines[i])) para.push(lines[i++]);
-    out.push(h("p", null, inline(para.join(" "))));
-  }
-  return h("div", {class: "md"}, out);
-}
-function hubGateBody(card, g){
-  const saved = HUB.answers[g.code];
-  const optLab = v => ((g.options || []).find(o => o.value === v) || {}).label || v;
-  if (saved) { add(card, h("p", {class: "status"}, "You answered: ", saved.answer_value ? h("b", null, optLab(saved.answer_value)) : null,
-      saved.answer_text ? (saved.answer_value ? " — " : "") + saved.answer_text : "", ". Claude records it the next time it checks (or tell Claude in the chat to check now).")); return card; }
-  if (!HUB.db) { add(card, h("p", {class: "note"}, "Answer in the chat with Claude; answering here needs you signed in to claude.ai as this page's owner.")); return card; }
-  const nm = "opt-" + g.code;
-  const opts = (g.options || []).length ? h("div", {class: "opts", role: "radiogroup", "aria-label": "Choices"},
-    g.options.map(o => h("label", null, h("input", {type: "radio", name: nm, value: o.value}), h("span", null, o.label, o.description ? h("small", null, o.description) : null)))) : null;
-  const ta = g.allow_text ? h("textarea", {placeholder: opts ? "Add a note or a different answer (optional)" : "Your answer", "aria-label": "Your answer"}) : null;
-  const msg = h("div"), form = h("div", {class: "gate"});
-  const send = h("button", {class: "btn", type: "button", onclick: async () => {
-    const picked = card.querySelector(`input[name="${nm}"]:checked`), val = picked ? picked.value : null, txt = ta ? ta.value.trim() : "";
-    if (!val && !txt) { put(msg, h("p", {class: "status err"}, "Choose an option or write an answer.")); return; }
-    send.disabled = true;
-    try {
-      await HUB.db.doc("answers/" + g.code).set({gate: g.code, answer_value: val, answer_text: txt || null, answered_at: new Date().toISOString()});
-      HUB.answers[g.code] = {answer_value: val, answer_text: txt || null};
-      put(form, h("p", {class: "status"}, "Saved. Claude records it the next time it checks (or tell Claude in the chat to check now)."));
-      drawTabs("inbox");
-    } catch (e) { put(msg, h("p", {class: "status err"}, "Your answer could not be saved here" + (e && e.code === "invalid_argument" ? ": only this page's owner can answer." : ". Try again, or answer in the chat."))); send.disabled = false; }
-  }}, "Send answer");
-  add(form, opts, ta, h("div", null, send), msg); add(card, form); return card;
-}
-
-if (STATIC) document.addEventListener("click", e => {
-  const a = e.target.closest && e.target.closest('a[href^="#/"]');
-  if (!a || e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey) return;
-  e.preventDefault(); nav(a.getAttribute("href"));
-});
-'''
-
-HUB_GUIDE_VIEW = r'''
-VIEWS.guide = async () => {
-  const o = OVERVIEW || await api("overview");
-  const plans = await api("plans"), revs = await api("reviews");
-  const r = revs[0], p = plans[0], waiting = Math.max(0, o.queue - (STATIC ? hubAnsweredOpen() : 0));
-  setView(
-    h("h1", null, "How it works"),
-    h("p", {class:"lede"}, "What this site is, how a review runs, what the words mean, and where things stand right now."),
-    h("div", {class:"card"}, h("h2", null, "Where things stand"),
-      kv([["Latest review", r ? h("a", {href:"#/review/" + r.code}, `${r.code} · ${lab("review", r.status)} · ${r.points} points`) : "None yet"],
-          ["Fix plan", p ? h("a", {href:"#/plan/" + p.code}, `${p.code} · ${lab("plan", p.status)} · ${p.done || 0} of ${p.steps || 0} steps done`) : "None yet"],
-          ["Waiting on you", waiting ? h("a", {href:"#/inbox"}, `${waiting} ${waiting === 1 ? "question" : "questions"}`) : "Nothing right now"],
-          ["Updated", when(STATIC ? STATIC.taken : null)]])),
-    md(STATIC ? STATIC.guide : ""));
-};
-'''
-
 HUB_GUIDE_MD = """## What this site is
 
 This is the review ledger for this project, shown as a website. Every review, every point it raised, the issues those points describe, the fix plan, and every question waiting on you live here. Claude updates the site after each step of a review and after each batch of fixes; the date at the top says when.
@@ -2343,32 +2463,11 @@ You can answer every question here, under **Waiting on you**. Your answer is sav
 **Overview** shows the totals and the ledger's own checks. **Reviews** lists every review; open one for its report, the areas reviewed and skipped, the reviewers, and every point with the code it cites. **Issues** lets you search and filter every issue and see its full history. **Fix plans** shows every step by phase, with what it changes, how it is proven, and which points it closes. **Over time** shows how the numbers move between reviews. **Explore** shows the raw tables behind everything.
 """
 
-# (text in page.html, its replacement): each must occur exactly once; hub_page refuses to build otherwise, so an edit
-# of page.html that moves one of these fails test_hub_patches_apply instead of shipping a broken hub.
+# The one change progress-page makes to page.html: the data script (%s is the JSON), put in front of the page's own
+# script. Everything the hub does with the data is in the page (STATIC). hub_page refuses to build when the first text
+# is not in the page exactly once.
 HUB_PATCHES = [
-    ('takeToken();\nlet LABELS', 'takeToken();\n' + HUB_JS + '\nlet LABELS'),
-    ('async function api(path, body){', 'async function api(path, body){\n  if (STATIC) return staticApi(path, body);'),
-    ('function go(hash){ location.hash = hash; }', 'function go(hash){ if (STATIC) return nav(hash); location.hash = hash; }'),
-    ('history.replaceState(null, "", `#/plan/${code}/phase/${phase}`)', 'setPath(`#/plan/${code}/phase/${phase}`)'),
-    ('history.replaceState(null, "", "#/explore/" + t);', 'setPath("#/explore/" + t);'),
-    ('const raw = location.hash.replace(/^#\\/?/, "");', 'const raw = currentPath();'),
-    ('"Make sure the viewer is still running in your terminal, then reload the page."',
-     'STATIC ? "This is a read-only snapshot; reload the page to start again." : "Make sure the viewer is still running in your terminal, then reload the page."'),
-    ('"Questions and approvals the agent cannot get past without you. Answer here or in the chat; the agent picks answers up the next time it checks the ledger."',
-     'STATIC ? "Questions and approvals the agent cannot get past without you. Answer here: your answer is saved with this page, and Claude records it the next time it checks." : "Questions and approvals the agent cannot get past without you. Answer here or in the chat; the agent picks answers up the next time it checks the ledger."'),
-    ('  const name = "opt-" + g.code;', '  if (STATIC) return hubGateBody(card, g);\n  const name = "opt-" + g.code;'),
-    ('    h("div", {class:"card", style:"display:flex;flex-direction:column;gap:8px"}, h("b", null, "Query"),',
-     '    STATIC ? h("p", {class:"note"}, "The query box needs the local viewer (python3 ledger.py serve). Here each table and view shows up to 500 rows, and long values are shortened.") : h("div", {class:"card", style:"display:flex;flex-direction:column;gap:8px"}, h("b", null, "Query"),'),
-    ('"Browse every table and saved view, or run your own read-only query. Nothing here can change the ledger."',
-     'STATIC ? "Browse every table and saved view as they were when this snapshot was taken." : "Browse every table and saved view, or run your own read-only query. Nothing here can change the ledger."'),
-    ('h("small", null, "review ledger")', 'h("small", null, STATIC ? "review ledger · updated " + when(STATIC.taken) : "review ledger")'),
-    ('h("div", {class:"mdtext"}, r.report_md)', '(STATIC ? md(r.report_md) : h("div", {class:"mdtext"}, r.report_md))'),
-    ('h("div", {class:"mdtext"}, pl.narrative_md)', '(STATIC ? md(pl.narrative_md) : h("div", {class:"mdtext"}, pl.narrative_md))'),
-    ('const TABS = [["home","#/","Overview"],', 'const TABS = [["home","#/","Overview"],["guide","#/guide","How it works"],'),
-    ('  const n = OVERVIEW ? OVERVIEW.queue : 0;', '  const n = Math.max(0, (OVERVIEW ? OVERVIEW.queue : 0) - (STATIC ? hubAnsweredOpen() : 0));'),
-    ('h("a", {href, "aria-current": active === k ? "page" : null}, t,', 'h("a", {href, "data-k": k, "aria-current": active === k ? "page" : null}, t,'),
-    ('// ---------- routing', HUB_GUIDE_VIEW + '\n// ---------- routing'),
-    ('route();\n</script>', 'route();\nhubInit();\n</script>'),
+    ('<script>\n"use strict";', '<script>window.LEDGER_SNAPSHOT = %s;</script>\n<script>\n"use strict";'),
 ]
 HUB_MAX_ROWS = 500   # rows of each table and view embedded (Explore)
 HUB_MAX_CELL = 400   # characters of one embedded table cell
@@ -2376,7 +2475,10 @@ HUB_MAX_LINES = 400  # lines of one embedded code excerpt
 
 
 def hub_snapshot(root, db, con, start=None):
-    """Every viewer API response the page can ask for, from route() on a read-only connection, as one dict."""
+    """Every viewer API response the page can ask for, as one dict keyed by path: each GET row of ROUTES, over the
+    paths its hub() lists for this ledger, answered by route() on a read-only connection. Three are reshaped: a
+    table keeps HUB_MAX_ROWS rows of cut cells under table/<name>; a code reference is the excerpt saved in the
+    ledger (the hub cannot read git); each issue of the list gains the text its search box matches."""
     def call(path):
         p, _, q = path.partition("?")
         res = route(root, db, con, "/api/" + p, parse_qs(q), None)
@@ -2384,35 +2486,19 @@ def hub_snapshot(root, db, con, start=None):
             raise LedgerError(f"progress-page: /api/{path} failed: {res[0].get('error')}")
         return res
 
-    R = {"overview": call("overview"), "gates?status=pending": call("gates?status=pending"),
-         "gates?status=all": call("gates?status=all"), "reviews": call("reviews"), "plans": call("plans"),
-         "trends": call("trends"), "goals": call("goals")}
-    for r in R["reviews"]:
-        R["review/" + r["code"]] = call("review/" + r["code"])
-    for p in R["plans"]:
-        R["plan/" + p["code"]] = call("plan/" + p["code"])
-    issues = call("issues?status=")
-    search = {}
-    for code, point, path in con.execute("""SELECT i.code, f.point_id, COALESCE(fl.path, '') FROM issues i
-                                            JOIN findings f ON f.issue_id=i.id
-                                            LEFT JOIN finding_locations fl ON fl.finding_id=f.id"""):
-        search.setdefault(code, set()).update([point, path])
-    for i in issues:
-        i["search"] = " ".join([i["code"], i["title"] or "", i.get("sub") or ""] + sorted(search.get(i["code"], ())))
-        R["issue/" + i["code"]] = call("issue/" + i["code"])
-    R["issues"] = issues
-    R["tables"] = call("tables")
-    for t in R["tables"]:
-        d = call(f"table/{t['name']}?limit={HUB_MAX_ROWS}&offset=0")
+    def table(path):
+        d = call(path)
         cut = [[(v[:HUB_MAX_CELL] + "…") if isinstance(v, str) and len(v) > HUB_MAX_CELL else
                 ({"blob_bytes": len(v)} if isinstance(v, bytes) else v) for v in r] for r in d["rows"]]
-        R["table/" + t["name"]] = {"columns": d["columns"], "rows": cut, "count": len(cut), "total": d["count"]}
+        return {"columns": d["columns"], "rows": cut, "count": len(cut), "total": d["count"]}
+
     cmds = {r[0]: r[1] for r in con.execute("SELECT location_id, git_command FROM v_code_refs")}
-    for (lid,) in con.execute("SELECT id FROM finding_locations ORDER BY id"):
+
+    def saved_excerpt(lid):
         loc = location(con, lid)
         a, b = loc["line_start"], loc["line_end"] or loc["line_start"]
         lines = loc["excerpt"].split("\n") if loc["excerpt"] is not None else []
-        R[f"source/{lid}"] = {
+        return {
             "path": loc["path"], "commit_sha": loc["commit_sha"], "line_start": a, "line_end": b,
             "symbol": loc["symbol"], "permalink": loc["permalink"], "repo_name": loc["repo_name"],
             "blob_sha": loc["blob_sha"], "excerpt_redacted": bool(loc.get("excerpt_redacted")),
@@ -2420,6 +2506,23 @@ def hub_snapshot(root, db, con, start=None):
             "git_error": (f"Showing the first {HUB_MAX_LINES} of {len(lines)} lines." if len(lines) > HUB_MAX_LINES
                           else "This copy shows the excerpt saved in the ledger."),
             "lines": [{"n": (a or 1) + k, "text": t} for k, t in enumerate(lines[:HUB_MAX_LINES])]}
+
+    R = {}
+    for r in ROUTES:
+        for path in (r.hub(con) if r.hub else ()):
+            if r.handler is get_source:
+                R[path] = saved_excerpt(int(path.split("/")[1]))
+            elif r.handler is get_table:
+                R[path.split("?")[0]] = table(path)
+            else:
+                R[path] = call(path)
+    search = {}
+    for code, point, path in con.execute("""SELECT i.code, f.point_id, COALESCE(fl.path, '') FROM issues i
+                                            JOIN findings f ON f.issue_id=i.id
+                                            LEFT JOIN finding_locations fl ON fl.finding_id=f.id"""):
+        search.setdefault(code, set()).update([point, path])
+    for i in R["issues"]:
+        i["search"] = " ".join([i["code"], i["title"] or "", i.get("sub") or ""] + sorted(search.get(i["code"], ())))
     try:
         active = [r[0] for r in con.execute("SELECT value FROM issue_statuses WHERE active = 1 ORDER BY position")]
     except sqlite3.Error:
@@ -2431,10 +2534,9 @@ def hub_page(root, db, start=None, page=None):
     """The hub: the viewer page with the snapshot embedded (see HUB_PATCHES). start is the route it opens on when the
     address has no #route (e.g. 'plan/P-0001'). Returns (html, number of responses)."""
     page = PAGE if page is None else page
-    for old, new in HUB_PATCHES:
-        if page.count(old) != 1:
-            raise LedgerError(f"progress-page: page.html changed; this text is not in it exactly once: {old[:70]!r}")
-        page = page.replace(old, new)
+    (marker, script), = HUB_PATCHES
+    if page.count(marker) != 1:
+        raise LedgerError("progress-page: page.html changed; its main <script> was not found")
     con = connect(db, readonly=True)
     try:
         snap = hub_snapshot(root, db, con, start)
@@ -2444,10 +2546,7 @@ def hub_page(root, db, start=None, page=None):
     # bend the data script.
     data = json.dumps(snap, ensure_ascii=False, default=str, separators=(",", ":")).replace("<", "\\u003c")
     data = data.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
-    marker = '<script>\n"use strict";'
-    if page.count(marker) != 1:
-        raise LedgerError("progress-page: page.html changed; its main <script> was not found")
-    page = page.replace(marker, f"<script>window.LEDGER_SNAPSHOT = {data};</script>\n{marker}", 1)
+    page = page.replace(marker, script % data, 1)
     name = snap["responses"]["overview"].get("project") or root.name
     esc = str(name).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     page = page.replace("<title>Review ledger</title>", f"<title>Review ledger: {esc}</title>", 1)
@@ -5144,6 +5243,39 @@ def cmd_set_verdict(ctx):
     return [f"{rv['code']}: verdict recorded"]
 
 
+@_command("set-doc-url", "record the address of the document the owner keeps for a review or a plan",
+          "ledger.py set-doc-url R-0001|P-0001 URL [--actor A-0001]")
+def cmd_set_doc_url(ctx):
+    a, con = ctx.a, ctx.con
+    code = _need(a.code, "the review's or plan's code")
+    if not re.match(r"^[RP]-[0-9]+$", code):
+        raise WriteError(f"{code!r} is not a review or a plan; give R-0001 or P-0001")
+    url = _need(a.url, "the address").strip()
+    if not SAFE_URL.match(url):
+        raise WriteError(f"{url!r} is not an http(s) address")
+    if code.startswith("R-"):
+        ctx.x("UPDATE reviews SET summary_doc_url=? WHERE id=?", (url, review_row(con, code)["id"]))
+    else:
+        ctx.x("UPDATE plans SET doc_url=? WHERE id=?", (url, plan_row(con, code)["id"]))
+    return [f"{code}: document {url}"]
+
+
+@_command("plan-add-review", "add a review to the reviews a plan covers",
+          "ledger.py plan-add-review P-0001 R-0002 [--actor A-0001]")
+def cmd_plan_add_review(ctx):
+    a, con = ctx.a, ctx.con
+    pl = plan_row(con, _need(a.plan, "the plan's code"))
+    rv = review_row(con, _need(a.review, "the review's code"))
+    if pl["status"] in ("superseded", "abandoned"):
+        raise WriteError(f"{pl['code']} is {pl['status']}; add the review to the plan that replaced it")
+    if one(con, "SELECT 1 x FROM plan_reviews WHERE plan_id=? AND review_id=?", (pl["id"], rv["id"])):
+        raise WriteError(f"{pl['code']} already covers {rv['code']}")
+    ctx.x("INSERT INTO plan_reviews(plan_id, review_id) VALUES (?, ?)", (pl["id"], rv["id"]))
+    covered = rows(con, "SELECT r.code FROM plan_reviews pr JOIN reviews r ON r.id = pr.review_id "
+                        "WHERE pr.plan_id=? ORDER BY r.code", (pl["id"],))
+    return [f"{pl['code']}: covers {', '.join(r['code'] for r in covered)}"]
+
+
 @_command("add-metric", "record a measured, counted or estimated metric of a review",
           "ledger.py add-metric R-0001 NAME VALUE --method measured|counted|estimated [--domain D] [--repo NAME] "
           "[--scope all] [--unit U] [--note TEXT] [--actor A-0001]")
@@ -5472,6 +5604,8 @@ def add_write_commands_131(p):
     s.add_argument("--test", help="PATH::NAME (default: every guard test of the issue)")
     s.add_argument("--gone", action="store_true", help="the test no longer exists or no longer guards the issue")
     s = p("set-verdict"); s.add_argument("review"); s.add_argument("--verdict"); s.add_argument("--summary")
+    s = p("set-doc-url"); s.add_argument("code", help="R-0001 or P-0001"); s.add_argument("url")
+    s = p("plan-add-review"); s.add_argument("plan"); s.add_argument("review")
     s = p("add-metric"); s.add_argument("review"); s.add_argument("name"); s.add_argument("value")
     for o in ("--method", "--domain", "--repo", "--scope", "--unit", "--note"):
         s.add_argument(o)
@@ -5539,14 +5673,38 @@ class _TerminalSafeStream:
         return getattr(self._stream, name)
 
 
+def _discard_stdout(out):
+    """Point the process's standard output at the null device, so nothing written or flushed after the reader
+    closed raises again."""
+    try:
+        fd = out.fileno()
+        null = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(null, fd)
+        finally:
+            os.close(null)
+    except (OSError, ValueError, AttributeError):  # not a real file (a test's StringIO)
+        pass
+
+
 def main():
     """The CLI. Whatever way a command ends (return, sys.exit, an exception), the ledger connection it opened is
     closed before main() returns or raises. Everything it prints goes through terminal_safe(), the message of a
-    sys.exit("...") included (the interpreter prints that one after main() has returned)."""
+    sys.exit("...") included (the interpreter prints that one after main() has returned). When the reader of its
+    output closes early (`| head`), it ends quietly with exit 0."""
     out, err = sys.stdout, sys.stderr
     sys.stdout, sys.stderr = _TerminalSafeStream(out), _TerminalSafeStream(err)
     try:
-        return _main()
+        try:
+            result = _main()
+            out.flush()  # here, so a closed reader is noticed now and not when the interpreter exits
+            return result
+        except SystemExit:
+            out.flush()
+            raise
+    except BrokenPipeError:
+        _discard_stdout(out)  # the reader closed early (`ledger.py gates | head`): end quietly
+        return None
     except SystemExit as e:
         if isinstance(e.code, str):
             raise SystemExit(terminal_safe(e.code)) from None
@@ -5614,6 +5772,8 @@ def _main():
         inside_root = db.parent == root or root in db.parent.parents
         init(root, db, force=a.force, copy_tool=in_ledger_folder or where == "env",
              gitignore=in_ledger_folder and inside_root)
+        if old_sqlite_note():
+            print(old_sqlite_note(), file=sys.stderr)
         return
     if a.cmd == "migrate":
         migrate(db); return
@@ -5637,6 +5797,8 @@ def _main():
                   f"init records the new place)", file=sys.stderr)
         bad = check(con, quiet=a.quiet, full=a.full)
         bad += check_git_refs(root, con, quiet=a.quiet)
+        if old_sqlite_note():
+            print(old_sqlite_note(), file=sys.stderr)
         sys.exit(1 if bad else 0)
     elif a.cmd == "fill-refs":
         sys.exit(1 if fill_refs(root, con, a.review) else 0)

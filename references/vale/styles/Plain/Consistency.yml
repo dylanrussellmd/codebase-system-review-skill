@@ -1,0 +1,9 @@
+# One term per thing within a file. Replace the pairs with the project's own.
+extends: consistency
+message: "Inconsistent term: '%s'. Pick one."
+level: error
+ignorecase: true
+either:
+  sign in: log in
+  email: e-mail
+  set up: setup

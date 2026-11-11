@@ -134,13 +134,15 @@ def require_browser():
 class ViewerPage:
     """One page of the viewer in its own browser context, with error and request recording."""
 
-    def __init__(self, browser, base_url, *, token=None, viewport=None, color_scheme="light", permissions=None):
+    def __init__(self, browser, base_url, *, token=None, viewport=None, color_scheme="light", permissions=None,
+                 timezone_id=None, locale=None):
         self.base_url = base_url
         self.token = token  # sent once, in the #k= fragment of the first load, as serve()'s launch URL does
         host = urlsplit(base_url).hostname
         self.page_errors, self.console_errors, self.requests, self.outside_requests = [], [], [], []
         self.allow_console_errors = False
-        self.context = browser.new_context(viewport=viewport or DESKTOP, color_scheme=color_scheme)
+        self.context = browser.new_context(viewport=viewport or DESKTOP, color_scheme=color_scheme,
+                                           timezone_id=timezone_id, locale=locale)
         self.context.set_default_timeout(5000)  # fail fast: nothing in the viewer should take seconds
         if permissions:
             self.context.grant_permissions(permissions, origin=base_url.rstrip("/"))

@@ -1,0 +1,10 @@
+# The project's preferred terms. Replace the pairs with the project's own.
+extends: substitution
+message: "Use '%s', not '%s'."
+level: error
+ignorecase: true
+swap:
+  log ?in(?! to)|login: sign in
+  e-mail: email
+  whitelist: allowlist
+  drop ?down list: menu

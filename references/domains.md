@@ -1,10 +1,9 @@
 # Domain catalog
 
-Read this in Step 2a to choose the domains, and give each reviewer its domain's entry in the brief (Step 2c). Each
-entry names the domain, its default report file and, in italics, when it usually applies (the same sentence as
-`domains.description` in the ledger; the code is in `ledger.py query "SELECT code, report_file FROM domains"`). Choose
-from these; launch only what the owner approved. A domain the catalog lacks is added with
-`ledger.py add-domain`.
+Read this in Step 2a to choose the domains; each reviewer gets its domain's entry in the brief (Step 2d). An entry
+gives the domain, its report file and, in italics, when it applies (`domains.description` in the ledger; codes:
+`ledger.py query "SELECT code, report_file FROM domains"`). Launch only what the owner approved. Add a domain the
+catalog lacks with `ledger.py add-domain`.
 
 #### Correctness
 
@@ -20,7 +19,7 @@ requirements changed recently whose older version still survives somewhere in co
 unit of behavior or configuration (each public function, route, command, setting, rule, feature flag), one row: what it
 does and where the code reads it (flag things declared but never used); its options and valid range (type vs schema vs
 validation mismatches); how it interacts with other units; the cases needed for thorough coverage with concrete
-expected outcomes; the existing tests and whether each case is actually asserted (Yes / Partly / No); verdict and the
+expected outcomes; the existing tests and whether each case is asserted (Yes / Partly / No); verdict and the
 missing tests by name. Also list: inputs read with no validation, validation branches with no test,
 migrations/conversions with no test, and error paths with no test. End with totals (units, cases needed, asserted,
 missing).
@@ -31,8 +30,9 @@ PIT for Java; install outside the repo or in a temp copy) and report the mutatio
 mutants that matter most. Run the suite several times (and in random order where the runner allows) to find flaky and
 order-dependent tests. Find tests that depend on the real clock, time zone, network, or shared state. Report test
 suite speed and the slowest tests. Review test doubles: do fakes enforce the real limits and errors of what they
-replace? Check that every guard test recorded in the ledger (listed in the brief) still exists and still fails without its fix
-where cheap to try; the manager records the answer (`ledger.py confirm-guard`). If mutation tooling can't run, say so and fall back to sampling assertions by hand, marked "not measured".
+replace? Check that every guard test recorded in the ledger (listed in the brief) still exists and, where cheap to
+try, still fails without its fix; the manager records the answer (`ledger.py confirm-guard`). If mutation tooling
+can't run, say so and sample assertions by hand, marked "not measured".
 
 **Time, dates and concurrency, `time-concurrency.md`.** *Applies to anything with dates, schedules, deadlines,
 expiries, or more than one writer.* Inventory every place the code creates, parses, compares, formats or stores a date
@@ -52,7 +52,7 @@ failure, on a rerun, on overlap with itself, and on a missed run. Follow at leas
 what the user and the operator see. Missing tests by name.
 
 **Backward compatibility and migrations, `compatibility.md`.** *Applies whenever there is stored data, saved settings,
-public APIs, or deployed clients.* Can the new code read everything old code wrote (rows, saved settings, cached files,
+public APIs, or deployed clients.* Can today's code read everything older code wrote (rows, saved settings, cached files,
 cookies, URLs people bookmarked, calendar subscriptions)? Is every schema/settings migration tested from each older
 version still in the wild? Can each deploy roll back without losing or corrupting data? Do open browser tabs or old
 clients keep working across a deploy? Are API changes versioned or additive? List every breaking change waiting to
@@ -72,9 +72,10 @@ migration order with the tests that must pass before and after each move (same i
 
 **Internal contracts, `contracts.md`.** *Applies when there is more than one component.* For every boundary between
 components (service to service, app to library, worker to queue): endpoint/message inventory with request, response,
-errors, docs accuracy and tests. Can every setting or capability be reached through the boundary? Does the caller handle every response the callee can
-give (each success shape, refusal, error and timeout), not only the common one? Is every field of
-every response used by the caller? Does the caller populate every input? Field-by-field drift between the producer's
+errors, docs accuracy and tests. Can every setting or capability be reached through the boundary? Does the caller
+handle every response the callee can give (each success shape, refusal, error and timeout), not only the common one?
+Is every field of every response used by the caller? Does the caller populate every input? Field-by-field drift
+between the producer's
 contract and the consumer's copy (flag duplicated types). Test coverage per endpoint and response branch, including
 timeout, 4xx, 5xx, malformed response and unavailable dependency.
 
@@ -115,10 +116,11 @@ reviews). Run early if possible and share the ranked list with the other reviewe
 **Front end / UI (one to three reviewers, split by area), `ui-<area>.md`.** *Applies when there are screens.* Each
 reads every line of its screens and the backend views feeding them, and reports violations of each requirement with
 file:line, the exact text or code, and the fix: (1) generic, including what a second customer/tenant would see; (2) can
-display and act on every configuration the backend allows (best through settings forms generated from the
-settings schema, so a new setting needs no new screen code); (3) no internal names on screen; (4) select, don't type;
+display and act on every configuration the backend allows (best through settings forms generated from the settings
+schema, so a new setting needs no new screen code); (3) no internal names on screen; (4) select, don't type;
 (5) context-sensitive by tenant and by user role; (6) usability, looks, small-screen width, accessibility (keyboard,
-contrast, labels, focus, screen-reader names); (7) duplicated code that should be shared. One reviewer owns the
+contrast, labels, focus, screen-reader names); (7) duplicated code that should be shared; (8) every piece of text
+meets `references/writing.md`, each breach a finding with the shorter version. One reviewer owns the
 **ACCESS AUDIT**: a matrix of every kind of user (signed out, pending, no roles, each role, admin, super admin, service
 account, user of another tenant) against every link, button and page. List every link shown to someone who is then
 refused, and every page that, opened directly without access, shows anything other than the explanation (partial
@@ -163,7 +165,7 @@ weakness with file:line, how it could be misused in plain terms, severity, and t
   messages that reveal internals.
 - Threat model: a short list of who might misuse the system (outsider, ordinary user, admin, compromised account) and
   the worst thing each could do today.
-- Tests: which protections have a test that would fail if the protection were removed, and the missing ones by name.
+- Tests: which protections have a test that would fail without the protection, and the missing ones by name.
 
 **Privacy and data map, `privacy.md`.** *Applies whenever personal data is handled.* Every kind of personal data: where
 it enters, every place it is stored or copied (database, backups, logs, emails, feeds, analytics, third parties), who
@@ -228,13 +230,15 @@ storage, no spending limits).
 
 **Developer documentation (inline and repo), `docs-developer.md`.** *Almost always applies.*
 - Inline: every public/exported function, type, module and non-obvious block: is there a comment or docstring saying
-  what it does, its inputs/outputs, units, invariants and why (not just what)? Flag comments that are wrong, stale
+  what it does, its inputs/outputs, units, invariants and why, not only what? Flag comments that are wrong, stale
   (describe old behavior, reference removed code), contradict the code, or restate the obvious. Flag TODO/FIXME/HACK
   notes with no owner or issue. Magic numbers with no explanation.
 - Repo docs: README, setup, architecture overview, data model, API reference, settings reference, contribution guide,
   ADRs/decision log. For each: does it exist, is it accurate to the code now (check commands by running them where
   safe, check every settings name and file path it mentions), and is anything important undocumented?
 - Generated docs: are API/settings references generated from the source of truth, or hand-copied and drifting?
+- Writing: judge comments and docs by `references/writing.md`; each breach is a finding with the shorter version.
+  List every statement that is stale against the current code.
 - Report per module: documented / partly / undocumented, with the specific missing or wrong items.
 
 **End-user documentation, `docs-user.md`.** *Applies when the system has users other than its developers.* Inventory
@@ -242,8 +246,8 @@ every piece of help a user or admin gets: help pages, onboarding, in-page hints 
 tooltips, emails explaining what happened, FAQ, admin guides for every setting. For each: is it accurate to current
 behavior, written for the reader (no internal names or jargon), findable from where the user needs it, and does it
 cover every role's main tasks (cross-check against the task walkthroughs if that domain runs)? List every task,
-setting and error a user could meet with no explanation anywhere, and every doc describing behavior that no longer
-exists.
+setting and error a user could meet with no explanation anywhere. Judge the text by `references/writing.md`: each
+breach is a finding with the shorter version. List every statement that is stale against the current code.
 
 **Maintainability and handover, `handover.md`.** *Applies whenever someone other than the current author may need to
 run or change the system.* Could a new maintainer, using only the repo and its docs, clone, set up, run, test, deploy,

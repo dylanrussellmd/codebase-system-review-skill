@@ -726,10 +726,10 @@ DEMO_FILES_2 = {
 
 
 def seed_demo(ledger):
-    """Fill `ledger` with the demo: two reviews of a small time-off app, matching across them, a plan with a done
-    step and a step waiting on the owner, a decision, two open gates and metrics. Writes src/auth.py and
-    src/timeoff.py into ledger.repo and commits twice (the commits the two reviews looked at), so every cited file
-    exists. Every expectation is checked; a failed one raises DemoExpectationError. The work is committed.
+    """Fill `ledger` with the demo: two reviews of a small sample app (sign-in codes and a rule for requests),
+    matching across them, a plan with a done step and a step waiting on the owner, a decision, two open gates and
+    metrics. Writes src/auth.py and src/timeoff.py into ledger.repo and commits twice (the commits the two reviews
+    looked at), so every cited file exists. Every expectation is checked; a failed one raises DemoExpectationError. The work is committed.
 
     Returns a dict of the ids created:
       commits [c1, c2]; repository; actors {owner, manager, security, spec}; reviews {"R-0001", "R-0002"};
@@ -742,7 +742,7 @@ def seed_demo(ledger):
     L = ledger
     for p, t in DEMO_FILES_1.items():
         repo.write(p, t)
-    c1 = repo.commit("Initial time off and sign-in")
+    c1 = repo.commit("Initial requests and sign-in")
     for p, t in DEMO_FILES_2.items():
         repo.write(p, t)
     c2 = repo.commit("Use secrets for sign-in codes")
@@ -771,11 +771,11 @@ def seed_demo(ledger):
         L.insert("review_goals", review_id=rid, goal_id=g1)
         L.insert("review_goals", review_id=rid, goal_id=g2)
         L.review_domain(rid, "security", "included", "Sign-in codes and sessions exist", reviewers_planned=1)
-        L.review_domain(rid, "spec", "included", "Owner rules for time off are stated", reviewers_planned=1)
+        L.review_domain(rid, "spec", "included", "The owner stated the rules for requests", reviewers_planned=1)
         L.review_domain(rid, "database", "skipped", "No database in this project", reviewers_planned=0)
         ids["runs"][f"{code}/security"] = L.reviewer_run(rid, "security", sec, "security", "sign-in",
                                                          items_reviewed=4, high_count=1, medium_count=0, low_count=0)
-        ids["runs"][f"{code}/spec"] = L.reviewer_run(rid, "spec", spec, "spec", "time-off rules", items_reviewed=6,
+        ids["runs"][f"{code}/spec"] = L.reviewer_run(rid, "spec", spec, "spec", "request rules", items_reviewed=6,
                                                      high_count=0, medium_count=1, low_count=1)
         ids["reviews"][code] = rid
         return rid
@@ -797,7 +797,7 @@ def seed_demo(ledger):
         return iid
 
     # ---- first review
-    r1 = review("R-0001", c1, None, "handed-off", "Initial time off and sign-in")
+    r1 = review("R-0001", c1, None, "handed-off", "Initial requests and sign-in")
     f1 = finding(r1, "R-0001", "security", "SEC-H1", "H", "security", "security", "sign-in", "code-randomness",
                  "Sign-in codes come from a predictable random generator.",
                  "make_code uses random.randint, which is not suitable for secrets.", "Use secrets.randbelow.",

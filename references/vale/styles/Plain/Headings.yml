@@ -1,0 +1,8 @@
+# Headings that name no subject.
+extends: existence
+message: "Heading '%s' says nothing; name the subject or remove it."
+level: warning
+scope: heading
+nonword: true
+tokens:
+  - '^(?:Introduction|Overview|Description|About|Summary|General|Miscellaneous|Misc|Details|Notes|Other|Background|Conclusion|Getting Started)$'

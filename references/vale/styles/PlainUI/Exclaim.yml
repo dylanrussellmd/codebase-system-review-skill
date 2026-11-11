@@ -1,0 +1,7 @@
+extends: existence
+message: "No exclamation marks."
+level: error
+ignorecase: true
+nonword: true
+tokens:
+  - '!'

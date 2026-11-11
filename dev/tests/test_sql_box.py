@@ -208,10 +208,9 @@ class SqlBoxOverHttp(unittest.TestCase):
         self.assertEqual(self.srv.post("/api/sql", {"sql": "SELECT 1; SELECT 2"}).status, 400)
 
     def test_current_sql_route_bad_types_and_blobs(self):
-        # characterization: ISS-0085 a non-string sql gives 500 with the Python message
+        # ISS-0085 fixed: a non-string sql is a 400 with a plain sentence (was 500 with the Python message)
         r = self.srv.post("/api/sql", {"sql": 5})
-        self.assertEqual(r.status, 500)
-        self.assertIn("'int' object has no attribute 'strip'", r.json()["error"])
+        self.assertEqual((r.status, r.json()), (400, {"error": "sql must be text."}))
         # ISS-0071 fixed (step 52): blobs come back as their size only
         r = self.srv.post("/api/sql", {"sql": "SELECT x'41ff' AS b"})
         self.assertEqual(r.json()["rows"], [[{"blob_bytes": 2}]])

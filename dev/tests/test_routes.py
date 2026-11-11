@@ -158,8 +158,9 @@ class Overview(RouteCase):
         self.assertEqual(d["queue"], 7)
         self.assertEqual([r["code"] for r in d["reviews"]], ["R-0006", "R-0005", "R-0004", "R-0003", "R-0002"])
         self.assertEqual([p["code"] for p in d["plans"]], ["P-0002", "P-0001"])
+        # v_plan_totals: a plan with no steps counts 0, not NULL
         self.assertEqual(d["plans"][0], {"code": "P-0002", "title": "Empty plan", "status": "drafting",
-                                         "steps": 0, "done": None, "waiting": None})
+                                         "steps": 0, "done": 0, "waiting": 0})
 
     def test_overview_empty_ledger(self):
         d = self.ok("/api/overview", L=empty())
@@ -414,7 +415,7 @@ class Plans(RouteCase):
         rows = self.ok("/api/plans", L=L)
         self.assertEqual([r["code"] for r in rows], ["P-0002", "P-0001"])
         self.assertEqual({k: rows[0][k] for k in ("steps", "done", "doing", "waiting", "reviews")},
-                         {"steps": 0, "done": None, "doing": None, "waiting": None, "reviews": None})
+                         {"steps": 0, "done": 0, "doing": 0, "waiting": 0, "reviews": None})
         self.assertEqual(rows[1]["waiting"], 2)
         self.assertEqual(self.ok("/api/plans", L=empty()), [])
 
@@ -529,11 +530,10 @@ class Tables(RouteCase):
         self.assertEqual(self.ok("/api/table/issues", limit=-5)["limit"], 1)
         self.assertEqual(self.ok("/api/table/issues", limit=99999)["limit"], 500)
         self.assertEqual(self.ok("/api/table/issues", offset=-4)["offset"], 0)
-        # characterization: ISS-0085 a non-integer limit or offset raises inside route() (the server answers 500
-        # with the Python message); the fix makes it a 400
-        for qs in ({"limit": "abc"}, {"offset": "1.5"}):
-            with self.assertRaises(ValueError):
-                self.call("/api/table/issues", **qs)
+        # ISS-0085 fixed: a limit or offset that is not a whole number is a 400 with a plain sentence
+        self.assertEqual(self.call("/api/table/issues", limit="abc"), (400, {"error": "limit must be a whole number."}))
+        self.assertEqual(self.call("/api/table/issues", offset="1.5"),
+                         (400, {"error": "offset must be a whole number."}))
 
     def test_table_name_validation(self):
         for name in ('issues"--', "sqlite_master", "sqlite_schema", "nope", "issues;", "1issues", "%69ssues"):
@@ -546,20 +546,26 @@ class Tables(RouteCase):
 # ---------------------------------------------------------------- step 20: other routes and the contract
 
 class OtherRoutes(RouteCase):
-    def test_current_source_route_statuses(self):
+    def test_source_route_statuses(self):
         lid = self.L.scalar("SELECT min(id) FROM finding_locations")
         d = self.ok(f"/api/source/{lid}")
         self.assertEqual(d["source"], "git")
-        # characterization: ISS-0085 an unknown reference answers 200 with an error body, and a non-number raises
-        self.assertEqual(self.call("/api/source/99999"), (200, {"error": "no such reference"}))
-        with self.assertRaises(ValueError):
-            self.call("/api/source/abc")
+        # ISS-0085 fixed (was test_current_source_route_statuses): an unknown reference is 404, a non-number 400
+        self.assertEqual(self.call("/api/source/99999"), (404, {"error": "no such reference"}))
+        self.assertEqual(self.call("/api/source/abc"), (400, {"error": "The reference id must be a whole number."}))
 
     def test_unknown_routes_404(self):
-        for path in ("/api/nothing", "/api/", "/api/overview/extra", "/api/gates/GATE-0001", "/api/sql"):
+        for path in ("/api/nothing", "/api/", "/api/overview/extra", "/api/gates/GATE-0001"):
             self.assertEqual(self.call(path), (404, {"error": "not found"}), path)
-        # the answer route and the SQL box are POST-only (body None means GET)
-        self.assertEqual(self.call("/api/gates/GATE-0001/answer"), (404, {"error": "not found"}))
+        # the answer route and the SQL box are POST-only (body None means GET): 405 naming the method that works
+        for path in ("/api/sql", "/api/gates/GATE-0001/answer"):
+            res = self.call(path)
+            self.assertEqual(res, (405, {"error": "This address takes POST, not GET."}), path)
+        con = self.mod.connect(self.L.db)
+        try:
+            self.assertEqual(self.mod.route(self.L.root, self.L.db, con, "/api/sql", {}, None)[2], {"Allow": "POST"})
+        finally:
+            con.close()
         # ISS-0019 fixed (step 41): route() requires the 'api' segment, so /x/overview is not the overview
         self.assertEqual(self.call("/x/overview"), (404, {"error": "not found"}))
 
@@ -600,6 +606,10 @@ CONTRACT = {
     "table-404": ("GET", "/api/table/nope", None, 404, dict, {"error"}),
     "gate-404": ("POST", "/api/gates/GATE-9999/answer", {"answer_value": "x"}, 404, dict, {"error"}),
     "unknown-404": ("GET", "/api/nothing", None, 404, dict, {"error"}),
+    "source-404": ("GET", "/api/source/99999", None, 404, dict, {"error"}),
+    "source-400": ("GET", "/api/source/abc", None, 400, dict, {"error"}),
+    "sql-get-405": ("GET", "/api/sql", None, 405, dict, {"error"}),
+    "overview-post-405": ("POST", "/api/overview", {}, 405, dict, {"error"}),
 }
 
 
