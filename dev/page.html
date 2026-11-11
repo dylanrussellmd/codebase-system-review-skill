@@ -155,25 +155,18 @@ async function api(path, body){
   return j;
 }
 const words = s => s == null ? "" : String(s).replace(/[-_]/g," ").replace(/^./, c => c.toUpperCase());
-const L = {
-  sev:{H:"High",M:"Medium",L:"Low",T:"Missing test"},
-  issue:{open:"Open","needs-decision":"Needs your decision",planned:"Planned","in-progress":"In progress",fixed:"Fixed",verified:"Fixed and confirmed",regressed:"Came back","accepted-risk":"Accepted risk","wont-fix":"Won't fix",duplicate:"Duplicate",obsolete:"No longer applies"},
-  match:{new:"New","still-present":"Still present",changed:"Changed",recurrence:"Came back",regression:"Came back after a fix",continuation:"Continues an earlier issue"},
-  verif:{unverified:"Not checked yet",confirmed:"Confirmed",partly:"Partly confirmed",false:"False finding","not-checkable":"Could not be checked"},
-  review:{planning:"Planning","awaiting-approval":"Waiting for your approval",approved:"Approved",running:"Reviewers running",verifying:"Verifying",indexing:"Indexing points",consolidating:"Writing it up","handed-off":"Handed off",abandoned:"Abandoned"},
-  scope:{full:"Full review",partial:"Partial review",targeted:"Targeted review",second:"Second review","fix-verification":"Fix check"},
-  step:{"not-started":"Not started",doing:"In progress","waiting-owner":"Waiting on you",done:"Done",dropped:"Dropped"},
-  need:{none:"",decision:"Your decision",confirm:"Your confirmation",review:"Your review",production:"Production action"},
-  gate:{"domain-approval":"Approve review domains","plan-approval":"Approve fix plan",decision:"Decision","step-input":"Input on a step","confirm-false-finding":"Confirm a false finding","accept-risk":"Accept a risk","production-action":"Production action","review-handoff":"Review hand-off",confirm:"Confirm",other:"Question"},
-  gstat:{open:"Waiting on you",answered:"Answered, waiting for the agent",applied:"Done",withdrawn:"Withdrawn"},
-  rel:{"duplicate-of":"Duplicate of","continuation-of":"Continues","regression-of":"Regression of","related-to":"Related to","caused-by":"Caused by",blocks:"Blocks",supersedes:"Supersedes","split-from":"Split from","merged-into":"Merged into"},
-  relIn:{"duplicate-of":"Has duplicate","continuation-of":"Continued by","regression-of":"Came back as","related-to":"Related to","caused-by":"Causes",blocks:"Blocked by",supersedes:"Superseded by","split-from":"Split into","merged-into":"Absorbed"},
-  check:{"still-present":"Still present",changed:"Changed",fixed:"Fixed",regressed:"Came back",obsolete:"No longer applies","not-checked":"Not checked"},
-  kind:{defect:"Defect",test:"Missing test",validation:"Validation",refactor:"Refactor",feature:"Feature",design:"Design",docs:"Documentation",logging:"Logging",perf:"Performance",security:"Security",ops:"Operations",verify:"To verify"},
-  run:{queued:"Queued",running:"Running",finished:"Finished",failed:"Failed",cancelled:"Cancelled"},
-  plan:{drafting:"Drafting","awaiting-approval":"Waiting for your approval",approved:"Approved","in-progress":"In progress",complete:"Complete",superseded:"Replaced",abandoned:"Abandoned"},
-  decision:{open:"Open",decided:"Decided",revisit:"To revisit"},
-};
+// The words' labels come from the ledger (GET /api/overview labels.enums, from its lookup tables); L maps the page's
+// short names to them. Without them (an older ledger) a word is shown through words(), and a severity letter
+// through the fallback below, so the page never shows a raw value.
+const ENUM_OF = {sev:"severity", issue:"issue_status", match:"match_type", verif:"verification", review:"review_status",
+  scope:"review_scope", step:"step_status", need:"owner_need", gate:"gate_kind", gstat:"gate_status", rel:"relation_type",
+  relIn:"relation_type_inverse", check:"check_outcome", kind:"issue_kind", run:"run_status", plan:"plan_status",
+  decision:"decision_status"};
+const FALLBACK = {sev:{H:"High",M:"Medium",L:"Low",T:"Missing test"}, need:{none:""}};
+let L = {};
+const setLabels = enums => { L = Object.fromEntries(Object.entries(ENUM_OF).map(([k, e]) =>
+  [k, Object.assign({}, FALLBACK[k] || {}, (enums || {})[e] || {})])); };
+setLabels({});
 const lab = (map, v) => (L[map] && L[map][v] !== undefined) ? L[map][v] : words(v);
 const domainName = c => c ? (LABELS.domains[c] || words(c)) : "";
 const themeName = c => c ? (LABELS.themes[c] || words(c)) : "";
@@ -616,7 +609,7 @@ async function route(){
   const view = VIEWS[name] || VIEWS.home;
   const tab = {review:"reviews", issue:"issues", plan:"plans", history:"inbox"}[name] || (VIEWS[name] ? name : "home");
   try {
-    if (!OVERVIEW || name === "home" || name === "inbox") { OVERVIEW = await api("overview"); LABELS = OVERVIEW.labels;
+    if (!OVERVIEW || name === "home" || name === "inbox") { OVERVIEW = await api("overview"); LABELS = OVERVIEW.labels; setLabels(LABELS.enums);
       put(document.getElementById("brand"), OVERVIEW.project, h("small", null, "review ledger")); document.title = OVERVIEW.project + " · review ledger"; }
     drawTabs(tab);
     await view(parts.slice(1), new URLSearchParams(query || ""));

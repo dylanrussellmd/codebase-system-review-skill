@@ -24,10 +24,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
-TOOL_VERSION = "1.3.0"  # stamped by dev/build.py from `version:` in SKILL.md's frontmatter
-TOOL_HASH = "118784c92a97bc14827d023daab287d16dd6199d766e18c44b3964788dfda9e0"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
+TOOL_VERSION = "1.4.0"  # stamped by dev/build.py from `version:` in SKILL.md's frontmatter
+TOOL_HASH = "dc572dee48a000118388a31e05c33f7b797e9e5cb59748fab2e48ee8b64053a0"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
 SCHEMA = r"""-- =====================================================================
--- Code review ledger — schema version 5
+-- Code review ledger — schema version 7
 -- One SQLite file per project: <project root>/.code-review/ledger.sqlite
 -- Every connection must run:  PRAGMA foreign_keys = ON;
 -- Times are UTC ISO-8601 text with milliseconds (strftime('%Y-%m-%dT%H:%M:%fZ','now')); the tr_time_*
@@ -61,6 +61,66 @@ CREATE TABLE ledger_checks (
   label    TEXT NOT NULL,
   tier     TEXT NOT NULL CHECK (tier IN ('error','warning')),
   position INTEGER NOT NULL UNIQUE
+);
+
+-- ---------- Words: the single source of the ledger's status words (D-0009) ----
+-- Each lookup table lists the words a column may hold (referenced by foreign key), the plain label the viewer
+-- shows the owner, and the order the viewer lists them in. Views, triggers and the viewer pick words by the
+-- flags here, never by copies of the lists: a new issue status is one row in issue_statuses. Every other word
+-- column keeps its CHECK list, with its labels in enum_labels (a test keeps the two equal). Seeded at the end of
+-- this file.
+
+CREATE TABLE issue_statuses (
+  value    TEXT PRIMARY KEY,
+  label    TEXT NOT NULL,
+  position INTEGER NOT NULL UNIQUE,
+  active   INTEGER NOT NULL CHECK (active IN (0,1)),    -- still to fix (v_open_issues, the "Still to fix" filter)
+  resolved INTEGER NOT NULL CHECK (resolved IN (0,1)),  -- closed: entering it sets issues.resolved_at
+  fixed    INTEGER NOT NULL CHECK (fixed IN (0,1)),     -- the code was fixed: a regression match or check regresses it
+  reopens  INTEGER NOT NULL CHECK (reopens IN (0,1)),   -- closed without a fix: a recurrence reopens it
+  briefed  INTEGER NOT NULL CHECK (briefed IN (0,1)),   -- given to reviewers as a known issue (not merged away)
+  CHECK (active + resolved = 1),
+  CHECK (fixed = 0 OR resolved = 1),
+  CHECK (reopens = 0 OR (resolved = 1 AND fixed = 0))
+);
+
+CREATE TABLE severities (
+  value    TEXT PRIMARY KEY,                 -- H, M, L, T
+  label    TEXT NOT NULL,
+  position INTEGER NOT NULL UNIQUE           -- most severe first
+);
+
+CREATE TABLE match_types (
+  value     TEXT PRIMARY KEY,
+  label     TEXT NOT NULL,
+  position  INTEGER NOT NULL UNIQUE,
+  came_back INTEGER NOT NULL CHECK (came_back IN (0,1))  -- the issue was closed and was raised again
+);
+
+CREATE TABLE relation_types (
+  value         TEXT PRIMARY KEY,
+  label         TEXT NOT NULL,              -- read from the issue the relation starts at ("Duplicate of")
+  inverse_label TEXT NOT NULL,              -- read from the issue it points to ("Has duplicate")
+  position      INTEGER NOT NULL UNIQUE,
+  closes        INTEGER NOT NULL CHECK (closes IN (0,1))  -- recording it closes the active issue as duplicate
+);
+
+CREATE TABLE gate_kinds (
+  value    TEXT PRIMARY KEY,
+  label    TEXT NOT NULL,
+  position INTEGER NOT NULL UNIQUE
+);
+
+-- Labels of the words of every other word column (whose CHECK lists the allowed words). enum names the list:
+-- issue_kind is issues.kind and findings.kind, confidence is issue_relations.confidence and
+-- findings.match_confidence, verdict is the verdict of finding_requirements and review_requirement_checks.
+CREATE TABLE enum_labels (
+  enum     TEXT NOT NULL,
+  value    TEXT NOT NULL,
+  label    TEXT NOT NULL,
+  position INTEGER NOT NULL,
+  PRIMARY KEY (enum, value),
+  UNIQUE (enum, position)
 );
 
 -- ---------- Who and what ----------------------------------------------
@@ -137,13 +197,15 @@ CREATE TABLE design_goals (
 
 -- ---------- Reviews -----------------------------------------------------
 
--- ON DELETE CASCADE keys (review_repositories, review_goals, review_domains, reviewer_runs, findings, metrics and
--- the other children of reviews; finding_locations, finding_goals, finding_requirements of findings; phases,
--- steps, plan_reviews of plans; step_dependencies, step_findings, step_commits of steps; decision_issues of
--- decisions) fire only when their parent row is deleted. History is append-only: reviews, findings, steps and
--- decisions refuse DELETE (tr_*_no_delete), and a review that others still reference is refused by the plain
--- foreign keys too (issues.first_seen_review_id, plan_reviews ...). So the cascades reach only parents nothing
--- protects (a plan with no steps, for instance). Abandon a review (status 'abandoned') instead of deleting it.
+-- History is append-only: reviews, findings, steps and decisions refuse DELETE (tr_*_no_delete). The keys from
+-- the children of reviews (review_repositories, review_goals, review_domains, reviewer_runs, review_actors,
+-- findings, review_requirement_checks, review_issue_checks, metrics) and of findings (finding_locations,
+-- finding_goals, finding_requirements) are ON DELETE RESTRICT (schema 6), so even with the triggers gone a
+-- review or finding with rows under it cannot be deleted. The ON DELETE CASCADE keys left (phases, steps,
+-- plan_reviews of plans; step_dependencies, step_findings, step_commits of steps; decision_issues of decisions)
+-- fire only when their parent row is deleted, which the triggers refuse for steps and decisions; so they reach
+-- only parents nothing protects (a plan with no steps, for instance). Abandon a review (status 'abandoned')
+-- instead of deleting it.
 
 CREATE TABLE reviews (
   id                    INTEGER PRIMARY KEY,
@@ -182,7 +244,7 @@ CREATE TABLE reviews (
 
 -- The exact code state each review looked at.
 CREATE TABLE review_repositories (
-  review_id     INTEGER NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
+  review_id     INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
   repository_id INTEGER NOT NULL REFERENCES repositories(id),
   commit_sha    TEXT NOT NULL CHECK ((length(commit_sha) = 40 OR length(commit_sha) = 64)
                                    AND commit_sha NOT GLOB '*[^0-9a-f]*'),  -- full hash, lowercase hex
@@ -199,14 +261,14 @@ CREATE TABLE review_repositories (
 );
 
 CREATE TABLE review_goals (
-  review_id INTEGER NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
+  review_id INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
   goal_id   INTEGER NOT NULL REFERENCES design_goals(id),
   PRIMARY KEY (review_id, goal_id)
 );
 
 -- Which domains were proposed, approved, skipped, and why.
 CREATE TABLE review_domains (
-  review_id         INTEGER NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
+  review_id         INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
   domain_code       TEXT NOT NULL REFERENCES domains(code),
   decision          TEXT NOT NULL CHECK (decision IN ('included','skipped')),
   reason            TEXT NOT NULL,
@@ -220,7 +282,7 @@ CREATE TABLE review_domains (
 -- One row per reviewer (subagent) run.
 CREATE TABLE reviewer_runs (
   id             INTEGER PRIMARY KEY,
-  review_id      INTEGER NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
+  review_id      INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
   domain_code    TEXT NOT NULL REFERENCES domains(code),
   actor_id       INTEGER NOT NULL REFERENCES actors(id),
   label          TEXT NOT NULL,           -- 'tests-engine-A'
@@ -244,7 +306,7 @@ CREATE TABLE reviewer_runs (
 -- Every other agent that worked on a review (verifiers, indexers, matchers, drafters, fixers ...): reviewers are
 -- tied to it by reviewer_runs and the manager by reviews.manager_actor_id. v_review_agents lists all of them.
 CREATE TABLE review_actors (
-  review_id  INTEGER NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
+  review_id  INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
   actor_id   INTEGER NOT NULL REFERENCES actors(id),
   role_label TEXT NOT NULL,                -- what it did here: 'indexer for security.md', 'matcher'
   PRIMARY KEY (review_id, actor_id)
@@ -280,10 +342,8 @@ CREATE TABLE issues (
   kind                   TEXT NOT NULL CHECK (kind IN
                            ('defect','test','validation','refactor','feature','design','docs',
                             'logging','perf','security','ops','verify')),
-  severity               TEXT NOT NULL CHECK (severity IN ('H','M','L','T')),  -- current
-  status                 TEXT NOT NULL DEFAULT 'open' CHECK (status IN
-                           ('open','needs-decision','planned','in-progress','fixed','verified',
-                            'regressed','accepted-risk','wont-fix','duplicate','obsolete')),
+  severity               TEXT NOT NULL REFERENCES severities(value),             -- current
+  status                 TEXT NOT NULL DEFAULT 'open' REFERENCES issue_statuses(value),
   fingerprint            TEXT,                   -- domain:theme:sub[:symbol], for matching
   before_state           TEXT,                   -- what the system did when first found
   current_state          TEXT,                   -- what the latest review observed
@@ -315,9 +375,7 @@ CREATE TABLE issue_relations (
   id                       INTEGER PRIMARY KEY,
   from_issue_id            INTEGER NOT NULL REFERENCES issues(id),
   to_issue_id              INTEGER NOT NULL REFERENCES issues(id),
-  relation                 TEXT NOT NULL CHECK (relation IN
-                             ('duplicate-of','continuation-of','regression-of','related-to',
-                              'caused-by','blocks','supersedes','split-from','merged-into')),
+  relation                 TEXT NOT NULL REFERENCES relation_types(value),
   confidence               TEXT NOT NULL DEFAULT 'likely' CHECK (confidence IN ('certain','likely','possible')),
   rationale                TEXT NOT NULL,
   established_in_review_id INTEGER REFERENCES reviews(id),
@@ -331,16 +389,15 @@ CREATE TABLE issue_relations (
 
 CREATE TABLE findings (
   id                   INTEGER PRIMARY KEY,
-  review_id            INTEGER NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
+  review_id            INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
   reviewer_run_id      INTEGER REFERENCES reviewer_runs(id),
   point_id             TEXT NOT NULL,       -- index id: prefix + the report's own id (SEC-H3)
   issue_id             INTEGER REFERENCES issues(id),   -- set during matching, by an UPDATE (never on INSERT)
-  match_type           TEXT CHECK (match_type IN
-                         ('new','still-present','changed','recurrence','regression','continuation'))
+  match_type           TEXT REFERENCES match_types(value)
                          CHECK (match_type IS NULL OR issue_id IS NOT NULL),   -- a match type needs the issue
   match_confidence     TEXT CHECK (match_confidence IN ('certain','likely','possible')),
   match_rationale      TEXT,
-  severity             TEXT NOT NULL CHECK (severity IN ('H','M','L','T')),
+  severity             TEXT NOT NULL REFERENCES severities(value),
   kind                 TEXT NOT NULL CHECK (kind IN
                          ('defect','test','validation','refactor','feature','design','docs',
                           'logging','perf','security','ops','verify')),
@@ -378,7 +435,7 @@ CREATE TABLE findings (
 -- symbol survives line drift when looking for the same code in a later commit.
 CREATE TABLE finding_locations (
   id             INTEGER PRIMARY KEY,
-  finding_id     INTEGER NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
+  finding_id     INTEGER NOT NULL REFERENCES findings(id) ON DELETE RESTRICT,
   repository_id  INTEGER NOT NULL REFERENCES repositories(id),
   commit_sha     TEXT CHECK (commit_sha IS NULL OR ((length(commit_sha) = 40 OR length(commit_sha) = 64)
                                                     AND commit_sha NOT GLOB '*[^0-9a-f]*')),
@@ -412,13 +469,13 @@ CREATE TABLE finding_locations (
 );
 
 CREATE TABLE finding_goals (
-  finding_id INTEGER NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
+  finding_id INTEGER NOT NULL REFERENCES findings(id) ON DELETE RESTRICT,
   goal_id    INTEGER NOT NULL REFERENCES design_goals(id),
   PRIMARY KEY (finding_id, goal_id)
 );
 
 CREATE TABLE finding_requirements (
-  finding_id     INTEGER NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
+  finding_id     INTEGER NOT NULL REFERENCES findings(id) ON DELETE RESTRICT,
   requirement_id INTEGER NOT NULL REFERENCES requirements(id),
   verdict        TEXT NOT NULL CHECK (verdict IN ('matches','differs','partly','missing','untested')),
   PRIMARY KEY (finding_id, requirement_id)
@@ -428,7 +485,7 @@ CREATE TABLE finding_requirements (
 -- row has no finding). One row per review and requirement; v_requirement_trace lists them with counts.
 CREATE TABLE review_requirement_checks (
   id                INTEGER PRIMARY KEY,
-  review_id         INTEGER NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
+  review_id         INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
   requirement_id    INTEGER NOT NULL REFERENCES requirements(id),
   verdict           TEXT NOT NULL CHECK (verdict IN ('matches','differs','partly','missing','untested')),
   where_implemented TEXT,                  -- file, function or page that implements it
@@ -441,7 +498,7 @@ CREATE TABLE review_requirement_checks (
 -- What each review concluded about each issue already known when it started.
 -- Absence of a finding is NOT evidence of a fix; only a row here is.
 CREATE TABLE review_issue_checks (
-  review_id  INTEGER NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
+  review_id  INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
   issue_id   INTEGER NOT NULL REFERENCES issues(id),
   outcome    TEXT NOT NULL CHECK (outcome IN
                ('still-present','changed','fixed','regressed','obsolete','not-checked')),
@@ -487,10 +544,7 @@ CREATE TABLE gates (
   id              INTEGER PRIMARY KEY,
   code            TEXT NOT NULL UNIQUE      -- GATE-0001
                     CHECK (code GLOB 'GATE-[0-9][0-9][0-9][0-9]*' AND code NOT GLOB 'GATE-*[^0-9]*'),
-  kind            TEXT NOT NULL CHECK (kind IN
-                    ('domain-approval','plan-approval','decision','step-input',
-                     'confirm-false-finding','accept-risk','production-action',
-                     'review-handoff','confirm','other')),
+  kind            TEXT NOT NULL REFERENCES gate_kinds(value),
   title           TEXT NOT NULL,
   question        TEXT NOT NULL,
   context         TEXT,                     -- plain text the owner needs to answer
@@ -569,6 +623,11 @@ CREATE TABLE phases (
   UNIQUE (plan_id, number)
 );
 
+-- A step waiting on the owner asks through a gate of the kind its owner_need maps to (a test checks the map):
+--   owner_need decision -> gate kind decision
+--   owner_need confirm -> gate kind confirm
+--   owner_need review -> gate kind other
+--   owner_need production -> gate kind production-action
 CREATE TABLE steps (
   id                INTEGER PRIMARY KEY,
   plan_id           INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
@@ -595,6 +654,8 @@ CREATE TABLE steps (
   change_actor_id   INTEGER REFERENCES actors(id),
   change_commit_sha TEXT CHECK (change_commit_sha IS NULL OR ((length(change_commit_sha) = 40 OR length(change_commit_sha) = 64) AND change_commit_sha NOT GLOB '*[^0-9a-f]*')),
   change_note       TEXT,
+  no_findings_reason TEXT,                  -- why this step closes no finding by design (e.g. the follow-up
+                                            -- review that verifies the plan); v_coverage_problems skips it
   UNIQUE (plan_id, number)
 );
 
@@ -679,10 +740,10 @@ CREATE TABLE metric_defs (
 -- page weight, queries per page, p95 job time, dependency count ...
 CREATE TABLE metrics (
   id            INTEGER PRIMARY KEY,
-  review_id     INTEGER NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
+  review_id     INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
   domain_code   TEXT REFERENCES domains(code),
   repository_id INTEGER REFERENCES repositories(id),
-  name          TEXT NOT NULL,             -- stable key, e.g. 'mutation_score'
+  name          TEXT NOT NULL REFERENCES metric_defs(name),  -- stable key, e.g. 'mutation_score'
   scope         TEXT NOT NULL DEFAULT 'all',  -- module, page, job ...
   value         REAL NOT NULL,
   unit          TEXT,
@@ -723,6 +784,20 @@ CREATE TABLE artifacts (
 -- ---------- History of everything that changes state ------------------
 
 -- Append-only (G-04): triggers refuse every UPDATE and DELETE on events (tr_events_no_update/no_delete).
+-- Which tables write events (plan step 73; a test keeps these two lists equal to the triggers and the tables):
+-- Logged: reviews, reviewer_runs, issues, issue_relations, findings, review_issue_checks, decisions, gates, plans,
+-- steps, step_dependencies, step_findings, metrics.
+-- Not logged: finding_locations, finding_goals, finding_requirements, review_requirement_checks, test_runs,
+-- artifacts, step_commits, guard_tests, decision_issues, plan_reviews, phases, review_repositories, review_goals,
+-- review_domains, review_actors, actors, repositories, domains, themes, design_goals, requirements, metric_defs,
+-- meta, schema_migrations, ledger_checks, issue_statuses, severities, match_types, relation_types, gate_kinds,
+-- enum_labels.
+-- Why not: finding_locations, finding_goals and finding_requirements belong to their finding (logged when it is
+-- created) and cannot change but for fill-refs; review_requirement_checks, test_runs and artifacts are themselves
+-- timestamped records written once; step_commits, guard_tests, decision_issues, plan_reviews and phases are plan
+-- and evidence links whose rows are their own record; the rest are setup and configuration (who, which
+-- repositories, the catalogs and word lists, design goals and requirements, the schema's own bookkeeping), whose
+-- changes do not drive an issue's history.
 CREATE TABLE events (
   id          INTEGER PRIMARY KEY,
   entity_type TEXT NOT NULL CHECK (entity_type IN ('review','issue','step','plan','decision','finding','gate',
@@ -836,6 +911,12 @@ CREATE INDEX ix_fk_artifacts_reviewer_run_id         ON artifacts(reviewer_run_i
 CREATE INDEX ix_fk_events_actor_id                   ON events(actor_id);
 CREATE INDEX ix_fk_events_review_id                  ON events(review_id);
 CREATE INDEX ix_fk_events_step_id                    ON events(step_id);
+-- The keys to the lookup tables (schema 6), so a change to a lookup row finds its users without a scan.
+CREATE INDEX ix_fk_issues_severity                   ON issues(severity);
+CREATE INDEX ix_fk_issue_relations_relation          ON issue_relations(relation);
+CREATE INDEX ix_fk_findings_severity                 ON findings(severity);
+CREATE INDEX ix_fk_findings_match_type               ON findings(match_type);
+CREATE INDEX ix_fk_gates_kind                        ON gates(kind);
 
 -- ---------- Triggers ----------------------------------------------------
 -- (schema 3, plan steps 54-83) History is append-only, every tracked change writes an event, status and
@@ -883,6 +964,32 @@ WHEN NEW.status = 'fixed' AND OLD.status IS NOT 'fixed' AND NEW.after_state IS N
   SELECT RAISE(ABORT, 'an issue set fixed needs after_state (what the system does now)');
 END;
 
+-- Accepting a risk or declining a fix is a decision: its reason goes in resolution (v_closed_without_reason lists
+-- older rows without one).
+CREATE TRIGGER tr_issue_closed_needs_reason BEFORE UPDATE OF status, resolution ON issues
+WHEN NEW.status IN ('accepted-risk','wont-fix') AND NULLIF(trim(NEW.resolution), '') IS NULL BEGIN
+  SELECT RAISE(ABORT, 'an issue closed as accepted-risk or wont-fix needs a resolution (the reason)');
+END;
+
+CREATE TRIGGER tr_issue_closed_needs_reason_ins BEFORE INSERT ON issues
+WHEN NEW.status IN ('accepted-risk','wont-fix') AND NULLIF(trim(NEW.resolution), '') IS NULL BEGIN
+  SELECT RAISE(ABORT, 'an issue closed as accepted-risk or wont-fix needs a resolution (the reason)');
+END;
+
+-- Only a later review verifies a fix: entering 'verified' needs a 'fixed' check by the review named in
+-- change_review_id (tr_issue_checked sets both when it verifies), and that review started after every review that
+-- raised the issue (its first and last sightings). Reviews are compared with each other, not with resolved_at,
+-- since review times may be recorded rather than taken from the clock.
+CREATE TRIGGER tr_issue_verified_needs_check BEFORE UPDATE OF status ON issues
+WHEN NEW.status = 'verified' AND OLD.status IS NOT 'verified'
+  AND NOT EXISTS (SELECT 1 FROM review_issue_checks c JOIN reviews r ON r.id = c.review_id
+                  WHERE c.issue_id = NEW.id AND c.review_id = NEW.change_review_id AND c.outcome = 'fixed'
+                    AND julianday(r.started_at) > (SELECT max(julianday(x.started_at)) FROM reviews x
+                                                    WHERE x.id IN (OLD.first_seen_review_id,
+                                                                   OLD.last_seen_review_id))) BEGIN
+  SELECT RAISE(ABORT, 'an issue is verified only by a later review''s fixed check (record it in review_issue_checks)');
+END;
+
 -- resolved_at is set on entering a resolved status (kept from fixed to verified) and cleared on reopening;
 -- verified_at is set on verified and cleared on leaving it. A regression moves the old after_state into the
 -- event note and clears it.
@@ -896,9 +1003,9 @@ WHEN OLD.status IS NOT NEW.status BEGIN
                THEN COALESCE(NEW.change_note || ' ', '') || '(after_state was: ' || NEW.after_state || ')'
                ELSE NEW.change_note END);
   UPDATE issues SET
-    resolved_at = CASE WHEN NEW.status IN ('fixed','accepted-risk','wont-fix','duplicate','obsolete')
+    resolved_at = CASE WHEN NEW.status = 'verified' THEN COALESCE(resolved_at, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+                       WHEN NEW.status IN (SELECT value FROM issue_statuses WHERE resolved = 1)
                        THEN strftime('%Y-%m-%dT%H:%M:%fZ','now')
-                       WHEN NEW.status = 'verified' THEN COALESCE(resolved_at, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
                        ELSE NULL END,
     verified_at = CASE WHEN NEW.status = 'verified' THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE NULL END,
     after_state = CASE WHEN NEW.status = 'regressed' THEN NULL ELSE after_state END
@@ -1006,6 +1113,12 @@ WHEN EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at I
   SELECT RAISE(ABORT, 'that domain is retired; use a current one');
 END;
 
+-- Severity T means a missing test, nothing else (a finding's severity and kind never change after insert).
+CREATE TRIGGER tr_finding_test_severity BEFORE INSERT ON findings
+WHEN NEW.severity = 'T' AND NEW.kind IS NOT 'test' BEGIN
+  SELECT RAISE(ABORT, 'severity T is for a missing test: give the finding kind test, or another severity');
+END;
+
 CREATE TRIGGER tr_finding_created AFTER INSERT ON findings BEGIN
   INSERT INTO events(entity_type, entity_id, event, to_value, actor_id, review_id, note)
   VALUES ('finding', NEW.id, 'created', NEW.point_id, NULL, NEW.review_id, NEW.summary);
@@ -1033,7 +1146,7 @@ END;
 -- a closed issue raised again is a 'recurrence'.
 CREATE TRIGGER tr_finding_regression_guard BEFORE UPDATE OF issue_id, match_type ON findings
 WHEN NEW.match_type = 'regression' AND NEW.issue_id IS NOT NULL
- AND (SELECT status FROM issues WHERE id = NEW.issue_id) NOT IN ('fixed','verified','regressed') BEGIN
+ AND (SELECT status FROM issues WHERE id = NEW.issue_id) NOT IN (SELECT value FROM issue_statuses WHERE fixed = 1 OR value = 'regressed') BEGIN
   SELECT RAISE(ABORT, 'match_type regression needs a fixed or verified issue; use recurrence, still-present or changed');
 END;
 
@@ -1074,7 +1187,7 @@ WHEN OLD.issue_id IS NOT NEW.issue_id BEGIN
   SELECT 'issue', NEW.issue_id, 'recurred', status, NEW.match_type, NEW.review_id,
          'raised again by finding ' || NEW.point_id || ' while ' || status
     FROM issues WHERE NEW.issue_id IS NOT NULL AND id = NEW.issue_id AND status = 'accepted-risk'
-     AND NEW.verification <> 'false' AND NEW.match_type IN ('recurrence','regression');
+     AND NEW.verification <> 'false' AND NEW.match_type IN (SELECT value FROM match_types WHERE came_back = 1);
   UPDATE issues SET
     times_seen = max(1, (SELECT count(DISTINCT f.review_id) FROM findings f
                           WHERE f.issue_id = NEW.issue_id AND f.verification <> 'false')),
@@ -1096,8 +1209,9 @@ WHEN OLD.issue_id IS NOT NEW.issue_id BEGIN
     change_note = 'matched by finding ' || NEW.point_id,
     status = CASE
       WHEN NEW.verification = 'false' THEN status
-      WHEN NEW.match_type = 'regression' AND status IN ('fixed','verified') THEN 'regressed'
-      WHEN NEW.match_type IN ('recurrence','regression') AND status IN ('obsolete','wont-fix','duplicate') THEN 'open'
+      WHEN NEW.match_type = 'regression' AND status IN (SELECT value FROM issue_statuses WHERE fixed = 1) THEN 'regressed'
+      WHEN NEW.match_type IN (SELECT value FROM match_types WHERE came_back = 1)
+       AND status IN (SELECT value FROM issue_statuses WHERE reopens = 1) THEN 'open'
       ELSE status END
   WHERE NEW.issue_id IS NOT NULL AND id = NEW.issue_id;
   INSERT INTO events(entity_type, entity_id, event, to_value, review_id, note)
@@ -1185,7 +1299,7 @@ WHEN NEW.relation IN ('blocks','duplicate-of','merged-into') BEGIN
                   SELECT NEW.to_issue_id
                   UNION SELECT r.to_issue_id FROM issue_relations r JOIN reach ON r.from_issue_id = reach.n
                    WHERE r.relation = NEW.relation
-                      OR (NEW.relation <> 'blocks' AND r.relation IN ('duplicate-of','merged-into')))
+                      OR (NEW.relation <> 'blocks' AND r.relation IN (SELECT value FROM relation_types WHERE closes = 1)))
                 SELECT 1 FROM reach WHERE n = NEW.from_issue_id);
 END;
 
@@ -1196,7 +1310,7 @@ WHEN NEW.relation IN ('blocks','duplicate-of','merged-into') BEGIN
                   SELECT NEW.to_issue_id
                   UNION SELECT r.to_issue_id FROM issue_relations r JOIN reach ON r.from_issue_id = reach.n
                    WHERE r.id <> NEW.id AND (r.relation = NEW.relation
-                      OR (NEW.relation <> 'blocks' AND r.relation IN ('duplicate-of','merged-into'))))
+                      OR (NEW.relation <> 'blocks' AND r.relation IN (SELECT value FROM relation_types WHERE closes = 1))))
                 SELECT 1 FROM reach WHERE n = NEW.from_issue_id);
 END;
 
@@ -1209,7 +1323,7 @@ END;
 
 -- Recording that an active issue is a duplicate of (or merged into) another closes it as duplicate.
 CREATE TRIGGER tr_relation_closes_duplicate AFTER INSERT ON issue_relations
-WHEN NEW.relation IN ('duplicate-of','merged-into') BEGIN
+WHEN NEW.relation IN (SELECT value FROM relation_types WHERE closes = 1) BEGIN
   UPDATE issues SET
     status = 'duplicate',
     resolution = COALESCE(resolution, NEW.relation || ' ' || (SELECT code FROM issues WHERE id = NEW.to_issue_id)),
@@ -1218,7 +1332,7 @@ WHEN NEW.relation IN ('duplicate-of','merged-into') BEGIN
     change_step_id = NULL,
     change_commit_sha = NULL,
     change_note = NEW.relation || ' ' || (SELECT code FROM issues WHERE id = NEW.to_issue_id) || ': ' || NEW.rationale
-  WHERE id = NEW.from_issue_id AND status IN ('open','needs-decision','planned','in-progress','regressed');
+  WHERE id = NEW.from_issue_id AND status IN (SELECT value FROM issue_statuses WHERE active = 1);
 END;
 
 CREATE TRIGGER tr_relation_no_delete BEFORE DELETE ON issue_relations BEGIN
@@ -1229,7 +1343,12 @@ END;
 
 -- One check per review and issue, never replaced (INSERT OR REPLACE is refused too); not by the review that
 -- first found the issue; its finding must be from the same review; and 'fixed' cannot be recorded by a review
--- that also raised the issue again.
+-- that also raised the issue again. (A check that says the issue moved carries evidence: tr_check_needs_evidence.)
+CREATE TRIGGER tr_check_needs_evidence BEFORE INSERT ON review_issue_checks
+WHEN NEW.outcome IN ('fixed','regressed','changed') AND NULLIF(trim(NEW.evidence), '') IS NULL BEGIN
+  SELECT RAISE(ABORT, 'a fixed, regressed or changed check needs evidence (what the review saw)');
+END;
+
 CREATE TRIGGER tr_check_guard BEFORE INSERT ON review_issue_checks BEGIN
   SELECT RAISE(ABORT, 'checks are history: this review already recorded a check of this issue')
   WHERE EXISTS (SELECT 1 FROM review_issue_checks WHERE review_id = NEW.review_id AND issue_id = NEW.issue_id);
@@ -1272,16 +1391,16 @@ CREATE TRIGGER tr_issue_checked AFTER INSERT ON review_issue_checks BEGIN
     change_note = 'review check: ' || NEW.outcome || COALESCE(' — ' || NEW.evidence, ''),
     status = CASE
       WHEN NEW.outcome = 'fixed' AND status = 'fixed' THEN 'verified'
-      WHEN NEW.outcome = 'fixed' AND status IN ('open','needs-decision','planned','in-progress','regressed') THEN 'fixed'
-      WHEN NEW.outcome IN ('regressed','still-present','changed') AND status IN ('fixed','verified') THEN 'regressed'
+      WHEN NEW.outcome = 'fixed' AND status IN (SELECT value FROM issue_statuses WHERE active = 1) THEN 'fixed'
+      WHEN NEW.outcome IN ('regressed','still-present','changed') AND status IN (SELECT value FROM issue_statuses WHERE fixed = 1) THEN 'regressed'
       WHEN NEW.outcome = 'obsolete' AND status <> 'duplicate' THEN 'obsolete'
       ELSE status END,
-    after_state = CASE WHEN NEW.outcome = 'fixed' AND status IN ('open','needs-decision','planned','in-progress','regressed')
+    after_state = CASE WHEN NEW.outcome = 'fixed' AND status IN (SELECT value FROM issue_statuses WHERE active = 1)
                        THEN COALESCE(after_state, NEW.evidence,
                                      'Found fixed by review ' || (SELECT code FROM reviews WHERE id = NEW.review_id) || '.')
                        ELSE after_state END,
     resolution = CASE
-      WHEN NEW.outcome = 'fixed' AND status IN ('open','needs-decision','planned','in-progress','regressed')
+      WHEN NEW.outcome = 'fixed' AND status IN (SELECT value FROM issue_statuses WHERE active = 1)
       THEN COALESCE(resolution,
              'Found fixed by a later review while plan step ' || (
                SELECT p.code || ' #' || s.number FROM step_findings sf
@@ -2125,19 +2244,23 @@ END;
 
 -- ---------- Views ---------------------------------------------------------
 
--- Issues not yet closed, oldest and most severe first.
+-- Issues not yet closed, oldest and most severe first. locations: the primary locations of the issue's real
+-- findings (v_real_findings), each prefixed with its repository name when the ledger has more than one, so the
+-- same path in two repositories stays two places.
 CREATE VIEW v_open_issues AS
 SELECT i.code, i.title, i.severity, i.status, i.domain_code, i.theme_code, i.sub,
        i.times_seen, fr.code AS first_seen, fr.started_at AS first_seen_at,
        lr.code AS last_seen, cr.code AS last_checked, i.current_state, i.recommendation,
-       (SELECT group_concat(DISTINCT fl.path || COALESCE('#' || fl.symbol, ''))
-          FROM findings f JOIN finding_locations fl ON fl.finding_id = f.id
+       (SELECT group_concat(DISTINCT CASE WHEN (SELECT count(*) FROM repositories) > 1 THEN rp.name || ':' ELSE '' END
+                                     || fl.path || COALESCE('#' || fl.symbol, ''))
+          FROM v_real_findings f JOIN finding_locations fl ON fl.finding_id = f.id
+          JOIN repositories rp ON rp.id = fl.repository_id
          WHERE f.issue_id = i.id AND fl.role = 'primary') AS locations
 FROM issues i
 JOIN reviews fr ON fr.id = i.first_seen_review_id
 LEFT JOIN reviews lr ON lr.id = i.last_seen_review_id
 LEFT JOIN reviews cr ON cr.id = i.last_checked_review_id
-WHERE i.status IN ('open','needs-decision','planned','in-progress','regressed')
+WHERE i.status IN (SELECT value FROM issue_statuses WHERE active = 1)
 ORDER BY CASE i.severity WHEN 'H' THEN 0 WHEN 'M' THEN 1 WHEN 'L' THEN 2 ELSE 3 END,
          fr.started_at;
 
@@ -2156,16 +2279,17 @@ SELECT i.domain_code, i.code, i.title, i.severity, i.status, i.current_state,
              FROM decision_issues di JOIN decisions d ON d.id = di.decision_id
             WHERE di.issue_id = i.id AND d.status IN ('decided','revisit') ORDER BY d.code) x) AS decisions
 FROM issues i
-WHERE i.status NOT IN ('duplicate','obsolete')
-ORDER BY i.domain_code, i.code;
+WHERE i.status IN (SELECT value FROM issue_statuses WHERE briefed = 1)
+ORDER BY i.domain_code, i.id;   -- by id, so ISS-9999 comes before ISS-10000
 
--- Issues raised by more than one review, or that came back after a fix.
+-- Issues raised by more than one review, or that came back after a fix. Only real findings count (v_real_findings;
+-- times_seen counts them too): a false re-raise does not make an issue recurring.
 CREATE VIEW v_recurring_issues AS
 SELECT i.code, i.title, i.severity, i.status, i.times_seen,
        (SELECT count(*) FROM events e WHERE e.entity_type = 'issue' AND e.entity_id = i.id
           AND e.event = 'status-changed' AND e.to_value = 'regressed') AS regressions,
        (SELECT group_concat(r.code, ', ') FROM
-          (SELECT DISTINCT f.review_id FROM findings f WHERE f.issue_id = i.id) x
+          (SELECT DISTINCT f.review_id FROM v_real_findings f WHERE f.issue_id = i.id) x
           JOIN reviews r ON r.id = x.review_id) AS reviews
 FROM issues i
 WHERE i.times_seen > 1 OR EXISTS (SELECT 1 FROM events e WHERE e.entity_type = 'issue'
@@ -2192,65 +2316,96 @@ JOIN issues a ON a.id = r.from_issue_id
 JOIN issues b ON b.id = r.to_issue_id
 LEFT JOIN reviews rv ON rv.id = r.established_in_review_id;
 
--- Per review and domain: counts by severity, verified and false. r.code is a GROUP BY term so that a WHERE
--- review = ? filter is pushed into the findings scan (one review's findings, not every review's).
+-- Per review and domain: counts by severity, verified and false. Every count but false_findings is of real
+-- findings (the v_real_findings rule, verification <> 'false'); false_findings counts the rest. came_back counts
+-- the issues of this review's real findings that this review sent back, from their events (the trigger's own
+-- record): regressed, reopened from a closed status, or raised again while accepted. r.code is a GROUP BY term so
+-- that a WHERE review = ? filter is pushed into the findings scan (one review's findings, not every review's).
 CREATE VIEW v_review_summary AS
 SELECT r.code AS review, r.started_at, f.domain_code,
-       count(*) AS points,
-       sum(f.severity = 'H') AS high, sum(f.severity = 'M') AS medium,
-       sum(f.severity = 'L') AS low,  sum(f.severity = 'T') AS tests,
+       sum(f.verification <> 'false') AS points,
+       sum(f.verification <> 'false' AND f.severity = 'H') AS high,
+       sum(f.verification <> 'false' AND f.severity = 'M') AS medium,
+       sum(f.verification <> 'false' AND f.severity = 'L') AS low,
+       sum(f.verification <> 'false' AND f.severity = 'T') AS tests,
        sum(f.verification = 'confirmed') AS confirmed,
        sum(f.verification = 'false') AS false_findings,
-       sum(f.match_type IN ('new','continuation')) AS new_issues,  -- a continuation opens a new issue
-       sum(f.match_type IN ('still-present','changed')) AS carried_over,
-       sum(f.match_type IN ('recurrence','regression')) AS came_back
+       sum(f.verification <> 'false' AND f.match_type IN ('new','continuation')) AS new_issues,  -- a continuation opens a new issue
+       sum(f.verification <> 'false' AND f.match_type IN ('still-present','changed')) AS carried_over,
+       (SELECT count(DISTINCT e.entity_id) FROM events e
+         WHERE e.entity_type = 'issue' AND e.review_id = r.id
+           AND ((e.event = 'status-changed' AND (e.to_value = 'regressed'
+                 OR (e.to_value = 'open' AND e.from_value IN (SELECT value FROM issue_statuses WHERE reopens = 1))))
+                OR e.event = 'recurred')
+           AND EXISTS (SELECT 1 FROM v_real_findings f2 WHERE f2.review_id = r.id AND f2.issue_id = e.entity_id
+                         AND f2.domain_code = f.domain_code)) AS came_back
 FROM findings f JOIN reviews r ON r.id = f.review_id
 GROUP BY r.id, r.code, f.domain_code
 ORDER BY r.started_at, f.domain_code;
 
 -- Findings not yet matched to an issue (must be empty before consolidating). False findings too: a false finding
--- is matched to an issue closed as obsolete, so the ledger keeps what was claimed and why it was wrong.
+-- is matched to an issue closed as obsolete, so the ledger keeps what was claimed and why it was wrong. An
+-- abandoned review's findings are not required to be matched.
 CREATE VIEW v_unmatched_findings AS
 SELECT r.code AS review, f.point_id, f.severity, f.summary
 FROM findings f JOIN reviews r ON r.id = f.review_id
-WHERE f.issue_id IS NULL;
+WHERE f.issue_id IS NULL AND r.status <> 'abandoned';
+
+-- Every finding but the false ones: the one definition of a real finding. Counts (times_seen, v_recurring_issues,
+-- v_review_summary, v_file_hotspots, v_open_issues' locations) use it; the must-be-empty checks do not, since a
+-- false finding must still be matched (to an issue closed as obsolete) and closed by a plan step.
+CREATE VIEW v_real_findings AS
+SELECT * FROM findings WHERE verification <> 'false';
 
 -- Known issues in domains that ran, with no check recorded (must be empty). Known = first seen in another review
--- and opened before this one started, compared as julianday() values (an instant, not text).
+-- and opened before this one started, compared as julianday() values (an instant, not text). An abandoned review
+-- needs no checks.
 CREATE VIEW v_unchecked_known_issues AS
 SELECT r.code AS review, i.code AS issue, i.domain_code, i.title
 FROM reviews r
 JOIN review_domains rd ON rd.review_id = r.id AND rd.decision = 'included'
 JOIN issues i ON i.domain_code = rd.domain_code
-WHERE i.first_seen_review_id <> r.id
+WHERE r.status <> 'abandoned'
+  AND i.first_seen_review_id <> r.id
   AND julianday(i.opened_at) < julianday(r.started_at)
-  AND i.status NOT IN ('duplicate','obsolete')
+  AND i.status IN (SELECT value FROM issue_statuses WHERE briefed = 1)
   AND NOT EXISTS (SELECT 1 FROM review_issue_checks c WHERE c.review_id = r.id AND c.issue_id = i.id);
 
 -- Coverage: findings of a plan's reviews closed by no step (must be empty). A finding is covered by a step of
 -- this plan, or by a done step of a plan this plan supersedes (work already finished under the old plan). The
 -- probe goes from the finding to its steps (ix_step_findings_find), never over a whole plan's steps per finding.
+-- False findings count too (the plan's 'record false findings' step closes them). A dropped step covers nothing
+-- unless a decided decision is linked to it (the owner chose not to do it). Superseded and abandoned plans, and
+-- abandoned reviews, are not checked.
 CREATE VIEW v_uncovered_findings AS
 SELECT p.code AS plan, r.code AS review, f.point_id, f.severity, f.summary
 FROM plans p
 JOIN plan_reviews pr ON pr.plan_id = p.id
 JOIN reviews r ON r.id = pr.review_id
 JOIN findings f ON f.review_id = r.id
-WHERE f.verification <> 'false'
+WHERE p.status NOT IN ('superseded','abandoned') AND r.status <> 'abandoned'
   AND NOT EXISTS (SELECT 1 FROM step_findings sf JOIN steps s ON s.id = sf.step_id
                     JOIN plans sp ON sp.id = +s.plan_id
                   WHERE sf.finding_id = f.id
-                    AND (sp.id = p.id OR (sp.superseded_by = p.id AND s.status = 'done')));
+                    AND (sp.id = p.id OR (sp.superseded_by = p.id AND s.status = 'done'))
+                    AND (s.status <> 'dropped'
+                         OR EXISTS (SELECT 1 FROM decisions d WHERE d.step_id = s.id AND d.status = 'decided')));
 
--- Coverage: steps that close nothing, and multi-closed findings with no reason.
+-- Coverage (must be empty): steps that close nothing, and findings closed by several steps without a reason. A
+-- dropped step, or one whose no_findings_reason says why it closes nothing by design (the follow-up review that
+-- verifies the plan), is not a problem; dropped steps do not count towards closing a finding twice. Superseded
+-- and abandoned plans are not checked.
 CREATE VIEW v_coverage_problems AS
 SELECT p.code AS plan, 'step closes nothing' AS problem, CAST(s.number AS TEXT) AS item
 FROM steps s JOIN plans p ON p.id = s.plan_id
-WHERE NOT EXISTS (SELECT 1 FROM step_findings sf WHERE sf.step_id = s.id)
+WHERE p.status NOT IN ('superseded','abandoned') AND s.status <> 'dropped'
+  AND NULLIF(trim(s.no_findings_reason), '') IS NULL
+  AND NOT EXISTS (SELECT 1 FROM step_findings sf WHERE sf.step_id = s.id)
 UNION ALL
 SELECT p.code, 'finding closed by several steps without a reason', f.point_id
 FROM step_findings sf JOIN steps s ON s.id = sf.step_id JOIN plans p ON p.id = s.plan_id
 JOIN findings f ON f.id = sf.finding_id
+WHERE p.status NOT IN ('superseded','abandoned') AND s.status <> 'dropped'
 GROUP BY p.id, sf.finding_id
 HAVING count(*) > 1 AND sum(sf.multi_reason IS NULL) > 0;
 
@@ -2258,9 +2413,10 @@ HAVING count(*) > 1 AND sum(sf.multi_reason IS NULL) > 0;
 CREATE VIEW v_plan_progress AS
 SELECT p.code AS plan, ph.number AS phase, ph.title,
        min(s.number) AS first_step, max(s.number) AS last_step, count(s.id) AS steps,
-       sum(s.status = 'done') AS done, sum(s.status = 'doing') AS doing,
-       sum(s.status = 'waiting-owner') AS waiting_owner,
-       sum(s.status = 'not-started') AS not_started, sum(s.status = 'dropped') AS dropped
+       COALESCE(sum(s.status = 'done'), 0) AS done, COALESCE(sum(s.status = 'doing'), 0) AS doing,
+       COALESCE(sum(s.status = 'waiting-owner'), 0) AS waiting_owner,
+       COALESCE(sum(s.status = 'not-started'), 0) AS not_started,
+       COALESCE(sum(s.status = 'dropped'), 0) AS dropped   -- 0, not NULL, for a phase with no steps
 FROM phases ph JOIN plans p ON p.id = ph.plan_id
 LEFT JOIN steps s ON s.phase_id = ph.id
 GROUP BY ph.id ORDER BY p.code, ph.number;
@@ -2288,15 +2444,20 @@ FROM decisions d WHERE d.status IN ('open','revisit')
   AND NOT EXISTS (SELECT 1 FROM gates g WHERE g.decision_id = d.id AND g.status IN ('open','answered'))
   AND NOT EXISTS (SELECT 1 FROM gates g WHERE g.step_id = d.step_id AND g.status IN ('open','answered'));
 
--- Every code reference with what is needed to get back to the exact lines.
+-- Every code reference with what is needed to get back to the exact lines. commit_sha is the location's own
+-- commit, else its review's commit for that repository (commit_from says which: 'location', 'review', or NULL
+-- when neither is known; git_command is then NULL and v_untraceable_refs lists the row as 'no commit').
 CREATE VIEW v_code_refs AS
 SELECT r.code AS review, f.point_id, i.code AS issue, fl.id AS location_id, fl.role,
-       rp.name AS repository, rp.path AS repo_path, fl.commit_sha, rr.tag_name,
+       rp.name AS repository, rp.path AS repo_path, COALESCE(fl.commit_sha, rr.commit_sha) AS commit_sha,
+       CASE WHEN fl.commit_sha IS NOT NULL THEN 'location' WHEN rr.commit_sha IS NOT NULL THEN 'review' END
+         AS commit_from,
+       rr.tag_name,
        fl.path, fl.line_start, fl.line_end, fl.symbol, fl.blob_sha, fl.permalink,
        -- every argument single-quoted for a POSIX shell (an embedded quote is closed, escaped and reopened);
        -- ledger.py show, /api/source and the viewer's Copy button all use this one command
        'git -C ''' || replace(COALESCE(NULLIF(rp.path, ''), '.'), '''', '''\''''') || ''' show '''
-         || replace(fl.commit_sha || ':' || fl.path, '''', '''\''''') || ''''
+         || replace(COALESCE(fl.commit_sha, rr.commit_sha) || ':' || fl.path, '''', '''\''''') || ''''
          || CASE WHEN fl.line_start IS NOT NULL
                  THEN ' | sed -n ''' || fl.line_start || ',' || COALESCE(fl.line_end, fl.line_start) || 'p'''
                  ELSE '' END AS git_command,
@@ -2311,15 +2472,19 @@ LEFT JOIN issues i ON i.id = f.issue_id;
 -- References that could not be traced back (must be empty after indexing). A whole-file reference (whole_file = 1)
 -- needs no symbol; a not-text one (binary or not UTF-8) needs no excerpt. An excerpt whose line count differs from
 -- its line range (lines past the end of the file, or a hand-written excerpt) is a problem, except a whole-file
--- excerpt cut at 200 lines (excerpt_status 'truncated').
+-- excerpt cut at 200 lines (excerpt_status 'truncated'). An empty excerpt is no excerpt; a location whose commit
+-- differs from the commit its review looked at is a problem (unless the finding was discovered during fix work,
+-- at a later commit: discovered_in_step_id); a finding with no location at all is one too. An
+-- abandoned review's findings are not checked.
 CREATE VIEW v_untraceable_refs AS
 SELECT review, point_id, path, problem FROM (
   SELECT r.code AS review, f.point_id, fl.path,
          CASE WHEN fl.commit_sha IS NULL THEN 'no commit'
+              WHEN rr.commit_sha IS NOT NULL AND fl.commit_sha <> rr.commit_sha AND f.discovered_in_step_id IS NULL
+                THEN 'commit differs from the review commit'
               WHEN fl.line_start IS NULL AND fl.whole_file = 0 AND fl.symbol IS NULL THEN 'no lines or symbol'
               WHEN fl.line_start IS NULL AND fl.whole_file = 0 THEN 'symbol not resolved to lines'
-              WHEN fl.excerpt IS NULL AND fl.excerpt_status IS NOT 'not-text' THEN 'no excerpt'
-              WHEN fl.excerpt = '' THEN 'empty excerpt'
+              WHEN (fl.excerpt IS NULL OR fl.excerpt = '') AND fl.excerpt_status IS NOT 'not-text' THEN 'no excerpt'
               -- line count = newlines + 1 (an excerpt may also end with one extra newline)
               WHEN fl.excerpt_status IS NULL AND fl.line_start IS NOT NULL
                    AND length(fl.excerpt) - length(replace(fl.excerpt, char(10), '')) + 1
@@ -2333,6 +2498,12 @@ SELECT review, point_id, path, problem FROM (
   JOIN findings f ON f.id = fl.finding_id
   JOIN reviews r ON r.id = f.review_id
   LEFT JOIN review_repositories rr ON rr.review_id = f.review_id AND rr.repository_id = fl.repository_id
+  WHERE r.status <> 'abandoned'
+  UNION ALL
+  SELECT r.code, f.point_id, NULL, 'no location'
+  FROM findings f JOIN reviews r ON r.id = f.review_id
+  WHERE r.status <> 'abandoned'
+    AND NOT EXISTS (SELECT 1 FROM finding_locations fl WHERE fl.finding_id = f.id)
 ) WHERE problem IS NOT NULL;
 
 -- Defects found during fix work (findings.discovered_in_step_id) that no plan step closes yet while their issue is
@@ -2347,7 +2518,7 @@ JOIN plans p ON p.id = s.plan_id
 JOIN reviews r ON r.id = f.review_id
 LEFT JOIN issues i ON i.id = f.issue_id
 WHERE f.verification <> 'false'
-  AND (i.id IS NULL OR i.status IN ('open','needs-decision','planned','in-progress','regressed'))
+  AND (i.id IS NULL OR i.status IN (SELECT value FROM issue_statuses WHERE active = 1))
   AND NOT EXISTS (SELECT 1 FROM step_findings sf JOIN steps cs ON cs.id = sf.step_id
                   WHERE sf.finding_id = f.id AND cs.status <> 'dropped')
   AND NOT EXISTS (SELECT 1 FROM findings f2 JOIN step_findings sf ON sf.finding_id = f2.id
@@ -2360,7 +2531,7 @@ SELECT i.code, i.title, i.status,
        CASE WHEN NOT EXISTS (SELECT 1 FROM guard_tests g WHERE g.issue_id = i.id)
             THEN 'no guard test' ELSE 'guard test removed' END AS problem
 FROM issues i
-WHERE i.status IN ('fixed','verified') AND i.kind NOT IN ('docs','design')
+WHERE i.status IN (SELECT value FROM issue_statuses WHERE fixed = 1) AND COALESCE(i.kind, '') NOT IN ('docs','design')
   AND NOT EXISTS (SELECT 1 FROM guard_tests g WHERE g.issue_id = i.id AND g.still_exists = 1);
 
 -- Trend of each metric across reviews, with its label and direction from metric_defs (the unit falls back to the
@@ -2375,13 +2546,14 @@ LEFT JOIN repositories rp ON rp.id = m.repository_id
 LEFT JOIN metric_defs md ON md.name = m.name
 ORDER BY m.name, m.scope, r.started_at;
 
--- Hotspot memory: files that keep producing issues.
+-- Hotspot memory: files that keep producing issues, per repository (the same path in two repositories is two
+-- files), from real findings only (v_real_findings).
 CREATE VIEW v_file_hotspots AS
-SELECT fl.path, count(DISTINCT f.issue_id) AS issues, count(DISTINCT f.review_id) AS reviews,
-       sum(f.severity = 'H') AS high_points
-FROM finding_locations fl JOIN findings f ON f.id = fl.finding_id
-WHERE f.verification <> 'false'
-GROUP BY fl.path ORDER BY issues DESC, high_points DESC;
+SELECT rp.name AS repository, fl.path, count(DISTINCT f.issue_id) AS issues,
+       count(DISTINCT f.review_id) AS reviews, sum(f.severity = 'H') AS high_points
+FROM finding_locations fl JOIN v_real_findings f ON f.id = fl.finding_id
+JOIN repositories rp ON rp.id = fl.repository_id
+GROUP BY fl.repository_id, fl.path ORDER BY issues DESC, high_points DESC, rp.name, fl.path;
 
 -- Decisions the owner has already made, so future reviews don't re-raise them blindly.
 CREATE VIEW v_standing_decisions AS
@@ -2417,8 +2589,8 @@ WHERE s.status NOT IN ('done','dropped')
   AND NOT EXISTS (SELECT 1 FROM step_findings sf JOIN findings f ON f.id = sf.finding_id
                   LEFT JOIN issues i ON i.id = f.issue_id
                   WHERE sf.step_id = s.id
-                    AND (i.id IS NULL OR i.status NOT IN
-                         ('fixed','verified','accepted-risk','wont-fix','duplicate','obsolete')));
+                    AND (i.id IS NULL OR i.status IN
+                         (SELECT value FROM issue_statuses WHERE active = 1)));
 
 -- Per repository, the commit the latest finished (handed-off) review looked at: the start of the next review's
 -- `git log <commit>..HEAD`.
@@ -2457,6 +2629,119 @@ JOIN reviews r ON r.id = x.review_id
 JOIN actors a ON a.id = x.actor_id
 LEFT JOIN actors pa ON pa.id = a.parent_actor_id
 ORDER BY r.code, CASE a.kind WHEN 'manager' THEN 0 WHEN 'reviewer' THEN 1 ELSE 2 END, x.role, a.id;
+
+-- History gaps (must be empty): an issue with no 'opened' event, an issue whose status is not the last status
+-- its events logged, and a gate answered or applied with no event reaching that status. The triggers write
+-- these events, so a gap means a row was written with the triggers bypassed.
+CREATE VIEW v_history_gaps AS
+SELECT 'issue' AS kind, i.code AS ref, 'no opened event' AS problem
+FROM issues i
+WHERE NOT EXISTS (SELECT 1 FROM events e WHERE e.entity_type = 'issue' AND e.entity_id = i.id AND e.event = 'opened')
+UNION ALL
+SELECT 'issue', x.code, 'status ' || x.status || ' not in its history (last logged: ' || x.last || ')'
+FROM (SELECT i.code, i.status,
+             (SELECT e.to_value FROM events e WHERE e.entity_type = 'issue' AND e.entity_id = i.id
+                AND e.event IN ('opened','status-changed') ORDER BY e.id DESC LIMIT 1) AS last
+        FROM issues i) x
+WHERE x.last IS NOT NULL AND x.last IS NOT x.status
+UNION ALL
+SELECT 'gate', g.code, g.status || ' with no event'
+FROM gates g
+WHERE g.status IN ('answered','applied')
+  AND NOT EXISTS (SELECT 1 FROM events e WHERE e.entity_type = 'gate' AND e.entity_id = g.id
+                    AND e.to_value = g.status);
+
+-- Matches whose type disagrees with the issue (must be empty): a continuation needs a continuation-of relation
+-- from its new issue; 'new' (or 'continuation') is for an issue this review opened; 'still-present', 'changed',
+-- 'recurrence' and 'regression' are for an issue an earlier review opened; a recurrence is of an issue that was
+-- closed at some point; a real finding still present on an issue fixed before this review started is a
+-- regression (match it so: it then regresses the issue). Abandoned reviews are not checked.
+CREATE VIEW v_match_problems AS
+SELECT review, point_id, issue, match_type, problem FROM (
+  SELECT r.code AS review, f.point_id, i.code AS issue, f.match_type,
+         CASE WHEN f.match_type = 'continuation'
+                   AND NOT EXISTS (SELECT 1 FROM issue_relations ir WHERE ir.from_issue_id = i.id
+                                     AND ir.relation = 'continuation-of')
+                THEN 'continuation with no continuation-of relation'
+              WHEN f.match_type IN ('new','continuation') AND i.first_seen_review_id <> f.review_id
+                THEN 'matched as new to an issue first seen in another review'
+              WHEN f.match_type IN ('still-present','changed','recurrence','regression')
+                   AND i.first_seen_review_id = f.review_id
+                THEN 'matched as seen before to an issue this review opened'
+              WHEN f.match_type = 'recurrence'
+                   AND NOT EXISTS (SELECT 1 FROM events e WHERE e.entity_type = 'issue' AND e.entity_id = i.id
+                                     AND e.event IN ('opened','status-changed')
+                                     AND e.to_value IN ('fixed','verified','accepted-risk','wont-fix',
+                                                        'duplicate','obsolete'))
+                THEN 'recurrence of an issue that was never closed'
+              WHEN f.match_type IN ('still-present','changed') AND f.verification <> 'false'
+                   AND i.status IN ('fixed','verified') AND i.resolved_at IS NOT NULL
+                   AND julianday(i.resolved_at) < julianday(r.started_at)
+                THEN 'still present on a fixed issue: match it as a regression' END AS problem
+  FROM findings f
+  JOIN reviews r ON r.id = f.review_id
+  JOIN issues i ON i.id = f.issue_id
+  WHERE r.status <> 'abandoned'
+) WHERE problem IS NOT NULL;
+
+-- Steps closing a finding of a review their plan does not cover (must be empty): add the review back to
+-- plan_reviews or close the finding in its own plan. tr_step_finding_in_plan refuses such a link when it is made;
+-- this lists links made before it, or left behind when a plan_reviews row was removed.
+CREATE VIEW v_off_plan_coverage AS
+SELECT p.code AS plan, s.number AS step, r.code AS review, f.point_id
+FROM step_findings sf
+JOIN steps s ON s.id = sf.step_id
+JOIN plans p ON p.id = s.plan_id
+JOIN findings f ON f.id = sf.finding_id
+JOIN reviews r ON r.id = f.review_id
+WHERE p.status NOT IN ('superseded','abandoned')
+  AND NOT EXISTS (SELECT 1 FROM plan_reviews pr WHERE pr.plan_id = p.id AND pr.review_id = f.review_id);
+
+-- Done steps whose issues are still to do (must be empty): when a step is done, its issues move on (fixed with
+-- after_state, or another closing status), unless another unfinished step still works on them. Regressed issues
+-- are left to the next plan. Superseded and abandoned plans are not checked.
+CREATE VIEW v_done_steps_open_issues AS
+SELECT DISTINCT p.code AS plan, s.number AS step, i.code AS issue, i.status AS issue_status
+FROM steps s
+JOIN plans p ON p.id = s.plan_id
+JOIN step_findings sf ON sf.step_id = s.id
+JOIN findings f ON f.id = sf.finding_id
+JOIN issues i ON i.id = f.issue_id
+WHERE s.status = 'done' AND p.status NOT IN ('superseded','abandoned') AND f.verification <> 'false'
+  AND i.status IN ('open','needs-decision','planned','in-progress')
+  AND NOT EXISTS (SELECT 1 FROM findings f2 JOIN step_findings sf2 ON sf2.finding_id = f2.id
+                  JOIN steps s2 ON s2.id = sf2.step_id JOIN plans p2 ON p2.id = s2.plan_id
+                  WHERE f2.issue_id = i.id AND s2.status NOT IN ('done','dropped')
+                    AND p2.status NOT IN ('superseded','abandoned'))
+ORDER BY p.code, s.number, i.id;
+
+-- Issues closed as accepted-risk or wont-fix with no resolution (must be empty): the reason is the record. New
+-- closings are refused by tr_issue_closed_needs_reason; this lists rows written before it.
+CREATE VIEW v_closed_without_reason AS
+SELECT code, title, status FROM issues
+WHERE status IN ('accepted-risk','wont-fix') AND NULLIF(trim(resolution), '') IS NULL;
+
+-- Relation problems (must be empty): a related-to pair stored in both directions (related-to is symmetric, so one
+-- row says it; tr_relation_noreverse_dup refuses the second for new rows). The later row is listed.
+CREATE VIEW v_relation_problems AS
+SELECT a.code AS from_issue, b.code AS to_issue, ir.relation, 'related-to stored in both directions' AS problem
+FROM issue_relations ir
+JOIN issues a ON a.id = ir.from_issue_id
+JOIN issues b ON b.id = ir.to_issue_id
+WHERE ir.relation = 'related-to'
+  AND EXISTS (SELECT 1 FROM issue_relations rv WHERE rv.relation = 'related-to'
+                AND rv.from_issue_id = ir.to_issue_id AND rv.to_issue_id = ir.from_issue_id AND rv.id < ir.id);
+
+-- Review checks citing a finding matched to another issue (must be empty): a check's finding is the evidence for
+-- that issue.
+CREATE VIEW v_check_finding_owner AS
+SELECT r.code AS review, i.code AS issue, f.point_id, fi.code AS finding_issue
+FROM review_issue_checks c
+JOIN reviews r ON r.id = c.review_id
+JOIN issues i ON i.id = c.issue_id
+JOIN findings f ON f.id = c.finding_id
+JOIN issues fi ON fi.id = f.issue_id
+WHERE f.issue_id <> c.issue_id;
 
 -- ---------- Catalog seed (extend with custom domains/themes as needed) ---
 
@@ -2555,6 +2840,116 @@ INSERT OR IGNORE INTO metric_defs(name, label, unit, better) VALUES
  ('dependency_count','Dependencies','packages','lower'),
  ('vulnerable_dependencies','Dependencies with known vulnerabilities','packages','lower');
 
+-- The ledger's words and their labels (see issue_statuses ... enum_labels). Migration 0006 seeds the same rows.
+INSERT INTO issue_statuses(value, label, position, active, resolved, fixed, reopens, briefed) VALUES
+ ('open','Open',1,1,0,0,0,1),
+ ('needs-decision','Needs your decision',2,1,0,0,0,1),
+ ('planned','Planned',3,1,0,0,0,1),
+ ('in-progress','In progress',4,1,0,0,0,1),
+ ('fixed','Fixed',5,0,1,1,0,1),
+ ('verified','Fixed and confirmed',6,0,1,1,0,1),
+ ('regressed','Came back',7,1,0,0,0,1),
+ ('accepted-risk','Accepted risk',8,0,1,0,0,1),
+ ('wont-fix','Won''t fix',9,0,1,0,1,1),
+ ('duplicate','Duplicate',10,0,1,0,1,0),
+ ('obsolete','No longer applies',11,0,1,0,1,0);
+INSERT INTO severities(value, label, position) VALUES
+ ('H','High',1), ('M','Medium',2), ('L','Low',3), ('T','Missing test',4);
+INSERT INTO match_types(value, label, position, came_back) VALUES
+ ('new','New',1,0),
+ ('still-present','Still present',2,0),
+ ('changed','Changed',3,0),
+ ('recurrence','Came back',4,1),
+ ('regression','Came back after a fix',5,1),
+ ('continuation','Continues an earlier issue',6,0);
+INSERT INTO relation_types(value, label, inverse_label, position, closes) VALUES
+ ('duplicate-of','Duplicate of','Has duplicate',1,1),
+ ('continuation-of','Continues','Continued by',2,0),
+ ('regression-of','Regression of','Came back as',3,0),
+ ('related-to','Related to','Related to',4,0),
+ ('caused-by','Caused by','Causes',5,0),
+ ('blocks','Blocks','Blocked by',6,0),
+ ('supersedes','Supersedes','Superseded by',7,0),
+ ('split-from','Split from','Split into',8,0),
+ ('merged-into','Merged into','Absorbed',9,1);
+INSERT INTO gate_kinds(value, label, position) VALUES
+ ('domain-approval','Approve review domains',1),
+ ('plan-approval','Approve fix plan',2),
+ ('decision','Decision',3),
+ ('step-input','Input on a step',4),
+ ('confirm-false-finding','Confirm a false finding',5),
+ ('accept-risk','Accept a risk',6),
+ ('production-action','Production action',7),
+ ('review-handoff','Review hand-off',8),
+ ('confirm','Confirm',9),
+ ('other','Question',10);
+INSERT INTO enum_labels(enum, value, label, position) VALUES
+ ('check_tier','error','Must be empty',1), ('check_tier','warning','Worth a look',2),
+ ('actor_kind','owner','Owner',1), ('actor_kind','human','Person',2), ('actor_kind','manager','Manager agent',3),
+ ('actor_kind','reviewer','Reviewer agent',4), ('actor_kind','verifier','Verifier agent',5),
+ ('actor_kind','indexer','Indexer agent',6), ('actor_kind','matcher','Matcher agent',7),
+ ('actor_kind','drafter','Plan drafter agent',8), ('actor_kind','fixer','Fixer agent',9), ('actor_kind','tool','Tool',10),
+ ('domain_category','correctness','Correctness',1), ('domain_category','architecture','Architecture',2),
+ ('domain_category','user-facing','User-facing',3), ('domain_category','security-operations','Security and operations',4),
+ ('domain_category','documentation','Documentation',5), ('domain_category','custom','Custom',6),
+ ('review_scope','full','Full review',1), ('review_scope','partial','Partial review',2),
+ ('review_scope','targeted','Targeted review',3), ('review_scope','second','Second review',4),
+ ('review_scope','fix-verification','Fix check',5),
+ ('review_status','planning','Planning',1), ('review_status','awaiting-approval','Waiting for your approval',2),
+ ('review_status','approved','Approved',3), ('review_status','running','Reviewers running',4),
+ ('review_status','verifying','Verifying',5), ('review_status','indexing','Indexing points',6),
+ ('review_status','consolidating','Writing it up',7), ('review_status','handed-off','Handed off',8),
+ ('review_status','abandoned','Abandoned',9),
+ ('domain_decision','included','Included',1), ('domain_decision','skipped','Skipped',2),
+ ('owner_change','none','As proposed',1), ('owner_change','added-by-owner','Added by you',2),
+ ('owner_change','removed-by-owner','Removed by you',3), ('owner_change','modified-by-owner','Changed by you',4),
+ ('run_status','queued','Queued',1), ('run_status','running','Running',2), ('run_status','finished','Finished',3),
+ ('run_status','failed','Failed',4), ('run_status','cancelled','Cancelled',5),
+ ('requirement_status','active','In force',1), ('requirement_status','superseded','Replaced',2),
+ ('requirement_status','withdrawn','Withdrawn',3),
+ ('issue_kind','defect','Defect',1), ('issue_kind','test','Missing test',2), ('issue_kind','validation','Validation',3),
+ ('issue_kind','refactor','Refactor',4), ('issue_kind','feature','Feature',5), ('issue_kind','design','Design',6),
+ ('issue_kind','docs','Documentation',7), ('issue_kind','logging','Logging',8), ('issue_kind','perf','Performance',9),
+ ('issue_kind','security','Security',10), ('issue_kind','ops','Operations',11), ('issue_kind','verify','To verify',12),
+ ('confidence','certain','Certain',1), ('confidence','likely','Likely',2), ('confidence','possible','Possible',3),
+ ('verification','unverified','Not checked yet',1), ('verification','confirmed','Confirmed',2),
+ ('verification','partly','Partly confirmed',3), ('verification','false','False finding',4),
+ ('verification','not-checkable','Could not be checked',5),
+ ('location_role','primary','Main place',1), ('location_role','also','Also here',2), ('location_role','test','Test',3),
+ ('location_role','doc','Documentation',4), ('location_role','config','Configuration',5),
+ ('excerpt_status','truncated','First 200 lines only',1), ('excerpt_status','not-text','Not text',2),
+ ('verdict','matches','Matches',1), ('verdict','differs','Differs',2), ('verdict','partly','Partly matches',3),
+ ('verdict','missing','Missing',4), ('verdict','untested','Not tested',5),
+ ('tested','yes','Tested',1), ('tested','partly','Partly tested',2), ('tested','no','Not tested',3),
+ ('check_outcome','still-present','Still present',1), ('check_outcome','changed','Changed',2),
+ ('check_outcome','fixed','Fixed',3), ('check_outcome','regressed','Came back',4),
+ ('check_outcome','obsolete','No longer applies',5), ('check_outcome','not-checked','Not checked',6),
+ ('decision_status','open','Open',1), ('decision_status','decided','Decided',2), ('decision_status','revisit','To revisit',3),
+ ('gate_status','open','Waiting on you',1), ('gate_status','answered','Answered, waiting for the agent',2),
+ ('gate_status','applied','Done',3), ('gate_status','withdrawn','Withdrawn',4),
+ ('answered_via','chat','In chat',1), ('answered_via','viewer','In the viewer',2), ('answered_via','other','Elsewhere',3),
+ ('plan_status','drafting','Drafting',1), ('plan_status','awaiting-approval','Waiting for your approval',2),
+ ('plan_status','approved','Approved',3), ('plan_status','in-progress','In progress',4),
+ ('plan_status','complete','Complete',5), ('plan_status','superseded','Replaced',6), ('plan_status','abandoned','Abandoned',7),
+ ('owner_need','none','',1), ('owner_need','decision','Your decision',2), ('owner_need','confirm','Your confirmation',3),
+ ('owner_need','review','Your review',4), ('owner_need','production','Production action',5),
+ ('step_status','not-started','Not started',1), ('step_status','doing','In progress',2),
+ ('step_status','waiting-owner','Waiting on you',3), ('step_status','done','Done',4), ('step_status','dropped','Dropped',5),
+ ('test_purpose','baseline','Baseline',1), ('test_purpose','targeted','Targeted',2), ('test_purpose','flake-check','Flakiness check',3),
+ ('test_purpose','mutation','Mutation testing',4), ('test_purpose','before-fix','Before the fix',5),
+ ('test_purpose','after-fix','After the fix',6), ('test_purpose','ci','Continuous integration',7),
+ ('metric_better','higher','Higher is better',1), ('metric_better','lower','Lower is better',2),
+ ('metric_better','none','Neither',3),
+ ('metric_method','measured','Measured',1), ('metric_method','counted','Counted',2), ('metric_method','estimated','Estimated',3),
+ ('artifact_kind','brief','Brief',1), ('artifact_kind','report','Report',2), ('artifact_kind','index','Index',3),
+ ('artifact_kind','summary-doc','Summary document',4), ('artifact_kind','plan-file','Plan file',5),
+ ('artifact_kind','progress-page','Progress page',6), ('artifact_kind','probe-script','Probe script',7),
+ ('artifact_kind','other','Other',8),
+ ('entity_type','review','Review',1), ('entity_type','issue','Issue',2), ('entity_type','step','Plan step',3),
+ ('entity_type','plan','Plan',4), ('entity_type','decision','Decision',5), ('entity_type','finding','Finding',6),
+ ('entity_type','gate','Question for you',7), ('entity_type','relation','Relation',8), ('entity_type','check','Review check',9),
+ ('entity_type','step-finding','Step coverage',10);
+
 -- The checks `ledger.py check` runs (see ledger_checks).
 INSERT OR IGNORE INTO ledger_checks(view, label, tier, position) VALUES
  ('v_unmatched_findings','Findings not matched to an issue','error',10),
@@ -2566,12 +2961,23 @@ INSERT OR IGNORE INTO ledger_checks(view, label, tier, position) VALUES
 
 INSERT INTO ledger_checks(view, label, tier, position) VALUES
  ('v_unplanned_discoveries','Defects found during fix work that no plan step closes','error',60);
-INSERT INTO meta(key, value) VALUES ('schema_version','5');
+
+INSERT INTO ledger_checks(view, label, tier, position) VALUES
+ ('v_history_gaps','Issues and gates whose history is missing an event','error',70),
+ ('v_match_problems','Matches whose type disagrees with the issue','error',72),
+ ('v_off_plan_coverage','Steps closing a finding of a review their plan does not cover','error',74),
+ ('v_done_steps_open_issues','Done steps whose issues are still to do','error',76),
+ ('v_closed_without_reason','Issues accepted or declined with no reason recorded','error',78),
+ ('v_relation_problems','Related-to pairs stored in both directions','error',80),
+ ('v_check_finding_owner','Review checks citing a finding of another issue','error',82);
+INSERT INTO meta(key, value) VALUES ('schema_version','7');
 INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger schema'),
   (2, 'url, path, hash and code checks; repositories.allow_outside_root; finding_locations.excerpt_redacted'),
   (3, 'integrity rules: codes, hashes, checks, append-only history, owner actor on gate answers'),
   (4, 'check registry, requirement trace, review agents, metric catalog, domain descriptions, foreign-key indexes'),
-  (5, 'one UTC time format; whole-file and not-text references; report, plan narrative and fix-time discoveries');
+  (5, 'one UTC time format; whole-file and not-text references; report, plan narrative and fix-time discoveries'),
+  (6, 'lookup tables for the ledger''s words and labels; RESTRICT keys under reviews and findings; metrics.name catalogued'),
+  (7, 'must-be-empty checks for history gaps, matches, off-plan and done-step coverage, closings, relations and checks; steps.no_findings_reason');
 """
 PAGE = r"""<!doctype html>
 <html lang="en">
@@ -2730,25 +3136,18 @@ async function api(path, body){
   return j;
 }
 const words = s => s == null ? "" : String(s).replace(/[-_]/g," ").replace(/^./, c => c.toUpperCase());
-const L = {
-  sev:{H:"High",M:"Medium",L:"Low",T:"Missing test"},
-  issue:{open:"Open","needs-decision":"Needs your decision",planned:"Planned","in-progress":"In progress",fixed:"Fixed",verified:"Fixed and confirmed",regressed:"Came back","accepted-risk":"Accepted risk","wont-fix":"Won't fix",duplicate:"Duplicate",obsolete:"No longer applies"},
-  match:{new:"New","still-present":"Still present",changed:"Changed",recurrence:"Came back",regression:"Came back after a fix",continuation:"Continues an earlier issue"},
-  verif:{unverified:"Not checked yet",confirmed:"Confirmed",partly:"Partly confirmed",false:"False finding","not-checkable":"Could not be checked"},
-  review:{planning:"Planning","awaiting-approval":"Waiting for your approval",approved:"Approved",running:"Reviewers running",verifying:"Verifying",indexing:"Indexing points",consolidating:"Writing it up","handed-off":"Handed off",abandoned:"Abandoned"},
-  scope:{full:"Full review",partial:"Partial review",targeted:"Targeted review",second:"Second review","fix-verification":"Fix check"},
-  step:{"not-started":"Not started",doing:"In progress","waiting-owner":"Waiting on you",done:"Done",dropped:"Dropped"},
-  need:{none:"",decision:"Your decision",confirm:"Your confirmation",review:"Your review",production:"Production action"},
-  gate:{"domain-approval":"Approve review domains","plan-approval":"Approve fix plan",decision:"Decision","step-input":"Input on a step","confirm-false-finding":"Confirm a false finding","accept-risk":"Accept a risk","production-action":"Production action","review-handoff":"Review hand-off",confirm:"Confirm",other:"Question"},
-  gstat:{open:"Waiting on you",answered:"Answered, waiting for the agent",applied:"Done",withdrawn:"Withdrawn"},
-  rel:{"duplicate-of":"Duplicate of","continuation-of":"Continues","regression-of":"Regression of","related-to":"Related to","caused-by":"Caused by",blocks:"Blocks",supersedes:"Supersedes","split-from":"Split from","merged-into":"Merged into"},
-  relIn:{"duplicate-of":"Has duplicate","continuation-of":"Continued by","regression-of":"Came back as","related-to":"Related to","caused-by":"Causes",blocks:"Blocked by",supersedes:"Superseded by","split-from":"Split into","merged-into":"Absorbed"},
-  check:{"still-present":"Still present",changed:"Changed",fixed:"Fixed",regressed:"Came back",obsolete:"No longer applies","not-checked":"Not checked"},
-  kind:{defect:"Defect",test:"Missing test",validation:"Validation",refactor:"Refactor",feature:"Feature",design:"Design",docs:"Documentation",logging:"Logging",perf:"Performance",security:"Security",ops:"Operations",verify:"To verify"},
-  run:{queued:"Queued",running:"Running",finished:"Finished",failed:"Failed",cancelled:"Cancelled"},
-  plan:{drafting:"Drafting","awaiting-approval":"Waiting for your approval",approved:"Approved","in-progress":"In progress",complete:"Complete",superseded:"Replaced",abandoned:"Abandoned"},
-  decision:{open:"Open",decided:"Decided",revisit:"To revisit"},
-};
+// The words' labels come from the ledger (GET /api/overview labels.enums, from its lookup tables); L maps the page's
+// short names to them. Without them (an older ledger) a word is shown through words(), and a severity letter
+// through the fallback below, so the page never shows a raw value.
+const ENUM_OF = {sev:"severity", issue:"issue_status", match:"match_type", verif:"verification", review:"review_status",
+  scope:"review_scope", step:"step_status", need:"owner_need", gate:"gate_kind", gstat:"gate_status", rel:"relation_type",
+  relIn:"relation_type_inverse", check:"check_outcome", kind:"issue_kind", run:"run_status", plan:"plan_status",
+  decision:"decision_status"};
+const FALLBACK = {sev:{H:"High",M:"Medium",L:"Low",T:"Missing test"}, need:{none:""}};
+let L = {};
+const setLabels = enums => { L = Object.fromEntries(Object.entries(ENUM_OF).map(([k, e]) =>
+  [k, Object.assign({}, FALLBACK[k] || {}, (enums || {})[e] || {})])); };
+setLabels({});
 const lab = (map, v) => (L[map] && L[map][v] !== undefined) ? L[map][v] : words(v);
 const domainName = c => c ? (LABELS.domains[c] || words(c)) : "";
 const themeName = c => c ? (LABELS.themes[c] || words(c)) : "";
@@ -3191,7 +3590,7 @@ async function route(){
   const view = VIEWS[name] || VIEWS.home;
   const tab = {review:"reviews", issue:"issues", plan:"plans", history:"inbox"}[name] || (VIEWS[name] ? name : "home");
   try {
-    if (!OVERVIEW || name === "home" || name === "inbox") { OVERVIEW = await api("overview"); LABELS = OVERVIEW.labels;
+    if (!OVERVIEW || name === "home" || name === "inbox") { OVERVIEW = await api("overview"); LABELS = OVERVIEW.labels; setLabels(LABELS.enums);
       put(document.getElementById("brand"), OVERVIEW.project, h("small", null, "review ledger")); document.title = OVERVIEW.project + " · review ledger"; }
     drawTabs(tab);
     await view(parts.slice(1), new URLSearchParams(query || ""));
@@ -4045,6 +4444,607 @@ ALTER TABLE finding_locations ADD COLUMN excerpt_status TEXT
 
 INSERT INTO ledger_checks(view, label, tier, position) VALUES
  ('v_unplanned_discoveries','Defects found during fix work that no plan step closes','error',60);
+-- migration: 0006-lookups.sql
+-- lookup tables for the ledger's words and labels; RESTRICT keys under reviews and findings; metrics.name catalogued
+-- Plan P-0001 steps 95 (D-0009), 94, 70 and 61. The ledger's words get lookup tables: issue_statuses (with the
+-- active, resolved, fixed, reopens and briefed flags that views and triggers now read), severities, match_types
+-- (came_back), relation_types (inverse labels; closes) and gate_kinds, referenced by foreign key instead of the
+-- CHECK lists on issues.status, issues/findings.severity, findings.match_type, issue_relations.relation and
+-- gates.kind; every other word list keeps its CHECK and has its labels in enum_labels. metrics.name now
+-- references metric_defs(name), and the keys from the children of reviews and findings become ON DELETE RESTRICT
+-- (the append-only triggers already refused those deletes, so nothing behaves differently). Fifteen tables are
+-- rebuilt with SQLite's recipe (create <table>_new, copy the rows, drop the old table, rename the new one,
+-- re-create its indexes); every CHECK, trigger and column of schemas 3-5 is kept. migrate first lists any row a
+-- rule of this migration would refuse.
+
+CREATE TABLE issue_statuses (
+  value    TEXT PRIMARY KEY,
+  label    TEXT NOT NULL,
+  position INTEGER NOT NULL UNIQUE,
+  active   INTEGER NOT NULL CHECK (active IN (0,1)),    -- still to fix (v_open_issues, the "Still to fix" filter)
+  resolved INTEGER NOT NULL CHECK (resolved IN (0,1)),  -- closed: entering it sets issues.resolved_at
+  fixed    INTEGER NOT NULL CHECK (fixed IN (0,1)),     -- the code was fixed: a regression match or check regresses it
+  reopens  INTEGER NOT NULL CHECK (reopens IN (0,1)),   -- closed without a fix: a recurrence reopens it
+  briefed  INTEGER NOT NULL CHECK (briefed IN (0,1)),   -- given to reviewers as a known issue (not merged away)
+  CHECK (active + resolved = 1),
+  CHECK (fixed = 0 OR resolved = 1),
+  CHECK (reopens = 0 OR (resolved = 1 AND fixed = 0))
+);
+
+CREATE TABLE severities (
+  value    TEXT PRIMARY KEY,                 -- H, M, L, T
+  label    TEXT NOT NULL,
+  position INTEGER NOT NULL UNIQUE           -- most severe first
+);
+
+CREATE TABLE match_types (
+  value     TEXT PRIMARY KEY,
+  label     TEXT NOT NULL,
+  position  INTEGER NOT NULL UNIQUE,
+  came_back INTEGER NOT NULL CHECK (came_back IN (0,1))  -- the issue was closed and was raised again
+);
+
+CREATE TABLE relation_types (
+  value         TEXT PRIMARY KEY,
+  label         TEXT NOT NULL,              -- read from the issue the relation starts at ("Duplicate of")
+  inverse_label TEXT NOT NULL,              -- read from the issue it points to ("Has duplicate")
+  position      INTEGER NOT NULL UNIQUE,
+  closes        INTEGER NOT NULL CHECK (closes IN (0,1))  -- recording it closes the active issue as duplicate
+);
+
+CREATE TABLE gate_kinds (
+  value    TEXT PRIMARY KEY,
+  label    TEXT NOT NULL,
+  position INTEGER NOT NULL UNIQUE
+);
+
+CREATE TABLE enum_labels (
+  enum     TEXT NOT NULL,
+  value    TEXT NOT NULL,
+  label    TEXT NOT NULL,
+  position INTEGER NOT NULL,
+  PRIMARY KEY (enum, value),
+  UNIQUE (enum, position)
+);
+
+INSERT INTO issue_statuses(value, label, position, active, resolved, fixed, reopens, briefed) VALUES
+ ('open','Open',1,1,0,0,0,1),
+ ('needs-decision','Needs your decision',2,1,0,0,0,1),
+ ('planned','Planned',3,1,0,0,0,1),
+ ('in-progress','In progress',4,1,0,0,0,1),
+ ('fixed','Fixed',5,0,1,1,0,1),
+ ('verified','Fixed and confirmed',6,0,1,1,0,1),
+ ('regressed','Came back',7,1,0,0,0,1),
+ ('accepted-risk','Accepted risk',8,0,1,0,0,1),
+ ('wont-fix','Won''t fix',9,0,1,0,1,1),
+ ('duplicate','Duplicate',10,0,1,0,1,0),
+ ('obsolete','No longer applies',11,0,1,0,1,0);
+
+INSERT INTO severities(value, label, position) VALUES
+ ('H','High',1), ('M','Medium',2), ('L','Low',3), ('T','Missing test',4);
+
+INSERT INTO match_types(value, label, position, came_back) VALUES
+ ('new','New',1,0),
+ ('still-present','Still present',2,0),
+ ('changed','Changed',3,0),
+ ('recurrence','Came back',4,1),
+ ('regression','Came back after a fix',5,1),
+ ('continuation','Continues an earlier issue',6,0);
+
+INSERT INTO relation_types(value, label, inverse_label, position, closes) VALUES
+ ('duplicate-of','Duplicate of','Has duplicate',1,1),
+ ('continuation-of','Continues','Continued by',2,0),
+ ('regression-of','Regression of','Came back as',3,0),
+ ('related-to','Related to','Related to',4,0),
+ ('caused-by','Caused by','Causes',5,0),
+ ('blocks','Blocks','Blocked by',6,0),
+ ('supersedes','Supersedes','Superseded by',7,0),
+ ('split-from','Split from','Split into',8,0),
+ ('merged-into','Merged into','Absorbed',9,1);
+
+INSERT INTO gate_kinds(value, label, position) VALUES
+ ('domain-approval','Approve review domains',1),
+ ('plan-approval','Approve fix plan',2),
+ ('decision','Decision',3),
+ ('step-input','Input on a step',4),
+ ('confirm-false-finding','Confirm a false finding',5),
+ ('accept-risk','Accept a risk',6),
+ ('production-action','Production action',7),
+ ('review-handoff','Review hand-off',8),
+ ('confirm','Confirm',9),
+ ('other','Question',10);
+
+INSERT INTO enum_labels(enum, value, label, position) VALUES
+ ('check_tier','error','Must be empty',1), ('check_tier','warning','Worth a look',2),
+ ('actor_kind','owner','Owner',1), ('actor_kind','human','Person',2), ('actor_kind','manager','Manager agent',3),
+ ('actor_kind','reviewer','Reviewer agent',4), ('actor_kind','verifier','Verifier agent',5),
+ ('actor_kind','indexer','Indexer agent',6), ('actor_kind','matcher','Matcher agent',7),
+ ('actor_kind','drafter','Plan drafter agent',8), ('actor_kind','fixer','Fixer agent',9), ('actor_kind','tool','Tool',10),
+ ('domain_category','correctness','Correctness',1), ('domain_category','architecture','Architecture',2),
+ ('domain_category','user-facing','User-facing',3), ('domain_category','security-operations','Security and operations',4),
+ ('domain_category','documentation','Documentation',5), ('domain_category','custom','Custom',6),
+ ('review_scope','full','Full review',1), ('review_scope','partial','Partial review',2),
+ ('review_scope','targeted','Targeted review',3), ('review_scope','second','Second review',4),
+ ('review_scope','fix-verification','Fix check',5),
+ ('review_status','planning','Planning',1), ('review_status','awaiting-approval','Waiting for your approval',2),
+ ('review_status','approved','Approved',3), ('review_status','running','Reviewers running',4),
+ ('review_status','verifying','Verifying',5), ('review_status','indexing','Indexing points',6),
+ ('review_status','consolidating','Writing it up',7), ('review_status','handed-off','Handed off',8),
+ ('review_status','abandoned','Abandoned',9),
+ ('domain_decision','included','Included',1), ('domain_decision','skipped','Skipped',2),
+ ('owner_change','none','As proposed',1), ('owner_change','added-by-owner','Added by you',2),
+ ('owner_change','removed-by-owner','Removed by you',3), ('owner_change','modified-by-owner','Changed by you',4),
+ ('run_status','queued','Queued',1), ('run_status','running','Running',2), ('run_status','finished','Finished',3),
+ ('run_status','failed','Failed',4), ('run_status','cancelled','Cancelled',5),
+ ('requirement_status','active','In force',1), ('requirement_status','superseded','Replaced',2),
+ ('requirement_status','withdrawn','Withdrawn',3),
+ ('issue_kind','defect','Defect',1), ('issue_kind','test','Missing test',2), ('issue_kind','validation','Validation',3),
+ ('issue_kind','refactor','Refactor',4), ('issue_kind','feature','Feature',5), ('issue_kind','design','Design',6),
+ ('issue_kind','docs','Documentation',7), ('issue_kind','logging','Logging',8), ('issue_kind','perf','Performance',9),
+ ('issue_kind','security','Security',10), ('issue_kind','ops','Operations',11), ('issue_kind','verify','To verify',12),
+ ('confidence','certain','Certain',1), ('confidence','likely','Likely',2), ('confidence','possible','Possible',3),
+ ('verification','unverified','Not checked yet',1), ('verification','confirmed','Confirmed',2),
+ ('verification','partly','Partly confirmed',3), ('verification','false','False finding',4),
+ ('verification','not-checkable','Could not be checked',5),
+ ('location_role','primary','Main place',1), ('location_role','also','Also here',2), ('location_role','test','Test',3),
+ ('location_role','doc','Documentation',4), ('location_role','config','Configuration',5),
+ ('excerpt_status','truncated','First 200 lines only',1), ('excerpt_status','not-text','Not text',2),
+ ('verdict','matches','Matches',1), ('verdict','differs','Differs',2), ('verdict','partly','Partly matches',3),
+ ('verdict','missing','Missing',4), ('verdict','untested','Not tested',5),
+ ('tested','yes','Tested',1), ('tested','partly','Partly tested',2), ('tested','no','Not tested',3),
+ ('check_outcome','still-present','Still present',1), ('check_outcome','changed','Changed',2),
+ ('check_outcome','fixed','Fixed',3), ('check_outcome','regressed','Came back',4),
+ ('check_outcome','obsolete','No longer applies',5), ('check_outcome','not-checked','Not checked',6),
+ ('decision_status','open','Open',1), ('decision_status','decided','Decided',2), ('decision_status','revisit','To revisit',3),
+ ('gate_status','open','Waiting on you',1), ('gate_status','answered','Answered, waiting for the agent',2),
+ ('gate_status','applied','Done',3), ('gate_status','withdrawn','Withdrawn',4),
+ ('answered_via','chat','In chat',1), ('answered_via','viewer','In the viewer',2), ('answered_via','other','Elsewhere',3),
+ ('plan_status','drafting','Drafting',1), ('plan_status','awaiting-approval','Waiting for your approval',2),
+ ('plan_status','approved','Approved',3), ('plan_status','in-progress','In progress',4),
+ ('plan_status','complete','Complete',5), ('plan_status','superseded','Replaced',6), ('plan_status','abandoned','Abandoned',7),
+ ('owner_need','none','',1), ('owner_need','decision','Your decision',2), ('owner_need','confirm','Your confirmation',3),
+ ('owner_need','review','Your review',4), ('owner_need','production','Production action',5),
+ ('step_status','not-started','Not started',1), ('step_status','doing','In progress',2),
+ ('step_status','waiting-owner','Waiting on you',3), ('step_status','done','Done',4), ('step_status','dropped','Dropped',5),
+ ('test_purpose','baseline','Baseline',1), ('test_purpose','targeted','Targeted',2), ('test_purpose','flake-check','Flakiness check',3),
+ ('test_purpose','mutation','Mutation testing',4), ('test_purpose','before-fix','Before the fix',5),
+ ('test_purpose','after-fix','After the fix',6), ('test_purpose','ci','Continuous integration',7),
+ ('metric_better','higher','Higher is better',1), ('metric_better','lower','Lower is better',2),
+ ('metric_better','none','Neither',3),
+ ('metric_method','measured','Measured',1), ('metric_method','counted','Counted',2), ('metric_method','estimated','Estimated',3),
+ ('artifact_kind','brief','Brief',1), ('artifact_kind','report','Report',2), ('artifact_kind','index','Index',3),
+ ('artifact_kind','summary-doc','Summary document',4), ('artifact_kind','plan-file','Plan file',5),
+ ('artifact_kind','progress-page','Progress page',6), ('artifact_kind','probe-script','Probe script',7),
+ ('artifact_kind','other','Other',8),
+ ('entity_type','review','Review',1), ('entity_type','issue','Issue',2), ('entity_type','step','Plan step',3),
+ ('entity_type','plan','Plan',4), ('entity_type','decision','Decision',5), ('entity_type','finding','Finding',6),
+ ('entity_type','gate','Question for you',7), ('entity_type','relation','Relation',8), ('entity_type','check','Review check',9),
+ ('entity_type','step-finding','Step coverage',10);
+
+-- Every metric name in use has a catalog row (0004 added them; again here, before the key exists).
+INSERT OR IGNORE INTO metric_defs(name, label, unit)
+  SELECT DISTINCT name, upper(substr(name, 1, 1)) || replace(substr(name, 2), '_', ' '), NULL FROM metrics;
+
+CREATE TABLE review_repositories_new (
+  review_id     INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
+  repository_id INTEGER NOT NULL REFERENCES repositories(id),
+  commit_sha    TEXT NOT NULL CHECK ((length(commit_sha) = 40 OR length(commit_sha) = 64)
+                                   AND commit_sha NOT GLOB '*[^0-9a-f]*'),  -- full hash, lowercase hex
+  branch        TEXT,
+  commit_time   TEXT,                     -- the commit's committer time in UTC (…Z, like every time here; a git
+                                          -- time with an offset is converted); tag-review fills it when NULL
+  commit_subject TEXT,
+  tag_name      TEXT,                     -- e.g. review/R-0001, keeps the commit reachable
+  tag_pushed    INTEGER NOT NULL DEFAULT 0 CHECK (tag_pushed IN (0,1)),
+  is_dirty      INTEGER NOT NULL DEFAULT 0 CHECK (is_dirty IN (0,1)),
+  dirty_note    TEXT,                     -- what was uncommitted, if anything
+  dirty_patch_path TEXT,                  -- saved `git diff` of uncommitted changes, if any
+  PRIMARY KEY (review_id, repository_id)
+);
+INSERT INTO review_repositories_new(review_id, repository_id, commit_sha, branch, commit_time, commit_subject, tag_name, tag_pushed, is_dirty, dirty_note, dirty_patch_path)
+  SELECT review_id, repository_id, commit_sha, branch, commit_time, commit_subject, tag_name, tag_pushed, is_dirty, dirty_note, dirty_patch_path FROM review_repositories;
+DROP TABLE review_repositories;
+ALTER TABLE review_repositories_new RENAME TO review_repositories;
+
+CREATE TABLE review_goals_new (
+  review_id INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
+  goal_id   INTEGER NOT NULL REFERENCES design_goals(id),
+  PRIMARY KEY (review_id, goal_id)
+);
+INSERT INTO review_goals_new(review_id, goal_id)
+  SELECT review_id, goal_id FROM review_goals;
+DROP TABLE review_goals;
+ALTER TABLE review_goals_new RENAME TO review_goals;
+
+CREATE TABLE review_domains_new (
+  review_id         INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
+  domain_code       TEXT NOT NULL REFERENCES domains(code),
+  decision          TEXT NOT NULL CHECK (decision IN ('included','skipped')),
+  reason            TEXT NOT NULL,
+  owner_change      TEXT NOT NULL DEFAULT 'none' CHECK (owner_change IN
+                      ('none','added-by-owner','removed-by-owner','modified-by-owner')),
+  reviewers_planned INTEGER,
+  split_note        TEXT,                 -- how the domain was split between reviewers
+  PRIMARY KEY (review_id, domain_code)
+);
+INSERT INTO review_domains_new(review_id, domain_code, decision, reason, owner_change, reviewers_planned, split_note)
+  SELECT review_id, domain_code, decision, reason, owner_change, reviewers_planned, split_note FROM review_domains;
+DROP TABLE review_domains;
+ALTER TABLE review_domains_new RENAME TO review_domains;
+
+CREATE TABLE reviewer_runs_new (
+  id             INTEGER PRIMARY KEY,
+  review_id      INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
+  domain_code    TEXT NOT NULL REFERENCES domains(code),
+  actor_id       INTEGER NOT NULL REFERENCES actors(id),
+  label          TEXT NOT NULL,           -- 'tests-engine-A'
+  scope          TEXT NOT NULL,
+  prompt         TEXT,
+  report_path    TEXT,
+  report_sha256  TEXT,
+  status         TEXT NOT NULL DEFAULT 'queued' CHECK (status IN
+                   ('queued','running','finished','failed','cancelled')),
+  items_reviewed INTEGER CHECK (items_reviewed IS NULL OR items_reviewed >= 0),
+  high_count     INTEGER CHECK (high_count IS NULL OR high_count >= 0),
+  medium_count   INTEGER CHECK (medium_count IS NULL OR medium_count >= 0),
+  low_count      INTEGER CHECK (low_count IS NULL OR low_count >= 0),
+  test_count     INTEGER CHECK (test_count IS NULL OR test_count >= 0),
+  final_message  TEXT,
+  started_at     TEXT,
+  finished_at    TEXT,
+  UNIQUE (review_id, label)
+);
+INSERT INTO reviewer_runs_new(id, review_id, domain_code, actor_id, label, scope, prompt, report_path, report_sha256, status, items_reviewed, high_count, medium_count, low_count, test_count, final_message, started_at, finished_at)
+  SELECT id, review_id, domain_code, actor_id, label, scope, prompt, report_path, report_sha256, status, items_reviewed, high_count, medium_count, low_count, test_count, final_message, started_at, finished_at FROM reviewer_runs;
+DROP TABLE reviewer_runs;
+ALTER TABLE reviewer_runs_new RENAME TO reviewer_runs;
+
+CREATE TABLE review_actors_new (
+  review_id  INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
+  actor_id   INTEGER NOT NULL REFERENCES actors(id),
+  role_label TEXT NOT NULL,                -- what it did here: 'indexer for security.md', 'matcher'
+  PRIMARY KEY (review_id, actor_id)
+);
+INSERT INTO review_actors_new(review_id, actor_id, role_label)
+  SELECT review_id, actor_id, role_label FROM review_actors;
+DROP TABLE review_actors;
+ALTER TABLE review_actors_new RENAME TO review_actors;
+
+CREATE TABLE issues_new (
+  id                     INTEGER PRIMARY KEY,
+  code                   TEXT NOT NULL UNIQUE    -- ISS-0001, never reused
+                           CHECK (code GLOB 'ISS-[0-9][0-9][0-9][0-9]*' AND code NOT GLOB 'ISS-*[^0-9]*'),
+  title                  TEXT NOT NULL,
+  domain_code            TEXT NOT NULL REFERENCES domains(code),
+  theme_code             TEXT REFERENCES themes(code),
+  sub                    TEXT,                   -- slug naming the specific thing
+  kind                   TEXT NOT NULL CHECK (kind IN
+                           ('defect','test','validation','refactor','feature','design','docs',
+                            'logging','perf','security','ops','verify')),
+  severity               TEXT NOT NULL REFERENCES severities(value),             -- current
+  status                 TEXT NOT NULL DEFAULT 'open' REFERENCES issue_statuses(value),
+  fingerprint            TEXT,                   -- domain:theme:sub[:symbol], for matching
+  before_state           TEXT,                   -- what the system did when first found
+  current_state          TEXT,                   -- what the latest review observed
+  after_state            TEXT,                   -- what it does once fixed
+  recommendation         TEXT,                   -- current agreed fix
+  resolution             TEXT,                   -- how it was closed, or why it was accepted
+  first_seen_review_id   INTEGER NOT NULL REFERENCES reviews(id),
+  last_seen_review_id    INTEGER REFERENCES reviews(id),   -- last review that raised it
+  last_checked_review_id INTEGER REFERENCES reviews(id),   -- last review that looked for it
+  times_seen             INTEGER NOT NULL DEFAULT 1 CHECK (times_seen >= 1),
+  opened_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  resolved_at            TEXT,
+  verified_at            TEXT,
+  updated_at             TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  -- Context for the next status/severity change, set in the same UPDATE: change_note is required (the
+  -- update is refused without it), the others where they apply. The triggers copy them into events, so
+  -- history records who, why, in which review/step/commit, and then set all five back to NULL, so context
+  -- is never reused by a later change.
+  change_actor_id        INTEGER REFERENCES actors(id),
+  change_review_id       INTEGER REFERENCES reviews(id),
+  change_step_id         INTEGER REFERENCES steps(id),
+  change_commit_sha      TEXT CHECK (change_commit_sha IS NULL OR ((length(change_commit_sha) = 40
+                                     OR length(change_commit_sha) = 64) AND change_commit_sha NOT GLOB '*[^0-9a-f]*')),
+  change_note            TEXT
+);
+INSERT INTO issues_new(id, code, title, domain_code, theme_code, sub, kind, severity, status, fingerprint, before_state, current_state, after_state, recommendation, resolution, first_seen_review_id, last_seen_review_id, last_checked_review_id, times_seen, opened_at, resolved_at, verified_at, updated_at, change_actor_id, change_review_id, change_step_id, change_commit_sha, change_note)
+  SELECT id, code, title, domain_code, theme_code, sub, kind, severity, status, fingerprint, before_state, current_state, after_state, recommendation, resolution, first_seen_review_id, last_seen_review_id, last_checked_review_id, times_seen, opened_at, resolved_at, verified_at, updated_at, change_actor_id, change_review_id, change_step_id, change_commit_sha, change_note FROM issues;
+DROP TABLE issues;
+ALTER TABLE issues_new RENAME TO issues;
+
+CREATE TABLE issue_relations_new (
+  id                       INTEGER PRIMARY KEY,
+  from_issue_id            INTEGER NOT NULL REFERENCES issues(id),
+  to_issue_id              INTEGER NOT NULL REFERENCES issues(id),
+  relation                 TEXT NOT NULL REFERENCES relation_types(value),
+  confidence               TEXT NOT NULL DEFAULT 'likely' CHECK (confidence IN ('certain','likely','possible')),
+  rationale                TEXT NOT NULL,
+  established_in_review_id INTEGER REFERENCES reviews(id),
+  established_by_actor_id  INTEGER REFERENCES actors(id),
+  created_at               TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  CHECK (from_issue_id <> to_issue_id),
+  UNIQUE (from_issue_id, to_issue_id, relation)
+);
+INSERT INTO issue_relations_new(id, from_issue_id, to_issue_id, relation, confidence, rationale, established_in_review_id, established_by_actor_id, created_at)
+  SELECT id, from_issue_id, to_issue_id, relation, confidence, rationale, established_in_review_id, established_by_actor_id, created_at FROM issue_relations;
+DROP TABLE issue_relations;
+ALTER TABLE issue_relations_new RENAME TO issue_relations;
+
+CREATE TABLE findings_new (
+  id                   INTEGER PRIMARY KEY,
+  review_id            INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
+  reviewer_run_id      INTEGER REFERENCES reviewer_runs(id),
+  point_id             TEXT NOT NULL,       -- index id: prefix + the report's own id (SEC-H3)
+  issue_id             INTEGER REFERENCES issues(id),   -- set during matching, by an UPDATE (never on INSERT)
+  match_type           TEXT REFERENCES match_types(value)
+                         CHECK (match_type IS NULL OR issue_id IS NOT NULL),   -- a match type needs the issue
+  match_confidence     TEXT CHECK (match_confidence IN ('certain','likely','possible')),
+  match_rationale      TEXT,
+  severity             TEXT NOT NULL REFERENCES severities(value),
+  kind                 TEXT NOT NULL CHECK (kind IN
+                         ('defect','test','validation','refactor','feature','design','docs',
+                          'logging','perf','security','ops','verify')),
+  domain_code          TEXT NOT NULL REFERENCES domains(code),
+  theme_code           TEXT REFERENCES themes(code),
+  sub                  TEXT NOT NULL,
+  summary              TEXT NOT NULL,       -- one self-contained sentence
+  detail               TEXT,
+  before_state         TEXT,                -- what the system does now, as observed
+  recommendation       TEXT,                -- the fix
+  recommended_test     TEXT,                -- test name and what it must assert
+  evidence             TEXT,
+  where_report         TEXT,                -- report line numbers
+  fingerprint          TEXT,
+  related_point_ids    TEXT CHECK (related_point_ids IS NULL OR json_valid(related_point_ids)),
+  verification         TEXT NOT NULL DEFAULT 'unverified' CHECK (verification IN
+                         ('unverified','confirmed','partly','false','not-checkable')),
+  verified_by_actor_id INTEGER REFERENCES actors(id),
+  verified_at          TEXT,
+  verification_note    TEXT,
+  created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  discovered_in_step_id INTEGER REFERENCES steps(id),  -- set when the point was found during fix work on this
+                                            -- plan step (not by a reviewer); v_unplanned_discoveries checks it
+  UNIQUE (review_id, point_id)
+);
+INSERT INTO findings_new(id, review_id, reviewer_run_id, point_id, issue_id, match_type, match_confidence, match_rationale, severity, kind, domain_code, theme_code, sub, summary, detail, before_state, recommendation, recommended_test, evidence, where_report, fingerprint, related_point_ids, verification, verified_by_actor_id, verified_at, verification_note, created_at, discovered_in_step_id)
+  SELECT id, review_id, reviewer_run_id, point_id, issue_id, match_type, match_confidence, match_rationale, severity, kind, domain_code, theme_code, sub, summary, detail, before_state, recommendation, recommended_test, evidence, where_report, fingerprint, related_point_ids, verification, verified_by_actor_id, verified_at, verification_note, created_at, discovered_in_step_id FROM findings;
+DROP TABLE findings;
+ALTER TABLE findings_new RENAME TO findings;
+
+CREATE TABLE finding_locations_new (
+  id             INTEGER PRIMARY KEY,
+  finding_id     INTEGER NOT NULL REFERENCES findings(id) ON DELETE RESTRICT,
+  repository_id  INTEGER NOT NULL REFERENCES repositories(id),
+  commit_sha     TEXT CHECK (commit_sha IS NULL OR ((length(commit_sha) = 40 OR length(commit_sha) = 64)
+                                                    AND commit_sha NOT GLOB '*[^0-9a-f]*')),
+                                            -- full hash, lowercase hex; filled from review_repositories if left
+                                            -- NULL (the location's repository must be one the review looked at)
+  path           TEXT NOT NULL,             -- repo-relative, forward slashes (see the CHECK below)
+  line_start     INTEGER CHECK (line_start IS NULL OR line_start >= 1),
+  line_end       INTEGER CHECK (line_end IS NULL OR line_start IS NOT NULL),   -- no end without a start
+  symbol         TEXT,                      -- function, class, route, setting name
+  blob_sha       TEXT,                      -- `git rev-parse <commit>:<path>`
+  excerpt        TEXT,                      -- the cited lines, verbatim, at that commit
+  excerpt_sha256 TEXT,                      -- hash of excerpt, to detect the same code later
+  permalink      TEXT CHECK (permalink IS NULL OR permalink GLOB 'https://*' OR permalink GLOB 'http://*'),
+                                            -- e.g. https://github.com/o/r/blob/<sha>/<path>#L10-L20
+  role           TEXT NOT NULL DEFAULT 'primary' CHECK (role IN ('primary','also','test','doc','config')),
+  excerpt_redacted INTEGER NOT NULL DEFAULT 0 CHECK (excerpt_redacted IN (0,1)),
+                                            -- 1 = fill-refs masked secret-looking values in excerpt as [redacted];
+                                            -- excerpt_sha256 is still the hash of the real lines
+  whole_file     INTEGER NOT NULL DEFAULT 0 CHECK (whole_file IN (0,1)),
+                                            -- 1 = the point is about the whole file (location form repo:path, no
+                                            -- lines, no symbol); fill-refs sets it with lines 1..n
+  excerpt_status TEXT CHECK (excerpt_status IS NULL OR excerpt_status IN ('truncated','not-text')),
+                                            -- truncated = a whole-file excerpt holds only its first 200 lines;
+                                            -- not-text = binary or not UTF-8: no excerpt, excerpt_sha256 is of
+                                            -- the file's bytes
+  CHECK (line_end IS NULL OR line_start IS NULL OR line_end >= line_start),
+  -- path: relative (no leading / or -), no backslash, no .. segment, no control characters
+  CHECK (length(path) > 0 AND path NOT GLOB '/*' AND path NOT GLOB '-*' AND path NOT GLOB '*\*'
+         AND path <> '..' AND path NOT GLOB '../*' AND path NOT GLOB '*/../*' AND path NOT GLOB '*/..'
+         AND (path NOT GLOB '*[' || char(1) || '-' || char(31) || char(127) || ']*'))
+);
+INSERT INTO finding_locations_new(id, finding_id, repository_id, commit_sha, path, line_start, line_end, symbol, blob_sha, excerpt, excerpt_sha256, permalink, role, excerpt_redacted, whole_file, excerpt_status)
+  SELECT id, finding_id, repository_id, commit_sha, path, line_start, line_end, symbol, blob_sha, excerpt, excerpt_sha256, permalink, role, excerpt_redacted, whole_file, excerpt_status FROM finding_locations;
+DROP TABLE finding_locations;
+ALTER TABLE finding_locations_new RENAME TO finding_locations;
+
+CREATE TABLE finding_goals_new (
+  finding_id INTEGER NOT NULL REFERENCES findings(id) ON DELETE RESTRICT,
+  goal_id    INTEGER NOT NULL REFERENCES design_goals(id),
+  PRIMARY KEY (finding_id, goal_id)
+);
+INSERT INTO finding_goals_new(finding_id, goal_id)
+  SELECT finding_id, goal_id FROM finding_goals;
+DROP TABLE finding_goals;
+ALTER TABLE finding_goals_new RENAME TO finding_goals;
+
+CREATE TABLE finding_requirements_new (
+  finding_id     INTEGER NOT NULL REFERENCES findings(id) ON DELETE RESTRICT,
+  requirement_id INTEGER NOT NULL REFERENCES requirements(id),
+  verdict        TEXT NOT NULL CHECK (verdict IN ('matches','differs','partly','missing','untested')),
+  PRIMARY KEY (finding_id, requirement_id)
+);
+INSERT INTO finding_requirements_new(finding_id, requirement_id, verdict)
+  SELECT finding_id, requirement_id, verdict FROM finding_requirements;
+DROP TABLE finding_requirements;
+ALTER TABLE finding_requirements_new RENAME TO finding_requirements;
+
+CREATE TABLE review_requirement_checks_new (
+  id                INTEGER PRIMARY KEY,
+  review_id         INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
+  requirement_id    INTEGER NOT NULL REFERENCES requirements(id),
+  verdict           TEXT NOT NULL CHECK (verdict IN ('matches','differs','partly','missing','untested')),
+  where_implemented TEXT,                  -- file, function or page that implements it
+  tested            TEXT CHECK (tested IS NULL OR tested IN ('yes','partly','no')),
+  finding_id        INTEGER REFERENCES findings(id),   -- the finding raised for it, if any
+  evidence          TEXT,
+  UNIQUE (review_id, requirement_id)
+);
+INSERT INTO review_requirement_checks_new(id, review_id, requirement_id, verdict, where_implemented, tested, finding_id, evidence)
+  SELECT id, review_id, requirement_id, verdict, where_implemented, tested, finding_id, evidence FROM review_requirement_checks;
+DROP TABLE review_requirement_checks;
+ALTER TABLE review_requirement_checks_new RENAME TO review_requirement_checks;
+
+CREATE TABLE review_issue_checks_new (
+  review_id  INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
+  issue_id   INTEGER NOT NULL REFERENCES issues(id),
+  outcome    TEXT NOT NULL CHECK (outcome IN
+               ('still-present','changed','fixed','regressed','obsolete','not-checked')),
+  finding_id INTEGER REFERENCES findings(id),
+  evidence   TEXT,
+  actor_id   INTEGER REFERENCES actors(id),
+  checked_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  PRIMARY KEY (review_id, issue_id)
+);
+INSERT INTO review_issue_checks_new(review_id, issue_id, outcome, finding_id, evidence, actor_id, checked_at)
+  SELECT review_id, issue_id, outcome, finding_id, evidence, actor_id, checked_at FROM review_issue_checks;
+DROP TABLE review_issue_checks;
+ALTER TABLE review_issue_checks_new RENAME TO review_issue_checks;
+
+CREATE TABLE gates_new (
+  id              INTEGER PRIMARY KEY,
+  code            TEXT NOT NULL UNIQUE      -- GATE-0001
+                    CHECK (code GLOB 'GATE-[0-9][0-9][0-9][0-9]*' AND code NOT GLOB 'GATE-*[^0-9]*'),
+  kind            TEXT NOT NULL REFERENCES gate_kinds(value),
+  title           TEXT NOT NULL,
+  question        TEXT NOT NULL,
+  context         TEXT,                     -- plain text the owner needs to answer
+  options         TEXT CHECK (options IS NULL OR json_valid(options))
+                    CHECK (options IS NULL OR json_type(options) = 'array'),
+                                            -- JSON array of {"value","label","description"} (value and label
+                                            -- required: tr_gate_options_shape)
+  allow_text      INTEGER NOT NULL DEFAULT 1 CHECK (allow_text IN (0,1))
+                    -- someone must be able to answer: free text, or at least one option
+                    CHECK (allow_text = 1 OR (options IS NOT NULL AND json_array_length(options) > 0)),
+  blocking        INTEGER NOT NULL DEFAULT 1 CHECK (blocking IN (0,1)),  -- work stops until answered
+  status          TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','answered','applied','withdrawn'))
+                    CHECK (status <> 'answered' OR answer_value IS NOT NULL OR answer_text IS NOT NULL)
+                    CHECK (status <> 'applied' OR applied_note IS NOT NULL),
+  answer_value    TEXT,                     -- the option chosen
+  answer_text     TEXT,                     -- the owner's own words
+  answered_by     TEXT,
+  answered_via    TEXT CHECK (answered_via IS NULL OR answered_via IN ('chat','viewer','other')),
+  answered_at     TEXT,
+  applied_note    TEXT,                     -- what the agent did with the answer
+  applied_at      TEXT,
+  review_id       INTEGER REFERENCES reviews(id),
+  plan_id         INTEGER REFERENCES plans(id),
+  step_id         INTEGER REFERENCES steps(id),
+  issue_id        INTEGER REFERENCES issues(id),
+  decision_id     INTEGER REFERENCES decisions(id),
+  opened_by_actor_id INTEGER REFERENCES actors(id),
+  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  answered_by_actor_id INTEGER REFERENCES actors(id),  -- who answered (the viewer: the owner's actors row);
+                                            -- answered_by keeps the text for older rows
+  change_actor_id INTEGER REFERENCES actors(id)        -- who made the next status change (applied, withdrawn);
+                                            -- copied into its event, then cleared
+);
+INSERT INTO gates_new(id, code, kind, title, question, context, options, allow_text, blocking, status, answer_value, answer_text, answered_by, answered_via, answered_at, applied_note, applied_at, review_id, plan_id, step_id, issue_id, decision_id, opened_by_actor_id, created_at, answered_by_actor_id, change_actor_id)
+  SELECT id, code, kind, title, question, context, options, allow_text, blocking, status, answer_value, answer_text, answered_by, answered_via, answered_at, applied_note, applied_at, review_id, plan_id, step_id, issue_id, decision_id, opened_by_actor_id, created_at, answered_by_actor_id, change_actor_id FROM gates;
+DROP TABLE gates;
+ALTER TABLE gates_new RENAME TO gates;
+
+CREATE TABLE metrics_new (
+  id            INTEGER PRIMARY KEY,
+  review_id     INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
+  domain_code   TEXT REFERENCES domains(code),
+  repository_id INTEGER REFERENCES repositories(id),
+  name          TEXT NOT NULL REFERENCES metric_defs(name),  -- stable key, e.g. 'mutation_score'
+  scope         TEXT NOT NULL DEFAULT 'all',  -- module, page, job ...
+  value         REAL NOT NULL,
+  unit          TEXT,
+  method        TEXT NOT NULL CHECK (method IN ('measured','counted','estimated')),
+  note          TEXT,
+  recorded_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  UNIQUE (review_id, name, scope, repository_id)
+);
+INSERT INTO metrics_new(id, review_id, domain_code, repository_id, name, scope, value, unit, method, note, recorded_at)
+  SELECT id, review_id, domain_code, repository_id, name, scope, value, unit, method, note, recorded_at FROM metrics;
+DROP TABLE metrics;
+ALTER TABLE metrics_new RENAME TO metrics;
+
+-- The indexes of the rebuilt tables (DROP TABLE removed them).
+CREATE INDEX ix_findings_review      ON findings(review_id);
+CREATE INDEX ix_findings_issue       ON findings(issue_id);
+CREATE INDEX ix_findings_fingerprint ON findings(fingerprint);
+CREATE INDEX ix_findings_slug        ON findings(domain_code, theme_code, sub);
+CREATE INDEX ix_locations_finding    ON finding_locations(finding_id);
+CREATE INDEX ix_locations_path       ON finding_locations(path, symbol);
+CREATE INDEX ix_issues_status        ON issues(status);
+CREATE INDEX ix_issues_fingerprint   ON issues(fingerprint);
+CREATE INDEX ix_issues_slug          ON issues(domain_code, theme_code, sub);
+CREATE INDEX ix_relations_to         ON issue_relations(to_issue_id);
+CREATE INDEX ix_checks_issue         ON review_issue_checks(issue_id);
+CREATE INDEX ix_metrics_name         ON metrics(name, scope);
+CREATE INDEX ix_runs_review          ON reviewer_runs(review_id);
+CREATE INDEX ix_gates_status         ON gates(status);
+CREATE UNIQUE INDEX ux_metrics_key            ON metrics(review_id, name, scope, COALESCE(repository_id, 0));
+CREATE UNIQUE INDEX ux_locations_one_primary  ON finding_locations(finding_id) WHERE role = 'primary';
+CREATE INDEX ix_fk_gates_change_actor_id      ON gates(change_actor_id);
+CREATE INDEX ix_fk_gates_answered_by_actor_id ON gates(answered_by_actor_id);
+CREATE INDEX ix_fk_review_repositories_repository_id ON review_repositories(repository_id);
+CREATE INDEX ix_fk_review_goals_goal_id              ON review_goals(goal_id);
+CREATE INDEX ix_fk_review_domains_domain_code        ON review_domains(domain_code);
+CREATE INDEX ix_fk_reviewer_runs_actor_id            ON reviewer_runs(actor_id);
+CREATE INDEX ix_fk_reviewer_runs_domain_code         ON reviewer_runs(domain_code);
+CREATE INDEX ix_fk_review_actors_actor_id            ON review_actors(actor_id);
+CREATE INDEX ix_fk_issues_change_actor_id            ON issues(change_actor_id);
+CREATE INDEX ix_fk_issues_change_review_id           ON issues(change_review_id);
+CREATE INDEX ix_fk_issues_change_step_id             ON issues(change_step_id);
+CREATE INDEX ix_fk_issues_first_seen_review_id       ON issues(first_seen_review_id);
+CREATE INDEX ix_fk_issues_last_checked_review_id     ON issues(last_checked_review_id);
+CREATE INDEX ix_fk_issues_last_seen_review_id        ON issues(last_seen_review_id);
+CREATE INDEX ix_fk_issues_theme_code                 ON issues(theme_code);
+CREATE INDEX ix_fk_issue_relations_established_by_actor_id ON issue_relations(established_by_actor_id);
+CREATE INDEX ix_fk_issue_relations_established_in_review_id ON issue_relations(established_in_review_id);
+CREATE INDEX ix_findings_run                         ON findings(reviewer_run_id);
+CREATE INDEX ix_fk_findings_theme_code               ON findings(theme_code);
+CREATE INDEX ix_fk_findings_verified_by_actor_id     ON findings(verified_by_actor_id);
+CREATE INDEX ix_fk_findings_discovered_in_step_id    ON findings(discovered_in_step_id);
+CREATE INDEX ix_fk_finding_locations_repository_id   ON finding_locations(repository_id);
+CREATE INDEX ix_fk_finding_goals_goal_id             ON finding_goals(goal_id);
+CREATE INDEX ix_fk_finding_requirements_requirement_id ON finding_requirements(requirement_id);
+CREATE INDEX ix_fk_review_requirement_checks_finding_id ON review_requirement_checks(finding_id);
+CREATE INDEX ix_fk_review_requirement_checks_requirement_id ON review_requirement_checks(requirement_id);
+CREATE INDEX ix_fk_review_issue_checks_actor_id      ON review_issue_checks(actor_id);
+CREATE INDEX ix_ric_finding                          ON review_issue_checks(finding_id);
+CREATE INDEX ix_gates_decision                       ON gates(decision_id);
+CREATE INDEX ix_fk_gates_issue_id                    ON gates(issue_id);
+CREATE INDEX ix_fk_gates_opened_by_actor_id          ON gates(opened_by_actor_id);
+CREATE INDEX ix_fk_gates_plan_id                     ON gates(plan_id);
+CREATE INDEX ix_fk_gates_review_id                   ON gates(review_id);
+CREATE INDEX ix_gates_step                           ON gates(step_id);
+CREATE INDEX ix_fk_metrics_domain_code               ON metrics(domain_code);
+CREATE INDEX ix_fk_metrics_repository_id             ON metrics(repository_id);
+CREATE INDEX ix_fk_issues_severity                   ON issues(severity);
+CREATE INDEX ix_fk_issue_relations_relation          ON issue_relations(relation);
+CREATE INDEX ix_fk_findings_severity                 ON findings(severity);
+CREATE INDEX ix_fk_findings_match_type               ON findings(match_type);
+CREATE INDEX ix_fk_gates_kind                        ON gates(kind);
+-- migration: 0007-views.sql
+-- must-be-empty checks for history gaps, matches, off-plan and done-step coverage, closings, relations and checks; steps.no_findings_reason
+-- Plan P-0001 steps 58, 65, 67, 68, 70, 73, 76, 77, 78, 83 and 93 (views and triggers). The views and triggers come
+-- with the shipped schema, which migrate re-creates after the last migration: the reporting views count real
+-- findings only (v_real_findings), the must-be-empty views forgive abandoned reviews, superseded and abandoned
+-- plans and dropped steps, references fall back to their review's commit, and new triggers refuse accepted-risk or
+-- wont-fix without a resolution, 'verified' without a later review's fixed check, a fixed/regressed/changed check
+-- without evidence and severity T on a finding that is not a test. Rows already in the ledger are not changed:
+-- the new checks below list the ones that break these rules. No table is rebuilt; steps gains one column at the
+-- end (the reason a step closes no finding by design, such as the follow-up review that verifies the plan).
+
+ALTER TABLE steps ADD COLUMN no_findings_reason TEXT;
+
+INSERT INTO ledger_checks(view, label, tier, position) VALUES
+ ('v_history_gaps','Issues and gates whose history is missing an event','error',70),
+ ('v_match_problems','Matches whose type disagrees with the issue','error',72),
+ ('v_off_plan_coverage','Steps closing a finding of a review their plan does not cover','error',74),
+ ('v_done_steps_open_issues','Done steps whose issues are still to do','error',76),
+ ('v_closed_without_reason','Issues accepted or declined with no reason recorded','error',78),
+ ('v_relation_problems','Related-to pairs stored in both directions','error',80),
+ ('v_check_finding_owner','Review checks citing a finding of another issue','error',82);
 """
 
 
@@ -4341,6 +5341,49 @@ def free_backup_name(db, v):
     return cand
 
 
+def _checks_of(sql):
+    """The CHECK expressions of one CREATE TABLE statement (normalized text), in order."""
+    text, out, i = normalize_sql(sql), [], 0
+    while True:
+        m = re.compile(r"\bCHECK\(", re.I).search(text, i)
+        if not m:
+            return out
+        depth, j, quote = 1, m.end(), False
+        while j < len(text) and depth:
+            c = text[j]
+            if c == "'":
+                quote = not quote
+            elif not quote:
+                depth += {"(": 1, ")": -1}.get(c, 0)
+            j += 1
+        out.append(text[m.end():j - 1])
+        i = j
+
+
+def rows_refused_by(con, stmt, limit=50):
+    """For a migration's `CREATE TABLE <table>_new (...)` statement: a line for each row of <table> that one of the
+    new table's CHECKs would refuse, '<table> <code, id or rowid>: <rule> (<column>=<value> ...)', at most `limit`.
+    Empty for any other statement. A rule naming a column the old table lacks (a column the rebuild adds) is
+    skipped: that column holds its default after the rebuild."""
+    m = re.match(r"CREATE TABLE ([A-Za-z_][A-Za-z0-9_]*)_new\s*\(", normalize_sql(stmt), re.I)
+    if not m:
+        return []
+    table, out = m.group(1), []
+    cols = [r[1] for r in con.execute(f"PRAGMA table_info({quote_name(table)})")]
+    key = "code" if "code" in cols else ("id" if "id" in cols else "rowid")
+    for rule in _checks_of(stmt) if cols else []:
+        used = [c for c in cols if re.search(rf"\b{re.escape(c)}\b", rule)]
+        try:
+            bad = con.execute(f"SELECT {key}, {', '.join(used) or 'NULL'} FROM {quote_name(table)} "
+                              f"WHERE NOT ({rule}) LIMIT {int(limit)}").fetchall()
+        except sqlite3.OperationalError:
+            continue  # names a column this table does not have yet
+        for r in bad:
+            vals = " ".join(f"{c}={r[n + 1]!r}" for n, c in enumerate(used))
+            out.append(f"{table} {r[0]}: {rule if len(rule) <= 140 else rule[:137] + '...'} ({vals})")
+    return out[:limit]
+
+
 def migrate(db):
     """Upgrade the ledger to SCHEMA_VERSION: back it up (SQLite backup API) to ledger.sqlite.bak-v<N>, then in one
     BEGIN IMMEDIATE transaction drop every view and trigger, apply each pending migration and record it in
@@ -4379,6 +5422,13 @@ def migrate(db):
             for ver, slug, desc, sql in pending:
                 step = f"migration {ver:04d}-{slug}"
                 for stmt in split_sql(sql):
+                    # before a table is rebuilt with new rules, list every row they refuse (step 61)
+                    refused = rows_refused_by(con, stmt)
+                    if refused:
+                        raise MigrationError(
+                            f"CHECK constraint failed for {len(refused)} existing row"
+                            f"{'s' if len(refused) != 1 else ''} (fix each, then run migrate again):\n  "
+                            + "\n  ".join(refused) + "\n")
                     con.execute(stmt)
                 con.execute("INSERT INTO schema_migrations(version, description) VALUES (?, ?)", (ver, desc))
             step = "the checks after " + ", ".join(f"migration {m[0]:04d}-{m[1]}" for m in pending)
@@ -4853,13 +5903,18 @@ def count_view(con, view):
     return con.execute(f"SELECT count(*) FROM {quote_name(view)}").fetchone()[0]
 
 
-def check(con, quiet=False):
+def check(con, quiet=False, full=False):
     """Print what check finds; return the number of failed checks (integrity, foreign keys, schema, each non-empty
-    error-tier view). A non-empty warning-tier view is printed with 'warning' and does not count."""
+    error-tier view). A non-empty warning-tier view is printed with 'warning' and does not count. The integrity
+    pass is PRAGMA quick_check (no index-content comparison, so fast on a large ledger) unless full, which runs the
+    full PRAGMA integrity_check (`check --full`); the line printed names the one that ran."""
     bad = 0
-    ic = con.execute("PRAGMA integrity_check").fetchone()[0]
+    pragma = "integrity_check" if full else "quick_check"
+    ic = con.execute(f"PRAGMA {pragma}").fetchone()[0]
     if ic != "ok":
-        print("integrity_check:", ic); bad += 1
+        print(f"{pragma}:", ic); bad += 1
+    elif not quiet:
+        print(f"{pragma}: ok" + ("" if full else " (check --full runs the full integrity_check)"))
     fk = con.execute("PRAGMA foreign_key_check").fetchall()
     if fk:
         print(f"foreign_key_check: {len(fk)} broken references"); bad += 1
@@ -5357,6 +6412,27 @@ def dump(con, db):
 # ---------------------------------------------------------------- viewer API
 
 LABEL_TABLES = ("domains", "themes")
+# The lookup tables of the ledger's words (schema 6), by the name their labels have in /api/overview labels.enums.
+LOOKUP_TABLES = (("issue_status", "issue_statuses"), ("severity", "severities"), ("match_type", "match_types"),
+                 ("relation_type", "relation_types"), ("gate_kind", "gate_kinds"))
+ACTIVE = "(SELECT value FROM issue_statuses WHERE active = 1)"  # issue statuses still to fix
+
+
+def enum_labels(con):
+    """{enum: {value: label}} in display order, from the lookup tables and enum_labels (plus relation_type_inverse,
+    the labels read from the issue a relation points to). Empty for a ledger older than schema 6: the page then
+    falls back to its own wording."""
+    out = {}
+    try:
+        for name, table in LOOKUP_TABLES:
+            out[name] = {r[0]: r[1] for r in con.execute(f"SELECT value, label FROM {table} ORDER BY position, value")}
+        out["relation_type_inverse"] = {r[0]: r[1] for r in con.execute(
+            "SELECT value, inverse_label FROM relation_types ORDER BY position, value")}
+        for enum, value, label in con.execute("SELECT enum, value, label FROM enum_labels ORDER BY enum, position"):
+            out.setdefault(enum, {})[value] = label
+    except sqlite3.Error:
+        return {}
+    return out
 
 
 ROUTE_SECONDS = 3  # a viewer page read that runs longer is stopped (the SQL box has its own SQL_SECONDS)
@@ -5467,7 +6543,7 @@ def route(root, db, con, path, qs, body):
             "project": meta.get("project_name", root.name),
             "schema_version": meta.get("schema_version"),
             "open_by_severity": rows(con, """SELECT severity, count(*) n FROM issues
-                WHERE status IN ('open','needs-decision','planned','in-progress','regressed') GROUP BY severity"""),
+                WHERE status IN {ACTIVE} GROUP BY severity""".format(ACTIVE=ACTIVE)),
             "issues_by_status": rows(con, "SELECT status, count(*) n FROM issues GROUP BY status"),
             "gates_open": one(con, "SELECT count(*) n FROM gates WHERE status='open'")["n"],
             "queue": one(con, "SELECT count(*) n FROM v_owner_queue")["n"],
@@ -5481,7 +6557,8 @@ def route(root, db, con, path, qs, body):
             "recurring": one(con, "SELECT count(*) n FROM v_recurring_issues")["n"],
             "checks": [{"label": label, "view": v, "tier": tier, "n": count_view(con, v)}
                        for v, label, tier in (ledger_checks(con) or [])],
-            "labels": {t: {r["code"]: r["name"] for r in rows(con, f"SELECT code, name FROM {t}")} for t in LABEL_TABLES},
+            "labels": {**{t: {r["code"]: r["name"] for r in rows(con, f"SELECT code, name FROM {t}")} for t in LABEL_TABLES},
+                       "enums": enum_labels(con)},
         }
 
     if p == ["gates"]:
@@ -5511,7 +6588,7 @@ def route(root, db, con, path, qs, body):
             (SELECT count(*) FROM findings f WHERE f.review_id=r.id AND f.severity='M') medium,
             (SELECT count(*) FROM findings f WHERE f.review_id=r.id AND f.severity='L') low,
             (SELECT count(*) FROM findings f WHERE f.review_id=r.id AND f.match_type IN ('new','continuation')) new_issues,
-            (SELECT count(*) FROM findings f WHERE f.review_id=r.id AND f.match_type IN ('recurrence','regression')) came_back
+            (SELECT count(*) FROM findings f WHERE f.review_id=r.id AND f.match_type IN (SELECT value FROM match_types WHERE came_back = 1)) came_back
             FROM reviews r ORDER BY r.started_at DESC""")
 
     if len(p) == 2 and p[0] == "review":
@@ -5524,7 +6601,7 @@ def route(root, db, con, path, qs, body):
         rid = r["id"]
         findings = rows(con, """SELECT f.*, i.code issue_code, i.status issue_status, rr.label run_label
             FROM findings f LEFT JOIN issues i ON i.id=f.issue_id LEFT JOIN reviewer_runs rr ON rr.id=f.reviewer_run_id
-            WHERE f.review_id=? ORDER BY CASE f.severity WHEN 'H' THEN 0 WHEN 'M' THEN 1 WHEN 'L' THEN 2 ELSE 3 END, f.point_id""", (rid,))
+            WHERE f.review_id=? ORDER BY CASE f.severity WHEN 'H' THEN 0 WHEN 'M' THEN 1 WHEN 'L' THEN 2 ELSE 3 END, length(f.point_id), f.point_id""", (rid,))
         locs = rows(con, """SELECT fl.id, fl.finding_id, fl.path, fl.line_start, fl.line_end, fl.symbol, fl.role,
             fl.commit_sha, fl.permalink, rp.name repo FROM finding_locations fl
             JOIN findings f ON f.id=fl.finding_id JOIN repositories rp ON rp.id=fl.repository_id WHERE f.review_id=?""", (rid,))
@@ -5563,7 +6640,7 @@ def route(root, db, con, path, qs, body):
         for k in ("status", "severity", "domain_code"):
             v = arg(k)
             if v == "active" and k == "status":
-                where.append("i.status IN ('open','needs-decision','planned','in-progress','regressed')")
+                where.append(f"i.status IN {ACTIVE}")
             elif v:
                 where.append(f"i.{k} = ?"); args.append(v)
         q = arg("q")
@@ -5574,7 +6651,7 @@ def route(root, db, con, path, qs, body):
             i.opened_at, i.updated_at, fr.code first_seen, lr.code last_seen
             FROM issues i JOIN reviews fr ON fr.id=i.first_seen_review_id LEFT JOIN reviews lr ON lr.id=i.last_seen_review_id
             WHERE {' AND '.join(where)}
-            ORDER BY CASE i.severity WHEN 'H' THEN 0 WHEN 'M' THEN 1 WHEN 'L' THEN 2 ELSE 3 END, i.code LIMIT 2000""", args)
+            ORDER BY CASE i.severity WHEN 'H' THEN 0 WHEN 'M' THEN 1 WHEN 'L' THEN 2 ELSE 3 END, i.id LIMIT 2000""", args)
 
     if len(p) == 2 and p[0] == "issue":
         i = one(con, """SELECT i.*, fr.code first_seen, lr.code last_seen, cr.code last_checked FROM issues i
@@ -5891,7 +6968,9 @@ def main():
                    help="replace the project's .code-review/ledger.py even when it is newer than this copy")
     sub.add_parser("migrate", help="upgrade an older ledger to this schema (keeps a .bak-v<N> copy)")
     s = sub.add_parser("serve"); s.add_argument("--port", type=int, default=8765); s.add_argument("--no-open", action="store_true")
-    sub.add_parser("check")
+    s = sub.add_parser("check")
+    s.add_argument("--full", action="store_true",
+                   help="run the full PRAGMA integrity_check instead of quick_check")
     s = sub.add_parser("fill-refs"); s.add_argument("review", nargs="?")
     s = sub.add_parser("tag-review"); s.add_argument("review")
     s = sub.add_parser("set-report", help="store the review document (Markdown) shown in the viewer")
@@ -5939,7 +7018,7 @@ def main():
         if was and was[0] != str(db.parent):
             print(f"warning: this ledger was set up at {was[0]} and is now used from {db.parent} (fine after a move; "
                   f"init records the new place)", file=sys.stderr)
-        bad = check(con)
+        bad = check(con, full=a.full)
         bad += check_git_refs(root, con)
         sys.exit(1 if bad else 0)
     elif a.cmd == "fill-refs":

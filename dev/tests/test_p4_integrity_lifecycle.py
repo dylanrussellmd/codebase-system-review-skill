@@ -340,6 +340,8 @@ class Timestamps(Base):
                 def go():
                     start = "planned" if target != "planned" else "in-progress"
                     iid = self.new_issue(start, resolved_at=FIXED, verified_at=FIXED)
+                    if target == "verified":   # schema 7: only a later review's fixed check verifies (tested in
+                        self.x("DROP TRIGGER tr_issue_verified_needs_check")   # test_p4_views2_checks)
                     self.L.update("issues", iid, status=target, after_state="done")
                     got = self.row(iid)["resolved_at"]
                     if target == "verified":
@@ -356,6 +358,8 @@ class Timestamps(Base):
                 def go():
                     start = "planned" if target != "planned" else "in-progress"
                     iid = self.new_issue(start, resolved_at=FIXED, verified_at=FIXED)
+                    if target == "verified":   # schema 7: only a later review's fixed check verifies (tested in
+                        self.x("DROP TRIGGER tr_issue_verified_needs_check")   # test_p4_views2_checks)
                     self.L.update("issues", iid, status=target, after_state="done")
                     got = self.row(iid)["verified_at"]
                     if target == "verified":
@@ -368,8 +372,9 @@ class Timestamps(Base):
         iid = self.new_issue("open")
         self.L.update("issues", iid, status="fixed", after_state="ok")
         self.assertIsNotNone(self.row(iid)["resolved_at"])
-        self.L.update("issues", iid, status="verified")
+        self.L.check_row(self.r2, iid, "fixed", evidence="Works.")   # schema 7: a later review's check verifies
         r = self.row(iid)
+        self.assertEqual(r["status"], "verified")
         self.assertIsNotNone(r["resolved_at"])
         self.assertIsNotNone(r["verified_at"])
         self.L.update("issues", iid, status="regressed")

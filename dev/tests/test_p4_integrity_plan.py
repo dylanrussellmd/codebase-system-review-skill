@@ -77,7 +77,8 @@ class Deletes(IntegrityCase):
             for row in con.execute(f'PRAGMA foreign_key_list("{t}")'):
                 if row[6] == "CASCADE":
                     fks.append((t, row[2], row[3], row[4] or "id"))
-        self.assertGreaterEqual(len(fks), 17, fks)
+        # schema 6 (step 70): the keys under reviews and findings are RESTRICT, so 7 CASCADE keys are left
+        self.assertGreaterEqual(len(fks), 7, fks)
         exercised = 0
         for child, parent, col, key in fks:
             with self.subTest(child=child, parent=parent):
@@ -96,7 +97,7 @@ class Deletes(IntegrityCase):
                                                      parents).fetchone()[0], 0)
                 finally:
                     con.rollback()
-        self.assertGreaterEqual(exercised, 10, "the demo should give most cascade keys children to delete")
+        self.assertGreaterEqual(exercised, 6, "the demo should give most cascade keys children to delete")
 
 
 class PlanGuards(IntegrityCase):

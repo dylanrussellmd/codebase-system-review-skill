@@ -90,7 +90,7 @@ class FillRefsP4(unittest.TestCase):
         L.x("UPDATE finding_locations SET excerpt='line 5', line_start=5, line_end=7 WHERE id=?", (lid,))
         self.assertEqual(untraceable(L, "src/a.py"), ["excerpt does not cover its lines (past the end of the file?)"])
         L.x("UPDATE finding_locations SET excerpt='' WHERE id=?", (lid,))
-        self.assertEqual(untraceable(L, "src/a.py"), ["empty excerpt"])
+        self.assertEqual(untraceable(L, "src/a.py"), ["no excerpt"])   # step 76 (schema 7): empty is no excerpt
 
     def test_fill_refs_whole_file(self):
         L, sha, rid, _ = project({"src/a.py": NUMBERED, "big.txt": numbered(250)}, test=self)

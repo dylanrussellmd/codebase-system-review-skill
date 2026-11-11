@@ -138,7 +138,8 @@ class Overview(RouteCase):
         n = {c["view"]: c["n"] for c in d["checks"]}
         self.assertEqual(n["v_untraceable_refs"], 5)  # fill-refs / tag-review not run on this ledger
         self.assertEqual(sum(v for k, v in n.items() if k != "v_untraceable_refs"), 0)
-        self.assertEqual(set(d["labels"]), {"domains", "themes"})
+        self.assertEqual(set(d["labels"]), {"domains", "themes", "enums"})  # enums: schema 6, step 95
+        self.assertEqual(d["labels"]["enums"]["issue_status"]["needs-decision"], "Needs your decision")
         self.assertEqual(d["labels"]["domains"]["security"], "Security")
         self.assertEqual(d["labels"]["themes"]["sign-in"], "Sign-in and sessions")
 

@@ -2,6 +2,19 @@
 
 The tool version is `version:` in SKILL.md's frontmatter; `ledger.py --version` prints it with the schema version.
 
+## 1.4.0 (schema 7)
+
+- Schema 6 (migration 0006, lookups): issue statuses, severities, match types, relation types and gate kinds are
+  lookup tables with flags (active, resolved, reopens, came back...) that views and triggers use instead of literal
+  lists; every other word list has a label in `enum_labels`, and the viewer takes its labels from the API. Review and
+  finding foreign keys are RESTRICT; `metrics.name` references `metric_defs`. `migrate` lists every row a new rule
+  refuses.
+- Schema 7 (migration 0007, views): seven new must-be-empty checks (`v_history_gaps`, `v_match_problems`,
+  `v_off_plan_coverage`, `v_done_steps_open_issues`, `v_closed_without_reason`, `v_relation_problems`,
+  `v_check_finding_owner`) and `v_real_findings`; `verified` only through a later review's `fixed` check; evidence on
+  fixed, regressed and changed checks; a resolution on accepted-risk and wont-fix; `steps.no_findings_reason`.
+- `check` runs quick_check; `check --full` runs integrity_check. Review points are listed in natural order.
+
 ## 1.3.0 (schema 5)
 
 - Schema 3 (migration 0003, integrity): history is append-only; findings are inserted unmatched and matched by

@@ -1,7 +1,7 @@
 ---
 name: codebase-system-review
 description: Run a managed, read-only, multi-reviewer audit of any codebase (tests, security, performance, architecture, UI, API, DB, docs, logging), verify findings, record every point in a per-project SQLite ledger tracked across reviews, then turn every point into a tracked fix plan.
-version: 1.3.0
+version: 1.4.0
 ---
 
 # Comprehensive review of a software system
@@ -57,7 +57,8 @@ python3 <skill folder>/scripts/ledger.py init     # first time: create the ledge
 python3 <skill folder>/scripts/ledger.py migrate  # init said the ledger's schema is older: upgrade it (keeps a backup)
 python3 .code-review/ledger.py schema             # print the full schema with comments: read it before writing SQL
 python3 .code-review/ledger.py serve              # the owner's local viewer at http://127.0.0.1:8765
-python3 .code-review/ledger.py check              # integrity + must-be-empty checks; exit 1 on any problem
+python3 .code-review/ledger.py check              # quick integrity + must-be-empty checks; exit 1 on any problem
+python3 .code-review/ledger.py check --full       # the same with SQLite's full integrity_check (slower)
 python3 .code-review/ledger.py fill-refs R-0007   # copy cited lines, blob ids, permalinks from git
 python3 .code-review/ledger.py tag-review R-0007  # tag each reviewed commit (review/R-0007) so it stays reachable
 python3 .code-review/ledger.py set-report R-0007 review.md    # store the review document (Step 6) for the viewer
@@ -122,7 +123,14 @@ their logic.
   `v_standing_decisions`, `v_unguarded_fixes`, and the must-be-empty checks `v_unmatched_findings`,
   `v_unchecked_known_issues`, `v_untraceable_refs`, `v_uncovered_findings`, `v_coverage_problems`,
   `v_unplanned_discoveries` (a defect found during fix work, recorded as a finding with `discovered_in_step_id`, whose
-  issue is open and that no plan step closes).
+  issue is open and that no plan step closes), `v_history_gaps` (issue or gate history missing an event),
+  `v_match_problems` (a match type that disagrees with its issue), `v_off_plan_coverage`, `v_done_steps_open_issues`,
+  `v_closed_without_reason`, `v_relation_problems` and `v_check_finding_owner`. `check` runs SQLite's quick_check;
+  `check --full` runs the full integrity_check. `v_real_findings` is every finding not marked false: use it, not
+  `findings`, when counting.
+- **Rules the ledger enforces at write time:** an issue becomes `verified` only through a later review's `fixed`
+  check; `fixed`, `regressed` and `changed` checks need evidence; `accepted-risk` and `wont-fix` need a resolution; a
+  plan step that closes no finding by design sets `no_findings_reason`.
 
 ### Rules for the ledger
 
@@ -263,7 +271,8 @@ Reviewers judge the code against the owner's standards, not generic taste. Colle
    project's copy), then `gates` and `check`. Read:
    `v_owner_queue` (unanswered questions from last time), `v_open_issues`, `v_recurring_issues`,
    `v_standing_decisions` (accepted risks and rulings), `v_unguarded_fixes`, the last review's domains and their reasons,
-   and `v_metric_trends`. Note what changed in the code since the last review (`git log <last reviewed commit>..HEAD`).
+   and `v_metric_trends`. Note what changed in the code since the last review: `v_last_reviewed_commit` gives, per
+   repository, the commit the last finished review looked at, so run `git log <that commit>..HEAD`.
 3. Create the `reviews` row (status `planning`, `request_text` in the owner's words, `previous_review_id`), the
    manager's `actors` row (model, session), and `review_repositories` rows.
 4. Identify the stack, entry points, and how to run each test suite, linter and type-checker. Run the suites once to
@@ -344,6 +353,9 @@ Launch one subagent per approved scope (your harness's subagent or task tool), a
 BRIEF.md> and follow it exactly", then states the scope, the questions, the tables wanted, and the output file. If no
 subagent tool is available, run the scopes yourself one after another with the same briefs and report format. Record
 each in `actors` (kind `reviewer`, model, `parent_actor_id` = manager) and `reviewer_runs`; set the review to `running`.
+Every other agent that works on the review (verifiers, indexers, matchers, drafters, implementers) also gets an
+`actors` row and a `review_actors` row naming what it did (`role_label`, for example `indexer for security.md`), so
+`v_review_agents` and the review page list everyone who touched the review.
 
 Tell the owner the reviewers are running and what each covers. Do not report findings until they are verified.
 
@@ -607,6 +619,7 @@ its sha256):
 - Route "for other reviewers" notes to the domain they belong to; verify them like any other finding.
 - If a finding contradicts something you told the owner earlier, say so plainly and correct it.
 - Note findings in code you wrote yourself in this session; do not soften them.
+- Any agent you start to verify a finding goes into `actors` and `review_actors` (role `verifier`).
 
 ## Step 5: Index every point into the ledger and match it to history
 
@@ -615,7 +628,8 @@ Every point of every report goes into the ledger, not only the ones in the summa
 ### 5a. Index every report (one indexer per report, in parallel, read-only)
 
 Write one indexing brief. Each indexer reads ONE report in full and writes one TSV file, one point per line, with an id
-prefix you give it. It does not re-review and changes nothing.
+prefix you give it. It does not re-review and changes nothing. Record each indexer (and, in 5d, each matcher) in
+`actors` and `review_actors` with its role.
 
 What counts as a point (when in doubt, include it):
 - every ranked gap (High, Medium, Low);
@@ -755,7 +769,7 @@ At full-review scale (about 2,000 points) one pass is too large, so draft in par
   kept); move steps whose dependency sits in a later phase; order sections inside a phase with verification and pinning
   tests first; renumber globally. Load `steps`, `step_dependencies` (the ledger refuses a dependency on a later step,
   and later renumbering that would break one: renumber before loading dependencies) and `step_findings` (only findings
-  of the plan's `plan_reviews`).
+  of the plan's `plan_reviews`). Record each drafter in `actors` and `review_actors` (role `drafter for <cluster>`).
 - Count the steps that need the owner by kind (decision, confirm, review, production action) and the steps that change
   behavior on purpose.
 
@@ -811,6 +825,9 @@ The ledger is the record of progress; the viewer is the owner's live view of it.
 - Blocked on the owner: step status `waiting-owner`, `owner_question` set, and a `step-input` (or `decision`,
   `production-action`) gate, so it shows under Waiting on you.
 - After each step or small batch: `check`, `dump`, and tell the owner how many steps are done out of the total.
+  `v_step_issues` lists each step's findings with their issues and statuses (what a step's issues are when you move
+  them), and `v_stale_steps` (also printed by `gates`) lists steps still to do whose issues are already closed: mark
+  each done or dropped with a note. Record each implementer agent in `actors` and `review_actors`.
 
 **PROGRESS.md.** Generate `docs/fix-plan/PROGRESS.md` (or the project's equivalent) from the ledger after each batch,
 so the repository tells the same story as the viewer.

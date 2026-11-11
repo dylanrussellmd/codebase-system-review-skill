@@ -186,16 +186,17 @@ class ReviewAndIssueTables(SchemaCase):
         rid = self.review()
         self.run_cases(
             "issues", lambda n: {"code": self.L._code("ISS-"), "title": "t", "severity": "M", "kind": "defect",
-                                 "domain_code": "spec", "first_seen_review_id": rid},
+                                 "domain_code": "spec", "first_seen_review_id": rid,
+                                 "resolution": "A reason."},   # schema 7: accepted-risk and wont-fix need one
             good=each("kind", ISSUE_KINDS) + each("severity", ("H", "M", "L", "T")) + each("status", ISSUE_STATUSES),
             # ISS-0044 fixed by step 62 (schema 3): domain and kind are required.
             bad=[("no kind", {"kind": None}, nn("issues.kind")),
                  ("no domain", {"domain_code": None}, nn("issues.domain_code")),
                  ("times_seen 0", {"times_seen": 0}, ck("times_seen")),
                  ("code out of sequence", {"code": "ISS-9001"}, "sequential"),
-                 ("severity X", {"severity": "X"}, ck("severity")),
+                 ("severity X", {"severity": "X"}, FK),  # lookup table (schema 6)
                  ("kind bug", {"kind": "bug"}, ck("kind")),
-                 ("status closed", {"status": "closed"}, ck("status")),
+                 ("status closed", {"status": "closed"}, FK),  # lookup table (schema 6)
                  ("no severity", {"severity": None}, nn("issues.severity")),
                  ("no first review", {"first_seen_review_id": None}, nn("issues.first_seen_review_id")),
                  ("unknown domain", {"domain_code": "no-such-domain"}, FK),
@@ -208,7 +209,7 @@ class ReviewAndIssueTables(SchemaCase):
             "issue_relations",
             lambda n: {"from_issue_id": a, "to_issue_id": b, "relation": "related-to", "rationale": "r"},
             good=each("relation", RELATIONS) + each("confidence", CONFIDENCES),
-            bad=[("relation blocked-by", {"relation": "blocked-by"}, ck("relation")),
+            bad=[("relation blocked-by", {"relation": "blocked-by"}, FK),  # lookup table (schema 6)
                  ("confidence sure", {"confidence": "sure"}, ck("confidence")),
                  ("to itself", {"to_issue_id": a}, "CHECK constraint failed: from_issue_id <> to_issue_id"),
                  ("no rationale", {"rationale": None}, nn("issue_relations.rationale")),
@@ -276,7 +277,7 @@ class FindingPlanAndEventTables(SchemaCase):
     def test_constraints_review_issue_checks(self):
         self.run_cases(
             "review_issue_checks", lambda n: {"review_id": self.review(), "issue_id": self.issue(self.r1),
-                                              "outcome": "still-present"},
+                                              "outcome": "still-present", "evidence": "Seen."},
             good=each("outcome", ("still-present", "changed", "fixed", "regressed", "obsolete", "not-checked")),
             # ISS-0158 decided by step 59 (schema 3): the issue's own first review may not check it.
             bad=[("check by the issue's own first review", {"review_id": self.r1}, "first found"),

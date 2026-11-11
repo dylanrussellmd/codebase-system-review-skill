@@ -153,7 +153,8 @@ class Constraints(IntegrityCase):
                 def go():
                     with self.assertRaises(sqlite3.IntegrityError) as cm:
                         self.insert("findings", **{**base, col: val})
-                    self.assertIn("CHECK", str(cm.exception))
+                    # severity is a lookup table since schema 6 (step 95): refused by its foreign key
+                    self.assertIn("FOREIGN KEY" if col == "severity" else "CHECK", str(cm.exception))
                 self.in_savepoint(go)
         self.raises("UPDATE findings SET match_type='new' WHERE id=?", (fid,), "CHECK")
 

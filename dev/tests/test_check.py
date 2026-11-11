@@ -34,12 +34,33 @@ def must_be_empty():
     return [(v, label) for v, label, tier in seeded_checks() if tier == "error"]
 
 
+def traced(L, fid):
+    """Give finding fid a fully traceable location (its review's commit, tagged, one line with its excerpt), so it
+    fills no other check (step 76: a finding with no location is untraceable)."""
+    L.location(fid, excerpt="x = 1")
+    L.x("UPDATE review_repositories SET tag_name = 'review/' || (SELECT code FROM reviews WHERE id = review_id) "
+        "WHERE tag_name IS NULL")
+    return fid
+
+
+@contextlib.contextmanager
+def without_trigger(L, name):
+    """Write rows the shipped triggers would refuse or log (a scratch way to make a history gap); the trigger is
+    put back afterwards, so the schema still matches."""
+    sql = L.scalar("SELECT sql FROM sqlite_schema WHERE name=?", (name,))
+    L.x(f"DROP TRIGGER {name}")
+    try:
+        yield
+    finally:
+        L.x(sql)
+
+
 def offend(L, view, count=1):
     """Insert `count` rows that make `view` (an error-tier check) non-empty, and nothing that fills another one."""
     r1 = L.review()
     if view == "v_unmatched_findings":
         for _ in range(count):
-            L.finding(r1)
+            traced(L, L.finding(r1))
     elif view == "v_unchecked_known_issues":
         for _ in range(count):
             L.issue(first_seen_review_id=r1, domain_code="spec")
@@ -53,7 +74,7 @@ def offend(L, view, count=1):
         plan = L.plan(reviews=[r1])
         for _ in range(count):
             iid = L.issue(first_seen_review_id=r1)
-            L.finding(r1, issue_id=iid)
+            traced(L, L.finding(r1, issue_id=iid))
         assert plan
     elif view == "v_coverage_problems":
         plan = L.plan()
@@ -63,11 +84,51 @@ def offend(L, view, count=1):
     elif view == "v_unplanned_discoveries":
         plan = L.plan(reviews=[r1])
         ph = L.phase(plan, 1)
-        f0 = L.finding(r1, issue_id=L.issue(first_seen_review_id=r1))
+        f0 = traced(L, L.finding(r1, issue_id=L.issue(first_seen_review_id=r1)))
         step = L.step(plan, ph, 1, findings=[f0])
         r2 = L.review()                       # discoveries recorded under a review the plan does not cover
         for _ in range(count):
-            L.finding(r2, issue_id=L.issue(first_seen_review_id=r2), discovered_in_step_id=step)
+            traced(L, L.finding(r2, issue_id=L.issue(first_seen_review_id=r2), discovered_in_step_id=step))
+    elif view == "v_history_gaps":
+        with without_trigger(L, "tr_issue_opened"):
+            for _ in range(count):
+                L.issue(first_seen_review_id=r1)          # no opened event
+    elif view == "v_match_problems":
+        old = L.issue(first_seen_review_id=r1)
+        r2 = L.review()
+        for _ in range(count):
+            traced(L, L.finding(r2, issue_id=old, match_type="new"))   # 'new' on an issue R-1 opened
+    elif view == "v_off_plan_coverage":
+        plan = L.plan(reviews=[r1])
+        ph = L.phase(plan, 1)
+        fs = [traced(L, L.finding(r1, issue_id=L.issue(first_seen_review_id=r1))) for _ in range(count)]
+        L.step(plan, ph, 1, findings=fs)
+        L.x("DELETE FROM plan_reviews WHERE plan_id=?", (plan,))  # the review left the plan; its links stay
+    elif view == "v_done_steps_open_issues":
+        plan = L.plan(reviews=[r1])
+        ph = L.phase(plan, 1)
+        fs = [traced(L, L.finding(r1, issue_id=L.issue(first_seen_review_id=r1, status="planned")))
+              for _ in range(count)]
+        step = L.step(plan, ph, 1, findings=fs)
+        L.update("steps", step, status="done", change_note="Done, but its issues were left planned.")
+    elif view == "v_closed_without_reason":
+        with without_trigger(L, "tr_issue_closed_needs_reason_ins"):
+            for _ in range(count):
+                L.insert("issues", code=L._code("ISS-"), title="Declined", domain_code="spec", kind="defect",
+                         severity="M", status="wont-fix", first_seen_review_id=r1)
+    elif view == "v_relation_problems":
+        with without_trigger(L, "tr_relation_noreverse_dup"):
+            for _ in range(count):
+                a, b = L.issue(first_seen_review_id=r1), L.issue(first_seen_review_id=r1)
+                L.relation(a, b)
+                L.relation(b, a)
+    elif view == "v_check_finding_owner":
+        b = L.issue(first_seen_review_id=r1)
+        others = [L.issue(first_seen_review_id=r1) for _ in range(count)]
+        r2 = L.review()
+        fb = traced(L, L.finding(r2, issue_id=b, match_type="still-present"))
+        for a in others:
+            L.check_row(r2, a, "still-present", finding_id=fb)   # cites ISS-b's finding as evidence for a
     else:
         raise AssertionError(f"no offending fixture for {view}")
     L.commit()
@@ -103,13 +164,13 @@ class CheckFunction(unittest.TestCase):
         cls.must_be_empty = must_be_empty()
         cls.views = [v for v, _ in cls.must_be_empty]
 
-    def run_check(self, L, quiet=False):
+    def run_check(self, L, quiet=False, full=False):
         L.commit()
         con = self.mod.connect(L.db)
         try:
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
-                n = self.mod.check(con, quiet=quiet)
+                n = self.mod.check(con, quiet=quiet, full=full)
             return n, out.getvalue()
         finally:
             con.close()
@@ -118,7 +179,9 @@ class CheckFunction(unittest.TestCase):
         with new_ledger() as L:
             n, out = self.run_check(L)
         self.assertEqual(n, 0)
-        self.assertEqual(out.splitlines(), [f"    0  {label}" for _, label, _ in self.checks])
+        # step 92: the first line names the integrity pass that ran (quick_check unless check --full)
+        self.assertEqual(out.splitlines(), ["quick_check: ok (check --full runs the full integrity_check)"]
+                         + [f"    0  {label}" for _, label, _ in self.checks])
 
     def test_check_quiet(self):
         with new_ledger() as L:
@@ -135,7 +198,7 @@ class CheckFunction(unittest.TestCase):
                 L.close()
                 corrupt_integrity(L.db)
                 L.con = L.connect()
-                n, out = self.run_check(L)
+                n, out = self.run_check(L, full=True)   # step 92: index contents are checked by --full only
             # 2: the integrity failure, and (plan step 34) the scratch table and index the corruption needs, which
             # are not in the shipped schema.
             self.assertEqual(n, 2)
@@ -158,7 +221,7 @@ class CheckFunction(unittest.TestCase):
                 corrupt_integrity(L.db)
                 break_foreign_key(L.db)
                 L.con = L.connect()
-                n, out = self.run_check(L)
+                n, out = self.run_check(L, full=True)
             self.assertEqual(n, 4)  # integrity, foreign key, the view, and the scratch objects (schema drift)
 
     def test_check_each_must_be_empty_view(self):
@@ -210,10 +273,9 @@ class CheckFunction(unittest.TestCase):
                 j -= 1
             if "must be empty" in " ".join(comment).lower():
                 commented.add(m.group(1))
-        # characterization: ISS-0178 — v_coverage_problems is an error-tier check and in SKILL.md's must-be-empty list,
-        # but its schema.sql comment does not say "must be empty". The fix adds the words; then this becomes
-        # assertEqual(commented, set(self.views)).
-        self.assertEqual(commented, set(self.views) - {"v_coverage_problems"})
+        # Was a characterization of ISS-0178 (v_coverage_problems' comment lacked "must be empty"); step 65
+        # (schema 7) rewrote that comment with the words.
+        self.assertEqual(commented, set(self.views))
         skill = SKILL_MD.read_text(encoding="utf-8")
         for v in self.views:
             self.assertIn(f"`{v}`", skill)
@@ -235,7 +297,8 @@ class CheckCommand(unittest.TestCase):
         lines = p.stdout.splitlines()
         for _, label, _ in self.checks:
             self.assertIn(f"    0  {label}", lines)
-        self.assertTrue(all(l.startswith("    0  ") for l in lines), lines)
+        self.assertEqual(lines[0], "quick_check: ok (check --full runs the full integrity_check)")
+        self.assertTrue(all(l.startswith("    0  ") for l in lines[1:]), lines)
 
     def test_cli_check_each_view_exit1(self):
         for view, label in self.must_be_empty:

@@ -233,7 +233,8 @@ class PlanAndQueueViews(SchemaCase):
     # ---- steps 88 and 89: v_uncovered_findings
     def test_v_uncovered_findings(self):
         """TEST-T189: a finding of the plan's review with no step is a row; one closed only by another plan's step is
-        still a row; a false finding is not; one closed by this plan's step is not."""
+        still a row; a false finding is too (step 58, schema 7: false findings are closed by a step); one closed by
+        this plan's step is not."""
         bare = self.L.finding(self.r1, "SPEC-M1")
         other_plan = self.L.finding(self.r1, "SPEC-M2")
         self.L.finding(self.r1, "SPEC-M3", verification="false")
@@ -244,7 +245,8 @@ class PlanAndQueueViews(SchemaCase):
         self.assertTrue(bare)
         self.assertEqual([(r["plan"], r["review"], r["point_id"]) for r in self.view(
                              "v_uncovered_findings", "WHERE plan = 'P-0001' ORDER BY point_id")],
-                         [("P-0001", "R-0001", "SPEC-M1"), ("P-0001", "R-0001", "SPEC-M2")])
+                         [("P-0001", "R-0001", "SPEC-M1"), ("P-0001", "R-0001", "SPEC-M2"),
+                          ("P-0001", "R-0001", "SPEC-M3")])
 
     def test_superseding_plan_coverage(self):
         """WALK-M14: a plan that supersedes an earlier one over the same review has no uncovered findings for work
@@ -268,7 +270,7 @@ class PlanAndQueueViews(SchemaCase):
         """PERF-H1: on ledgers without superseded plans the rewritten view returns the old definition's rows."""
         old = ("SELECT p.code AS plan, r.code AS review, f.point_id, f.severity, f.summary FROM plans p "
                "JOIN plan_reviews pr ON pr.plan_id = p.id JOIN reviews r ON r.id = pr.review_id "
-               "JOIN findings f ON f.review_id = r.id WHERE f.verification <> 'false' "
+               "JOIN findings f ON f.review_id = r.id WHERE 1 "     # step 58: false findings too
                "AND NOT EXISTS (SELECT 1 FROM step_findings sf JOIN steps s ON s.id = sf.step_id "
                "WHERE sf.finding_id = f.id AND s.plan_id = p.id)")
         new = "SELECT * FROM v_uncovered_findings"
@@ -284,7 +286,8 @@ class PlanAndQueueViews(SchemaCase):
         p2 = self.L.plan("P-0002", reviews=[self.r1])
         self.L.step(p2, self.L.phase(p2, 1), 1, findings=fs[2:4])
         same()
-        self.assertEqual(len(self.view("v_uncovered_findings")), 4 + 4)  # each plan: the 4 the other closes or none do
+        self.assertEqual(len(self.view("v_uncovered_findings")), 5 + 5)  # each plan: the 4 the other closes or none
+                                                                          # do, and the false finding
 
     # ---- step 88: plan helper views
     def test_v_step_issues(self):
@@ -331,22 +334,24 @@ class PlanAndQueueViews(SchemaCase):
 
     # ---- step 91: v_review_summary
     def test_v_review_summary(self):
-        """TEST-T186: each sum column per review and domain; false findings counted; came_back."""
+        """TEST-T186: each sum column per review and domain; false findings counted apart (step 58, schema 7: the
+        other counts are of real findings); came_back from the issue's events, so a recurrence on an issue that is
+        still open does not count (v_match_problems lists that match)."""
         r2 = self.review("R-0002", started_at="2026-12-01T00:00:00.000Z")
         old = self.issue(self.r1)
         rows = (("H", "spec", "confirmed", None), ("M", "spec", "false", None), ("L", "spec", "confirmed", None),
                 ("T", "security", "confirmed", None))
         for n, (sev, dom, ver, _) in enumerate(rows, 1):
             self.L.finding(self.r1, f"P-{n}", severity=sev, domain_code=dom, verification=ver,
-                           issue_id=self.issue(self.r1))
+                           kind="test" if sev == "T" else "defect", issue_id=self.issue(self.r1))
         self.L.finding(r2, "Q-1", severity="M", issue_id=old, match_type="still-present")
         self.L.finding(r2, "Q-2", severity="H", issue_id=old, match_type="recurrence")
         got = [(r["review"], r["domain_code"], r["points"], r["high"], r["medium"], r["low"], r["tests"],
                 r["confirmed"], r["false_findings"], r["new_issues"], r["carried_over"], r["came_back"])
                for r in self.view("v_review_summary")]
         self.assertEqual(got, [("R-0001", "security", 1, 0, 0, 0, 1, 1, 0, 1, 0, 0),
-                               ("R-0001", "spec", 3, 1, 1, 1, 0, 2, 1, 3, 0, 0),
-                               ("R-0002", "spec", 2, 1, 1, 0, 0, 0, 0, 0, 1, 1)])
+                               ("R-0001", "spec", 2, 1, 0, 1, 0, 2, 1, 2, 0, 0),
+                               ("R-0002", "spec", 2, 1, 1, 0, 0, 0, 0, 0, 1, 0)])
         self.assertEqual([r["domain_code"] for r in self.L.all("SELECT * FROM v_review_summary WHERE review=?",
                                                                ("R-0002",))], ["spec"])
 

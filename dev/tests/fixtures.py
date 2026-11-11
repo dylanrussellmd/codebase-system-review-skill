@@ -501,6 +501,9 @@ class Ledger:
         refusal, write the UPDATE yourself."""
         if table in ("issues", "steps") and ("status" in cols or "severity" in cols) and "change_note" not in cols:
             cols["change_note"] = "test change"
+        if table == "issues" and cols.get("status") in ("accepted-risk", "wont-fix") and "resolution" not in cols \
+                and not self.scalar("SELECT NULLIF(trim(resolution), '') FROM issues WHERE id=?", (row_id,)):
+            cols["resolution"] = "test reason"   # schema 7 refuses these closings without a resolution
         sets = ", ".join(f'"{k}"=?' for k in cols)
         self.con.execute(f'UPDATE "{table}" SET {sets} WHERE id=?', (*cols.values(), row_id))
 
@@ -596,6 +599,8 @@ class Ledger:
               sub=None, theme_code=None, **kw):
         code = code or self._code("ISS-")
         sub = sub or code.lower()
+        if kw.get("status") in ("accepted-risk", "wont-fix"):
+            kw.setdefault("resolution", "test reason")   # schema 7 refuses these closings without a resolution
         kw.setdefault("fingerprint", f"{domain_code}:{theme_code or ''}:{sub}")
         return self.insert("issues", code=code, title=title or f"Issue {code}", severity=severity,
                            domain_code=domain_code, kind=kind, sub=sub, theme_code=theme_code,
@@ -607,7 +612,10 @@ class Ledger:
                     match_rationale=rationale)
 
     def check_row(self, review_id, issue_id, outcome="still-present", **kw):
-        """A review_issue_checks row (fires tr_issue_checked)."""
+        """A review_issue_checks row (fires tr_issue_checked). A fixed, regressed or changed check without evidence
+        gets "test evidence" (schema 7 requires it); pass evidence=None to test that refusal."""
+        if outcome in ("fixed", "regressed", "changed"):
+            kw.setdefault("evidence", "test evidence")
         return self.insert("review_issue_checks", review_id=review_id, issue_id=issue_id, outcome=outcome, **kw)
 
     def plan(self, code=None, title=None, status="drafting", *, reviews=(), **kw):

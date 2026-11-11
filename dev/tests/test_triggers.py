@@ -67,6 +67,8 @@ class IssueTriggers(TriggerCase):
                 def go():
                     start = "planned" if target != "planned" else "in-progress"
                     iid = self.issue(self.r1, status=start, resolved_at=FIXED, verified_at=FIXED)
+                    if target == "verified":   # schema 7: only a later review's fixed check verifies (tested in
+                        self.x("DROP TRIGGER tr_issue_verified_needs_check")   # test_p4_views2_checks)
                     self.L.update("issues", iid, status=target, after_state="works")
                     got = self.issue_row(iid)["resolved_at"]
                     if target in RESOLVING:
@@ -85,6 +87,8 @@ class IssueTriggers(TriggerCase):
                 def go():
                     start = "planned" if target != "planned" else "in-progress"
                     iid = self.issue(self.r1, status=start, resolved_at=FIXED, verified_at=FIXED)
+                    if target == "verified":   # schema 7: only a later review's fixed check verifies (tested in
+                        self.x("DROP TRIGGER tr_issue_verified_needs_check")   # test_p4_views2_checks)
                     self.L.update("issues", iid, status=target, after_state="works")
                     got = self.issue_row(iid)["verified_at"]
                     if target == "verified":

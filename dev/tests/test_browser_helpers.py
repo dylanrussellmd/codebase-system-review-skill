@@ -129,7 +129,8 @@ class Helpers(browser.ViewerTestCase):
         self.ledger.commit()
         try:
             page = self.open("#/")
-            self.assertEqual(page.texts(".status.err"), ["1 check needs attention."])
+            # two: the finding is unmatched, and (step 76, schema 7) a finding with no location is untraceable
+            self.assertEqual(page.texts(".status.err"), ["2 checks need attention."])
             row = page.page.locator(".card:has(h2:text('Ledger checks')) tbody tr", has_text="not matched")
             self.assertEqual(row.locator("td").nth(1).inner_text(), "1")
             page.after(row.click)

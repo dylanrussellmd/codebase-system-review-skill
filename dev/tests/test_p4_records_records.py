@@ -108,7 +108,7 @@ class Discoveries(unittest.TestCase):
             self.assertEqual(L.count("v_unplanned_discoveries"), 0)
         with self.subTest("a closed issue is not flagged"):
             L.x("DELETE FROM step_findings WHERE finding_id=?", (fid,))
-            L.x("UPDATE issues SET status='wont-fix', change_note='Not worth fixing.' WHERE id=?", (iid,))
+            L.x("UPDATE issues SET status='wont-fix', change_note='Not worth fixing.', resolution='Not worth fixing.' WHERE id=?", (iid,))
             self.assertEqual(L.count("v_unplanned_discoveries"), 0)
 
 

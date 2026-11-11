@@ -128,8 +128,15 @@ class MakeServer(unittest.TestCase):
 
 # ---------------------------------------------------------------- step 17: static page checks
 
+# Lookup-backed columns (schema 6, step 95): their words are rows of a lookup table, not a CHECK list.
+LOOKUP_COLUMNS = {("issues", "status"): "issue_statuses", ("issues", "severity"): "severities",
+                  ("findings", "severity"): "severities", ("findings", "match_type"): "match_types",
+                  ("issue_relations", "relation"): "relation_types", ("gates", "kind"): "gate_kinds"}
+
+
 def schema_enums():
-    """{(table, column): [values]} for every `CHECK (col IN ('a','b',...))` in schema.sql."""
+    """{(table, column): [values]} for every `CHECK (col IN ('a','b',...))` in schema.sql, plus the lookup-backed
+    columns with the values of their lookup table (from a fresh ledger)."""
     out = {}
     for m in re.finditer(r"CREATE TABLE (\w+) \((.*?)\n\);", SCHEMA_SQL, re.S):
         table, body = m.group(1), m.group(2)
@@ -137,23 +144,25 @@ def schema_enums():
             vals = re.findall(r"'([^']*)'", c.group(2))
             if vals:
                 out[(table, c.group(1))] = vals
+    with Ledger(fixtures.temp_dir("enums-")) as L:
+        for col, lookup in LOOKUP_COLUMNS.items():
+            out[col] = [r[0] for r in L.x(f"SELECT value FROM {lookup} ORDER BY position")]
     return out
 
 
 def page_label_maps():
-    """{map name: set of keys} from `const L = {...}` in page.html."""
-    m = re.search(r"const L = \{\n(.*?)\n\};", PAGE_HTML, re.S)
-    assert m, "const L label maps not found in page.html"
-    maps = {}
-    for line in m.group(1).splitlines():
-        lm = re.match(r"\s*(\w+):\{(.*)\},?\s*$", line)
-        if not lm:
-            continue
-        keys = set()
-        for k in re.finditer(r'(?:"([^"]+)"|([A-Za-z_][\w]*))\s*:', lm.group(2)):
-            keys.add(k.group(1) or k.group(2))
-        maps[lm.group(1)] = keys
-    return maps
+    """{map name: set of keys}: the page's label maps L are built from /api/overview labels.enums (step 95), named
+    by ENUM_OF in page.html; read here from a fresh ledger's overview."""
+    m = re.search(r"const ENUM_OF = \{(.*?)\};", PAGE_HTML, re.S)
+    assert m, "const ENUM_OF (page label map -> API enum) not found in page.html"
+    names = dict(re.findall(r'(\w+):"(\w+)"', m.group(1)))
+    with Ledger(fixtures.temp_dir("enums-")) as L:
+        con = L.module.connect(L.db)
+        try:
+            enums = L.module.route(L.root, L.db, con, "/api/overview", {}, None)["labels"]["enums"]
+        finally:
+            con.close()
+    return {name: set(enums.get(enum, {})) for name, enum in names.items()}
 
 
 # Which schema column each page label map translates.

@@ -324,6 +324,49 @@ def free_backup_name(db, v):
     return cand
 
 
+def _checks_of(sql):
+    """The CHECK expressions of one CREATE TABLE statement (normalized text), in order."""
+    text, out, i = normalize_sql(sql), [], 0
+    while True:
+        m = re.compile(r"\bCHECK\(", re.I).search(text, i)
+        if not m:
+            return out
+        depth, j, quote = 1, m.end(), False
+        while j < len(text) and depth:
+            c = text[j]
+            if c == "'":
+                quote = not quote
+            elif not quote:
+                depth += {"(": 1, ")": -1}.get(c, 0)
+            j += 1
+        out.append(text[m.end():j - 1])
+        i = j
+
+
+def rows_refused_by(con, stmt, limit=50):
+    """For a migration's `CREATE TABLE <table>_new (...)` statement: a line for each row of <table> that one of the
+    new table's CHECKs would refuse, '<table> <code, id or rowid>: <rule> (<column>=<value> ...)', at most `limit`.
+    Empty for any other statement. A rule naming a column the old table lacks (a column the rebuild adds) is
+    skipped: that column holds its default after the rebuild."""
+    m = re.match(r"CREATE TABLE ([A-Za-z_][A-Za-z0-9_]*)_new\s*\(", normalize_sql(stmt), re.I)
+    if not m:
+        return []
+    table, out = m.group(1), []
+    cols = [r[1] for r in con.execute(f"PRAGMA table_info({quote_name(table)})")]
+    key = "code" if "code" in cols else ("id" if "id" in cols else "rowid")
+    for rule in _checks_of(stmt) if cols else []:
+        used = [c for c in cols if re.search(rf"\b{re.escape(c)}\b", rule)]
+        try:
+            bad = con.execute(f"SELECT {key}, {', '.join(used) or 'NULL'} FROM {quote_name(table)} "
+                              f"WHERE NOT ({rule}) LIMIT {int(limit)}").fetchall()
+        except sqlite3.OperationalError:
+            continue  # names a column this table does not have yet
+        for r in bad:
+            vals = " ".join(f"{c}={r[n + 1]!r}" for n, c in enumerate(used))
+            out.append(f"{table} {r[0]}: {rule if len(rule) <= 140 else rule[:137] + '...'} ({vals})")
+    return out[:limit]
+
+
 def migrate(db):
     """Upgrade the ledger to SCHEMA_VERSION: back it up (SQLite backup API) to ledger.sqlite.bak-v<N>, then in one
     BEGIN IMMEDIATE transaction drop every view and trigger, apply each pending migration and record it in
@@ -362,6 +405,13 @@ def migrate(db):
             for ver, slug, desc, sql in pending:
                 step = f"migration {ver:04d}-{slug}"
                 for stmt in split_sql(sql):
+                    # before a table is rebuilt with new rules, list every row they refuse (step 61)
+                    refused = rows_refused_by(con, stmt)
+                    if refused:
+                        raise MigrationError(
+                            f"CHECK constraint failed for {len(refused)} existing row"
+                            f"{'s' if len(refused) != 1 else ''} (fix each, then run migrate again):\n  "
+                            + "\n  ".join(refused) + "\n")
                     con.execute(stmt)
                 con.execute("INSERT INTO schema_migrations(version, description) VALUES (?, ?)", (ver, desc))
             step = "the checks after " + ", ".join(f"migration {m[0]:04d}-{m[1]}" for m in pending)
@@ -836,13 +886,18 @@ def count_view(con, view):
     return con.execute(f"SELECT count(*) FROM {quote_name(view)}").fetchone()[0]
 
 
-def check(con, quiet=False):
+def check(con, quiet=False, full=False):
     """Print what check finds; return the number of failed checks (integrity, foreign keys, schema, each non-empty
-    error-tier view). A non-empty warning-tier view is printed with 'warning' and does not count."""
+    error-tier view). A non-empty warning-tier view is printed with 'warning' and does not count. The integrity
+    pass is PRAGMA quick_check (no index-content comparison, so fast on a large ledger) unless full, which runs the
+    full PRAGMA integrity_check (`check --full`); the line printed names the one that ran."""
     bad = 0
-    ic = con.execute("PRAGMA integrity_check").fetchone()[0]
+    pragma = "integrity_check" if full else "quick_check"
+    ic = con.execute(f"PRAGMA {pragma}").fetchone()[0]
     if ic != "ok":
-        print("integrity_check:", ic); bad += 1
+        print(f"{pragma}:", ic); bad += 1
+    elif not quiet:
+        print(f"{pragma}: ok" + ("" if full else " (check --full runs the full integrity_check)"))
     fk = con.execute("PRAGMA foreign_key_check").fetchall()
     if fk:
         print(f"foreign_key_check: {len(fk)} broken references"); bad += 1
@@ -1340,6 +1395,27 @@ def dump(con, db):
 # ---------------------------------------------------------------- viewer API
 
 LABEL_TABLES = ("domains", "themes")
+# The lookup tables of the ledger's words (schema 6), by the name their labels have in /api/overview labels.enums.
+LOOKUP_TABLES = (("issue_status", "issue_statuses"), ("severity", "severities"), ("match_type", "match_types"),
+                 ("relation_type", "relation_types"), ("gate_kind", "gate_kinds"))
+ACTIVE = "(SELECT value FROM issue_statuses WHERE active = 1)"  # issue statuses still to fix
+
+
+def enum_labels(con):
+    """{enum: {value: label}} in display order, from the lookup tables and enum_labels (plus relation_type_inverse,
+    the labels read from the issue a relation points to). Empty for a ledger older than schema 6: the page then
+    falls back to its own wording."""
+    out = {}
+    try:
+        for name, table in LOOKUP_TABLES:
+            out[name] = {r[0]: r[1] for r in con.execute(f"SELECT value, label FROM {table} ORDER BY position, value")}
+        out["relation_type_inverse"] = {r[0]: r[1] for r in con.execute(
+            "SELECT value, inverse_label FROM relation_types ORDER BY position, value")}
+        for enum, value, label in con.execute("SELECT enum, value, label FROM enum_labels ORDER BY enum, position"):
+            out.setdefault(enum, {})[value] = label
+    except sqlite3.Error:
+        return {}
+    return out
 
 
 ROUTE_SECONDS = 3  # a viewer page read that runs longer is stopped (the SQL box has its own SQL_SECONDS)
@@ -1450,7 +1526,7 @@ def route(root, db, con, path, qs, body):
             "project": meta.get("project_name", root.name),
             "schema_version": meta.get("schema_version"),
             "open_by_severity": rows(con, """SELECT severity, count(*) n FROM issues
-                WHERE status IN ('open','needs-decision','planned','in-progress','regressed') GROUP BY severity"""),
+                WHERE status IN {ACTIVE} GROUP BY severity""".format(ACTIVE=ACTIVE)),
             "issues_by_status": rows(con, "SELECT status, count(*) n FROM issues GROUP BY status"),
             "gates_open": one(con, "SELECT count(*) n FROM gates WHERE status='open'")["n"],
             "queue": one(con, "SELECT count(*) n FROM v_owner_queue")["n"],
@@ -1464,7 +1540,8 @@ def route(root, db, con, path, qs, body):
             "recurring": one(con, "SELECT count(*) n FROM v_recurring_issues")["n"],
             "checks": [{"label": label, "view": v, "tier": tier, "n": count_view(con, v)}
                        for v, label, tier in (ledger_checks(con) or [])],
-            "labels": {t: {r["code"]: r["name"] for r in rows(con, f"SELECT code, name FROM {t}")} for t in LABEL_TABLES},
+            "labels": {**{t: {r["code"]: r["name"] for r in rows(con, f"SELECT code, name FROM {t}")} for t in LABEL_TABLES},
+                       "enums": enum_labels(con)},
         }
 
     if p == ["gates"]:
@@ -1494,7 +1571,7 @@ def route(root, db, con, path, qs, body):
             (SELECT count(*) FROM findings f WHERE f.review_id=r.id AND f.severity='M') medium,
             (SELECT count(*) FROM findings f WHERE f.review_id=r.id AND f.severity='L') low,
             (SELECT count(*) FROM findings f WHERE f.review_id=r.id AND f.match_type IN ('new','continuation')) new_issues,
-            (SELECT count(*) FROM findings f WHERE f.review_id=r.id AND f.match_type IN ('recurrence','regression')) came_back
+            (SELECT count(*) FROM findings f WHERE f.review_id=r.id AND f.match_type IN (SELECT value FROM match_types WHERE came_back = 1)) came_back
             FROM reviews r ORDER BY r.started_at DESC""")
 
     if len(p) == 2 and p[0] == "review":
@@ -1507,7 +1584,7 @@ def route(root, db, con, path, qs, body):
         rid = r["id"]
         findings = rows(con, """SELECT f.*, i.code issue_code, i.status issue_status, rr.label run_label
             FROM findings f LEFT JOIN issues i ON i.id=f.issue_id LEFT JOIN reviewer_runs rr ON rr.id=f.reviewer_run_id
-            WHERE f.review_id=? ORDER BY CASE f.severity WHEN 'H' THEN 0 WHEN 'M' THEN 1 WHEN 'L' THEN 2 ELSE 3 END, f.point_id""", (rid,))
+            WHERE f.review_id=? ORDER BY CASE f.severity WHEN 'H' THEN 0 WHEN 'M' THEN 1 WHEN 'L' THEN 2 ELSE 3 END, length(f.point_id), f.point_id""", (rid,))
         locs = rows(con, """SELECT fl.id, fl.finding_id, fl.path, fl.line_start, fl.line_end, fl.symbol, fl.role,
             fl.commit_sha, fl.permalink, rp.name repo FROM finding_locations fl
             JOIN findings f ON f.id=fl.finding_id JOIN repositories rp ON rp.id=fl.repository_id WHERE f.review_id=?""", (rid,))
@@ -1546,7 +1623,7 @@ def route(root, db, con, path, qs, body):
         for k in ("status", "severity", "domain_code"):
             v = arg(k)
             if v == "active" and k == "status":
-                where.append("i.status IN ('open','needs-decision','planned','in-progress','regressed')")
+                where.append(f"i.status IN {ACTIVE}")
             elif v:
                 where.append(f"i.{k} = ?"); args.append(v)
         q = arg("q")
@@ -1557,7 +1634,7 @@ def route(root, db, con, path, qs, body):
             i.opened_at, i.updated_at, fr.code first_seen, lr.code last_seen
             FROM issues i JOIN reviews fr ON fr.id=i.first_seen_review_id LEFT JOIN reviews lr ON lr.id=i.last_seen_review_id
             WHERE {' AND '.join(where)}
-            ORDER BY CASE i.severity WHEN 'H' THEN 0 WHEN 'M' THEN 1 WHEN 'L' THEN 2 ELSE 3 END, i.code LIMIT 2000""", args)
+            ORDER BY CASE i.severity WHEN 'H' THEN 0 WHEN 'M' THEN 1 WHEN 'L' THEN 2 ELSE 3 END, i.id LIMIT 2000""", args)
 
     if len(p) == 2 and p[0] == "issue":
         i = one(con, """SELECT i.*, fr.code first_seen, lr.code last_seen, cr.code last_checked FROM issues i
@@ -1874,7 +1951,9 @@ def main():
                    help="replace the project's .code-review/ledger.py even when it is newer than this copy")
     sub.add_parser("migrate", help="upgrade an older ledger to this schema (keeps a .bak-v<N> copy)")
     s = sub.add_parser("serve"); s.add_argument("--port", type=int, default=8765); s.add_argument("--no-open", action="store_true")
-    sub.add_parser("check")
+    s = sub.add_parser("check")
+    s.add_argument("--full", action="store_true",
+                   help="run the full PRAGMA integrity_check instead of quick_check")
     s = sub.add_parser("fill-refs"); s.add_argument("review", nargs="?")
     s = sub.add_parser("tag-review"); s.add_argument("review")
     s = sub.add_parser("set-report", help="store the review document (Markdown) shown in the viewer")
@@ -1922,7 +2001,7 @@ def main():
         if was and was[0] != str(db.parent):
             print(f"warning: this ledger was set up at {was[0]} and is now used from {db.parent} (fine after a move; "
                   f"init records the new place)", file=sys.stderr)
-        bad = check(con)
+        bad = check(con, full=a.full)
         bad += check_git_refs(root, con)
         sys.exit(1 if bad else 0)
     elif a.cmd == "fill-refs":

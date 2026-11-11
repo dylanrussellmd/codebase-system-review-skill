@@ -254,7 +254,7 @@ def build(proj, scale=1, reviews=5, files=300, reports=None, ledger_py=None, see
                      summary,detail,before_state,recommendation,recommended_test,evidence,where_report,fingerprint,
                      verification,verified_by_actor_id,verification_note,created_at)
                      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                  (rid, run_id, pid, sev, rnd.choice(KINDS), dom, th, sub, text(22), text(100), text(45), text(45),
+                  (rid, run_id, pid, sev, (lambda k: "test" if sev == "T" else k)(rnd.choice(KINDS)), dom, th, sub, text(22), text(100), text(45), text(45),
                    text(22), text(45), f"{rnd.randrange(900)}-{rnd.randrange(900, 1000)}", f"{dom}:{th}:{sub}",
                    rnd.choices(["confirmed", "unverified", "partly", "false"], (6, 2, 1, 1))[0], mgr, text(12),
                    _ts(day, 3600)))
@@ -327,9 +327,20 @@ def build(proj, scale=1, reviews=5, files=300, reports=None, ledger_py=None, see
             iid = rnd.choice(pool)[0]
             mt = rnd.choices(["still-present", "changed", "recurrence", "regression", "continuation"],
                              (6, 2, 1, 1, 1))[0]
-            if mt == "regression" and x("SELECT status FROM issues WHERE id=?", (iid,)).fetchone()[0] not in (
-                    "fixed", "verified", "regressed"):
+            st, first = x("SELECT status, first_seen_review_id FROM issues WHERE id=?", (iid,)).fetchone()
+            if mt == "regression" and st not in ("fixed", "verified", "regressed"):
                 mt = "recurrence"
+            # schema 7 (v_match_problems): the type agrees with the issue
+            if first == rid:
+                mt = "new"                      # an issue this review opened
+            elif mt == "continuation":
+                mt = "changed"                  # a continuation would need its own issue and relation
+            if mt in ("still-present", "changed") and st in ("fixed", "verified"):
+                mt = "regression"
+            if mt == "recurrence" and not x("SELECT 1 FROM events WHERE entity_type='issue' AND entity_id=? AND "
+                                            "event IN ('opened','status-changed') AND to_value IN ('fixed','verified',"
+                                            "'accepted-risk','wont-fix','duplicate','obsolete')", (iid,)).fetchone():
+                mt = "still-present"
             x("UPDATE findings SET issue_id=?, match_type=?, match_confidence='likely', match_rationale=? WHERE id=?",
               (iid, mt, text(15), fid))
         T.add("match_existing_issue", time.perf_counter() - t0, len(fids) - nnew)
