@@ -15,10 +15,17 @@ Copy this into the brief of every agent that implements plan steps, and fill in 
 - After a source change: <the build or check command>. Before you report: <the whole test suite>; it must pass.
 
 ## Record each step
-`python3 .code-review/ledger.py step-status <step> doing --note "<what you start>" --actor <your A- code>`, and when it
-is finished `step-status <step> done --note "<for the owner, in plain sentences: what a person would now see or what is
-now refused, anything that turned out different from the plan>"`. A step blocked on the owner: `step-status <step>
-waiting-owner --question "<the question>"`.
+You write to the ledger only what belongs to your own steps, with `step-status`, `add-commit`, `add-guard` and
+`report-finding`, each under your own actor (`--actor <your A- code>`). Read everything else with `query`; the manager
+writes the rest (issue statuses, gates, the plan).
+
+- Start: `python3 .code-review/ledger.py step-status <step> doing --note "<what you start>" --actor <your A- code>`.
+- Finish: `step-status <step> done --note "<for the owner, in plain sentences: what a person would now see or what is
+  now refused, anything that turned out different from the plan>" --commit <sha> --guard <test path>::<test name>`
+  (`--failed-before` when you saw the test fail before the fix). A further commit or a pull request:
+  `add-commit <step> <sha> --pr <URL>`; a guard test for one issue: `add-guard ISS-0001 <test path> <test name>`.
+  Leave out `--commit` where the owner's rules keep you from committing, and say so in the note.
+- Blocked on the owner: `step-status <step> waiting-owner --question "<the question>"`.
 
 ## Defects you discover that the plan does not cover (mandatory)
 Never just mention a new defect in a note, a comment or your final reply. Record it the moment you find it:

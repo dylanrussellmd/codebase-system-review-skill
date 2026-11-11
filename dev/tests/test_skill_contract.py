@@ -173,7 +173,7 @@ class Commands(unittest.TestCase):
             self.assertRegex(text, rf"ledger\.py {cmd}\b", f"SKILL.md never tells the agent to run ledger.py {cmd}")
 
     def test_skill_steps_have_no_hand_written_sql(self):
-        """Writes in Steps 0-9 are commands or links to a tested recipe; no INSERT/UPDATE in SKILL.md itself."""
+        """Writes in Steps 0-9 are commands; no INSERT/UPDATE in SKILL.md itself."""
         self.assertNotRegex(skill_text(), r"\b(INSERT INTO|UPDATE \w+ SET|DELETE FROM)\b")
 
     def test_model_agnostic(self):
@@ -248,9 +248,13 @@ class Words(unittest.TestCase):
     def test_skill_mentions_listed_columns(self):
         docs = "\n".join(f.read_text(encoding="utf-8") for f in doc_files())
         for name in ("match_rationale", "still_exists", "last_confirmed_review_id", "tag_pushed",
-                     "finding_locations.role", "doc_url", "page_url", "review_issue_checks.finding_id",
+                     "finding_locations.role", "page_url", "review_issue_checks.finding_id",
                      "report_path", "owner_change", "category", "source"):
             self.assertIn(name, docs, f"the docs never say when to set {name}")
+        # each is set by a command the docs name
+        for cmd in ("confirm-guard", "tag-review R-0001 --pushed", "add-artifact progress-page", "finish-run",
+                    "review-domain", "add-domain", "add-requirement"):
+            self.assertIn(f"ledger.py {cmd}", docs, f"the docs never name ledger.py {cmd}")
 
     def test_docs_name_existing_tables_columns_and_views(self):
         tables, views, cols, _, _ = Schema.get()
@@ -340,9 +344,23 @@ class OwnerRules(unittest.TestCase):
 
     def test_one_writer_names_the_viewer(self):
         text = " ".join(section(skill_text(), "The tool").split())
-        self.assertRegex(text, r"\*\*One writer\.\*\* Only the manager writes; the viewer and `import-answers` write gate")
+        self.assertRegex(text, r"\*\*One writer\.\*\* Only the manager writes, except: the viewer and `import-answers` "
+                               r"write gate answers")
         self.assertIn("`BEGIN IMMEDIATE`", text)
         self.assertIn("`--actor`", text)
+
+    def test_implementers_write_their_own_steps_only(self):
+        """Owner decision D-0011, said the same way in SKILL.md and the implementer brief."""
+        own = "`step-status`, `add-commit`, `add-guard`, `report-finding`"
+        text = " ".join(section(skill_text(), "The tool").split())
+        self.assertIn(f"an implementer writes its own steps ({own}) under its own actor", text)
+        self.assertIn("Reviewers, verifiers, indexers, matchers and drafters read with `ledger.py query", text)
+        self.assertIn("it writes only its own steps, under its own actor", " ".join(section(skill_text(), "Step 9").split()))
+        brief = " ".join((REFS / "implementer-brief.md").read_text(encoding="utf-8").split())
+        self.assertIn(f"only what belongs to your own steps, with {own.replace(', `report', ' and `report')}", brief)
+        self.assertIn("each under your own actor", brief)
+        for f in ("brief.md", "indexing.md", "fix-plan.md"):
+            self.assertRegex((REFS / f).read_text(encoding="utf-8"), r"read-only", f)
 
     def test_skill_md_lists_every_repo_write(self):
         text = " ".join(skill_text().split())

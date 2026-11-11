@@ -1,88 +1,59 @@
 # Recipes
 
-Read this when a step points here or something goes wrong. Each recipe is tested against a demo ledger
+Read this when a step points here or something goes wrong. Every block is tested against a demo ledger
 (`dev/tests/test_p5_docs_recipes.py`), in this order.
 
-Most writes have a `ledger.py` command (see SKILL.md and `ledger.py <command> --help`); prefer it. The writes below
-have none yet, so they are SQL. Replace the example codes (`R-0002`, `ISS-0003`, `P-0001`, step 2, repository `demo`)
-and the `<...>` values with yours, keep the `BEGIN IMMEDIATE` / `COMMIT` lines, and run a block with:
+Every write a review or a plan needs is a `ledger.py` command: `ledger.py <command> --help` lists its options, and
+`ledger.py X` stands for `python3 <skill folder>/scripts/ledger.py --root <project root> X`. Replace the example codes
+(`R-0002`, `ISS-0004`, `P-0002`, step 2, repository `demo`) and the `<...>` values with yours.
+
+Raw SQL is only for the corrections under "Correcting the ledger" that no command covers. Only the manager runs it,
+one block at a time, keeping the `BEGIN IMMEDIATE` / `COMMIT` lines, with:
 
     python3 -c "import sqlite3, sys; c = sqlite3.connect(sys.argv[1], timeout=30); c.execute('PRAGMA foreign_keys = ON'); c.executescript(sys.stdin.read())" .code-review/ledger.sqlite < recipe.sql
 
-(with `CODE_REVIEW_DIR` set, the ledger is `$CODE_REVIEW_DIR/ledger.sqlite`). A refused statement prints the
-ledger's reason and nothing of the block is written. Only the manager runs recipes, one block at a time, and runs
-`ledger.py check` afterwards (after creating a plan, once `import-steps` has loaded its steps: a plan with no steps
-leaves its reviews' findings uncovered). `(SELECT id FROM actors WHERE kind='manager' ORDER BY id DESC LIMIT 1)` is the current
-manager; with several managers in one ledger, write the manager's actor id instead. In the `sh` blocks,
-`ledger.py X` is the skill's `python3 <skill folder>/scripts/ledger.py --root <project root> X`.
+(with `CODE_REVIEW_DIR` set, the ledger is `$CODE_REVIEW_DIR/ledger.sqlite`). A refused statement prints the ledger's
+reason and nothing of the block is written. Run `ledger.py check` afterwards.
+`(SELECT id FROM actors WHERE kind='manager' ORDER BY id DESC LIMIT 1)` is the current manager; with several managers
+in one ledger, write the manager's actor id instead.
 
 ## Setting up a review
 
-### Add a design goal
+### Add a goal a document states
 
-Goals come from the owner interview (SKILL.md Step 2c): `ledger.py propose-goal --domain <D> --from IQ-0001
-'<statement>'`, approved with `ledger.py approve-goals G-03 --actor <owner>`. Only where those commands are not in your
-copy of the tool yet, add one by hand:
+Goals come from the owner interview (SKILL.md Step 2c). One that a document or the owner already states takes
+`--source` in place of `--from`, and the owner approves it like any other:
 
-```sql
-BEGIN IMMEDIATE;
-INSERT INTO design_goals(code, text, source)
-  VALUES ((SELECT next_code FROM v_next_codes WHERE prefix = 'G'),
-          'One validator per input, shared by the server and the client.', 'owner, chat 2026-11-11');
-COMMIT;
+```sh
+ledger.py propose-goal --source 'README.md, section 2' 'One validator per input, shared by the server and the client.'
+ledger.py approve-goals G-03 --actor A-0001
 ```
-
-and link it to a review that exists:
-
-```sql
-BEGIN IMMEDIATE;
-INSERT INTO review_goals(review_id, goal_id)
-  VALUES ((SELECT id FROM reviews WHERE code = 'R-0002'), (SELECT id FROM design_goals WHERE code = 'G-03'));
-COMMIT;
-```
-
-A goal the owner drops is retired, never deleted: `UPDATE design_goals SET retired_at =
-strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE code = 'G-01';` (a replaced one also sets `superseded_by`).
 
 ### Add a requirement
 
-`source` is required: a document path, an issue URL, or `owner, chat <date>`; `source_location` says where in it.
+`--source` is required: a document path, an issue URL, or `owner, chat <date>`; `--location` says where in it.
 
-```sql
-BEGIN IMMEDIATE;
-INSERT INTO requirements(code, text, source, source_location, first_review_id)
-  VALUES ((SELECT next_code FROM v_next_codes WHERE prefix = 'REQ'),
-          'A signed-out visitor sees the sign-in page, never a blank page.', 'docs/spec.md', 'section 2.1',
-          (SELECT id FROM reviews WHERE code = 'R-0002'));
-COMMIT;
+```sh
+ledger.py add-requirement 'A signed-out visitor sees the sign-in page, never a blank page.' --source docs/spec.md --location 'section 2.1' --review R-0002
 ```
 
 ### Add a custom domain
 
-A domain the catalog lacks has category `custom` (and a theme, when the seeded themes do not fit):
+A domain the catalog lacks gets `category` `custom`, and a theme when the seeded themes do not fit:
 
-```sql
-BEGIN IMMEDIATE;
-INSERT INTO domains(code, name, category, description, report_file)
-  VALUES ('payments', 'Payments flow', 'custom', 'Applies when the system takes or refunds payments.', 'payments.md');
-INSERT INTO themes(code, name) VALUES ('payments', 'Payments');
-COMMIT;
+```sh
+ledger.py add-domain payments 'Payments flow' --description 'Applies when the system takes or refunds payments.' --report-file payments.md --theme payments=Payments
 ```
 
 ### Change the domain list
 
 After the owner's answer to the `domain-approval` gate (before you apply it), record each change with its
-`owner_change`: `added-by-owner`, `removed-by-owner` or `modified-by-owner`.
+`owner_change`: `added-by-owner`, `removed-by-owner` or `modified-by-owner`. A domain that has reviewer runs cannot
+be skipped.
 
-```sql
-BEGIN IMMEDIATE;
-UPDATE review_domains SET decision = 'included', reason = 'the owner wants the data model reviewed',
-       owner_change = 'added-by-owner'
- WHERE review_id = (SELECT id FROM reviews WHERE code = 'R-0002') AND domain_code = 'database';
-INSERT INTO review_domains(review_id, domain_code, decision, reason, owner_change, reviewers_planned)
-  VALUES ((SELECT id FROM reviews WHERE code = 'R-0002'), 'payments', 'included', 'added by the owner',
-          'added-by-owner', 1);
-COMMIT;
+```sh
+ledger.py review-domain R-0002 database include --reason 'the owner wants the data model reviewed' --owner-change added-by-owner
+ledger.py review-domain R-0002 payments include --reason 'added by the owner' --owner-change added-by-owner --reviewers 1
 ```
 
 ### Several repositories
@@ -100,220 +71,141 @@ lists it explicitly: `add-repo shared ../shared --outside-root`, after a `decisi
 
 ### Record a test run
 
-`purpose` is one of `baseline`, `targeted`, `flake-check`, `mutation`, `before-fix`, `after-fix`, `ci`. A run for a
-plan step sets `step_id` instead of (or with) `review_id`.
+`--purpose` is one of `baseline`, `targeted`, `flake-check`, `mutation`, `before-fix`, `after-fix`, `ci`. The commit
+is the repository's `HEAD` unless `--commit` names another. A run for a plan step takes `--step 12` in place of
+`--review`.
 
-```sql
-BEGIN IMMEDIATE;
-INSERT INTO test_runs(review_id, repository_id, commit_sha, command, purpose, passed, failed, skipped, exit_code,
-                      duration_ms, notes)
-  VALUES ((SELECT id FROM reviews WHERE code = 'R-0002'), (SELECT id FROM repositories WHERE name = 'demo'),
-          '<full commit sha>', 'python3 -m unittest', 'baseline', 120, 0, 2, 0, 5400, 'two tests skipped: no network');
-COMMIT;
+```sh
+ledger.py record-test-run --purpose baseline --command 'python3 -m unittest' --review R-0002 --passed 120 --skipped 2 --exit-code 0 --duration-ms 5400 --note 'two tests skipped: no network'
 ```
 
 ### Finish a reviewer run
 
-When a report arrives: its path inside the review folder, its sha256 (`sha256sum <file>`), the counts it states, and
-the status (`finished`, `failed` or `cancelled`).
+When a report arrives, give its path inside the review folder and the counts it states; `--status` is `finished`
+(the default), `failed` or `cancelled`. The command computes the file's sha256 for `report_sha256`, stores the path as
+`report_path` and records the report as an artifact.
 
-```sql
-BEGIN IMMEDIATE;
-UPDATE reviewer_runs SET status = 'finished', report_path = '.code-review/reviews/R-0002/security.md',
-       report_sha256 = '<sha256 of the report>', items_reviewed = 4, high_count = 1, medium_count = 0, low_count = 0,
-       final_message = 'Reviewed 4 sign-in paths; 1 high.', finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
- WHERE review_id = (SELECT id FROM reviews WHERE code = 'R-0002') AND label = 'security';
-COMMIT;
+```sh
+ledger.py finish-run R-0002 security-1 --report .code-review/reviews/R-0002/security.md --items 4 --high 1 --message 'Reviewed 4 sign-in paths; 1 high.'
 ```
 
 ### Record a verification
 
-After loading (Step 5c), for each finding you checked: `verification` is `confirmed`, `partly`, `false` or
-`not-checkable` (it starts `unverified`), with a note saying what you saw. A `false` finding is still matched in 5d.
+After loading (Step 5c), for each finding you checked: `confirmed`, `partly`, `false` or `not-checkable` (it starts
+`unverified`), with a note saying what you saw. A `false` finding is still matched in 5d.
 
-```sql
-BEGIN IMMEDIATE;
-UPDATE findings SET verification = 'confirmed', verification_note = 'read src/auth.py:3-5 at the reviewed commit',
-       verified_by_actor_id = (SELECT id FROM actors WHERE kind = 'manager' ORDER BY id DESC LIMIT 1),
-       verified_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
- WHERE review_id = (SELECT id FROM reviews WHERE code = 'R-0002') AND point_id = 'SEC-M1';
-COMMIT;
+```sh
+ledger.py verify R-0002:SEC-M1 confirmed --note 'read src/auth.py:3-5 at the reviewed commit'
 ```
 
 ### Record a metric
 
 Keep metric names stable between reviews (`mutation_score`, `line_coverage`, `test_cases_asserted`, `page_weight`,
 `queries_per_page`, ...: `ledger.py query "SELECT * FROM metric_defs"`); a new name is added to `metric_defs`
-automatically. `method` is `measured`, `counted` or `estimated`.
+automatically. `--method` is `measured`, `counted` or `estimated`.
 
-```sql
-BEGIN IMMEDIATE;
-INSERT INTO metrics(review_id, domain_code, repository_id, name, scope, value, unit, method, note)
-  VALUES ((SELECT id FROM reviews WHERE code = 'R-0002'), 'security', (SELECT id FROM repositories WHERE name = 'demo'),
-          'test_cases_asserted', 'src/auth.py', 7, 'cases', 'counted', 'from the security report, table 2');
-COMMIT;
+```sh
+ledger.py add-metric R-0002 test_cases_asserted 7 --method counted --domain security --repo demo --scope src/auth.py --unit cases --note 'from the security report, table 2'
 ```
 
 ### Record an artifact
 
 Briefs, reports, indexes and the review report are kept inside the ledger's folder, in `.code-review/reviews/R-0002/`
-(copy them there first; never record a path in a scratch folder or elsewhere in the repository). `kind` is `brief`,
-`report`, `index`, `summary-doc`, `plan-file`, `progress-page`, `probe-script` or `other`; a report also names its
-run.
+(copy them there first; never record a path in a scratch folder or elsewhere in the repository). The kind is `brief`,
+`report`, `index`, `summary-doc`, `plan-file`, `progress-page`, `probe-script` or `other`; `--run security-1` names the
+reviewer run a file belongs to. `finish-run` has already recorded each report.
 
-```sql
-BEGIN IMMEDIATE;
-INSERT INTO artifacts(review_id, reviewer_run_id, kind, path, sha256)
-  VALUES ((SELECT id FROM reviews WHERE code = 'R-0002'),
-          (SELECT id FROM reviewer_runs WHERE label = 'security'
-              AND review_id = (SELECT id FROM reviews WHERE code = 'R-0002')),
-          'report', '.code-review/reviews/R-0002/security.md', '<sha256 of the report>');
-COMMIT;
+```sh
+ledger.py add-artifact brief --path .code-review/reviews/R-0002/BRIEF.md --review R-0002
 ```
 
 ### Set a review's verdict
 
-```sql
-BEGIN IMMEDIATE;
-UPDATE reviews SET verdict = 'Usable, with one high-severity sign-in weakness to fix first.',
-       summary = 'Two domains, five points, one confirmed high.',
-       change_actor_id = (SELECT id FROM actors WHERE kind = 'manager' ORDER BY id DESC LIMIT 1)
- WHERE code = 'R-0002';
-COMMIT;
+```sh
+ledger.py set-verdict R-0002 --verdict 'Usable, with one high-severity sign-in weakness to fix first.' --summary 'Two domains, five points, one confirmed high.'
 ```
 
 ### Confirm guard tests
 
-Each review checks the guard tests of fixed issues (the test-quality reviewer, or you): still there and still
-guarding, or gone.
+Each review checks the guard tests of fixed issues (the test-quality reviewer, or you). One that is still there and
+still guards its issue (`still_exists`, `last_confirmed_review_id`):
 
-```sql
-BEGIN IMMEDIATE;
-UPDATE guard_tests SET still_exists = 1, last_confirmed_review_id = (SELECT id FROM reviews WHERE code = 'R-0002')
- WHERE issue_id IN (SELECT id FROM issues WHERE code IN ('ISS-0001'));
-COMMIT;
+```sh
+ledger.py confirm-guard R-0002 ISS-0001
 ```
 
-A test that is gone: `still_exists = 0` (then `v_unguarded_fixes` lists its issue).
+One that is gone takes `--gone` (and `--test PATH::NAME` when the issue has several); `v_unguarded_fixes` then lists
+its issue.
 
 ### Record that tags were pushed
 
-Only when the ledger-location decision lets tags be pushed, after `git push origin review/R-0001`:
+Only when the ledger-location decision lets tags be pushed, after `git push origin review/R-0001` (sets `tag_pushed`):
 
-```sql
-BEGIN IMMEDIATE;
-UPDATE review_repositories SET tag_pushed = 1
- WHERE review_id = (SELECT id FROM reviews WHERE code = 'R-0001') AND tag_name IS NOT NULL;
-INSERT INTO events(entity_type, entity_id, event, to_value, note, actor_id, review_id)
-  VALUES ('review', (SELECT id FROM reviews WHERE code = 'R-0001'), 'tag-pushed', 'review/R-0001',
-          'git push origin review/R-0001', (SELECT id FROM actors WHERE kind = 'manager' ORDER BY id DESC LIMIT 1),
-          (SELECT id FROM reviews WHERE code = 'R-0001'));
-COMMIT;
+```sh
+ledger.py tag-review R-0001 --pushed
 ```
 
 ## The plan
 
 ### Create a plan
 
-```sql
-BEGIN IMMEDIATE;
-INSERT INTO plans(code, title, change_actor_id)
-  VALUES ((SELECT next_code FROM v_next_codes WHERE prefix = 'P'), 'Fix plan for R-0002',
-          (SELECT id FROM actors WHERE kind = 'manager' ORDER BY id DESC LIMIT 1));
-INSERT INTO plan_reviews(plan_id, review_id)
-  VALUES ((SELECT max(id) FROM plans), (SELECT id FROM reviews WHERE code = 'R-0002'));
-COMMIT;
-```
-
-Add one `plan_reviews` row per review the plan covers. Then load the drafted steps (`references/fix-plan.md`):
+One `--review` per review the plan covers. Then load the drafted steps (`references/fix-plan.md`); until they are
+loaded, `check` lists the reviews' findings as uncovered.
 
 ```sh
+ledger.py new-plan --title 'Fix plan for R-0002' --review R-0002
 ledger.py import-steps P-0002 steps.jsonl
 ```
 
 ### Move a plan's status
 
-`drafting`, `awaiting-approval`, `approved` (with `approved_at` and the approver, only once its `plan-approval` gate
-is applied), `in-progress` (at the first step), `complete` (every step done or dropped), or `superseded` /
-`abandoned` (with a note; a superseded plan names its successor). Each change takes `change_actor_id` and
-`change_note`.
-
-```sql
-BEGIN IMMEDIATE;
-UPDATE plans SET status = 'awaiting-approval', change_note = 'the steps are ready for the owner',
-       change_actor_id = (SELECT id FROM actors WHERE kind = 'manager' ORDER BY id DESC LIMIT 1)
- WHERE code = 'P-0002';
-COMMIT;
-```
-
-Approval goes through the owner's gate first:
+`drafting`, `awaiting-approval`, `approved` (only once its `plan-approval` gate is applied), `in-progress` (at the
+first step), `complete` (every step done or dropped), `superseded` (with `--superseded-by P-0003`) or `abandoned`.
+Every change takes `--note`.
 
 ```sh
+ledger.py plan-status P-0002 awaiting-approval --note 'the steps are ready for the owner'
 ledger.py open-gate plan-approval --plan P-0002 --title 'Approve the fix plan' --question 'Start work in this order?' --option approve='Approve the plan' --option change='Change it first'
 ledger.py answer-gate GATE-0003 --value approve --text 'Go ahead.'
 ledger.py apply-gate GATE-0003 --note 'plan approved; work starts with phase 1'
+ledger.py plan-status P-0002 approved --note 'the owner approved the plan (GATE-0003)' --approved-by A-0001
+ledger.py issue-status ISS-0004 planned --note 'in P-0002 step 1'
 ```
-
-```sql
-BEGIN IMMEDIATE;
-UPDATE plans SET status = 'approved', approved_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-       approved_by_actor_id = (SELECT id FROM actors WHERE kind = 'owner' ORDER BY id LIMIT 1),
-       change_note = 'the owner approved the plan (GATE-0003)',
-       change_actor_id = (SELECT id FROM actors WHERE kind = 'manager' ORDER BY id DESC LIMIT 1)
- WHERE code = 'P-0002';
-COMMIT;
-```
-
-The plan's open issues then go to `planned` (`ledger.py issue-status ISS-0004 planned --note 'in P-0002 step 1'`), and
-at the first step the plan goes `in-progress` the same way (`status = 'in-progress'`), at the end `complete`.
 
 ### Record a step's commit
 
-```sql
-BEGIN IMMEDIATE;
-INSERT INTO step_commits(step_id, repository_id, commit_sha, branch, summary, committed_at)
-  VALUES ((SELECT s.id FROM steps s JOIN plans p ON p.id = s.plan_id WHERE p.code = 'P-0001' AND s.number = 2),
-          (SELECT id FROM repositories WHERE name = 'demo'), '<full commit sha>', 'fix/sign-in-codes',
-          'Sign-in codes from secrets.token_hex', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
-COMMIT;
+`step-status 2 done --commit <sha>` records the commit with the status. For a further commit, or a pull request:
+
+```sh
+ledger.py add-commit P-0001#2 <full commit sha> --pr https://example.com/o/demo/pull/7
 ```
 
-`pr_url` takes the pull request's `https://` address when there is one. If a step's own commit cannot name itself,
-record it with the next commit.
+The branch and the summary come from git. If a step's own commit cannot name itself, record it with the next commit.
 
 ### Record a guard test
 
-The test that would fail if the fixed issue came back, with whether it failed before the fix and passes after:
+The test that would fail if the fixed issue came back; `--failed-before` when you saw it fail before the fix.
+`step-status 2 done --guard PATH::NAME` records one for each issue of the step.
 
-```sql
-BEGIN IMMEDIATE;
-INSERT INTO guard_tests(issue_id, repository_id, test_path, test_name, step_id, added_commit_sha, failed_before_fix,
-                        passes_after_fix)
-  VALUES ((SELECT id FROM issues WHERE code = 'ISS-0004'), (SELECT id FROM repositories WHERE name = 'demo'),
-          'tests/test_auth.py', 'test_sign_in_code_is_unpredictable',
-          (SELECT s.id FROM steps s JOIN plans p ON p.id = s.plan_id WHERE p.code = 'P-0001' AND s.number = 2),
-          '<full commit sha>', 1, 1);
-COMMIT;
+```sh
+ledger.py add-guard ISS-0004 tests/test_auth.py test_sign_in_code_is_unpredictable --failed-before --step 2 --plan P-0001
 ```
 
 ### Record the hub address
 
-After publishing the hub page (`progress-page`) somewhere, keep its address on the plan and as an artifact:
+After publishing the hub page (`progress-page`) somewhere, record its address; this also sets the plan's `page_url`.
 
-```sql
-BEGIN IMMEDIATE;
-UPDATE plans SET page_url = 'https://example.com/hub' WHERE code = 'P-0001';
-INSERT INTO artifacts(plan_id, kind, path, url)
-  VALUES ((SELECT id FROM plans WHERE code = 'P-0001'), 'progress-page', '.code-review/hub.html',
-          'https://example.com/hub');
-COMMIT;
+```sh
+ledger.py add-artifact progress-page --plan P-0001 --url https://example.com/hub
 ```
 
-`plans.doc_url` is only for a document the owner keeps elsewhere and asks to link.
+A document the owner keeps elsewhere and asks to link is an artifact too:
+`ledger.py add-artifact plan-file --plan P-0001 --url <address>`.
 
 ## Correcting the ledger
 
-History is never deleted; every correction is a new row or a change with its reason.
+History is never deleted; every correction is a new row or a change with its reason. The SQL blocks here are the
+only hand-written SQL the skill uses.
 
 ### Re-match a finding
 
@@ -340,14 +232,23 @@ ledger.py issue-status ISS-0001 fixed --note 'the regression match was wrong: SE
 
 ### Mark a false finding
 
-Set its verification (as in "Record a verification") to `false` with the reason in `verification_note`, then match it
-as usual. With no existing issue, `match R-0002 SEC-M1 new --type new` creates one closed as `obsolete` with
-resolution `false finding: <why>`. A false finding marked fixed by mistake is corrected the same way: its issue
-`issue-status ISS-0005 obsolete --note 'false finding: <why>'`.
+`ledger.py verify R-0002:SEC-M1 false --note '<why it is false>'`, then match it as usual. With no existing issue,
+`match R-0002 SEC-M1 new --type new` creates one closed as `obsolete` with resolution `false finding: <why>`. The
+issue of a false finding marked fixed by mistake: `issue-status ISS-0005 obsolete --note 'false finding: <why>'`.
+
+### Retire a goal
+
+A goal the owner drops is retired, never deleted (one that another replaces also sets `superseded_by`):
+
+```sql
+BEGIN IMMEDIATE;
+UPDATE design_goals SET retired_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE code = 'G-02';
+COMMIT;
+```
 
 ### Withdraw or change a gate
 
-A gate that is no longer needed is withdrawn (only an open or answered one). To ask again, open a new gate; or reopen
+A gate nobody needs is withdrawn (only an open or answered one). To ask again, open a new gate; or reopen
 an answered one by clearing both answer columns (the cleared answer stays in `events`).
 
 ```sql
@@ -361,37 +262,24 @@ COMMIT;
 Check that it changed one row (`ledger.py gates`). To reopen instead:
 `UPDATE gates SET status = 'open', answer_value = NULL, answer_text = NULL WHERE code = 'GATE-0002' AND status = 'answered';`
 
-### Remove a test review
+### A review started by mistake
 
-There is no command to delete a review (`drop-review` is planned). Try the skill on a throwaway ledger instead:
-`ledger.py --db /tmp/trial.sqlite init`, then pass `--db /tmp/trial.sqlite` to every command. A review started by
-mistake in the real ledger is abandoned: `ledger.py review-status R-0003 abandoned --note 'started by mistake'`.
+It is abandoned and stays in history: `ledger.py review-status R-0003 abandoned --note 'started by mistake'`. Try the
+skill on a throwaway ledger: `ledger.py --db /tmp/trial.sqlite init`, then `--db /tmp/trial.sqlite` on every command.
 
 ### Redact a secret
 
-Finding text and events cannot be edited in place, so a secret that reached the ledger is removed through the dump:
+`redact` replaces the secret with `[redacted]` in the named field and in every copy of it elsewhere in the ledger, and
+logs an event with your reason (never the value). `--only` limits it to the secret inside a longer text; without it
+the whole field is replaced. Then write the dump again:
 
-    ledger.py dump
-    python3 -c "import sys; p = sys.argv[1]; t = open(p, encoding='utf-8').read(); open('/tmp/redacted.sql', 'w', encoding='utf-8').write(t.replace(sys.argv[2], '[redacted]'))" .code-review/ledger.sql '<the secret value>'
-    ledger.py restore /tmp/redacted.sql --to /tmp/redacted.sqlite
-    cp .code-review/ledger.sqlite .code-review/ledger.sqlite.bak-redact
-    cp /tmp/redacted.sqlite .code-review/ledger.sqlite
-    ledger.py check
-
-Choose the replaced text so it occurs only where the secret is (the whole value, never a common word); `restore`
-refuses a dump that does not load and `check` must pass. Then record what was redacted and why (never the value),
-delete the backup and `/tmp/redacted.*`, and run `dump` again:
-
-```sql
-BEGIN IMMEDIATE;
-INSERT INTO events(entity_type, entity_id, event, note, actor_id)
-  VALUES ('finding', (SELECT id FROM findings WHERE point_id = 'SEC-H1' ORDER BY id LIMIT 1), 'redacted',
-          'an API key value in the summary and its excerpt replaced by [redacted]: a secret',
-          (SELECT id FROM actors WHERE kind = 'manager' ORDER BY id DESC LIMIT 1));
-COMMIT;
+```sh
+ledger.py redact findings.summary R-0001:SEC-H1 --only '<the secret value>' --reason 'an API key in the summary'
+ledger.py dump
 ```
 
-Tell the owner: a secret already committed stays in git history until the history is rewritten, and must be rotated.
+Delete every older copy that still holds it (`ledger.sql` copies, `ledger.sqlite.bak*`). Tell the owner to rotate
+the secret: one that reached git stays in its history until the history is rewritten.
 
 ## When something goes wrong
 
@@ -420,7 +308,7 @@ Tell the owner: a secret already committed stays in git history until the histor
 - `v_relation_problems`: a relation that contradicts its issues: add the right relation and close or reopen with a
   note.
 - `v_check_finding_owner`: a check's finding belongs to another review: re-record the check in its own review.
-- `v_unguarded_fixes` (warning): a fixed issue with no guard test: record one.
+- `v_unguarded_fixes` (warning): a fixed issue with no guard test: record one with `add-guard`.
 - `quick_check` / `integrity_check` or `foreign_key_check` failures: stop writing; `ledger.py restore
   .code-review/ledger.sql --to /tmp/check.sqlite` from the last dump, compare, and ask the owner before replacing.
 - A schema difference (a table, view or trigger that is not the shipped one): someone changed the ledger's schema;
@@ -437,6 +325,6 @@ other and merge it in; then dump.
     ledger.py dump
 
 `merge` prints codes it renumbered; text that mentions them (notes, tags) is not rewritten. Back up by running `dump`
-after each writing session, and copy `ledger.sqlite` before `migrate`, `merge` or a redaction (`migrate` and `merge`
+after each writing session, and copy `ledger.sqlite` before `migrate` or `merge` (both
 also keep their own backups). Expect about 7 MB of ledger and 5 MB of dump per 1,000 findings (measured at 10,000
 findings: 72 MB and 50 MB).

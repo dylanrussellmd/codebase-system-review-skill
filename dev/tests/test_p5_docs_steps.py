@@ -2,8 +2,8 @@
 review-qualified (step 111).
 
 test_skill_step1_commands_run   every ledger.py line of the fenced blocks of Steps 1, 2a, 2b, 2c (once the interview
-                                commands of step 129 are built) and 3, with the recipes Steps 1 and 2a point to (a
-                                requirement, a custom domain), runs with
+                                commands of step 129 are built) and 3, with the recipes' commands for what Steps 1
+                                and 2a name (add-requirement, add-domain), runs with
                                 exit 0 on a new git project; the review ends running with its domains, the goal, the
                                 requirement and the custom domain recorded, and check passes
 test_drafter_closes_are_review_qualified
@@ -14,7 +14,7 @@ import json
 import re
 import shlex
 import sqlite3
-import unittest
+import unittest  # sqlite3: read-only checks of the result
 
 from dev.tests import fixtures
 from dev.tests.fixtures import Ledger, ScratchRepo, finish_demo, seed_demo
@@ -47,8 +47,9 @@ def skill_lines(text, *titles):
 
 
 def recipe(text, title):
-    """The first sql block of a recipe section."""
-    return [b for lang, b in fenced_blocks(section(text, title)) if lang == "sql"][0]
+    """The ledger.py lines of a recipe section's sh blocks."""
+    return [l for lang, b in fenced_blocks(section(text, title)) if lang == "sh"
+            for l in b.splitlines() if l.startswith("ledger.py ")]
 
 
 class SkillSteps(unittest.TestCase):
@@ -61,7 +62,7 @@ class SkillSteps(unittest.TestCase):
         repo.commit("first")
         L = Ledger(repo, real_init=True)
         self.addCleanup(L.close)
-        L.close()  # this test writes only through the CLI and the recipes' runner
+        L.close()  # this test writes only through the CLI
         (repo.path / "prompt.txt").write_text("First read BRIEF.md and follow it exactly.\n", encoding="utf-8")
 
         def run_line(line):
@@ -73,22 +74,21 @@ class SkillSteps(unittest.TestCase):
             self.assertEqual(p.returncode, 0, f"SKILL.md: {line}\n{p.stdout}\n{p.stderr}")
             return p
 
-        def run_recipe(sql):
-            con = sqlite3.connect(str(L.db), timeout=30)
-            con.execute("PRAGMA foreign_keys = ON")
-            con.executescript(sql.replace("'R-0002'", "'R-0001'").replace("'demo'", "'app'"))
-            con.close()
+        def run_recipe(lines, command):
+            self.assertEqual([shlex.split(l)[1] for l in lines], [command])
+            self.assertIn(f"`ledger.py {command}", skill, f"SKILL.md no longer names {command}")
+            run_line(lines[0].replace("R-0002", "R-0001"))
 
         step1 = skill_lines(skill, "Step 1:")
         self.assertEqual([shlex.split(l)[1] for l in step1],
                          ["init", "add-actor", "add-actor", "add-repo", "open-gate", "gates", "check"])
         for line in step1:
             run_line(line)
-        run_recipe(recipe(recipes, "Add a custom domain"))
+        run_recipe(recipe(recipes, "Add a custom domain"), "add-domain")
         step2a = skill_lines(skill, "2a. Draft the selection")
         self.assertEqual([shlex.split(l)[1] for l in step2a], ["new-review"])
         run_line(step2a[0])
-        run_recipe(recipe(recipes, "Add a requirement"))
+        run_recipe(recipe(recipes, "Add a requirement"), "add-requirement")
         (repo.path / ".code-review" / "reviews" / "R-0001").mkdir(parents=True)
         (repo.path / ".code-review" / "reviews" / "R-0001" / "proposal.md").write_text("Domains: security, tests.\n")
         step2b = skill_lines(skill, "2b. Ask the owner to approve")

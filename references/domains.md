@@ -4,7 +4,7 @@ Read this in Step 2a to choose the domains, and give each reviewer its domain's 
 entry names the domain, its default report file and, in italics, when it usually applies (the same sentence as
 `domains.description` in the ledger; the code is in `ledger.py query "SELECT code, report_file FROM domains"`). Choose
 from these; launch only what the owner approved. A domain the catalog lacks is added with
-`references/recipes.md#add-a-custom-domain`.
+`ledger.py add-domain`.
 
 #### Correctness
 
@@ -32,7 +32,7 @@ mutants that matter most. Run the suite several times (and in random order where
 order-dependent tests. Find tests that depend on the real clock, time zone, network, or shared state. Report test
 suite speed and the slowest tests. Review test doubles: do fakes enforce the real limits and errors of what they
 replace? Check that every guard test recorded in the ledger (listed in the brief) still exists and still fails without its fix
-where cheap to try; the manager records the answer (`references/recipes.md#confirm-guard-tests`). If mutation tooling can't run, say so and fall back to sampling assertions by hand, marked "not measured".
+where cheap to try; the manager records the answer (`ledger.py confirm-guard`). If mutation tooling can't run, say so and fall back to sampling assertions by hand, marked "not measured".
 
 **Time, dates and concurrency, `time-concurrency.md`.** *Applies to anything with dates, schedules, deadlines,
 expiries, or more than one writer.* Inventory every place the code creates, parses, compares, formats or stores a date

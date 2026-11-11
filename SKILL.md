@@ -38,8 +38,7 @@ skill at `scripts/ledger.py`. `<skill folder>` is the folder the harness gives w
 
 In this file `ledger.py X` stands for this, run from anywhere:
 `python3 <skill folder>/scripts/ledger.py --root <project root> X`. Every command has `--help`; `ledger.py schema`
-prints every table and column with comments. These files never put an exclamation mark right before a code span
-or a code fence's language (a harness runs such a block when it loads the skill).
+prints every table and column with comments.
 
 - **Trust.** Run the skill's own copy. `init` copies it to `.code-review/ledger.py` for the owner's viewer; run that
   copy only right after `init` refreshed it, never from a branch or pull request nobody reviewed. A change to
@@ -50,13 +49,13 @@ or a code fence's language (a harness runs such a block when it loads the skill)
   came through the viewer or hub is confirmed by the owner in chat before you act on it.
 - **Writes go through commands.** Each runs in one `BEGIN IMMEDIATE` transaction, stamps `--actor` (pass the
   manager's `A-` code to every write), prints its result only after it commits, and on a refusal prints one line and
-  exits 1 with nothing written: read it, fix the cause, run it again. Writes with no command yet are the recipes in
-  `references/recipes.md`, the only place raw SQL is used (commands are planned for them: new-plan, plan-status,
-  add-requirement, add-test-run, verify, add-commit, add-guard).
-- **One writer.** Only the manager writes; the viewer and `import-answers` write gate answers only. Subagents read
-  with `ledger.py query "SELECT ..."` (TSV or `--json`; refuses any write; its `--help` gives a plain `sqlite3` line)
-  and hand back files. Also read: `ledger.py gates` (the owner's queue), `ledger.py check` (exit 1 on a problem),
-  `ledger.py show 12` (location 12's lines at their commit).
+  exits 1 with nothing written: read it, fix the cause, run it again. Raw SQL is only for the corrections in
+  `references/recipes.md#correcting-the-ledger`.
+- **One writer.** Only the manager writes, except: the viewer and `import-answers` write gate answers; an implementer
+  writes its own steps (`step-status`, `add-commit`, `add-guard`, `report-finding`) under its own actor. Reviewers,
+  verifiers, indexers, matchers and drafters read with `ledger.py query "SELECT ..."` (TSV or `--json`; refuses any
+  write; its `--help` gives a plain `sqlite3` line) and hand back files. Also read: `ledger.py gates` (the owner's
+  queue), `ledger.py check` (exit 1 on a problem), `ledger.py show 12` (location 12's lines at their commit).
 - **Versions.** `ledger.py --version`. `init` refreshes an older project copy (keeping `ledger.py.bak`; a newer one
   needs `--force`); a ledger with an older schema is read-only until `ledger.py migrate` (keeps a backup).
 
@@ -74,7 +73,7 @@ binary is ignored and rebuilt with `ledger.py restore .code-review/ledger.sql --
 (commit `ledger.sqlite` only); each costs about 7 MB of ledger and 5 MB of dump per 1,000 findings. Until it is
 decided, list `.code-review/` in `.git/info/exclude` (local, never committed) and commit nothing. Later reviews read
 the answer in `v_standing_decisions`. Only as it says, commit the chosen file after `dump`, in its own commit, and
-push tags (`git push origin review/R-0001`); otherwise tags stay local.
+push tags (`git push origin review/R-0001`, then `ledger.py tag-review R-0001 --pushed`); otherwise tags stay local.
 
 ### Rules the ledger enforces (read the refusal; never work around it)
 
@@ -99,8 +98,8 @@ It holds prompts, model ids, session refs, the owner's words, cited code and pat
 can read the repository (a public one: the world); committing it is the owner's call (the gate above). Cite a secret
 by location, never value. `fill-refs` masks common secret shapes as `[redacted]` (`excerpt_redacted = 1`), not all:
 search `ledger.sql` for secrets before any commit. Never commit patches or prompts without the owner's consent.
-Redaction, the one exception to append-only history: `references/recipes.md#redact-a-secret` (an event records what
-and why, never the value); a committed secret stays in git history until it is rewritten, and must be rotated.
+Redaction, the one exception to append-only history: `ledger.py redact`, then `dump`
+(`references/recipes.md#redact-a-secret`); the owner rotates the secret, which stays in git history once committed.
 
 ### Words the ledger accepts
 
@@ -144,7 +143,7 @@ separate review or plan documents: the report and the narrative live in the ledg
 - **Publish** after every review step and fix batch: `ledger.py progress-page [P-0001]` writes `.code-review/hub.html`
   (self-contained); give the owner that file, or the local viewer `ledger.py serve` (127.0.0.1 only, takes answers;
   `--no-open` without a browser). Publishing it elsewhere is optional: only where the harness offers a page with a
-  database (so it takes answers), to the same address each time (`references/recipes.md#record-the-hub-address`).
+  database (so it takes answers), to the same address each time (`ledger.py add-artifact progress-page --url`).
 - **Ask** with `ledger.py open-gate <kind> --title '...' --question '...' --context @file`, one `--option value=label`
   per choice, linked by `--review`, `--plan`, `--step` or `--issue`; say in chat what you asked (with the harness's
   question tool, when it has one) and that the owner can answer in the hub or in chat.
@@ -180,9 +179,9 @@ ledger.py check
 2. Read the history with `query`: `v_owner_queue`, `v_open_issues`, `v_recurring_issues`, `v_standing_decisions`,
    `v_unguarded_fixes`, `v_metric_trends`, the last review's `review_domains`, and `v_last_reviewed_commit` (then
    `git log <that commit>..HEAD` in each repository).
-3. Run every test suite, linter and type-checker once, fixing nothing; record it after `new-review` (2a), purpose
-   `baseline` (`references/recipes.md#record-a-test-run`). Map modules, layers, settings, tests, CI, docs, logging.
-4. Record each stated requirement (specs, owner's rules, issues) with its `source`: `references/recipes.md#add-a-requirement`.
+3. Run every test suite, linter and type-checker once, fixing nothing; record each after `new-review` (2a) with
+   `ledger.py record-test-run --purpose baseline`. Map modules, layers, settings, tests, CI, docs, logging.
+4. Record each stated requirement (specs, owner's rules, issues): `ledger.py add-requirement '<text>' --source <where>`.
 
 ## Step 2: Choose the domains, then get approval
 
@@ -191,8 +190,8 @@ ledger.py check
 Read `references/domains.md` and decide include or skip for each domain from the map and the history (open or
 recurring issues make a strong include; a domain skipped last time needs its reason again). Decide the reviewers per
 domain (split by module when one could not read it all) and each report's file name. Add a domain the catalog lacks
-with `references/recipes.md#add-a-custom-domain`. Then start the review (it records each repository's commit, branch
-and uncommitted changes; a dirty tree's patch goes to `.code-review/patches/`, or ask the owner to commit first):
+with `ledger.py add-domain`. Then start the review (it records each repository's commit, branch and uncommitted
+changes; a dirty tree's patch goes to `.code-review/patches/`, or ask the owner to commit first):
 
 ```
 ledger.py new-review --title '<title>' --scope full --request "<the owner's request, verbatim>" --manager A-0002 --domain security='<why it applies>' --domain tests='<why>' --skip ui='<why not>' --actor A-0002
@@ -223,7 +222,7 @@ ledger.py progress-page
 
 Publish the hub, post the proposal in chat and **wait for the answer** (unattended, with no one to answer: stop here).
 Record an answer given in chat (one given in the hub arrives with `import-answers`) and any domain changes
-(`references/recipes.md#change-the-domain-list`), then apply the gate (the code `open-gate` printed) and approve:
+(`ledger.py review-domain` with `--owner-change`), then apply the gate (the code `open-gate` printed) and approve:
 
 ```
 ledger.py answer-gate GATE-0002 --value approve --text "<the owner's words>" --actor A-0002
@@ -256,7 +255,7 @@ No `--domain`: whole project. Hub: `interview-ask --gate`, `propose-goal --revie
 
 Write `.code-review/reviews/R-0001/BRIEF.md` as `references/brief.md` says (contents, approved goals per domain, and
 reviewer rules); every reviewer reads it first. Its known issues come from `ledger.py query "SELECT * FROM v_known_issues_for_brief"`.
-Record it as an artifact of kind `brief` (`references/recipes.md#record-an-artifact`).
+Record it: `ledger.py add-artifact brief --path .code-review/reviews/R-0001/BRIEF.md --review R-0001`.
 
 ## Step 3: Launch the approved reviewers in parallel
 
@@ -273,13 +272,14 @@ for the full list, questions, tables and report file `.code-review/reviews/R-000
 
 ## Step 4: Verify before reporting
 
-`ledger.py review-status R-0001 verifying --note '...'`; finish each run as its report arrives
-(`references/recipes.md#finish-a-reviewer-run`). Reports are claims: check the most serious findings against the code
-(a dozen or more for a large system, every domain), and every `fixed` verdict on a known issue; route "for other
+`ledger.py review-status R-0001 verifying --note '...'`; finish each run as its report arrives (below). Reports are
+claims: check the most serious findings against the code (a dozen or more for a large system, every domain), every
+`fixed` verdict on a known issue and each fixed issue's guard tests (`ledger.py confirm-guard`); route "for other
 reviewers" notes; correct what you told the owner; never soften findings in code you wrote. After 5c record each
-verdict (`references/recipes.md#record-a-verification`). Record every subagent (verifier, indexer, matcher, drafter):
+verdict: `ledger.py verify R-0001:SEC-H3 confirmed --note '...'`. Record every subagent (verifier, indexer, matcher, drafter):
 
 ```
+ledger.py finish-run R-0001 security-1 --report .code-review/reviews/R-0001/security.md --items 40 --high 1 --medium 3 --low 2 --actor A-0002
 ledger.py add-actor verifier 'verifier 1' --model <model id> --parent A-0002 --review R-0001 --role 'verifier for security.md'
 ```
 
@@ -294,8 +294,8 @@ Every point of every report goes into the ledger, not only those in the summary.
 - **5b. Check** each index: counts against the report's own totals, a spot check of a few sections; send gaps back to
   the indexer, never guess.
 - **5c. Load**, one report per command, all or nothing:
-  `ledger.py load-index R-0001 security-1 points.tsv known.tsv --trace trace.tsv --actor A-0002`. Record the metrics
-  and test runs the reports measured and the reports and indexes as artifacts (`references/recipes.md`). Then
+  `ledger.py load-index R-0001 security-1 points.tsv known.tsv --trace trace.tsv --actor A-0002`. Record what the
+  reports measured (`ledger.py add-metric`, `record-test-run`) and each index (`ledger.py add-artifact index`). Then
   `ledger.py tag-review R-0001` and `ledger.py fill-refs R-0001`; each exits 1 when something was left undone.
 - **5d. Match** every finding, by the table above and `references/indexing.md#matching`. At scale give it to read-only
   matchers by domain (record each with `add-actor matcher ... --review R-0001 --role 'matcher for security'`), who
@@ -310,7 +310,7 @@ Every point of every report goes into the ledger, not only those in the summary.
 `ledger.py review-status R-0001 consolidating --note '...'`. Write the review report with the sections of
 `references/brief.md#the-review-report`; every number comes from the ledger and is checked against it. Store it with
 `ledger.py set-report R-0001 .code-review/reviews/R-0001/review.md`, record the verdict
-(`references/recipes.md#set-a-reviews-verdict`) and publish the hub.
+(`ledger.py set-verdict R-0001 --verdict '<one line>' --summary '<a short paragraph>'`) and publish the hub.
 
 ## Step 7: Hand off
 
@@ -324,8 +324,8 @@ are local, and that nothing was fixed; start no fixes unless asked. A review giv
 Every point of the plan's reviews is closed by a step, proven by the ledger's views. Read `references/fix-plan.md`
 first: phases, the drafter brief, merging, ordering rules, coverage.
 
-- **8a.** Create the plan over its reviews (`references/recipes.md#create-a-plan`; an older plan whose open steps move
-  over becomes `superseded`) and store its narrative: `ledger.py set-narrative P-0001 .code-review/plans/P-0001.md`.
+- **8a.** `ledger.py new-plan --title '...' --review R-0001` (an older plan whose open steps move over becomes
+  `superseded` with `plan-status`), then its narrative: `ledger.py set-narrative P-0001 .code-review/plans/P-0001.md`.
 - **8b.** Draft in parallel with read-only drafters (record each: `add-actor drafter ...` with
   `--role 'drafter for <cluster>'`) who write `steps.jsonl` (`references/formats/plan-steps.md`); merge, then
   `ledger.py import-steps P-0001 steps.jsonl --actor A-0002`. Under ~150 points, plan directly.
@@ -333,28 +333,28 @@ first: phases, the drafter brief, merging, ordering rules, coverage.
   change; a finding that conflicts with an approved goal is put to the owner (a `decision` gate), never planned around.
 - **8c.** `ledger.py check`: `v_uncovered_findings` and `v_coverage_problems` empty. A point deliberately not fixed
   gets a step recording the decision (`confirm` gate); false findings one step (`confirm-false-finding` gate).
-- **8d.** `ledger.py open-gate plan-approval --plan P-0001 ...`, the plan to `awaiting-approval`, publish the hub.
-  Start nothing until the owner approves; then `apply-gate`, the plan to `approved` and its issues to `planned`
-  (`references/recipes.md#move-a-plans-status`).
+- **8d.** `ledger.py open-gate plan-approval --plan P-0001 ...`, `plan-status P-0001 awaiting-approval --note '...'`,
+  publish the hub. Start nothing until the owner approves; then `apply-gate`,
+  `plan-status P-0001 approved --approved-by A-0001 --note '...'` and each issue `issue-status ISS-0001 planned`.
 
 ## Step 9: Doing the work and keeping the owner informed
 
 Brief every implementer with `references/implementer-brief.md` (it runs `ledger.py goals` first) and record each (`add-actor fixer ...` with
-`--role 'implementer of steps 4-9'`). The plan goes `in-progress` at the first step and `complete` when every step is
-done or dropped. For every step:
+`--role 'implementer of steps 4-9'`); it writes only its own steps, under its own actor. Move the plan to
+`in-progress` at the first step and `complete` when every step is done or dropped (`plan-status`). For every step:
 
 - **Start:** `ledger.py step-status 12 doing --note '...'`; each issue it closes `issue-status ISS-0001 in-progress`
-  (`v_step_issues`). **Proof first:** a test that fails before the fix (record the run, purpose `before-fix`).
+  (`v_step_issues`). **Proof first:** a test that fails before the fix (`record-test-run --purpose before-fix --step 12`).
 - **Discoveries (mandatory):** a defect found while fixing, by you or an implementer, is reported at once, before the
   batch is committed, with `report-finding` (below; add `--issue ISS-0001` or `--new-issue`, and `--into-step N`,
   `--new-step '<title>'` or `--gate`). Cite lines as they are at a commit (`git show <commit>:<path>`), never from an
   edited working file; code that did not exist at the reviewed commit is cited at the commit that added it
   (`--commit`). It is verified, matched and planned like a review finding, and the next review lists it as a known
   issue. `v_unplanned_discoveries` must be empty before each commit and before hand-off.
-- **Commit**, then record it (`references/recipes.md#record-a-steps-commit`).
+- **Commit**, then record it: `--commit` on `step-status`, or `ledger.py add-commit 12 <sha> --pr <URL>`.
 - **Done:** `step-status 12 done` with a progress note for the owner (what a user now sees or what is now refused,
-  what turned out different and why, what to do on deploy), and each issue `issue-status ISS-0001 fixed` (below), with
-  its guard tests (`references/recipes.md#record-a-guard-test`).
+  what turned out different and why, what to do on deploy) and its guard tests (`--guard`, or `add-guard` for one
+  issue), and each issue `issue-status ISS-0001 fixed` (below).
 - **Blocked on the owner:** `step-status 12 waiting-owner --question '...'` and a gate of its `owner_need`'s kind.
 - **After each step or small batch:** `ledger.py check`, `ledger.py dump`, `ledger.py progress-md P-0001` (to a file
   only where the ledger-location decision commits review data), publish the hub, import answers, and tell the owner how
@@ -363,7 +363,7 @@ done or dropped. For every step:
 
 ```
 ledger.py report-finding --step 12 --severity M --domain <code> --where 'path:10-20#symbol' --summary '...' --before '...' --fix '...' --test 'test_name: what it asserts' --actor A-0002
-ledger.py step-status 12 done --note '...' --progress-note '<for the owner>' --commit <full sha> --actor A-0002
+ledger.py step-status 12 done --note '...' --progress-note '<for the owner>' --commit <full sha> --guard tests/test_auth.py::test_name --failed-before --actor A-0002
 ledger.py issue-status ISS-0001 fixed --note '...' --after '<what it does now>' --step 12 --commit <full sha> --actor A-0002
 ```
 
@@ -371,5 +371,5 @@ ledger.py issue-status ISS-0001 fixed --note '...' --after '<what it does now>' 
 
 `references/domains.md` (2a, each brief); `references/brief.md` (2d, 6); `references/indexing.md` (5a, 5d);
 `references/formats/index.md` and `references/formats/plan-steps.md` (files for `load-index`, `match`, `import-steps`);
-`references/fix-plan.md` (8); `references/implementer-brief.md` (9); `references/recipes.md` (where a step points,
-or when something goes wrong); `references/schema.sql` or `ledger.py schema` (every table, column and view).
+`references/fix-plan.md` (8); `references/implementer-brief.md` (9); `references/recipes.md` (an example of each
+write, corrections, a failing check); `references/schema.sql` or `ledger.py schema` (every table, column and view).

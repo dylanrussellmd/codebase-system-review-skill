@@ -21,9 +21,6 @@ class SkillWritesTest(unittest.TestCase):
             named = set(re.findall(r"ledger\.py (?:--[a-z-]+ \S+ )*([a-z][a-z-]+)", text))
             self.assertEqual(sorted(named - known - {"py"}), [], f"{name} names commands the tool lacks")
 
-    # Until SKILL.md and references/recipes.md use the step 131 commands (the docs agent applies the changes listed in
-    # the step 131 report): then this passes, and the decorator must go.
-    @unittest.expectedFailure
     def test_skill_steps_need_no_sql(self):
         steps = SKILL[SKILL.index("## Step 0"):SKILL.index("## Reference files")]
         self.assertNotIn("recipes.md", steps, "a SKILL.md step still sends a write to a recipe")

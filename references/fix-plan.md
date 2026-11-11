@@ -6,10 +6,11 @@ skip the parallel drafting and write `steps.jsonl` yourself.
 
 ## Create the plan (8a)
 
-Create the plan over its reviews with `references/recipes.md#create-a-plan` (status `drafting`). A plan may cover
-several reviews and may take over still-open steps of an older plan; that plan then becomes `superseded`
-(`references/recipes.md#move-a-plans-status`). Write the plan's narrative (how to read it, why this order, what needs
-the owner, how it was built, what was not checked) in `.code-review/plans/P-0001.md` and store it with
+Create the plan over its reviews with `ledger.py new-plan --title '...' --review R-0001` (status `drafting`). A plan
+may cover several reviews (one `--review` each) and may take over still-open steps of an older plan; that plan then
+becomes `superseded` (`ledger.py plan-status P-0001 superseded --superseded-by P-0002 --note '...'`). Write the
+plan's narrative (how to read it, why this order, what needs the owner, how it was built, what was not checked) in
+`.code-review/plans/P-0001.md` and store it with
 `ledger.py set-narrative P-0001 .code-review/plans/P-0001.md`, again whenever it changes. The hub shows it on the plan
 page; there is no separate plan document.
 
@@ -82,6 +83,6 @@ Check every number and step range in the narrative against the ledger, then:
     ledger.py open-gate plan-approval --plan P-0001 --title 'Approve the fix plan' --question 'Start work in this order?' \
         --option approve='Approve the plan' --option change='Change it first' --actor A-0002
 
-Move the plan to `awaiting-approval`, publish the hub, and tell the owner the steps are in the hub's Fix plans. Start
-nothing until the owner approves; then `apply-gate`, move the plan to `approved` and its issues to `planned`
-(`references/recipes.md#move-a-plans-status`).
+Move the plan to `awaiting-approval` (`ledger.py plan-status P-0001 awaiting-approval --note '...'`), publish the hub,
+and tell the owner the steps are in the hub's Fix plans. Start nothing until the owner approves; then `apply-gate`,
+`plan-status P-0001 approved --approved-by A-0001 --note '...'`, and each of its issues `issue-status ISS-0001 planned`.

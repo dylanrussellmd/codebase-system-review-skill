@@ -104,6 +104,10 @@ must appear exactly once in core.py and nowhere else; the build refuses otherwis
 filled and reviews tagged) to try the viewer; it exits 1 if any of the ledger behaviour it relies on has changed.
 Shared test builders (scratch repositories, ledgers, the demo data, a viewer server) are in `dev/tests/fixtures.py`.
 
+`SKILL.md` and `references/*.md` never put an exclamation mark right before a code span or a code fence's language:
+some harnesses run such a block when they load the skill. `SKILL.md` stays within 375 lines; longer material goes in
+`references/`.
+
 CI (`.github/workflows/ci.yml`) runs the build check and the suite on Python 3.9 and 3.12 for every push and pull
 request.
 

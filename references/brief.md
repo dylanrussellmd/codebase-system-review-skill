@@ -27,7 +27,7 @@ Write `.code-review/reviews/R-0001/BRIEF.md` (in the ledger's folder; with `CODE
   `not-checked`, with evidence for each but `not-checked`. A new finding that continues, repeats or relates to a known
   issue names that issue's code.
 - **Guard tests** recorded for fixed issues of the domain (from `guard_tests`): the reviewer says whether each still
-  exists and still guards its issue (recorded with `references/recipes.md#confirm-guard-tests`).
+  exists and still guards its issue (the manager records it with `ledger.py confirm-guard`).
 
 ### Rules for reviewers (copy them into the brief)
 
@@ -79,6 +79,6 @@ Sections (skip any whose domain did not run):
    diagnosed today; documentation with the most important gaps; handover with the checklist).
 10. **Proposed order of work** and any decision the owner must make.
 
-Record the reports, indexes, the brief and the review report as artifacts with paths inside the ledger's folder
-(`references/recipes.md#record-an-artifact`), and the verdict and summary on the review
-(`references/recipes.md#set-a-reviews-verdict`).
+Record the indexes, the brief and the review report as artifacts with paths inside the ledger's folder
+(`ledger.py add-artifact`; `finish-run` records each report), and the verdict and summary on the review
+(`ledger.py set-verdict`).
