@@ -53,23 +53,29 @@ class SeedDemo(unittest.TestCase):
         for r in L.all("""SELECT rv.code, fl.commit_sha FROM finding_locations fl JOIN findings f ON f.id=fl.finding_id
                           JOIN reviews rv ON rv.id=f.review_id"""):
             self.assertEqual(r["commit_sha"], c1 if r["code"] == "R-0001" else c2)
-        # characterization: the exact event history today's triggers write for the demo
+        # the exact event history the triggers write for the demo (schema 3: text edits, checks and created rows
+        # are events too, and reviews move through every status on the way)
         self.assertEqual(
             [e[2:] for e in L.events("issue", ids["issues"]["ISS-0001"])],
-            [("opened", None, "open"), ("seen", None, "new"), ("status-changed", "open", "fixed"),
-             ("status-changed", "fixed", "verified")])
-        self.assertEqual([e[2:] for e in L.events("issue", ids["issues"]["ISS-0002"])],
-                         [("opened", None, "open"), ("seen", None, "new"), ("seen", None, "still-present")])
-        self.assertEqual([e[3:] for e in L.events("step")],
+            [("opened", None, "open"),
+             ("current-state-changed", None, "make_code uses random.randint, which is not suitable for secrets."),
+             ("seen", None, "new"), ("after-state-changed", None, "Codes come from secrets.randbelow."),
+             ("status-changed", "open", "fixed"), ("status-changed", "fixed", "verified"), ("checked", None, "fixed")])
+        self.assertEqual([e[2] for e in L.events("issue", ids["issues"]["ISS-0002"])],
+                         ["opened", "current-state-changed", "seen", "current-state-changed", "seen", "checked"])
+        self.assertEqual([e[3:] for e in L.events("step") if e[2] == "status-changed"],
                          [("not-started", "doing"), ("doing", "done"), ("not-started", "waiting-owner")])
-        self.assertEqual([e[3:] for e in L.events("review")],
-                         [("planning", "handed-off"), ("planning", "awaiting-approval")])
+        walk = [("planning", "awaiting-approval"), ("awaiting-approval", "approved"), ("approved", "running")]
+        self.assertEqual([e[3:] for e in L.events("review") if e[2] == "status-changed"],
+                         walk + [("running", "verifying"), ("verifying", "indexing"), ("indexing", "consolidating"),
+                                 ("consolidating", "handed-off")] + walk)
 
     def test_seed_demo_check_is_not_vacuous(self):
         L = self.L
         self.assertEqual(L.count("v_unchecked_known_issues"), 0)
         L.con.execute("SAVEPOINT probe")
         try:
+            L.x("DROP TRIGGER tr_check_no_delete")   # checks are append-only (schema 3); undone with the probe
             L.x("DELETE FROM review_issue_checks WHERE review_id=?", (self.ids["reviews"]["R-0002"],))
             rows = L.all("SELECT review, issue FROM v_unchecked_known_issues ORDER BY issue")
             self.assertEqual(rows, [{"review": "R-0002", "issue": c} for c in ("ISS-0001", "ISS-0002", "ISS-0003")])

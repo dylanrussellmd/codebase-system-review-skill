@@ -56,8 +56,13 @@ class Init(unittest.TestCase):
         self.assertIn(f"created {db}", p.stdout)
         self.assertIn(f"copied ledger.py to {d / '.code-review' / 'ledger.py'}", p.stdout)
         counts = object_counts(db)
-        # The counts at commit ea00196 were 35, 18, 16; schema 2 (migration 0002) added tr_gate_answer_final and tr_gate_answer_cleared.
-        self.assertEqual((counts["table"], counts["view"], counts["trigger"]), (35, 18, 18))
+        # The counts at commit ea00196 were 35, 18, 16; schema 2 (migration 0002) added tr_gate_answer_final and
+        # tr_gate_answer_cleared; schema 3 and later add many triggers (plan phase 4), so the counts are now those of
+        # the shipped schema itself, and at least the ea00196 ones.
+        want = {k: sum(1 for o in mod.shipped_objects() if o[0] == k) for k in ("table", "view", "trigger")}
+        self.assertEqual((counts["table"], counts["view"], counts["trigger"]),
+                         (want["table"], want["view"], want["trigger"]))
+        self.assertGreaterEqual(want["trigger"], 18 + 140)  # schema 3 (0003-integrity) alone adds over 140
         # Same objects as the source schema.
         mem = sqlite3.connect(":memory:")
         mem.executescript(SCHEMA_SQL.read_text(encoding="utf-8"))

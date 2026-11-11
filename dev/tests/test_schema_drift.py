@@ -116,7 +116,10 @@ class ShippedObjects(unittest.TestCase):
         stored = con.execute("SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' "
                              "AND sql IS NOT NULL ORDER BY rowid").fetchall()
         self.assertEqual([(t, n, s) for t, n, _, s in mod.shipped_objects()], stored)
-        self.assertEqual(len(stored), 35 + 20 + 18 + 18)  # schema 2 added tr_gate_answer_final, _cleared
+        # one object per CREATE statement of the schema (35 + 20 + 18 + 18 at schema 2; phase 4 adds many)
+        creates = [s for s in mod.split_sql(mod.SCHEMA) if mod.CREATE_OBJECT.match(mod.normalize_sql(s))]
+        self.assertEqual(len(stored), len(creates))
+        self.assertGreater(len(stored), 35 + 20 + 18 + 18)
 
 
 class CommandsRefuseTamperedSchema(unittest.TestCase):

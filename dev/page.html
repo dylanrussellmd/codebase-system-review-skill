@@ -69,6 +69,7 @@ dl.kv dt{color:var(--muted);font-size:13px}dl.kv dd{margin:0;overflow-wrap:anywh
 .code td.ln{color:var(--muted);text-align:right;user-select:none;width:1%}
 .code tr.hit td{background:var(--warn-soft)}
 .note{font-size:13px;color:var(--muted)}
+.mdtext{white-space:pre-wrap;overflow-wrap:anywhere;max-height:480px;overflow:auto;font-size:14px}
 .status{padding:10px 12px;border-radius:6px;background:var(--accent-soft);color:var(--accent)}
 .status.err{background:var(--crit-soft);color:var(--crit)}
 .cols{display:grid;grid-template-columns:270px minmax(0,1fr);gap:24px;align-items:start}
@@ -163,7 +164,7 @@ const L = {
   scope:{full:"Full review",partial:"Partial review",targeted:"Targeted review",second:"Second review","fix-verification":"Fix check"},
   step:{"not-started":"Not started",doing:"In progress","waiting-owner":"Waiting on you",done:"Done",dropped:"Dropped"},
   need:{none:"",decision:"Your decision",confirm:"Your confirmation",review:"Your review",production:"Production action"},
-  gate:{"domain-approval":"Approve review domains","plan-approval":"Approve fix plan",decision:"Decision","step-input":"Input on a step","confirm-false-finding":"Confirm a false finding","accept-risk":"Accept a risk","production-action":"Production action","review-handoff":"Review hand-off",other:"Question"},
+  gate:{"domain-approval":"Approve review domains","plan-approval":"Approve fix plan",decision:"Decision","step-input":"Input on a step","confirm-false-finding":"Confirm a false finding","accept-risk":"Accept a risk","production-action":"Production action","review-handoff":"Review hand-off",confirm:"Confirm",other:"Question"},
   gstat:{open:"Waiting on you",answered:"Answered, waiting for the agent",applied:"Done",withdrawn:"Withdrawn"},
   rel:{"duplicate-of":"Duplicate of","continuation-of":"Continues","regression-of":"Regression of","related-to":"Related to","caused-by":"Caused by",blocks:"Blocks",supersedes:"Supersedes","split-from":"Split from","merged-into":"Merged into"},
   relIn:{"duplicate-of":"Has duplicate","continuation-of":"Continued by","regression-of":"Came back as","related-to":"Related to","caused-by":"Causes",blocks:"Blocked by",supersedes:"Superseded by","split-from":"Split into","merged-into":"Absorbed"},
@@ -356,6 +357,7 @@ VIEWS.reviews = async () => {
           list, r => go("#/review/" + r.code)));
 };
 
+const REQ_VERDICT = {matches:"matches", differs:"differs", partly:"partly matches", missing:"missing", untested:"not tested"};
 VIEWS.review = async ([code]) => {
   const d = await api("review/" + encodeURIComponent(code)); const r = d.review;
   const fs = d.findings;
@@ -378,12 +380,13 @@ VIEWS.review = async ([code]) => {
     h("h1", null, `${r.code} · ${r.title}`),
     h("p", {class:"lede"}, `${lab("scope", r.scope)} · ${lab("review", r.status)} · started ${when(r.started_at)}` + (r.completed_at ? ` · finished ${when(r.completed_at)}` : "")),
     h("div", {class:"facts"}, h("div", null, h("b", null, fs.length), h("span", null, "points")), ["H","M","L","T"].map(s => h("div", null, h("b", null, sumBy(s)), h("span", null, lab("sev", s)))),
-      h("div", null, h("b", null, fs.filter(f => f.match_type === "new").length), h("span", null, "new issues")),
+      h("div", null, h("b", null, fs.filter(f => ["new","continuation"].includes(f.match_type)).length), h("span", null, "new issues")),
       h("div", null, h("b", null, fs.filter(f => ["recurrence","regression"].includes(f.match_type)).length), h("span", null, "came back"))),
     d.gates.length ? h("div", {class:"card"}, h("h2", null, "Questions asked during this review"), table([{label:"About", get:g => lab("gate", g.kind)}, {label:"Title", key:"title"}, {label:"Status", get:g => lab("gstat", g.status)}, {label:"Answer", get:g => [g.answer_value || "", " ", g.answer_text || ""]}], d.gates, () => go("#/inbox"))) : null,
     h("div", {class:"card"}, kv([["Verdict", r.verdict], ["Summary", r.summary], ["What was asked", r.request_text], ["Run by", r.manager ? `${r.manager}${r.manager_model ? " (" + r.manager_model + ")" : ""}` : null],
       ["Domains approved by", r.approved_by ? `${r.approved_by}, ${when(r.approved_at)}` : null], ["Follows", r.previous_code ? h("a", {href:"#/review/" + r.previous_code}, r.previous_code) : null],
       ["Write-up", r.summary_doc_url ? extLink(r.summary_doc_url, "Open the review document") : null]])),
+    r.report_md ? h("div", {class:"card"}, h("h2", null, "The review document"), h("div", {class:"mdtext"}, r.report_md)) : null,
     h("h3", null, "Code reviewed"),
     table([{label:"Repository", key:"name"}, {label:"Branch", key:"branch"}, {label:"Commit", get:x => [h("code", null, short(x.commit_sha)), " ", copyBtn(x.commit_sha, "Copy")]},
            {label:"Commit message", key:"commit_subject"}, {label:"Kept by tag", get:x => x.tag_name ? x.tag_name + (x.tag_pushed ? "" : " (not pushed)") : "Not tagged"},
@@ -395,10 +398,16 @@ VIEWS.review = async ([code]) => {
     h("h3", null, "Reviewers"),
     table([{label:"Reviewer", key:"label"}, {label:"Area", get:x => domainName(x.domain_code)}, {label:"Agent", get:x => x.model ? `${x.actor} (${x.model})` : x.actor},
            {label:"Status", get:x => lab("run", x.status)}, {label:"Items", key:"items_reviewed", num:1}, {label:"High", key:"high_count", num:1}, {label:"Medium", key:"medium_count", num:1}, {label:"Low", key:"low_count", num:1}], d.runs),
+    d.agents.length ? [h("h3", null, "Agents"),
+      table([{label:"Agent", key:"name"}, {label:"Did", key:"role"}, {label:"Kind", get:x => words(x.kind)}, {label:"Model", key:"model"}, {label:"Run in", key:"harness"}, {label:"Started by", key:"parent"}], d.agents)] : null,
+    d.requirements.length ? [h("h3", null, "Requirements"),
+      h("p", {class:"note"}, [...new Map(d.requirements.map(x => [x.verdict, x.verdict_count]))].map(([v, n]) => `${n} ${REQ_VERDICT[v] || words(v)}`).join(" · ")),
+      table([{label:"Requirement", key:"requirement"}, {label:"Says", key:"text"}, {label:"Found", get:x => REQ_VERDICT[x.verdict] || words(x.verdict)}, {label:"Where", key:"where_implemented"},
+             {label:"Tested", get:x => words(x.tested)}, {label:"Point", key:"point_id"}, {label:"Evidence", key:"evidence"}], d.requirements)] : null,
     d.checks.length ? [h("h3", null, "Earlier issues this review looked for"),
       table([{label:"Issue", key:"issue_code"}, {label:"Title", key:"title"}, {label:"Found", get:x => lab("check", x.outcome)}, {label:"Evidence", key:"evidence"}, {label:"Now", get:x => issueTag(x.status)}],
             d.checks, x => go("#/issue/" + x.issue_code))] : null,
-    d.metrics.length ? [h("h3", null, "Measurements"), table([{label:"Measure", get:m => words(m.name)}, {label:"Of", key:"scope"}, {label:"Value", get:m => `${m.value}${m.unit ? " " + m.unit : ""}`, num:1}, {label:"How", get:m => words(m.method)}, {label:"Note", key:"note"}], d.metrics)] : null,
+    d.metrics.length ? [h("h3", null, "Measurements"), table([{label:"Measure", get:m => m.label || words(m.name)}, {label:"Of", key:"scope"}, {label:"Value", get:m => `${m.value}${m.unit ? " " + m.unit : ""}`, num:1}, {label:"How", get:m => words(m.method)}, {label:"Note", key:"note"}], d.metrics)] : null,
     h("h3", null, "Points raised"),
     h("div", {class:"tools"}, q, fd, fsv, fm, fv), listBox);
   draw();
@@ -429,6 +438,8 @@ VIEWS.issues = async (_, params) => {
 
 VIEWS.issue = async ([code]) => {
   const d = await api("issue/" + encodeURIComponent(code)); const i = d.issue;
+  const cont = d.relations.find(x => x.dir === "out" && x.relation === "continuation-of");
+  const continues = "Raised as a new issue that continues " + (cont ? cont.other : "an earlier issue");
   setView(
     h("h1", null, `${i.code} · ${i.title}`),
     h("div", null, sevTag(i.severity), issueTag(i.status), h("span", {class:"tag"}, domainName(i.domain_code)), i.theme_code ? h("span", {class:"tag"}, themeName(i.theme_code)) : null),
@@ -452,7 +463,7 @@ VIEWS.issue = async ([code]) => {
     h("h3", null, "History"),
     d.timeline.length ? h("div", {class:"timeline"}, d.timeline.map(e => h("div", null, h("b", null, when(e.at)), " — ",
       e.event === "status-changed" ? `${lab("issue", e.from_value)} → ${lab("issue", e.to_value)}` : e.event === "severity-changed" ? `Severity ${lab("sev", e.from_value)} → ${lab("sev", e.to_value)}`
-      : e.event === "seen" ? (e.to_value === "new" ? "Raised as a new issue" : `Raised again (${lab("match", e.to_value)})`) : e.event === "opened" ? "Opened" : words(e.event),
+      : e.event === "seen" ? (e.to_value === "new" ? "Raised as a new issue" : e.to_value === "continuation" ? continues : `Raised again (${lab("match", e.to_value)})`) : e.event === "opened" ? "Opened" : words(e.event),
       e.review ? ` · ${e.review}` : "", e.step ? ` · step ${e.step}` : "", e.commit_sha ? [" · ", h("code", null, short(e.commit_sha))] : "", e.actor ? ` · ${e.actor}` : "",
       e.note ? h("div", {class:"note", style:"padding:0;border:0"}, e.note) : null))) : empty("No history recorded."));
 };
@@ -513,6 +524,7 @@ VIEWS.plan = async ([code, , phaseArg]) => {
     h("div", {class:"facts"}, h("div", null, h("b", null, steps.length), h("span", null, "steps")), h("div", null, h("b", null, phases.length), h("span", null, "phases")),
       h("div", null, h("b", null, new Set(steps.flatMap(s => s.closes.map(c => c.review + c.point_id))).size), h("span", null, "points closed"))),
     progressBar(count("done"), count("doing"), count("waiting-owner"), steps.length),
+    pl.narrative_md ? h("div", {class:"card"}, h("h2", null, "About this plan"), h("div", {class:"mdtext"}, pl.narrative_md)) : null,
     h("div", {class:"tools"}, q, f), h("div", {class:"cols"}, nav, main));
   draw();
 };
@@ -544,7 +556,8 @@ VIEWS.trends = async () => {
            {label:"New", key:"new_issues", num:1}, {label:"Carried over", key:"carried_over", num:1}, {label:"Came back", key:"came_back", num:1}, {label:"False", key:"false_findings", num:1}], d.reviews, r => go("#/review/" + r.review)),
     h("h3", null, "Measurements"),
     Object.keys(groups).length ? h("div", {class:"grid2"}, Object.entries(groups).map(([k, pts]) => { const [n, sc, repo] = k.split("|");
-      return h("div", {class:"card"}, h("b", null, words(n)), h("div", {class:"note"}, [sc !== "all" ? sc : "", repo !== "all" ? repo : ""].filter(Boolean).join(" · ") || "Whole system"), lineChart(pts, pts[0].unit)); }))
+      const better = {higher:"higher is better", lower:"lower is better"}[pts[0].better];
+      return h("div", {class:"card"}, h("b", null, pts[0].label || words(n)), h("div", {class:"note"}, [[sc !== "all" ? sc : "", repo !== "all" ? repo : ""].filter(Boolean).join(" · ") || "Whole system", better].filter(Boolean).join(" · ")), lineChart(pts, pts[0].unit)); }))
       : empty("No measurements recorded yet."),
     h("h3", null, "Issues that keep coming back"),
     table([{label:"Issue", key:"code"}, {label:"Title", key:"title"}, {label:"Severity", get:i => sevTag(i.severity)}, {label:"Status", get:i => issueTag(i.status)}, {label:"Reviews", key:"times_seen", num:1}, {label:"Came back after a fix", key:"regressions", num:1}, {label:"Raised in", key:"reviews"}],

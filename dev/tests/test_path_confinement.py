@@ -84,10 +84,12 @@ class PathConfinementTests(unittest.TestCase):
         led = fixtures.Ledger(self.root)
         led.x("PRAGMA ignore_check_constraints = ON")  # plant rows the schema 2 CHECKs refuse
         rid = led.review()
-        ids = []
+        ids, repos = [], {}
         for n, (rp, sha, path) in enumerate(entries):
-            repo_id = led.repository(name=f"r{n}", path=rp)
-            led.review_repository(rid, sha, repository_id=repo_id)
+            if rp not in repos:  # one repository per path (schema 3)
+                repos[rp] = led.repository(name=f"r{n}", path=rp)
+                led.review_repository(rid, sha, repository_id=repos[rp])
+            repo_id = repos[rp]
             fid = led.finding(rid)
             ids.append(led.location(fid, path=path, line_start=1, repository_id=repo_id, commit_sha=sha))
         led.commit()

@@ -27,7 +27,7 @@ class IssuesPlansExplore(browser.ViewerTestCase):
             L.metric(rid, "line_coverage", v, "measured", scope="all", unit="%")
         L.metric(r2, "line_coverage", 70.0, "measured", scope="all", unit="%", repository_id=ids["repository"])
         for n in range(150):
-            L.design_goal(f"G-{100 + n}", f"Extra goal {n}.")
+            L.design_goal(None, f"Extra goal {n}.")   # codes are sequential (schema 3): G-03, G-04 ...
         return ids
 
     # ------------------------------------------------------------------ issues
@@ -83,8 +83,10 @@ class IssuesPlansExplore(browser.ViewerTestCase):
     def test_page_issue_timeline_labels(self):
         page = self.open("#/issue/ISS-0001")
         self.assertEqual([t.split(" — ", 1)[1].split(" · ")[0] for t in page.texts(".timeline > div")],
-                         ["Opened", "Raised as a new issue", "Open → Fixed", "Fixed → Fixed and confirmed"])
-        self.assertIn(" · step 2 · ", page.texts(".timeline > div")[2])
+                         # schema 3 logs text edits and every review check too
+                         ["Opened", "Current state changed", "Raised as a new issue", "After state changed",
+                          "Open → Fixed", "Fixed → Fixed and confirmed", "Checked"])
+        self.assertIn(" · step 2 · ", page.texts(".timeline > div")[4])
         self.assertEqual([r.split("\t")[:2] for r in page.texts("h3:text('Related issues') + div tbody tr")],
                          [["Related to", "ISS-0004"]])   # the incoming side of related-to
         self.assertEqual(page.texts("h3:text('Tests that guard the fix') + div tbody td:first-child"),
@@ -96,7 +98,8 @@ class IssuesPlansExplore(browser.ViewerTestCase):
                          [["Blocked by", "ISS-0003"]])
         page.hash("#/issue/ISS-0003")
         lines = [t.split(" — ", 1)[1] for t in page.texts(".timeline > div")]
-        self.assertIn("Severity Low → Medium", [x.split(" · ")[0] for x in lines])
+        # (schema 3: the event no longer carries a stale review from an earlier check, so the note follows directly)
+        self.assertIn("Severity Low → Medium", [x.split(" · ")[0].split("\n")[0] for x in lines])
         self.assertEqual([r.split("\t")[:2] for r in page.texts("h3:text('Related issues') + div tbody tr")],
                          [["Blocks", "ISS-0002"]])
         self.assertEqual(page.texts("#app > div:nth-of-type(1) .tag"), ["Medium", "Open", "Spec conformance",
@@ -236,8 +239,10 @@ class IssuesPlansExplore(browser.ViewerTestCase):
         cards = page.page.locator("#app .grid2 .card")
         got = cards.evaluate_all("cs => cs.map(c => [c.querySelector('b').textContent, "
                                  "c.querySelector('.note').textContent, c.querySelectorAll('circle').length])")
-        self.assertEqual(sorted(got), [["Line coverage", "Whole system", 2], ["Line coverage", "demo", 1],
-                                       ["Mutation score", "src", 2]])
+        # plan step 94: the title is the metric_defs label and the note says which way is better
+        self.assertEqual(sorted(got), [["Line coverage", "Whole system · higher is better", 2],
+                                       ["Line coverage", "demo · higher is better", 1],
+                                       ["Mutation score", "src · higher is better", 2]])
         self.assertEqual(page.texts("h3:text('Points per review') + div tbody td:first-child"), ["R-0001", "R-0002"])
         self.assertEqual(page.texts("h3:text('Issues that keep coming back') + div tbody td:first-child"),
                          ["ISS-0002"])

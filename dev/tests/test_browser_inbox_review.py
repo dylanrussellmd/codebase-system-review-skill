@@ -30,8 +30,11 @@ class Inbox(browser.ViewerTestCase):
                  answer_text="Go ahead.", answered_by="owner", answered_via="chat")
         L.gate("GATE-0004", "other", "Anything else?", "Is there anything the review should look at?", allow_text=1,
                blocking=0)
+        # schema 3 refuses a gate nobody can answer; this one is planted as an older ledger could hold it
+        L.x("PRAGMA ignore_check_constraints = ON")
         L.gate("GATE-0005", "other", "No way to answer", "This gate has no options and no text box.", allow_text=0,
                blocking=0)
+        L.x("PRAGMA ignore_check_constraints = OFF")
         L.update("steps", ids["steps"][1], status="waiting-owner")
         L.decision("D-0002", "Keep the weekend rule?", status="open")
         return ids
@@ -59,8 +62,9 @@ class Inbox(browser.ViewerTestCase):
         # Owner-queue items with no gate: answered in the chat, listed in a table.
         rows = page.js("[...document.querySelectorAll('#app table tbody tr')].map(r => "
                        "[...r.cells].map(c => c.textContent))")
-        # The step has no owner question or progress note, the decision no revisit note: Question is blank.
-        self.assertEqual(rows, [["Plan step P-0001 #1", "Your input", "Run every suite in CI", ""],
+        # The step has no owner question or progress note: Question falls back to its change text (was blank before
+        # plan step 66, ISS-0305). The decision has no revisit note: its Question is blank.
+        self.assertEqual(rows, [["Plan step P-0001 #1", "Your input", "Run every suite in CI", "Add a CI workflow."],
                                 ["Decision D-0002", "Your decision", "Keep the weekend rule?", ""]])
         self.assertEqual(page.page.locator("a", has_text="See every question and answer so far").get_attribute("href"),
                          "#/history")
@@ -253,7 +257,8 @@ class PointsAndCode(browser.ViewerTestCase):
         r1 = L.review("R-0001", commit_sha=sha, status="handed-off")
         r2 = L.review("R-0002", commit_sha=sha, previous_review_id=r1)
         old = L.finding(r1, "SPEC-M1", summary="Old point.")
-        iss = L.issue("ISS-0001", first_seen_review_id=r1, title="The issue")
+        # fixed once, so R-0002 can raise it as a regression (schema 3 allows that match type only then)
+        iss = L.issue("ISS-0001", first_seen_review_id=r1, title="The issue", status="fixed", after_state="Fixed once.")
         L.match(old, iss, "new")
         made = {}
         for pid, match, verif in (("SPEC-M2", "still-present", "confirmed"), ("SPEC-M3", "recurrence", "false"),

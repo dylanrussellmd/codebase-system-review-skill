@@ -19,7 +19,7 @@ top of the current git repository, else the current directory), --db FILE, --ver
 """
 import argparse, hashlib, json, os, re, secrets, shlex, sqlite3, subprocess, sys, threading
 import webbrowser
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
@@ -604,6 +604,7 @@ def _init(root, db, force, copy_tool, gitignore):
     if fresh:
         build_ledger(root, db)
         set_wal(db)
+        optimize_db(db)
         print(f"created {db}")
         print(f"ledger at {db} (created)")
     else:
@@ -632,6 +633,7 @@ def _init(root, db, force, copy_tool, gitignore):
             sys.exit(f"init: could not update {db}: {e}")
         con.close()
         set_wal(db)
+        optimize_db(db)
         for note in notes:
             print(f"note: {note}")
         if moved:
@@ -787,22 +789,53 @@ def find_root(start, explicit=False, script=None):
     return resolve_root(start, explicit, script)[0]
 
 
+TIME_FORMAT = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$")  # what the tr_time_* triggers accept
+_ISO_TIME = re.compile(r"^(\d{4})-(\d\d)-(\d\d)[T ](\d\d):(\d\d)(?::(\d\d)(?:\.(\d+))?)?\s*(Z|z|[+-]\d\d:?\d\d)?$")
+
+
 def now():
+    """The current time as the ledger stores every time: UTC with milliseconds, the same text as SQLite's
+    strftime('%Y-%m-%dT%H:%M:%fZ','now')."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
-# Twin of the must-be-empty list in SKILL.md (Rules for the ledger / check) and of the 'must be empty' comments in
-# references/schema.sql; change all three together. dev/tests/test_check.py enforces that they agree.
-MUST_BE_EMPTY = [
-    ("v_unmatched_findings", "Findings not matched to an issue"),
-    ("v_unchecked_known_issues", "Known issues in a domain that ran, with no check recorded"),
-    ("v_untraceable_refs", "Code references that cannot be traced to exact lines"),
-    ("v_uncovered_findings", "Findings no step of their plan closes"),
-    ("v_coverage_problems", "Steps closing nothing, or findings closed twice without a reason"),
-]
+def utc_time(text):
+    """An ISO-8601 time with any offset (git's %cI: 2026-11-10T10:00:00+02:00, or ...Z) in the ledger's format,
+    converted to UTC (2026-11-10T08:00:00.000Z). A time without an offset is taken as UTC. ValueError if unreadable."""
+    m = _ISO_TIME.match((text or "").strip())
+    if not m:
+        raise ValueError(f"not an ISO-8601 time: {text!r}")
+    y, mo, d, h, mi, sec, frac, zone = m.groups()
+    t = datetime(int(y), int(mo), int(d), int(h), int(mi), int(sec or 0),
+                 int(((frac or "") + "000000")[:6]), tzinfo=timezone.utc)
+    if zone and zone not in ("Z", "z"):
+        sign = -1 if zone[0] == "-" else 1
+        hh, mm = zone[1:3], zone[-2:]
+        t -= sign * timedelta(hours=int(hh), minutes=int(mm))
+    return t.strftime("%Y-%m-%dT%H:%M:%S.") + f"{t.microsecond // 1000:03d}Z"
+
+
+# The checks live in the ledger's ledger_checks table (view, label, tier, position): tier 'error' views must be empty
+# (check exits 1 otherwise), tier 'warning' views are listed but do not fail. The error tier is the twin of the
+# must-be-empty list in SKILL.md (Rules for the ledger / check) and of the 'must be empty' comments in
+# references/schema.sql; dev/tests/test_check.py enforces that they agree.
+def ledger_checks(con, tier=None):
+    """[(view, label, tier)] of the ledger's ledger_checks rows in position order (only `tier` if given); None when
+    the ledger has no ledger_checks table (an older schema, which check_schema reports)."""
+    try:
+        got = [tuple(r) for r in con.execute("SELECT view, label, tier FROM ledger_checks ORDER BY position, view")]
+    except sqlite3.Error:
+        return None
+    return [c for c in got if tier is None or c[2] == tier]
+
+
+def count_view(con, view):
+    return con.execute(f"SELECT count(*) FROM {quote_name(view)}").fetchone()[0]
 
 
 def check(con, quiet=False):
+    """Print what check finds; return the number of failed checks (integrity, foreign keys, schema, each non-empty
+    error-tier view). A non-empty warning-tier view is printed with 'warning' and does not count."""
     bad = 0
     ic = con.execute("PRAGMA integrity_check").fetchone()[0]
     if ic != "ok":
@@ -811,21 +844,49 @@ def check(con, quiet=False):
     if fk:
         print(f"foreign_key_check: {len(fk)} broken references"); bad += 1
     bad += check_schema(con)
-    for view, label in MUST_BE_EMPTY:
+    checks = ledger_checks(con)
+    if checks is None:
+        print("ledger_checks: the ledger has no ledger_checks table, so its views were not checked "
+              "(run: python3 ledger.py migrate)")
+        return bad + 1
+    for view, label, tier in checks:
+        warn = "  warning" if tier == "warning" else ""
         try:
-            n = con.execute(f"SELECT count(*) FROM {view}").fetchone()[0]
+            n = count_view(con, view)
         except sqlite3.Error as e:
-            bad += 1
-            print(f"  ERR  {label}  ({view}): {e}")
+            bad += tier == "error"
+            print(f"  ERR  {label}  ({view}){warn}: {e}")
             continue
         if n:
-            bad += 1
-            print(f"{n:5d}  {label}  ({view})")
-            for r in rows(con, f"SELECT * FROM {view} LIMIT 5"):
+            bad += tier == "error"
+            print(f"{n:5d}  {label}  ({view}){warn}")
+            for r in rows(con, f"SELECT * FROM {quote_name(view)} LIMIT 5"):
                 print("       ", json.dumps(r, ensure_ascii=False)[:200])
         elif not quiet:
             print(f"    0  {label}")
+    optimize(con)
     return bad
+
+
+def optimize_db(db):
+    """PRAGMA optimize on the ledger file (after init)."""
+    try:
+        con = connect(db)
+    except sqlite3.Error:
+        return
+    try:
+        optimize(con)
+    finally:
+        con.close()
+
+
+def optimize(con):
+    """PRAGMA optimize: lets SQLite gather the statistics its query planner uses (cheap; skipped on a read-only
+    connection or a busy ledger)."""
+    try:
+        con.execute("PRAGMA optimize")
+    except sqlite3.Error:
+        pass
 
 
 def check_schema(con):
@@ -876,14 +937,15 @@ def git(cwd, *args, timeout=15):
     return p.stdout
 
 
-def file_at(root, repo_path, sha, path, allow_outside=False):
-    """The file's text at commit sha. A refused path gives the fixed error 'bad path' before git runs, so no message
-    says whether some file outside the repository exists."""
+def file_at(root, repo_path, sha, path, allow_outside=False, raw=False):
+    """The file's text at commit sha (raw=True: its bytes). A refused path gives the fixed error 'bad path' before
+    git runs, so no message says whether some file outside the repository exists."""
     if not HEX.match(sha or ""):
         raise RuntimeError("commit is not a hex hash")
     if bad_location_path(path or ""):
         raise RuntimeError("bad path")
-    return git(repo_dir(root, repo_path, allow_outside), "show", f"{sha}:{path}").decode("utf-8", "replace")
+    data = git(repo_dir(root, repo_path, allow_outside), "show", f"{sha}:{path}")
+    return data if raw else data.decode("utf-8", "replace")
 
 
 def location(con, loc_id):
@@ -971,11 +1033,55 @@ def source(root, con, loc_id, context=8):
     return out
 
 
+WHOLE_FILE_EXCERPT_LINES = 200  # a whole-file reference keeps at most this many lines (excerpt_status 'truncated')
+_DEFINITION = (r"(?i:\b(?:def|class|function|interface|struct|enum|fn|func|"
+               r"CREATE\s+(?:UNIQUE\s+)?(?:TABLE|VIEW|TRIGGER|INDEX)(?:\s+IF\s+NOT\s+EXISTS)?))\s+")
+
+
+def symbol_line(lines, symbol):
+    """(line number, None) for the one line that defines symbol, else (None, why). A definition is a def, class,
+    function, interface, struct, enum, fn, func or SQL CREATE TABLE/VIEW/TRIGGER/INDEX followed by the symbol as a
+    whole word; with no definition, the one line holding the symbol as a whole word. Several candidates, or none,
+    leave the reference unlined (the caller counts it as failed)."""
+    word = r"(?<![\w$])" + re.escape(symbol) + r"(?![\w$])"
+    hits = [i for i, t in enumerate(lines, 1) if re.search(_DEFINITION + word, t)]
+    if len(hits) == 1:
+        return hits[0], None
+    if hits:
+        return None, (f"symbol {symbol!r} is defined on {len(hits)} lines "
+                      f"({', '.join(map(str, hits[:5]))}); give the lines")
+    hits = [i for i, t in enumerate(lines, 1) if re.search(word, t)]
+    if len(hits) == 1:
+        return hits[0], None
+    if not hits:
+        return None, f"symbol {symbol!r} not found"
+    return None, (f"symbol {symbol!r} is on {len(hits)} lines ({', '.join(map(str, hits[:5]))}) and defined on "
+                  f"none; give the lines")
+
+
+def permalink_for(template, sha, path, a, b):
+    """The permalink from repositories.permalink_template, or None. With no lines (a whole file), the #fragment that
+    holds {start} or {end} is dropped and any other {start}/{end} is left out of the link."""
+    link = template.replace("{sha}", sha).replace("{path}", path)
+    if a is None:
+        head, sep, frag = link.partition("#")
+        if "{start}" in frag or "{end}" in frag:
+            link = head
+        if "{start}" in link or "{end}" in link:
+            return None
+        return link
+    return link.replace("{start}", str(a)).replace("{end}", str(b or a))
+
+
 def fill_refs(root, con, review_code=None):
+    """Fill excerpt, excerpt_sha256, blob_sha and permalink (and lines from a symbol) of each reference from git.
+    Never overwrites an excerpt. A failure (file unreadable, lines past the end, a symbol not found or ambiguous, an
+    empty file) writes nothing for that reference and is counted; returns the count."""
     sql = """SELECT fl.id FROM finding_locations fl JOIN findings f ON f.id = fl.finding_id
              JOIN reviews r ON r.id = f.review_id
-             WHERE fl.commit_sha IS NOT NULL AND (fl.excerpt IS NULL OR fl.blob_sha IS NULL
-                   OR fl.permalink IS NULL OR (fl.line_start IS NULL AND fl.symbol IS NOT NULL))"""
+             WHERE fl.commit_sha IS NOT NULL
+               AND ((fl.excerpt IS NULL AND fl.excerpt_status IS NOT 'not-text') OR fl.blob_sha IS NULL
+                    OR fl.permalink IS NULL OR (fl.line_start IS NULL AND fl.whole_file = 0))"""
     args = ()
     if review_code:
         sql += " AND r.code = ?"; args = (review_code,)
@@ -986,29 +1092,47 @@ def fill_refs(root, con, review_code=None):
         where = f"ref {lid} {loc['path']}@{loc['commit_sha'][:10]}"
         outside = bool(loc["allow_outside_root"])
         try:
-            text = file_at(root, loc["repo_path"], loc["commit_sha"], loc["path"], outside)
+            data = file_at(root, loc["repo_path"], loc["commit_sha"], loc["path"], outside, raw=True)
         except Exception as e:
             print(f"{where}: {e}"); failed += 1; continue
-        lines = text.splitlines()
+        try:
+            text = None if b"\0" in data else data.decode("utf-8")
+        except UnicodeDecodeError:
+            text = None
         a, b = loc["line_start"], loc["line_end"]
-        if a is None and loc["symbol"]:
-            for i, t in enumerate(lines, 1):
-                if loc["symbol"] in t:
-                    a = b = i; break
-            else:
-                print(f"{where}: symbol {loc['symbol']!r} not found"); failed += 1; continue
-        if a and (b or a) > len(lines):
-            print(f"{where}: lines {a}-{b or a} are past the end of the file ({len(lines)} lines)")
-            failed += 1; continue
-        upd = {}
-        if a:
+        if a is None and b is not None:
+            print(f"{where}: line_end {b} without line_start"); failed += 1; continue
+        whole = bool(loc["whole_file"]) or (a is None and not loc["symbol"])
+        upd = {"whole_file": 1} if whole and not loc["whole_file"] else {}
+        if text is None:  # binary or not UTF-8: no lossy excerpt; the hash is of the file's bytes
+            if loc["excerpt"] is None and loc["excerpt_status"] != "not-text":
+                upd.update(excerpt_status="not-text", excerpt_sha256=hashlib.sha256(data).hexdigest())
+            if a is None and not whole:
+                print(f"{where}: not a text file; symbol {loc['symbol']!r} cannot be looked up"); failed += 1; continue
+        else:
+            lines = text.splitlines()
+            if whole and a is None:
+                if not lines:
+                    print(f"{where}: the file is empty; nothing to cite"); failed += 1; continue
+                a, b = 1, len(lines)
+            elif a is None:
+                a, why = symbol_line(lines, loc["symbol"])
+                if a is None:
+                    print(f"{where}: {why}"); failed += 1; continue
+                b = a
             b = b or a
-            excerpt = "\n".join(lines[a - 1:b])
+            if b > len(lines):
+                print(f"{where}: lines {a}-{b} are past the end of the file ({len(lines)} lines)")
+                failed += 1; continue
             upd.update(line_start=a, line_end=b)
             if loc["excerpt"] is None:
+                cut = whole and b - a + 1 > WHOLE_FILE_EXCERPT_LINES
+                excerpt = "\n".join(lines[a - 1:(a - 1 + WHOLE_FILE_EXCERPT_LINES) if cut else b])
                 shown, masked = mask_secrets(excerpt)
                 upd.update(excerpt=shown, excerpt_sha256=hashlib.sha256(excerpt.encode()).hexdigest(),
                            excerpt_redacted=1 if masked else 0)
+                if cut:
+                    upd["excerpt_status"] = "truncated"
         if loc["blob_sha"] is None:
             try:
                 upd["blob_sha"] = git(repo_dir(root, loc["repo_path"], outside), "rev-parse",
@@ -1016,10 +1140,9 @@ def fill_refs(root, con, review_code=None):
             except Exception:
                 pass
         if loc["permalink"] is None and loc["permalink_template"]:
-            link = (loc["permalink_template"].replace("{sha}", loc["commit_sha"])
-                    .replace("{path}", loc["path"]).replace("{start}", str(a or 1))
-                    .replace("{end}", str(b or a or 1)))
-            if SAFE_URL.match(link):
+            link = permalink_for(loc["permalink_template"], loc["commit_sha"], loc["path"],
+                                 None if whole else a, None if whole else b)
+            if link and SAFE_URL.match(link):
                 upd["permalink"] = link
             else:
                 print(f"{where}: the permalink template does not give an http(s) link; no permalink written")
@@ -1086,15 +1209,85 @@ def tag_review(root, con, code):
         except (RuntimeError, OSError, subprocess.SubprocessError) as e:
             print(f"{r['name']}: not tagged: {e}", file=sys.stderr)
             left += 1; continue
-        # recorded right away, in its own short transaction, so a later repository's failure cannot lose it
-        con.execute("UPDATE review_repositories SET tag_name=? WHERE review_id=? AND repository_id=?",
-                    (tag, rv["id"], r["repository_id"]))
+        # recorded right away, in its own short transaction, so a later repository's failure cannot lose it; an
+        # empty commit_time is filled from git, in UTC like every time in the ledger
+        try:
+            when = utc_time(git(d, "show", "-s", "--format=%cI", sha).decode().strip())
+        except (RuntimeError, ValueError, OSError, subprocess.SubprocessError):
+            when = None
+        con.execute("UPDATE review_repositories SET tag_name=?, commit_time=COALESCE(commit_time, ?) "
+                    "WHERE review_id=? AND repository_id=?", (tag, when, rv["id"], r["repository_id"]))
         con.commit()
         hint = f"git -C {shlex.quote(r['path'] or '.')} push origin {shlex.quote(tag)}"
         print(f"{r['name']}: {tag} -> {sha[:10]}  (push with: {hint})")
     if left:
         print(f"tag-review {code}: {left} of {len(repos)} repositories not tagged", file=sys.stderr)
     return 1 if left else 0
+
+
+def check_git_refs(root, con, quiet=False):
+    """Part of `check`: each reviewed commit must exist in its repository (git cat-file -e) and each recorded review
+    tag must point at it (refs/tags/<tag>). A repository folder that is not here (the ledger was copied elsewhere)
+    is noted and not counted. Returns the number of problems."""
+    bad = skipped = 0
+    try:
+        found = rows(con, """SELECT rv.code, rp.name, rp.path, rp.allow_outside_root, rr.commit_sha, rr.tag_name
+                             FROM review_repositories rr JOIN reviews rv ON rv.id = rr.review_id
+                             JOIN repositories rp ON rp.id = rr.repository_id ORDER BY rv.id, rp.id""")
+    except sqlite3.Error as e:  # an older schema (check_schema has already reported it)
+        print(f"    note: reviewed commits and tags were not checked ({e})")
+        return 0
+    for r in found:
+        try:
+            d = repo_dir(root, r["path"], bool(r["allow_outside_root"]))
+            if not d.is_dir():
+                raise FileNotFoundError(d)
+            git(d, "rev-parse", "--git-dir")
+        except (RuntimeError, OSError, subprocess.SubprocessError):
+            skipped += 1
+            continue
+        what = f"{r['code']} {r['name']} {r['commit_sha'][:10]}"
+        try:
+            git(d, "cat-file", "-e", f"{r['commit_sha']}^{{commit}}")
+        except (RuntimeError, subprocess.SubprocessError):
+            print(f"git: {what}: the reviewed commit is not in the repository"); bad += 1
+            continue
+        if r["tag_name"]:
+            try:
+                at = existing_tag(d, r["tag_name"])
+            except (RuntimeError, subprocess.SubprocessError) as e:
+                at = f"unreadable ({e})"
+            if at != r["commit_sha"]:
+                print(f"git: {what}: tag {r['tag_name']} " + ("is missing" if at is None else f"points at {at[:10]}"))
+                bad += 1
+    if skipped and not quiet:
+        print(f"    note: {skipped} reviewed repositories are not here; their commits and tags were not checked")
+    elif not bad and not quiet:
+        print("    0  Reviewed commits missing or review tags moved")
+    return bad
+
+
+TEXT_TARGETS = {"set-report": ("reviews", "report_md", "review", REVIEW_CODE),
+                "set-narrative": ("plans", "narrative_md", "plan", re.compile(r"P-[0-9]{4,}"))}
+
+
+def set_text(con, cmd, code, source):
+    """set-report R-0007 FILE / set-narrative P-0001 FILE: store the review document or the plan's narrative
+    (Markdown, UTF-8; FILE '-' reads standard input) in the ledger, where the viewer shows it. Returns 0."""
+    table, column, what, pattern = TEXT_TARGETS[cmd]
+    if not pattern.fullmatch(code or ""):
+        sys.exit(f"{cmd}: {code!r} is not a {what} code")
+    try:
+        text = sys.stdin.read() if source == "-" else Path(source).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        sys.exit(f"{cmd}: cannot read {source}: {e}")
+    cur = con.execute(f"UPDATE {table} SET {column}=? WHERE code=?", (text, code))
+    if cur.rowcount != 1:
+        con.rollback()
+        sys.exit(f"{cmd}: no {what} {code}")
+    con.commit()
+    print(f"{code}: stored {len(text):,} characters in {table}.{column}")
+    return 0
 
 
 DUMP_HEADER = "-- ledger.py dump: a text copy of the ledger for diffs; rebuild with: sqlite3 new.sqlite < ledger.sql"
@@ -1214,9 +1407,14 @@ def answer_gate(db, code, body):
                 return {"error": "Choose an option or write an answer."}, 400
             if txt and not g["allow_text"] and val is None:
                 return {"error": "Choose one of the options."}, 400
+            # who answered, as an actor (schema 3): the project's owner, made on first use if the ledger has none
+            owner = w.execute("SELECT min(id) FROM actors WHERE kind='owner'").fetchone()[0]
+            if owner is None:
+                owner = w.execute("INSERT INTO actors(kind, name) VALUES ('owner', 'owner')").lastrowid
             cur = w.execute("""UPDATE gates SET status='answered', answer_value=?, answer_text=?,
-                               answered_by='owner', answered_via='viewer' WHERE id=? AND status='open'""",
-                            (val, txt, g["id"]))
+                               answered_by='owner', answered_via='viewer', answered_by_actor_id=?
+                               WHERE id=? AND status='open'""",
+                            (val, txt, owner, g["id"]))
             if cur.rowcount != 1:
                 return {"error": "This question was already answered."}, 409
             w.execute("COMMIT")
@@ -1261,8 +1459,8 @@ def route(root, db, con, path, qs, body):
                 sum(s.status='done') done, sum(s.status='waiting-owner') waiting
                 FROM plans p LEFT JOIN steps s ON s.plan_id=p.id GROUP BY p.id ORDER BY p.created_at DESC"""),
             "recurring": one(con, "SELECT count(*) n FROM v_recurring_issues")["n"],
-            "checks": [{"label": label, "view": v, "n": con.execute(f"SELECT count(*) FROM {v}").fetchone()[0]}
-                       for v, label in MUST_BE_EMPTY],
+            "checks": [{"label": label, "view": v, "tier": tier, "n": count_view(con, v)}
+                       for v, label, tier in (ledger_checks(con) or [])],
             "labels": {t: {r["code"]: r["name"] for r in rows(con, f"SELECT code, name FROM {t}")} for t in LABEL_TABLES},
         }
 
@@ -1292,7 +1490,7 @@ def route(root, db, con, path, qs, body):
             (SELECT count(*) FROM findings f WHERE f.review_id=r.id AND f.severity='H') high,
             (SELECT count(*) FROM findings f WHERE f.review_id=r.id AND f.severity='M') medium,
             (SELECT count(*) FROM findings f WHERE f.review_id=r.id AND f.severity='L') low,
-            (SELECT count(*) FROM findings f WHERE f.review_id=r.id AND f.match_type='new') new_issues,
+            (SELECT count(*) FROM findings f WHERE f.review_id=r.id AND f.match_type IN ('new','continuation')) new_issues,
             (SELECT count(*) FROM findings f WHERE f.review_id=r.id AND f.match_type IN ('recurrence','regression')) came_back
             FROM reviews r ORDER BY r.started_at DESC""")
 
@@ -1329,7 +1527,12 @@ def route(root, db, con, path, qs, body):
                                    FROM review_issue_checks c JOIN issues i ON i.id=c.issue_id WHERE c.review_id=?
                                    ORDER BY c.outcome, i.code""", (rid,)),
             "summary": rows(con, "SELECT * FROM v_review_summary WHERE review=?", (p[1],)),
-            "metrics": rows(con, "SELECT name, scope, value, unit, method, note FROM metrics WHERE review_id=? ORDER BY name, scope", (rid,)),
+            "agents": rows(con, "SELECT * FROM v_review_agents WHERE review=?", (p[1],)),
+            "requirements": rows(con, "SELECT * FROM v_requirement_trace WHERE review=?", (p[1],)),
+            "metrics": rows(con, """SELECT m.name, m.scope, m.value, COALESCE(m.unit, md.unit) unit, m.method, m.note,
+                COALESCE(md.label, upper(substr(m.name, 1, 1)) || replace(substr(m.name, 2), '_', ' ')) label,
+                COALESCE(md.better, 'none') better
+                FROM metrics m LEFT JOIN metric_defs md ON md.name=m.name WHERE m.review_id=? ORDER BY m.name, m.scope""", (rid,)),
             "artifacts": rows(con, "SELECT kind, path, url FROM artifacts WHERE review_id=? ORDER BY kind", (rid,)),
             "gates": rows(con, "SELECT code, kind, title, status, answer_value, answer_text FROM gates WHERE review_id=? ORDER BY created_at", (rid,)),
             "findings": findings,
@@ -1431,7 +1634,8 @@ def route(root, db, con, path, qs, body):
 
     if p == ["tables"]:
         out = []
-        for t in rows(con, "SELECT name, type FROM sqlite_master WHERE type IN ('table','view') ORDER BY type, name"):
+        for t in rows(con, """SELECT name, type FROM sqlite_master WHERE type IN ('table','view')
+                              AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY type, name"""):
             cols = [c["name"] for c in rows(con, "SELECT name FROM pragma_table_info(?)", (t["name"],))]
             n = con.execute(f"SELECT count(*) FROM {quote_name(t['name'])}").fetchone()[0]
             out.append({**t, "columns": cols, "count": n})
@@ -1670,6 +1874,10 @@ def main():
     sub.add_parser("check")
     s = sub.add_parser("fill-refs"); s.add_argument("review", nargs="?")
     s = sub.add_parser("tag-review"); s.add_argument("review")
+    s = sub.add_parser("set-report", help="store the review document (Markdown) shown in the viewer")
+    s.add_argument("review"); s.add_argument("file", help="Markdown file, or - for standard input")
+    s = sub.add_parser("set-narrative", help="store the plan's narrative (Markdown) shown in the viewer")
+    s.add_argument("plan"); s.add_argument("file", help="Markdown file, or - for standard input")
     s = sub.add_parser("show"); s.add_argument("location", type=int)
     sub.add_parser("gates")
     sub.add_parser("dump")
@@ -1702,8 +1910,8 @@ def main():
         migrate(db); return
     # Writes refuse an older ledger; serve, gates and the writes also refuse a schema that differs from the shipped
     # one (a forged trigger could answer gates). show and dump still read it, for diagnosis; check reports it.
-    con = open_ledger(db, write=a.cmd in ("serve", "fill-refs", "tag-review"),
-                      verify=a.cmd in ("serve", "gates", "fill-refs", "tag-review"))
+    con = open_ledger(db, write=a.cmd in ("serve", "fill-refs", "tag-review", "set-report", "set-narrative"),
+                      verify=a.cmd in ("serve", "gates", "fill-refs", "tag-review", "set-report", "set-narrative"))
     if a.cmd == "serve":
         con.close(); serve(root, db, a.port, not a.no_open)
     elif a.cmd == "check":
@@ -1711,11 +1919,15 @@ def main():
         if was and was[0] != str(db.parent):
             print(f"warning: this ledger was set up at {was[0]} and is now used from {db.parent} (fine after a move; "
                   f"init records the new place)", file=sys.stderr)
-        sys.exit(1 if check(con) else 0)
+        bad = check(con)
+        bad += check_git_refs(root, con)
+        sys.exit(1 if bad else 0)
     elif a.cmd == "fill-refs":
         sys.exit(1 if fill_refs(root, con, a.review) else 0)
     elif a.cmd == "tag-review":
         sys.exit(tag_review(root, con, a.review))
+    elif a.cmd in ("set-report", "set-narrative"):
+        sys.exit(set_text(con, a.cmd, a.review if a.cmd == "set-report" else a.plan, a.file))
     elif a.cmd == "show":
         s = source(root, con, a.location, context=0)
         if s.get("error"):
@@ -1732,6 +1944,13 @@ def main():
         for g in rows(con, "SELECT * FROM gates WHERE status IN ('open','answered') ORDER BY created_at"):
             ans = f" -> {g['answer_value'] or ''} {g['answer_text'] or ''}".rstrip() if g["status"] == "answered" else ""
             print(f"{g['code']}  [{g['status']}] {g['kind']}: {g['title']}{ans}")
+        try:
+            stale = rows(con, "SELECT * FROM v_stale_steps ORDER BY plan, step")
+        except sqlite3.Error:
+            stale = []  # an older ledger (gates warned already): migrate adds the view
+        for s in stale:
+            print(f"stale step {s['plan']} #{s['step']} [{s['status']}] {s['title']}: its issues are all closed "
+                  f"({s['issues']}); mark it done or dropped")
     elif a.cmd == "dump":
         dump(con, db)
 

@@ -78,23 +78,32 @@ class ReviewAndIssueTables(SchemaCase):
 
     def test_constraints_design_goals(self):
         self.run_cases(
-            "design_goals", lambda n: {"code": f"G-{n:03d}", "text": "Every rule is a setting."},
-            good=[("superseded by a goal", lambda t: {"superseded_by": t.L.design_goal()})],
+            "design_goals", lambda n: {"code": self.L._code("G-", 2), "text": "Every rule is a setting."},
+            # schema 3: a superseded goal is retired (ISS-0171)
+            good=[("superseded by a goal", lambda t: {"superseded_by": t.L.design_goal(),
+                                                     "code": t.L._code("G-", 2),
+                                                     "retired_at": "2026-11-01T00:00:00.000Z"})],
             bad=[("no text", {"text": None}, nn("design_goals.text")),
-                 ("unknown successor", {"superseded_by": 9999}, FK)],
+                 ("unknown successor", {"superseded_by": 9999, "retired_at": "2026-11-01T00:00:00.000Z"}, FK),
+                 ("superseded but not retired", lambda t: {"superseded_by": t.L.design_goal()}, ck("superseded_by")),
+                 ("code out of sequence", {"code": "G-99"}, "sequential")],
             dup=[("same code", {"text": "Other."}, uq("design_goals.code"))])
 
     def test_constraints_reviews(self):
         self.run_cases(
-            "reviews", lambda n: {"code": f"R-9{n:03d}", "title": "t", "scope": "full"},
-            good=each("scope", REVIEW_SCOPES) + each("status", REVIEW_STATUSES),
+            "reviews", lambda n: {"code": self.L._code("R-"), "title": "t", "scope": "full"},
+            # schema 3: past awaiting-approval only with approved_at (ISS-0010)
+            good=each("scope", REVIEW_SCOPES)
+            + [(f"status={s}", {"status": s, "approved_at": "2026-11-01T00:00:00.000Z"}) for s in REVIEW_STATUSES],
             bad=[("scope whole", {"scope": "whole"}, ck("scope")),
                  ("status done", {"status": "done"}, ck("status")),
                  ("no scope", {"scope": None}, nn("reviews.scope")),
                  ("no title", {"title": None}, nn("reviews.title")),
-                 ("unknown previous review", {"previous_review_id": 9999}, FK)],
+                 ("unknown previous review", {"previous_review_id": 9999}, FK),
+                 ("running without approved_at", {"status": "running"}, ck("status IN ('planning'")),
+                 ("code out of sequence", {"code": "R-9001"}, "sequential")],
             dup=[("same code", {"title": "other"}, uq("reviews.code"))])
-        rid = self.review()
+        rid = self.insert("reviews", code=self.L._code("R-"), title="t", scope="full")
         self.assertEqual(self.scalar("SELECT status FROM reviews WHERE id=?", (rid,)), "planning")
 
     def test_constraints_review_repositories(self):
@@ -139,16 +148,19 @@ class ReviewAndIssueTables(SchemaCase):
 
     def test_constraints_reviewer_runs(self):
         rid, actor = self.review(), self.actor("reviewer")
+        self.L.review_domain(rid, "spec")   # schema 3: runs need the domain included
         self.run_cases(
             "reviewer_runs",
             lambda n: {"review_id": rid, "domain_code": "spec", "actor_id": actor, "label": f"spec-{n}",
                        "scope": "all"},
             good=each("status", ("queued", "running", "finished", "failed", "cancelled"))
-            + [("same label in another review", lambda t: {"review_id": t.review(), "label": "spec-shared"})],
+            + [("same label in another review",
+                lambda t: {"review_id": (r := t.review(), t.L.review_domain(r, "spec"))[0], "label": "spec-shared"})],
             bad=[("status done", {"status": "done"}, ck("status")),
                  ("no scope", {"scope": None}, nn("reviewer_runs.scope")),
                  ("no actor", {"actor_id": None}, nn("reviewer_runs.actor_id")),
-                 ("unknown domain", {"domain_code": "no-such-domain"}, FK)],
+                 # schema 3: tr_run_review_approved refuses a domain the review did not include, before the FK
+                 ("unknown domain", {"domain_code": "no-such-domain"}, "included")],
             dup=[("same label in the same review", {"scope": "other"},
                   uq("reviewer_runs.review_id", "reviewer_runs.label"))])
         run = self.insert("reviewer_runs", review_id=rid, domain_code="spec", actor_id=actor, label="x", scope="all")
@@ -156,25 +168,32 @@ class ReviewAndIssueTables(SchemaCase):
 
     def test_constraints_requirements(self):
         self.run_cases(
-            "requirements", lambda n: {"code": f"REQ-{n:04d}", "text": "It must.", "source": "owner"},
-            good=each("status", ("active", "superseded", "withdrawn"))
+            "requirements", lambda n: {"code": self.L._code("REQ-"), "text": "It must.", "source": "owner"},
+            # schema 3: status superseded exactly when superseded_by is set (ISS-0171)
+            good=each("status", ("active", "withdrawn"))
             + [("superseded by a requirement and first review",
-                lambda t: {"superseded_by": t.insert("requirements", code="REQ-9999", text="t", source="s"),
-                           "first_review_id": t.review()})],
+                lambda t: {"superseded_by": t.insert("requirements", code=t.L._code("REQ-"), text="t", source="s"),
+                           "code": t.L._code("REQ-"), "status": "superseded", "first_review_id": t.review()})],
             bad=[("status done", {"status": "done"}, ck("status")),
                  ("no source", {"source": None}, nn("requirements.source")),
                  ("no text", {"text": None}, nn("requirements.text")),
-                 ("unknown first review", {"first_review_id": 9999}, FK)],
+                 ("unknown first review", {"first_review_id": 9999}, FK),
+                 ("superseded without superseded_by", {"status": "superseded"}, ck("(status = 'superseded')")),
+                 ("code out of sequence", {"code": "REQ-9999"}, "sequential")],
             dup=[("same code", {"text": "Other."}, uq("requirements.code"))])
 
     def test_constraints_issues(self):
         rid = self.review()
         self.run_cases(
-            "issues", lambda n: {"code": f"ISS-9{n:03d}", "title": "t", "severity": "M", "first_seen_review_id": rid},
-            good=each("kind", ISSUE_KINDS) + each("severity", ("H", "M", "L", "T")) + each("status", ISSUE_STATUSES)
-            # characterization: ISS-0044 — an issue with no kind and no domain is accepted; the fix may refuse it.
-            + [("no kind and no domain accepted", {"kind": None, "domain_code": None})],
-            bad=[("severity X", {"severity": "X"}, ck("severity")),
+            "issues", lambda n: {"code": self.L._code("ISS-"), "title": "t", "severity": "M", "kind": "defect",
+                                 "domain_code": "spec", "first_seen_review_id": rid},
+            good=each("kind", ISSUE_KINDS) + each("severity", ("H", "M", "L", "T")) + each("status", ISSUE_STATUSES),
+            # ISS-0044 fixed by step 62 (schema 3): domain and kind are required.
+            bad=[("no kind", {"kind": None}, nn("issues.kind")),
+                 ("no domain", {"domain_code": None}, nn("issues.domain_code")),
+                 ("times_seen 0", {"times_seen": 0}, ck("times_seen")),
+                 ("code out of sequence", {"code": "ISS-9001"}, "sequential"),
+                 ("severity X", {"severity": "X"}, ck("severity")),
                  ("kind bug", {"kind": "bug"}, ck("kind")),
                  ("status closed", {"status": "closed"}, ck("status")),
                  ("no severity", {"severity": None}, nn("issues.severity")),
@@ -202,16 +221,18 @@ class ReviewAndIssueTables(SchemaCase):
             with self.subTest(reverse=rel):
                 def go():
                     self.accepted("issue_relations", from_issue_id=a, to_issue_id=b, relation=rel, rationale="r")
-                    self.refused("issue_relations", "the reverse relation already exists",
+                    # duplicate-of and merged-into reversed are also a cycle, refused by tr_relation_no_cycle first
+                    self.refused("issue_relations", "cycle" if rel in ("duplicate-of", "merged-into")
+                                 else "the reverse relation already exists",
                                  from_issue_id=b, to_issue_id=a, relation=rel, rationale="r")
                 self.in_savepoint(go)
-        # ... but the symmetric ones do not.
-        # characterization: ISS-0175 — a related-to (and blocks) pair stored in both directions is accepted.
-        for rel in ("related-to", "blocks"):
+        # ... and so do related-to (symmetric) and blocks (a cycle): ISS-0167/ISS-0175 fixed by step 56 (schema 3).
+        for rel, needle in (("related-to", "the reverse relation already exists"), ("blocks", "cycle")):
             with self.subTest(reverse=rel):
                 def go():
                     self.accepted("issue_relations", from_issue_id=a, to_issue_id=b, relation=rel, rationale="r")
-                    self.accepted("issue_relations", from_issue_id=b, to_issue_id=a, relation=rel, rationale="r")
+                    self.refused("issue_relations", needle, from_issue_id=b, to_issue_id=a, relation=rel,
+                                 rationale="r")
                 self.in_savepoint(go)
 
 
@@ -241,7 +262,7 @@ class FindingPlanAndEventTables(SchemaCase):
 
     def test_constraints_finding_requirements(self):
         def base(n):
-            req = self.insert("requirements", code=f"REQ-{n:04d}", text="t", source="s")
+            req = self.insert("requirements", code=self.L._code("REQ-"), text="t", source="s")
             return {"finding_id": self.f1, "requirement_id": req, "verdict": "matches"}
         self.run_cases(
             "finding_requirements", base,
@@ -254,28 +275,31 @@ class FindingPlanAndEventTables(SchemaCase):
 
     def test_constraints_review_issue_checks(self):
         self.run_cases(
-            "review_issue_checks", lambda n: {"review_id": self.review(), "issue_id": self.iss,
+            "review_issue_checks", lambda n: {"review_id": self.review(), "issue_id": self.issue(self.r1),
                                               "outcome": "still-present"},
-            good=each("outcome", ("still-present", "changed", "fixed", "regressed", "obsolete", "not-checked"))
-            # characterization: ISS-0158 — the issue's own first review may record a check of it; whether that is
-            # allowed is an open decision, and the fix step flips this case if it is refused.
-            + [("check by the issue's own first review accepted", {"review_id": self.r1})],
-            bad=[("outcome gone", {"outcome": "gone"}, ck("outcome")),
+            good=each("outcome", ("still-present", "changed", "fixed", "regressed", "obsolete", "not-checked")),
+            # ISS-0158 decided by step 59 (schema 3): the issue's own first review may not check it.
+            bad=[("check by the issue's own first review", {"review_id": self.r1}, "first found"),
+                 ("outcome gone", {"outcome": "gone"}, ck("outcome")),
                  ("no outcome", {"outcome": None}, nn("review_issue_checks.outcome")),
                  ("unknown issue", {"issue_id": 9999}, FK),
-                 ("unknown finding", {"finding_id": 9999}, FK)],
-            dup=[("one check per review per issue", {"outcome": "fixed"},
-                  uq("review_issue_checks.review_id", "review_issue_checks.issue_id"))])
+                 # schema 3: tr_check_guard refuses a finding not of this review, before the FK
+                 ("unknown finding", {"finding_id": 9999}, "another review")],
+            # schema 3: a second check (or INSERT OR REPLACE) of the same issue by the same review is refused by
+            # tr_check_guard before the primary key is reached
+            dup=[("one check per review per issue", {"outcome": "fixed"}, "already recorded a check")])
 
     def test_constraints_decisions(self):
         self.run_cases(
-            "decisions", lambda n: {"code": f"D-9{n:03d}", "question": "Which way?"},
-            good=each("status", ("open", "decided", "revisit"))
+            "decisions", lambda n: {"code": self.L._code("D-"), "question": "Which way?"},
+            good=each("status", ("open", "revisit"))
             + [("options a JSON array", {"options": '[{"value": "a", "label": "A"}]'}),
                ("options NULL", {"options": None}),
-               # characterization: ISS-0159 — a decided decision with no decided_at is accepted.
-               ("decided with no decided_at accepted", {"status": "decided", "answer": "a", "decided_at": None})],
-            bad=[("status closed", {"status": "closed"}, ck("status")),
+               # ISS-0159 fixed by step 60 (schema 3): a decision inserted decided gets decided_at from its trigger.
+               ("decided with an answer", {"status": "decided", "answer": "a", "decided_at": None})],
+            bad=[("decided without an answer", {"status": "decided"}, ck("status <> 'decided'")),
+                 ("code out of sequence", {"code": "D-9001"}, "sequential"),
+                 ("status closed", {"status": "closed"}, ck("status")),
                  ("options not JSON", {"options": "[1,"}, "CHECK constraint failed: options IS NULL OR json_valid"),
                  ("no question", {"question": None}, nn("decisions.question")),
                  ("unknown step", {"step_id": 9999}, FK)],
@@ -291,11 +315,15 @@ class FindingPlanAndEventTables(SchemaCase):
 
     def test_constraints_plans(self):
         self.run_cases(
-            "plans", lambda n: {"code": f"P-9{n:03d}", "title": "Plan"},
-            good=each("status", ("drafting", "awaiting-approval", "approved", "in-progress", "complete", "superseded",
-                                 "abandoned"))
+            "plans", lambda n: {"code": self.L._code("P-"), "title": "Plan"},
+            # schema 3: approved, in-progress and complete need approved_at (ISS-0010)
+            good=each("status", ("drafting", "awaiting-approval", "superseded", "abandoned"))
+            + [(f"status={s}", {"status": s, "approved_at": "2026-11-01T00:00:00.000Z"})
+               for s in ("approved", "in-progress", "complete")]
             + [("superseded by a plan", {"superseded_by": self.plan})],
-            bad=[("status done", {"status": "done"}, ck("status")),
+            bad=[("approved without approved_at", {"status": "approved"}, ck("status IN ('drafting'")),
+                 ("code out of sequence", {"code": "P-9001"}, "sequential"),
+                 ("status done", {"status": "done"}, ck("status")),
                  ("no title", {"title": None}, nn("plans.title")),
                  ("unknown successor", {"superseded_by": 9999}, FK)],
             dup=[("same code", {"title": "Other"}, uq("plans.code"))])
@@ -350,10 +378,14 @@ class FindingPlanAndEventTables(SchemaCase):
 
     def test_constraints_step_findings(self):
         sid = self.step()
+        self.L.plan_review(self.plan, self.r1)   # schema 3: a step closes only findings of its plan's reviews
         self.run_cases(
             "step_findings", lambda n: {"step_id": sid, "finding_id": self.L.finding(self.r1)},
             good=[("with a multi_reason", {"multi_reason": "two halves"})],
-            bad=[("unknown finding", {"finding_id": 9999}, FK), ("unknown step", {"step_id": 9999}, FK)],
+            # tr_step_finding_in_plan refuses these before the foreign keys are checked
+            bad=[("unknown finding", {"finding_id": 9999}, "plan_reviews"),
+                 ("unknown step", {"step_id": 9999}, "plan_reviews"),
+                 ("finding of another review", lambda t: {"finding_id": t.L.finding(t.review())}, "plan_reviews")],
             dup=[("same pair", {"multi_reason": "again"}, uq("step_findings.step_id", "step_findings.finding_id"))])
 
     def test_constraints_step_commits(self):
@@ -405,20 +437,22 @@ class FindingPlanAndEventTables(SchemaCase):
     def test_constraints_events(self):
         self.run_cases(
             "events", lambda n: {"entity_type": "issue", "entity_id": self.iss, "event": "note"},
-            good=each("entity_type", ("review", "issue", "step", "plan", "decision", "finding", "gate")),
+            good=each("entity_type", ("review", "issue", "step", "plan", "decision", "finding", "gate", "relation",
+                                      "check", "step-finding")),
             bad=[("entity_type plan-step", {"entity_type": "plan-step"}, ck("entity_type")),
                  ("no event", {"event": None}, nn("events.event")),
                  ("no entity id", {"entity_id": None}, nn("events.entity_id")),
                  ("unknown actor", {"actor_id": 9999}, FK)])
 
-    def test_current_events_update_and_delete_accepted(self):
-        # characterization: ISS-0014 — history is append-only by discipline only: UPDATE and DELETE on events are
-        # accepted. The fix step makes both raise.
+    def test_events_update_and_delete_refused(self):
+        # Was test_current_events_update_and_delete_accepted (characterization of ISS-0014); step 70 (schema 3) makes
+        # both raise, and the row is unchanged.
         eid = self.insert("events", entity_type="issue", entity_id=self.iss, event="note", note="before")
-        self.x("UPDATE events SET note='rewritten' WHERE id=?", (eid,))
-        self.assertEqual(self.scalar("SELECT note FROM events WHERE id=?", (eid,)), "rewritten")
-        self.x("DELETE FROM events WHERE id=?", (eid,))
-        self.assertEqual(self.scalar("SELECT count(*) FROM events WHERE id=?", (eid,)), 0)
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.x("UPDATE events SET note='rewritten' WHERE id=?", (eid,))
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.x("DELETE FROM events WHERE id=?", (eid,))
+        self.assertEqual(self.scalar("SELECT note FROM events WHERE id=?", (eid,)), "before")
 
 
 class ForeignKeysNeedThePragma(SchemaCase):

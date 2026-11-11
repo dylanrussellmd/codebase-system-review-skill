@@ -146,7 +146,8 @@ class RepoDirConfinement(unittest.TestCase):
         L.x("PRAGMA ignore_check_constraints = ON")  # a ledger written before the path CHECK, or by hand
         rep = L.repository("other", "../other")
         L.x("PRAGMA ignore_check_constraints = OFF")
-        listed = L.repository("sibling", "../other", allow_outside_root=1)
+        # the same checkout listed explicitly (one repository per path in schema 3, so spelled with a trailing /)
+        listed = L.repository("sibling", "../other/", allow_outside_root=1)
         rid = L.review("R-0001", commit_sha=osha, repository_id=rep)
         L.review_repository(rid, osha, repository_id=listed)
         fid = L.finding(rid)

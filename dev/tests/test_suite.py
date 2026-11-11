@@ -138,13 +138,13 @@ class LedgerFixture(unittest.TestCase):
         i = L.issue(first_seen_review_id=r)
         L.match(f, i)
         L.location(f, "src/x.py", 3, 4)
-        L.check_row(r, i, "still-present")
+        L.check_row(L.review(), i, "still-present")   # a later review checks it (not the one that found it)
         p = L.plan(reviews=(r,))
         ph = L.phase(p, 1)
         s = L.step(p, ph, 1, findings=(f,))
         L.gate(options=[{"value": "a", "label": "A"}], step_id=s)
         L.decision()
-        self.assertEqual(L.scalar("SELECT code FROM reviews"), "R-0001")
+        self.assertEqual(L.scalar("SELECT min(code) FROM reviews"), "R-0001")
         self.assertEqual(L.scalar("SELECT code FROM issues"), "ISS-0001")
         self.assertEqual(L.scalar("SELECT code FROM gates"), "GATE-0001")
         self.assertEqual(L.scalar("SELECT commit_sha FROM finding_locations"), sha)
@@ -153,7 +153,9 @@ class LedgerFixture(unittest.TestCase):
         self.assertEqual(stamps, sorted(stamps))
         self.assertTrue(all(s.startswith("2026-11-01T09:") for s in stamps), stamps)
         self.assertEqual(L.scalar("SELECT times_seen FROM issues"), 1)
-        self.assertEqual(L.events("issue")[-1][2:], ("seen", None, "new"))
+        # the match's seen event, then the later review's check (schema 3 logs every check)
+        self.assertEqual([e[2:] for e in L.events("issue") if e[2] in ("seen", "checked")],
+                         [("seen", None, "new"), ("checked", None, "still-present")])
 
     def test_run_commits_first_and_reports_exit(self):
         L = Ledger()

@@ -62,11 +62,12 @@ def extra():
     f = L.finding(made["R-0003"], "SPEC-L9", severity="L", domain_code="spec", summary="Admin bypass again.")
     L.match(f, ids["issues"]["ISS-0003"], "recurrence")
     # issues in the non-active statuses and the active ones the demo lacks
-    for code, sev, status in (("ISS-0101", "H", "needs-decision"), ("ISS-0102", "H", "in-progress"),
-                              ("ISS-0103", "T", "planned"), ("ISS-0104", "T", "regressed"),
-                              ("ISS-0105", "M", "accepted-risk"), ("ISS-0106", "M", "wont-fix"),
-                              ("ISS-0107", "L", "duplicate"), ("ISS-0108", "L", "obsolete"),
-                              ("ISS-0109", "H", "fixed")):
+    # (codes are sequential in schema 3: ISS-0005 follows the demo's ISS-0004)
+    for code, sev, status in (("ISS-0005", "H", "needs-decision"), ("ISS-0006", "H", "in-progress"),
+                              ("ISS-0007", "T", "planned"), ("ISS-0008", "T", "regressed"),
+                              ("ISS-0009", "M", "accepted-risk"), ("ISS-0010", "M", "wont-fix"),
+                              ("ISS-0011", "L", "duplicate"), ("ISS-0012", "L", "obsolete"),
+                              ("ISS-0013", "H", "fixed")):
         L.issue(code, first_seen_review_id=r2, severity=sev, status=status, title=f"Extra {status}")
     # a plan with no steps
     made["p2"] = L.plan("P-0002", "Empty plan")
@@ -127,9 +128,13 @@ class Overview(RouteCase):
         # characterization: ISS-0237 overview plans carry done and waiting counts but no doing count
         self.assertEqual(d["plans"], [{"code": "P-0001", "title": "Fix plan for R-0001", "status": "in-progress",
                                        "steps": 3, "done": 1, "waiting": 1}])
-        self.assertEqual([c["view"] for c in d["checks"]],
-                         ["v_unmatched_findings", "v_unchecked_known_issues", "v_untraceable_refs",
-                          "v_uncovered_findings", "v_coverage_problems"])
+        # plan step 69: the checks come from the ledger's ledger_checks table, with their tier
+        got = [(c["view"], c["tier"]) for c in d["checks"]]
+        self.assertEqual(got, [(r["view"], r["tier"]) for r in self.L.all(
+            "SELECT view, tier FROM ledger_checks ORDER BY position, view")])
+        self.assertLessEqual({("v_unmatched_findings", "error"), ("v_unchecked_known_issues", "error"),
+                              ("v_untraceable_refs", "error"), ("v_uncovered_findings", "error"),
+                              ("v_coverage_problems", "error"), ("v_unguarded_fixes", "warning")}, set(got))
         n = {c["view"]: c["n"] for c in d["checks"]}
         self.assertEqual(n["v_untraceable_refs"], 5)  # fill-refs / tag-review not run on this ledger
         self.assertEqual(sum(v for k, v in n.items() if k != "v_untraceable_refs"), 0)
@@ -159,7 +164,7 @@ class Overview(RouteCase):
         d = self.ok("/api/overview", L=empty())
         self.assertEqual((d["open_by_severity"], d["issues_by_status"], d["reviews"], d["plans"]), ([], [], [], []))
         self.assertEqual((d["gates_open"], d["queue"], d["recurring"]), (0, 0, 0))
-        self.assertEqual([c["n"] for c in d["checks"]], [0, 0, 0, 0, 0])
+        self.assertEqual([c["n"] for c in d["checks"]], [0] * empty().count("ledger_checks"))
         self.assertGreater(len(d["labels"]["domains"]), 10)
 
 
@@ -242,7 +247,7 @@ class Reviews(RouteCase):
     def test_review_detail_shape(self):
         d = self.ok("/api/review/R-0002")
         self.assertEqual(set(d), {"review", "repos", "goals", "domains", "runs", "checks", "summary", "metrics",
-                                  "artifacts", "gates", "findings"})
+                                  "artifacts", "gates", "findings", "agents", "requirements"})
         r = d["review"]
         self.assertEqual((r["code"], r["previous_code"], r["manager"], r["approved_by"]),
                          ("R-0002", "R-0001", "Review manager", fixtures.DEMO_OWNER))
@@ -489,7 +494,9 @@ def bulk():
 class Tables(RouteCase):
     def test_tables_lists_all_objects(self):
         rows = self.ok("/api/tables")
-        want = self.L.all("SELECT name, type FROM sqlite_master WHERE type IN ('table','view') ORDER BY type, name")
+        # sqlite_stat1 (made by PRAGMA optimize, plan step 89) and other internal tables are not listed
+        want = self.L.all("SELECT name, type FROM sqlite_master WHERE type IN ('table','view') "
+                          "AND name NOT LIKE 'sqlite%' ORDER BY type, name")
         self.assertEqual([(r["name"], r["type"]) for r in rows], [(w["name"], w["type"]) for w in want])
         self.assertFalse([r["name"] for r in rows if r["name"].startswith("sqlite_")])
         self.assertEqual(set(rows[0]), {"name", "type", "columns", "count"})
@@ -566,7 +573,7 @@ CONTRACT = {
                  "high", "medium", "low", "new_issues", "came_back"}),
     "review": ("GET", "/api/review/R-0001", None, 200, dict,
                {"review", "repos", "goals", "domains", "runs", "checks", "summary", "metrics", "artifacts", "gates",
-                "findings"}),
+                "findings", "agents", "requirements"}),
     "issues": ("GET", "/api/issues", None, 200, list,
                {"code", "title", "severity", "status", "domain_code", "theme_code", "times_seen", "opened_at",
                 "updated_at", "first_seen", "last_seen"}),

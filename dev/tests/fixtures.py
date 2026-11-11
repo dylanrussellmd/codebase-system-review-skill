@@ -346,6 +346,8 @@ class Clock:
 
 
 # Columns that default to "now" in the schema; the insert helpers fill them from the Clock unless given.
+DEFAULT_COMMIT = "a" * 40   # the commit Ledger.location records for a review that has none for the repository
+
 TIMESTAMP_COLUMNS = ("created_at", "started_at", "updated_at", "opened_at", "checked_at", "asked_at",
                      "recorded_at", "adopted_at", "at")
 
@@ -494,11 +496,23 @@ class Ledger:
         return cur.lastrowid
 
     def update(self, table, row_id, **cols):
-        """UPDATE one row by id (triggers run as in real use)."""
+        """UPDATE one row by id (triggers run as in real use). A status or severity change of an issue or step
+        without change_note gets the note "test change" (schema 3 refuses such a change without one); to test that
+        refusal, write the UPDATE yourself."""
+        if table in ("issues", "steps") and ("status" in cols or "severity" in cols) and "change_note" not in cols:
+            cols["change_note"] = "test change"
         sets = ", ".join(f'"{k}"=?' for k in cols)
         self.con.execute(f'UPDATE "{table}" SET {sets} WHERE id=?', (*cols.values(), row_id))
 
+    CODE_TABLES = {"R-": "reviews", "ISS-": "issues", "P-": "plans", "D-": "decisions", "GATE-": "gates",
+                   "REQ-": "requirements", "G-": "design_goals"}
+
     def _code(self, prefix, width=4):
+        table = self.CODE_TABLES.get(prefix)
+        if table:  # codes are sequential in the ledger (schema 3): the next number after the highest one there
+            have = self.scalar(f'SELECT max(CAST(substr(code, {len(prefix) + 1}) AS INTEGER)) FROM "{table}" '
+                               f'WHERE code LIKE ?', (prefix + "%",))
+            return f"{prefix}{(have or 0) + 1:0{width}d}"
         n = self._seq.get(prefix, 0) + 1
         self._seq[prefix] = n
         return f"{prefix}{n:0{width}d}"
@@ -519,9 +533,13 @@ class Ledger:
     def design_goal(self, code=None, text="Every rule is a setting.", **kw):
         return self.insert("design_goals", code=code or self._code("G-", 2), text=text, **kw)
 
-    def review(self, code=None, *, commit_sha=None, repository_id=None, scope="full", status="planning",
+    def review(self, code=None, *, commit_sha=None, repository_id=None, scope="full", status="running",
                title=None, **kw):
-        """A review; with commit_sha also its review_repositories row (repository default_repository())."""
+        """A review; with commit_sha also its review_repositories row (repository default_repository()). By default it
+        is inserted approved and running (approved_at from the clock), since findings and reviewer runs need an
+        approved review (schema 3)."""
+        if status not in ("planning", "awaiting-approval", "abandoned"):
+            kw.setdefault("approved_at", self.clock.tick())
         code = code or self._code("R-")
         rid = self.insert("reviews", code=code, title=title or f"Review {code}", scope=scope, status=status, **kw)
         if commit_sha:
@@ -538,6 +556,10 @@ class Ledger:
                            reason=reason, **kw)
 
     def reviewer_run(self, review_id, domain_code, actor_id=None, label=None, scope="all", status="finished", **kw):
+        """A reviewer run; the review_domains row including domain_code is made first if missing (schema 3 needs it)."""
+        if not self.scalar("SELECT 1 FROM review_domains WHERE review_id=? AND domain_code=? AND decision='included'",
+                           (review_id, domain_code)):
+            self.review_domain(review_id, domain_code)
         actor_id = actor_id or self.actor("reviewer", f"{domain_code} reviewer")
         return self.insert("reviewer_runs", review_id=review_id, domain_code=domain_code, actor_id=actor_id,
                            label=label or self._code(f"{domain_code}-", 1), scope=scope, status=status, **kw)
@@ -555,9 +577,19 @@ class Ledger:
         return fid
 
     def location(self, finding_id, path="src/app.py", line_start=1, line_end=None, *, repository_id=None, **kw):
-        """A finding_locations row; commit_sha left NULL takes the review's commit (trigger)."""
+        """A finding_locations row; commit_sha left NULL takes the review's commit (trigger). The location's repository
+        must be one its review looked at (schema 3): when the review has no review_repositories row for it, one is
+        made with commit DEFAULT_COMMIT."""
+        repository_id = repository_id or self.default_repository()
+        if "role" not in kw and self.scalar("SELECT 1 FROM finding_locations WHERE finding_id=? AND role='primary'",
+                                            (finding_id,)):
+            kw["role"] = "also"   # one primary location per finding (schema 3); later ones default to 'also'
+        rid = self.scalar("SELECT review_id FROM findings WHERE id=?", (finding_id,))
+        if rid is not None and not self.scalar("SELECT 1 FROM review_repositories WHERE review_id=? AND repository_id=?",
+                                               (rid, repository_id)):
+            self.review_repository(rid, DEFAULT_COMMIT, repository_id=repository_id)
         return self.insert("finding_locations", finding_id=finding_id,
-                           repository_id=repository_id or self.default_repository(), path=path,
+                           repository_id=repository_id, path=path,
                            line_start=line_start, line_end=line_end if line_end is not None else line_start, **kw)
 
     def issue(self, code=None, *, first_seen_review_id, title=None, severity="M", domain_code="spec", kind="defect",
@@ -603,6 +635,9 @@ class Ledger:
         return sid
 
     def step_finding(self, step_id, finding_id, multi_reason=None):
+        """A coverage link; the finding's review is added to the step's plan (plan_reviews) first if missing."""
+        self.x("""INSERT OR IGNORE INTO plan_reviews(plan_id, review_id)
+                  SELECT s.plan_id, f.review_id FROM steps s, findings f WHERE s.id=? AND f.id=?""", (step_id, finding_id))
         return self.insert("step_findings", step_id=step_id, finding_id=finding_id, multi_reason=multi_reason)
 
     def dependency(self, step_id, depends_on_step_id):
@@ -619,7 +654,13 @@ class Ledger:
         return self.insert("decisions", code=code or self._code("D-"), question=question, **kw)
 
     def gate(self, code=None, kind="decision", title=None, question="Which way?", **kw):
-        """A gate; options may be a list of {"value","label","description"} (stored as JSON)."""
+        """A gate; options may be a list of {"value","label","description"} (stored as JSON). A gate inserted answered
+        or applied without an answer gets answer_text "test answer", and applied without applied_note gets "applied
+        in a test" (schema 3 requires both)."""
+        if kw.get("status") in ("answered", "applied") and kw.get("answer_value") is None and kw.get("answer_text") is None:
+            kw["answer_text"] = "test answer"
+        if kw.get("status") == "applied":
+            kw.setdefault("applied_note", "applied in a test")
         code = code or self._code("GATE-")
         return self.insert("gates", code=code, kind=kind, title=title or f"Gate {code}", question=question, **kw)
 
@@ -710,11 +751,14 @@ def seed_demo(ledger):
     g2 = L.design_goal("G-02", "No internal names on screen.", source="owner")
 
     def review(code, sha, prev, status, subject):
+        # Inserted planning, then moved through the approval to running (findings and runs need an approved review);
+        # R-0001 moves on to handed-off once its points are in.
         rid = L.review(code, title=f"Comprehensive review {code}", scope="second" if prev else "full",
-                       request_text="Run the full system review", requested_by_actor_id=owner,
+                       status="planning", request_text="Run the full system review", requested_by_actor_id=owner,
                        manager_actor_id=manager, approved_by_actor_id=owner, approved_at=L.clock.tick(),
                        previous_review_id=prev, verdict="Solid core; sign-in codes and notice rules need work.")
-        L.update("reviews", rid, status=status)
+        for st in ("awaiting-approval", "approved", "running"):
+            L.update("reviews", rid, status=st, change_actor_id=owner if st == "approved" else manager)
         L.review_repository(rid, sha, repository_id=ids["repository"], commit_subject=subject)
         L.insert("review_goals", review_id=rid, goal_id=g1)
         L.insert("review_goals", review_id=rid, goal_id=g2)
@@ -763,6 +807,8 @@ def seed_demo(ledger):
                    "defect", "14 days in code.")
     i3 = new_issue("ISS-0003", f3, r1, "Admins bypass the weekend limit", "spec", "spec-mismatch", "admin-bypass",
                    "L", "defect", "Admin bypass.")
+    for st in ("verifying", "indexing", "consolidating", "handed-off"):
+        L.update("reviews", r1, status=st, change_actor_id=manager)
 
     # ---- plan
     pid = L.plan("P-0001", "Fix plan for R-0001", "drafting", reviews=(r1,), approved_by_actor_id=owner,
@@ -792,16 +838,17 @@ def seed_demo(ledger):
     L.step_finding(s2, f1)
     L.step_finding(s3, f2)
     L.step_finding(s1, f3)
-    L.update("plans", pid, status="in-progress")
-    L.update("steps", s2, status="doing", change_actor_id=manager)
+    for st in ("awaiting-approval", "approved", "in-progress"):
+        L.update("plans", pid, status=st, change_actor_id=owner if st == "approved" else manager)
+    L.update("steps", s2, status="doing", change_actor_id=manager, change_note="Started the change.")
     L.update("steps", s2, status="done", progress_note="Sign-in codes now come from a secure generator.",
-             change_commit_sha=c2)
+             change_commit_sha=c2, change_note="Sign-in codes now come from a secure generator.")
     L.step_commit(s2, c2, repository_id=ids["repository"], branch="main", summary="Use secrets for sign-in codes")
     L.update("issues", i1, status="fixed", after_state="Codes come from secrets.randbelow.", change_step_id=s2,
              change_commit_sha=c2, change_actor_id=manager, change_note="Step 2 done")
     L.guard_test(i1, "tests/test_auth.py", "test_code_uses_secrets", repository_id=ids["repository"], step_id=s2,
                  added_commit_sha=c2, failed_before_fix=1, passes_after_fix=1)
-    L.update("steps", s3, status="waiting-owner")
+    L.update("steps", s3, status="waiting-owner", change_note="Waiting for the owner: Should the default stay 14 days?")
     _expect(L.scalar("SELECT status FROM steps WHERE id=?", (s2,)) == "done", "step 2 should be done")
     _expect(L.scalar("SELECT done_at IS NOT NULL FROM steps WHERE id=?", (s2,)) == 1, "step 2 should have done_at")
 
@@ -863,12 +910,15 @@ def seed_demo(ledger):
         _expect(loc["commit_sha"] == want, f"a {loc['code']} location should take that review's commit")
     for view in ("v_unmatched_findings", "v_unchecked_known_issues", "v_uncovered_findings", "v_coverage_problems"):
         _expect(L.count(view) == 0, f"{view} should be empty after seeding: {L.all(f'SELECT * FROM {view}')}")
-    seq = [e[2:] for e in L.events("issue", i1)]
+    seq = [e[2:] for e in L.events("issue", i1) if e[2] in ("opened", "seen", "status-changed", "checked")]
     _expect(seq == [("opened", None, "open"), ("seen", None, "new"), ("status-changed", "open", "fixed"),
-                    ("status-changed", "fixed", "verified")], f"ISS-0001 history is not as expected: {seq}")
+                    ("status-changed", "fixed", "verified"), ("checked", None, "fixed")],
+            f"ISS-0001 history is not as expected: {seq}")
 
-    # ---- regression probe: a later finding matched to the verified issue makes it regressed; then undone
-    probe = L.finding(r2, "SEC-H9", severity="H", kind="security", domain_code="security", theme_code="sign-in",
+    # ---- regression probe: a finding of a later review matched to the verified issue as a regression makes it
+    # regressed; then undone (R-0002 itself reported it fixed, so it cannot also raise it again)
+    r3 = L.review(None, title="Probe review", previous_review_id=r2)
+    probe = L.finding(r3, "SEC-H9", severity="H", kind="security", domain_code="security", theme_code="sign-in",
                       sub="code-randomness", summary="Test probe: randomness returned")
     L.match(probe, i1, "regression")
     got = L.one("SELECT status, times_seen FROM issues WHERE id=?", (i1,))

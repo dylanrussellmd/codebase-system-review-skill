@@ -136,7 +136,13 @@ class Helpers(browser.ViewerTestCase):
             self.assertEqual(page.location_hash(), "#/explore/v_unmatched_findings")
             self.assertEqual(page.text("#app h2"), "v_unmatched_findings")
         finally:
-            self.write("DELETE FROM findings WHERE id=?", (fid,))
+            # findings are append-only (schema 3): lift the guard for this cleanup only, then put it back as it was
+            con = self.ledger.con
+            guard = con.execute("SELECT sql FROM sqlite_master WHERE name='tr_finding_no_delete'").fetchone()[0]
+            con.execute("DROP TRIGGER tr_finding_no_delete")
+            con.execute("DELETE FROM findings WHERE id=?", (fid,))
+            con.execute(guard)
+            self.ledger.commit()
 
     def test_page_router_tabs_and_unknown(self):
         page = self.open("#/")

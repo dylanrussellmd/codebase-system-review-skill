@@ -78,9 +78,14 @@ class SchemaChecks(unittest.TestCase):
         for bad in ("../x", "/x", "a/../../x", "..", "a\\b", "-C", "a\x01b"):
             with self.subTest(path=bad):
                 self.refused(lambda: L.repository("bad", bad))
-        for good in (".", "", None, "sub", "sub/repo"):
+        # '.' is the setup repository's own path: one repository per path (schema 3, plan step 64)
+        for good in ("", None, "sub", "sub/repo"):
             with self.subTest(path=good):
                 self.accepted(lambda: L.repository("good", good))
+        with self.assertRaises(sqlite3.IntegrityError) as cm:
+            L.repository("again", ".")
+        L.con.rollback()
+        self.assertIn("UNIQUE constraint failed: repositories.path", str(cm.exception))
         # Listed explicitly (D-0007): a sibling checkout may be outside the root, but never look like an option.
         for good in ("../sibling", "/abs/checkout"):
             with self.subTest(outside=good):
@@ -93,13 +98,18 @@ class SchemaChecks(unittest.TestCase):
         for bad in ("../x", "R-1", "R-12a4", "R-0001 ", "--message=x", "r-0001", "R-"):
             with self.subTest(code=bad):
                 self.refused(lambda: L.review(bad))
-        for good in ("R-0002", "R-12345"):
+        for good in ("R-0002",):
             with self.subTest(code=good):
                 self.accepted(lambda: L.review(good))
+        # schema 3 (plan step 61): codes are also sequential, so a well-formed code out of sequence is refused
+        with self.assertRaises(sqlite3.IntegrityError) as cm:
+            L.review("R-12345")
+        L.con.rollback()
+        self.assertIn("sequential", str(cm.exception))
 
     def test_commit_sha_checks(self):
         L = self.L
-        rid2 = L.review("R-0009")
+        rid2 = L.review()
         for bad in ("--message=x" + "0" * 29, "A" * 40, "abc1234", "g" * 40):
             with self.subTest(sha=bad):
                 self.refused(lambda: L.review_repository(rid2, bad, repository_id=self.rep))

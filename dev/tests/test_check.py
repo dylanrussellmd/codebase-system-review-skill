@@ -1,7 +1,8 @@
-"""Tests for check() and the `ledger.py check` command, and for the MUST_BE_EMPTY list against the schema.
+"""Tests for check() and the `ledger.py check` command, and for the ledger_checks list against the schema.
 
-check() runs PRAGMA integrity_check and foreign_key_check and counts the rows of each must-be-empty view; the CLI
-exits 1 when anything is found. Each must-be-empty view gets one offending fixture. `# characterization:` comments
+check() runs PRAGMA integrity_check and foreign_key_check and counts the rows of each view in the ledger's
+ledger_checks table (plan step 69; it was the MUST_BE_EMPTY constant); the CLI exits 1 when an error-tier view has
+rows (a warning-tier view is listed but does not fail). Each must-be-empty view gets one offending fixture. `# characterization:` comments
 mark assertions that pin a known defect, naming the issue, so the step that fixes it changes them on purpose.
 """
 import contextlib
@@ -21,8 +22,20 @@ def new_ledger():
     return Ledger(temp_dir("check-"))
 
 
+def seeded_checks():
+    """[(view, label, tier)] of a fresh ledger's ledger_checks, in check's order."""
+    with new_ledger() as L:
+        return [(r["view"], r["label"], r["tier"]) for r in L.all(
+            "SELECT view, label, tier FROM ledger_checks ORDER BY position, view")]
+
+
+def must_be_empty():
+    """The error tier as (view, label) pairs: the twin of SKILL.md's must-be-empty list."""
+    return [(v, label) for v, label, tier in seeded_checks() if tier == "error"]
+
+
 def offend(L, view, count=1):
-    """Insert `count` rows that make `view` (one of MUST_BE_EMPTY) non-empty, and nothing that fills another one."""
+    """Insert `count` rows that make `view` (an error-tier check) non-empty, and nothing that fills another one."""
     r1 = L.review()
     if view == "v_unmatched_findings":
         for _ in range(count):
@@ -47,6 +60,14 @@ def offend(L, view, count=1):
         ph = L.phase(plan, 1)
         for n in range(1, count + 1):
             L.step(plan, ph, n)               # closes nothing
+    elif view == "v_unplanned_discoveries":
+        plan = L.plan(reviews=[r1])
+        ph = L.phase(plan, 1)
+        f0 = L.finding(r1, issue_id=L.issue(first_seen_review_id=r1))
+        step = L.step(plan, ph, 1, findings=[f0])
+        r2 = L.review()                       # discoveries recorded under a review the plan does not cover
+        for _ in range(count):
+            L.finding(r2, issue_id=L.issue(first_seen_review_id=r2), discovered_in_step_id=step)
     else:
         raise AssertionError(f"no offending fixture for {view}")
     L.commit()
@@ -78,7 +99,9 @@ class CheckFunction(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.mod = fixtures.load_ledger_module()
-        cls.views = [v for v, _ in cls.mod.MUST_BE_EMPTY]
+        cls.checks = seeded_checks()
+        cls.must_be_empty = must_be_empty()
+        cls.views = [v for v, _ in cls.must_be_empty]
 
     def run_check(self, L, quiet=False):
         L.commit()
@@ -95,7 +118,7 @@ class CheckFunction(unittest.TestCase):
         with new_ledger() as L:
             n, out = self.run_check(L)
         self.assertEqual(n, 0)
-        self.assertEqual(out.splitlines(), [f"    0  {label}" for _, label in self.mod.MUST_BE_EMPTY])
+        self.assertEqual(out.splitlines(), [f"    0  {label}" for _, label, _ in self.checks])
 
     def test_check_quiet(self):
         with new_ledger() as L:
@@ -139,7 +162,7 @@ class CheckFunction(unittest.TestCase):
             self.assertEqual(n, 4)  # integrity, foreign key, the view, and the scratch objects (schema drift)
 
     def test_check_each_must_be_empty_view(self):
-        for view, label in self.mod.MUST_BE_EMPTY:
+        for view, label in self.must_be_empty:
             with self.subTest(view=view):
                 with new_ledger() as L:
                     offend(L, view)
@@ -147,7 +170,7 @@ class CheckFunction(unittest.TestCase):
                 self.assertEqual(n, 1, out)
                 lines = out.splitlines()
                 self.assertIn(f"    1  {label}  ({view})", lines)
-                for other, other_label in self.mod.MUST_BE_EMPTY:
+                for other, other_label, _ in self.checks:
                     if other != view:
                         self.assertIn(f"    0  {other_label}", lines)
                 samples = [l for l in lines if l.startswith("        ")]
@@ -168,7 +191,9 @@ class CheckFunction(unittest.TestCase):
     def test_must_be_empty_views_exist(self):
         with new_ledger() as L:
             views = {r["name"] for r in L.all("SELECT name FROM sqlite_schema WHERE type='view'")}
-        self.assertEqual(len(self.views), 5)
+        self.assertLessEqual({"v_unmatched_findings", "v_unchecked_known_issues", "v_untraceable_refs",
+                              "v_uncovered_findings", "v_coverage_problems"}, set(self.views))
+        self.assertEqual([(v, t) for v, _, t in self.checks if t == "warning"], [("v_unguarded_fixes", "warning")])
         for v in self.views:
             self.assertIn(v, views)
 
@@ -185,7 +210,7 @@ class CheckFunction(unittest.TestCase):
                 j -= 1
             if "must be empty" in " ".join(comment).lower():
                 commented.add(m.group(1))
-        # characterization: ISS-0178 — v_coverage_problems is in MUST_BE_EMPTY and SKILL.md's must-be-empty list,
+        # characterization: ISS-0178 — v_coverage_problems is an error-tier check and in SKILL.md's must-be-empty list,
         # but its schema.sql comment does not say "must be empty". The fix adds the words; then this becomes
         # assertEqual(commented, set(self.views)).
         self.assertEqual(commented, set(self.views) - {"v_coverage_problems"})
@@ -200,17 +225,20 @@ class CheckCommand(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.mod = fixtures.load_ledger_module()
+        cls.checks = seeded_checks()
+        cls.must_be_empty = must_be_empty()
 
     def test_cli_check_clean_exit0(self):
         with new_ledger() as L:
             p = L.run("check")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         lines = p.stdout.splitlines()
-        self.assertEqual(len(lines), 5)
+        for _, label, _ in self.checks:
+            self.assertIn(f"    0  {label}", lines)
         self.assertTrue(all(l.startswith("    0  ") for l in lines), lines)
 
     def test_cli_check_each_view_exit1(self):
-        for view, label in self.mod.MUST_BE_EMPTY:
+        for view, label in self.must_be_empty:
             with self.subTest(view=view):
                 with new_ledger() as L:
                     offend(L, view)
@@ -221,7 +249,7 @@ class CheckCommand(unittest.TestCase):
 
     def test_check_fails_on_each_view(self):
         # DB-T3: the exit code and the view name, with several offending rows at once.
-        for view, _ in self.mod.MUST_BE_EMPTY:
+        for view, _ in self.must_be_empty:
             with self.subTest(view=view):
                 with new_ledger() as L:
                     offend(L, view, count=2)

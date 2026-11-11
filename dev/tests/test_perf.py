@@ -23,9 +23,9 @@ MATCH_BUDGET_S = 0.4
 
 
 def must_be_empty_counts(db):
-    views = [v for v, _ in fixtures.load_ledger_module().MUST_BE_EMPTY]
     con = sqlite3.connect(str(db))
     try:
+        views = [r[0] for r in con.execute("SELECT view FROM ledger_checks WHERE tier='error' ORDER BY position")]
         return {v: con.execute(f'SELECT count(*) FROM "{v}"').fetchone()[0] for v in views}
     finally:
         con.close()
@@ -37,7 +37,7 @@ class ScaleGenerator(unittest.TestCase):
         p = scale.check(info)
         self.assertEqual(p.returncode, 0, f"check failed on the generated ledger:\n{p.stdout}\n{p.stderr}")
         counts = must_be_empty_counts(info["db"])
-        self.assertEqual(len(counts), 5)
+        self.assertGreaterEqual(len(counts), 5)   # the error-tier checks of ledger_checks (6 since v_unplanned_discoveries)
         self.assertEqual(counts, {v: 0 for v in counts})
 
     def test_scale_generator_small(self):

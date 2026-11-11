@@ -19,18 +19,19 @@ top of the current git repository, else the current directory), --db FILE, --ver
 """
 import argparse, hashlib, json, os, re, secrets, shlex, sqlite3, subprocess, sys, threading
 import webbrowser
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
-TOOL_VERSION = "1.2.1"  # stamped by dev/build.py from `version:` in SKILL.md's frontmatter
-TOOL_HASH = "4ab5de9b9f468ac394088e26013eb5431e6da3c482e9fbcefa9ac93634855b30"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
+TOOL_VERSION = "1.3.0"  # stamped by dev/build.py from `version:` in SKILL.md's frontmatter
+TOOL_HASH = "892eabf1173ca02c8cd674c88bfe77bec422085db1602b4336b885be0d460eda"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
 SCHEMA = r"""-- =====================================================================
--- Code review ledger — schema version 2
+-- Code review ledger — schema version 5
 -- One SQLite file per project: <project root>/.code-review/ledger.sqlite
 -- Every connection must run:  PRAGMA foreign_keys = ON;
--- Times are UTC ISO-8601 text (strftime('%Y-%m-%dT%H:%M:%fZ','now')).
+-- Times are UTC ISO-8601 text with milliseconds (strftime('%Y-%m-%dT%H:%M:%fZ','now')); the tr_time_*
+-- triggers refuse any other format.
 -- JSON columns are TEXT checked with json_valid().
 --
 -- Core idea: a FINDING is one point raised by one review; an ISSUE is the
@@ -50,6 +51,16 @@ CREATE TABLE schema_migrations (
   version     INTEGER PRIMARY KEY,
   description TEXT NOT NULL,
   applied_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+-- The checks `ledger.py check` and the viewer's home page run, in position order: each view must be empty (tier
+-- 'error': check exits 1 when it is not) or should be (tier 'warning': listed, check still exits 0). Seeded at the
+-- end of this file; a schema that adds a check inserts its row in its migration.
+CREATE TABLE ledger_checks (
+  view     TEXT PRIMARY KEY,
+  label    TEXT NOT NULL,
+  tier     TEXT NOT NULL CHECK (tier IN ('error','warning')),
+  position INTEGER NOT NULL UNIQUE
 );
 
 -- ---------- Who and what ----------------------------------------------
@@ -114,15 +125,25 @@ CREATE TABLE themes (
 
 CREATE TABLE design_goals (
   id            INTEGER PRIMARY KEY,
-  code          TEXT NOT NULL UNIQUE,    -- G-01
+  code          TEXT NOT NULL UNIQUE     -- G-01
+                  CHECK (code GLOB 'G-[0-9][0-9]*' AND code NOT GLOB 'G-*[^0-9]*'),
   text          TEXT NOT NULL,
   source        TEXT,                    -- where it came from (doc path, "owner, 2026-11-10")
   adopted_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   retired_at    TEXT,
-  superseded_by INTEGER REFERENCES design_goals(id)
+  superseded_by INTEGER REFERENCES design_goals(id),
+  CHECK (superseded_by IS NULL OR retired_at IS NOT NULL)   -- a superseded goal is retired
 );
 
 -- ---------- Reviews -----------------------------------------------------
+
+-- ON DELETE CASCADE keys (review_repositories, review_goals, review_domains, reviewer_runs, findings, metrics and
+-- the other children of reviews; finding_locations, finding_goals, finding_requirements of findings; phases,
+-- steps, plan_reviews of plans; step_dependencies, step_findings, step_commits of steps; decision_issues of
+-- decisions) fire only when their parent row is deleted. History is append-only: reviews, findings, steps and
+-- decisions refuse DELETE (tr_*_no_delete), and a review that others still reference is refused by the plain
+-- foreign keys too (issues.first_seen_review_id, plan_reviews ...). So the cascades reach only parents nothing
+-- protects (a plan with no steps, for instance). Abandon a review (status 'abandoned') instead of deleting it.
 
 CREATE TABLE reviews (
   id                    INTEGER PRIMARY KEY,
@@ -133,7 +154,9 @@ CREATE TABLE reviews (
                           ('full','partial','targeted','second','fix-verification')),
   status                TEXT NOT NULL DEFAULT 'planning' CHECK (status IN
                           ('planning','awaiting-approval','approved','running','verifying',
-                           'indexing','consolidating','handed-off','abandoned')),
+                           'indexing','consolidating','handed-off','abandoned'))
+                          -- past awaiting-approval only once the owner approved (set approved_at with it)
+                          CHECK (status IN ('planning','awaiting-approval','abandoned') OR approved_at IS NOT NULL),
   request_text          TEXT,                   -- what the owner asked for, in their words
   requested_by_actor_id INTEGER REFERENCES actors(id),
   manager_actor_id      INTEGER REFERENCES actors(id),
@@ -147,8 +170,14 @@ CREATE TABLE reviews (
   verdict               TEXT,
   summary               TEXT,
   started_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-  completed_at          TEXT,
-  updated_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  completed_at          TEXT CHECK (completed_at IS NULL OR julianday(started_at) <= julianday(completed_at)),
+  updated_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  -- Context for the next status change, copied into its event and then cleared (like issues.change_*);
+  -- leaving handed-off or abandoned needs change_note.
+  change_actor_id       INTEGER REFERENCES actors(id),
+  change_note           TEXT,
+  report_md             TEXT                    -- the review document for the owner (Markdown), shown in the
+                                                -- viewer; written in Step 6 with `ledger.py set-report`
 );
 
 -- The exact code state each review looked at.
@@ -158,7 +187,8 @@ CREATE TABLE review_repositories (
   commit_sha    TEXT NOT NULL CHECK ((length(commit_sha) = 40 OR length(commit_sha) = 64)
                                    AND commit_sha NOT GLOB '*[^0-9a-f]*'),  -- full hash, lowercase hex
   branch        TEXT,
-  commit_time   TEXT,
+  commit_time   TEXT,                     -- the commit's committer time in UTC (…Z, like every time here; a git
+                                          -- time with an offset is converted); tag-review fills it when NULL
   commit_subject TEXT,
   tag_name      TEXT,                     -- e.g. review/R-0001, keeps the commit reachable
   tag_pushed    INTEGER NOT NULL DEFAULT 0 CHECK (tag_pushed IN (0,1)),
@@ -200,28 +230,39 @@ CREATE TABLE reviewer_runs (
   report_sha256  TEXT,
   status         TEXT NOT NULL DEFAULT 'queued' CHECK (status IN
                    ('queued','running','finished','failed','cancelled')),
-  items_reviewed INTEGER,
-  high_count     INTEGER,
-  medium_count   INTEGER,
-  low_count      INTEGER,
-  test_count     INTEGER,
+  items_reviewed INTEGER CHECK (items_reviewed IS NULL OR items_reviewed >= 0),
+  high_count     INTEGER CHECK (high_count IS NULL OR high_count >= 0),
+  medium_count   INTEGER CHECK (medium_count IS NULL OR medium_count >= 0),
+  low_count      INTEGER CHECK (low_count IS NULL OR low_count >= 0),
+  test_count     INTEGER CHECK (test_count IS NULL OR test_count >= 0),
   final_message  TEXT,
   started_at     TEXT,
   finished_at    TEXT,
   UNIQUE (review_id, label)
 );
 
+-- Every other agent that worked on a review (verifiers, indexers, matchers, drafters, fixers ...): reviewers are
+-- tied to it by reviewer_runs and the manager by reviews.manager_actor_id. v_review_agents lists all of them.
+CREATE TABLE review_actors (
+  review_id  INTEGER NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
+  actor_id   INTEGER NOT NULL REFERENCES actors(id),
+  role_label TEXT NOT NULL,                -- what it did here: 'indexer for security.md', 'matcher'
+  PRIMARY KEY (review_id, actor_id)
+);
+
 -- ---------- Requirements (for spec conformance over time) -------------
 
 CREATE TABLE requirements (
   id              INTEGER PRIMARY KEY,
-  code            TEXT NOT NULL UNIQUE,   -- REQ-0001
+  code            TEXT NOT NULL UNIQUE    -- REQ-0001
+                    CHECK (code GLOB 'REQ-[0-9][0-9][0-9][0-9]*' AND code NOT GLOB 'REQ-*[^0-9]*'),
   text            TEXT NOT NULL,
   source          TEXT NOT NULL,          -- doc path, issue URL, "owner, chat 2026-11-10"
   source_location TEXT,
   stated_at       TEXT,
   status          TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','superseded','withdrawn')),
-  superseded_by   INTEGER REFERENCES requirements(id),
+  superseded_by   INTEGER REFERENCES requirements(id)   -- set exactly when status is superseded
+                    CHECK ((status = 'superseded') = (superseded_by IS NOT NULL)),
   first_review_id INTEGER REFERENCES reviews(id),
   created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
@@ -230,12 +271,13 @@ CREATE TABLE requirements (
 
 CREATE TABLE issues (
   id                     INTEGER PRIMARY KEY,
-  code                   TEXT NOT NULL UNIQUE,   -- ISS-0001, never reused
+  code                   TEXT NOT NULL UNIQUE    -- ISS-0001, never reused
+                           CHECK (code GLOB 'ISS-[0-9][0-9][0-9][0-9]*' AND code NOT GLOB 'ISS-*[^0-9]*'),
   title                  TEXT NOT NULL,
-  domain_code            TEXT REFERENCES domains(code),
+  domain_code            TEXT NOT NULL REFERENCES domains(code),
   theme_code             TEXT REFERENCES themes(code),
   sub                    TEXT,                   -- slug naming the specific thing
-  kind                   TEXT CHECK (kind IN
+  kind                   TEXT NOT NULL CHECK (kind IN
                            ('defect','test','validation','refactor','feature','design','docs',
                             'logging','perf','security','ops','verify')),
   severity               TEXT NOT NULL CHECK (severity IN ('H','M','L','T')),  -- current
@@ -251,19 +293,20 @@ CREATE TABLE issues (
   first_seen_review_id   INTEGER NOT NULL REFERENCES reviews(id),
   last_seen_review_id    INTEGER REFERENCES reviews(id),   -- last review that raised it
   last_checked_review_id INTEGER REFERENCES reviews(id),   -- last review that looked for it
-  times_seen             INTEGER NOT NULL DEFAULT 1,
+  times_seen             INTEGER NOT NULL DEFAULT 1 CHECK (times_seen >= 1),
   opened_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   resolved_at            TEXT,
   verified_at            TEXT,
   updated_at             TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-  -- Context for the next status/severity change. Set ALL FIVE in the same
-  -- UPDATE that changes status or severity (NULL the ones that don't apply,
-  -- or stale context from an earlier change is logged); the trigger copies
-  -- them into events, so history records who, why, in which review/step/commit.
+  -- Context for the next status/severity change, set in the same UPDATE: change_note is required (the
+  -- update is refused without it), the others where they apply. The triggers copy them into events, so
+  -- history records who, why, in which review/step/commit, and then set all five back to NULL, so context
+  -- is never reused by a later change.
   change_actor_id        INTEGER REFERENCES actors(id),
   change_review_id       INTEGER REFERENCES reviews(id),
   change_step_id         INTEGER REFERENCES steps(id),
-  change_commit_sha      TEXT,
+  change_commit_sha      TEXT CHECK (change_commit_sha IS NULL OR ((length(change_commit_sha) = 40
+                                     OR length(change_commit_sha) = 64) AND change_commit_sha NOT GLOB '*[^0-9a-f]*')),
   change_note            TEXT
 );
 
@@ -291,9 +334,10 @@ CREATE TABLE findings (
   review_id            INTEGER NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
   reviewer_run_id      INTEGER REFERENCES reviewer_runs(id),
   point_id             TEXT NOT NULL,       -- index id: prefix + the report's own id (SEC-H3)
-  issue_id             INTEGER REFERENCES issues(id),   -- set during matching
+  issue_id             INTEGER REFERENCES issues(id),   -- set during matching, by an UPDATE (never on INSERT)
   match_type           TEXT CHECK (match_type IN
-                         ('new','still-present','changed','recurrence','regression','continuation')),
+                         ('new','still-present','changed','recurrence','regression','continuation'))
+                         CHECK (match_type IS NULL OR issue_id IS NOT NULL),   -- a match type needs the issue
   match_confidence     TEXT CHECK (match_confidence IN ('certain','likely','possible')),
   match_rationale      TEXT,
   severity             TEXT NOT NULL CHECK (severity IN ('H','M','L','T')),
@@ -318,6 +362,8 @@ CREATE TABLE findings (
   verified_at          TEXT,
   verification_note    TEXT,
   created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  discovered_in_step_id INTEGER REFERENCES steps(id),  -- set when the point was found during fix work on this
+                                            -- plan step (not by a reviewer); v_unplanned_discoveries checks it
   UNIQUE (review_id, point_id)
 );
 
@@ -334,11 +380,13 @@ CREATE TABLE finding_locations (
   id             INTEGER PRIMARY KEY,
   finding_id     INTEGER NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
   repository_id  INTEGER NOT NULL REFERENCES repositories(id),
-  commit_sha     TEXT CHECK (commit_sha IS NULL OR (length(commit_sha) >= 7 AND commit_sha NOT GLOB '*[^0-9a-f]*')),
-                                            -- filled from review_repositories if left NULL
+  commit_sha     TEXT CHECK (commit_sha IS NULL OR ((length(commit_sha) = 40 OR length(commit_sha) = 64)
+                                                    AND commit_sha NOT GLOB '*[^0-9a-f]*')),
+                                            -- full hash, lowercase hex; filled from review_repositories if left
+                                            -- NULL (the location's repository must be one the review looked at)
   path           TEXT NOT NULL,             -- repo-relative, forward slashes (see the CHECK below)
   line_start     INTEGER CHECK (line_start IS NULL OR line_start >= 1),
-  line_end       INTEGER,
+  line_end       INTEGER CHECK (line_end IS NULL OR line_start IS NOT NULL),   -- no end without a start
   symbol         TEXT,                      -- function, class, route, setting name
   blob_sha       TEXT,                      -- `git rev-parse <commit>:<path>`
   excerpt        TEXT,                      -- the cited lines, verbatim, at that commit
@@ -349,6 +397,13 @@ CREATE TABLE finding_locations (
   excerpt_redacted INTEGER NOT NULL DEFAULT 0 CHECK (excerpt_redacted IN (0,1)),
                                             -- 1 = fill-refs masked secret-looking values in excerpt as [redacted];
                                             -- excerpt_sha256 is still the hash of the real lines
+  whole_file     INTEGER NOT NULL DEFAULT 0 CHECK (whole_file IN (0,1)),
+                                            -- 1 = the point is about the whole file (location form repo:path, no
+                                            -- lines, no symbol); fill-refs sets it with lines 1..n
+  excerpt_status TEXT CHECK (excerpt_status IS NULL OR excerpt_status IN ('truncated','not-text')),
+                                            -- truncated = a whole-file excerpt holds only its first 200 lines;
+                                            -- not-text = binary or not UTF-8: no excerpt, excerpt_sha256 is of
+                                            -- the file's bytes
   CHECK (line_end IS NULL OR line_start IS NULL OR line_end >= line_start),
   -- path: relative (no leading / or -), no backslash, no .. segment, no control characters
   CHECK (length(path) > 0 AND path NOT GLOB '/*' AND path NOT GLOB '-*' AND path NOT GLOB '*\*'
@@ -369,6 +424,20 @@ CREATE TABLE finding_requirements (
   PRIMARY KEY (finding_id, requirement_id)
 );
 
+-- The spec reviewer's verdict on every requirement a review traced, findings or not (a 'matches' or 'untested'
+-- row has no finding). One row per review and requirement; v_requirement_trace lists them with counts.
+CREATE TABLE review_requirement_checks (
+  id                INTEGER PRIMARY KEY,
+  review_id         INTEGER NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
+  requirement_id    INTEGER NOT NULL REFERENCES requirements(id),
+  verdict           TEXT NOT NULL CHECK (verdict IN ('matches','differs','partly','missing','untested')),
+  where_implemented TEXT,                  -- file, function or page that implements it
+  tested            TEXT CHECK (tested IS NULL OR tested IN ('yes','partly','no')),
+  finding_id        INTEGER REFERENCES findings(id),   -- the finding raised for it, if any
+  evidence          TEXT,
+  UNIQUE (review_id, requirement_id)
+);
+
 -- What each review concluded about each issue already known when it started.
 -- Absence of a finding is NOT evidence of a fix; only a row here is.
 CREATE TABLE review_issue_checks (
@@ -387,12 +456,14 @@ CREATE TABLE review_issue_checks (
 
 CREATE TABLE decisions (
   id                  INTEGER PRIMARY KEY,
-  code                TEXT NOT NULL UNIQUE,   -- D-0001
+  code                TEXT NOT NULL UNIQUE    -- D-0001
+                        CHECK (code GLOB 'D-[0-9][0-9][0-9][0-9]*' AND code NOT GLOB 'D-*[^0-9]*'),
   question            TEXT NOT NULL,
   options             TEXT CHECK (options IS NULL OR json_valid(options)),
   answer              TEXT,
   rationale           TEXT,
-  status              TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','decided','revisit')),
+  status              TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','decided','revisit'))
+                        CHECK (status <> 'decided' OR answer IS NOT NULL),   -- a decided decision has its answer
   revisit_when        TEXT,                   -- condition or date that reopens it
   review_id           INTEGER REFERENCES reviews(id),
   step_id             INTEGER REFERENCES steps(id),
@@ -414,19 +485,26 @@ CREATE TABLE decision_issues (
 -- rulings; a gate of kind 'decision' records its answer in decisions too.
 CREATE TABLE gates (
   id              INTEGER PRIMARY KEY,
-  code            TEXT NOT NULL UNIQUE,     -- GATE-0001
+  code            TEXT NOT NULL UNIQUE      -- GATE-0001
+                    CHECK (code GLOB 'GATE-[0-9][0-9][0-9][0-9]*' AND code NOT GLOB 'GATE-*[^0-9]*'),
   kind            TEXT NOT NULL CHECK (kind IN
                     ('domain-approval','plan-approval','decision','step-input',
                      'confirm-false-finding','accept-risk','production-action',
-                     'review-handoff','other')),
+                     'review-handoff','confirm','other')),
   title           TEXT NOT NULL,
   question        TEXT NOT NULL,
   context         TEXT,                     -- plain text the owner needs to answer
-  options         TEXT CHECK (options IS NULL OR json_valid(options)),
-                                            -- JSON array of {"value","label","description"}
-  allow_text      INTEGER NOT NULL DEFAULT 1 CHECK (allow_text IN (0,1)),
+  options         TEXT CHECK (options IS NULL OR json_valid(options))
+                    CHECK (options IS NULL OR json_type(options) = 'array'),
+                                            -- JSON array of {"value","label","description"} (value and label
+                                            -- required: tr_gate_options_shape)
+  allow_text      INTEGER NOT NULL DEFAULT 1 CHECK (allow_text IN (0,1))
+                    -- someone must be able to answer: free text, or at least one option
+                    CHECK (allow_text = 1 OR (options IS NOT NULL AND json_array_length(options) > 0)),
   blocking        INTEGER NOT NULL DEFAULT 1 CHECK (blocking IN (0,1)),  -- work stops until answered
-  status          TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','answered','applied','withdrawn')),
+  status          TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','answered','applied','withdrawn'))
+                    CHECK (status <> 'answered' OR answer_value IS NOT NULL OR answer_text IS NOT NULL)
+                    CHECK (status <> 'applied' OR applied_note IS NOT NULL),
   answer_value    TEXT,                     -- the option chosen
   answer_text     TEXT,                     -- the owner's own words
   answered_by     TEXT,
@@ -440,25 +518,39 @@ CREATE TABLE gates (
   issue_id        INTEGER REFERENCES issues(id),
   decision_id     INTEGER REFERENCES decisions(id),
   opened_by_actor_id INTEGER REFERENCES actors(id),
-  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  answered_by_actor_id INTEGER REFERENCES actors(id),  -- who answered (the viewer: the owner's actors row);
+                                            -- answered_by keeps the text for older rows
+  change_actor_id INTEGER REFERENCES actors(id)        -- who made the next status change (applied, withdrawn);
+                                            -- copied into its event, then cleared
 );
 
 -- ---------- Fix plans -----------------------------------------------------
 
 CREATE TABLE plans (
   id                   INTEGER PRIMARY KEY,
-  code                 TEXT NOT NULL UNIQUE,   -- P-0001
+  code                 TEXT NOT NULL UNIQUE    -- P-0001
+                         CHECK (code GLOB 'P-[0-9][0-9][0-9][0-9]*' AND code NOT GLOB 'P-*[^0-9]*'),
   title                TEXT NOT NULL,
   status               TEXT NOT NULL DEFAULT 'drafting' CHECK (status IN
                          ('drafting','awaiting-approval','approved','in-progress','complete',
-                          'superseded','abandoned')),
+                          'superseded','abandoned'))
+                         -- approved, in-progress and complete only once the owner approved (set approved_at with it)
+                         CHECK (status IN ('drafting','awaiting-approval','superseded','abandoned')
+                                OR approved_at IS NOT NULL),
   approved_by_actor_id INTEGER REFERENCES actors(id),
   approved_at          TEXT,
   superseded_by        INTEGER REFERENCES plans(id),
   doc_url              TEXT,
   page_url             TEXT,
   created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-  updated_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  updated_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  -- Context for the next status change, copied into its event and then cleared; leaving superseded or
+  -- abandoned needs change_note.
+  change_actor_id      INTEGER REFERENCES actors(id),
+  change_note          TEXT,
+  narrative_md         TEXT                    -- the plan's narrative for the owner (Markdown: how to read it,
+                                               -- why this order), shown in the viewer; `ledger.py set-narrative`
 );
 
 CREATE TABLE plan_reviews (
@@ -498,8 +590,11 @@ CREATE TABLE steps (
   started_at        TEXT,
   done_at           TEXT,
   updated_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-  change_actor_id   INTEGER REFERENCES actors(id),   -- context for the status trigger
-  change_commit_sha TEXT,
+  -- Context for the next status change: change_note is required (on waiting-owner, owner_question will do);
+  -- copied into the event, then cleared.
+  change_actor_id   INTEGER REFERENCES actors(id),
+  change_commit_sha TEXT CHECK (change_commit_sha IS NULL OR ((length(change_commit_sha) = 40 OR length(change_commit_sha) = 64) AND change_commit_sha NOT GLOB '*[^0-9a-f]*')),
+  change_note       TEXT,
   UNIQUE (plan_id, number)
 );
 
@@ -539,7 +634,7 @@ CREATE TABLE guard_tests (
   test_path               TEXT NOT NULL,
   test_name               TEXT NOT NULL,
   step_id                 INTEGER REFERENCES steps(id),
-  added_commit_sha        TEXT,
+  added_commit_sha        TEXT CHECK (added_commit_sha IS NULL OR ((length(added_commit_sha) = 40 OR length(added_commit_sha) = 64) AND added_commit_sha NOT GLOB '*[^0-9a-f]*')),
   failed_before_fix       INTEGER CHECK (failed_before_fix IN (0,1)),
   passes_after_fix        INTEGER CHECK (passes_after_fix IN (0,1)),
   still_exists            INTEGER NOT NULL DEFAULT 1 CHECK (still_exists IN (0,1)),
@@ -555,7 +650,7 @@ CREATE TABLE test_runs (
   review_id     INTEGER REFERENCES reviews(id),
   step_id       INTEGER REFERENCES steps(id),
   repository_id INTEGER REFERENCES repositories(id),
-  commit_sha    TEXT,
+  commit_sha    TEXT CHECK (commit_sha IS NULL OR ((length(commit_sha) = 40 OR length(commit_sha) = 64) AND commit_sha NOT GLOB '*[^0-9a-f]*')),
   command       TEXT NOT NULL,
   purpose       TEXT NOT NULL CHECK (purpose IN
                   ('baseline','targeted','flake-check','mutation','before-fix','after-fix','ci')),
@@ -568,6 +663,16 @@ CREATE TABLE test_runs (
   output_path   TEXT,
   notes         TEXT,
   started_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+-- The catalog of metric names: what the viewer shows for each (label, default unit) and which way is better.
+-- Seeded with the names the domains ask for; a metric recorded under a new name gets a row here from
+-- tr_metric_defined (label = the name with spaces, capitalized), which can then be given a better label.
+CREATE TABLE metric_defs (
+  name   TEXT PRIMARY KEY,                 -- the stable key used in metrics.name
+  label  TEXT NOT NULL,
+  unit   TEXT,
+  better TEXT NOT NULL DEFAULT 'none' CHECK (better IN ('higher','lower','none'))
 );
 
 -- Numbers worth trending: mutation score, coverage %, cases asserted,
@@ -586,6 +691,17 @@ CREATE TABLE metrics (
   recorded_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   UNIQUE (review_id, name, scope, repository_id)
 );
+
+-- A metric recorded under a name the catalog lacks gets a metric_defs row (so every metric has a label).
+CREATE TRIGGER tr_metric_defined AFTER INSERT ON metrics BEGIN
+  INSERT OR IGNORE INTO metric_defs(name, label, unit)
+    VALUES (NEW.name, upper(substr(NEW.name, 1, 1)) || replace(substr(NEW.name, 2), '_', ' '), NEW.unit);
+END;
+
+CREATE TRIGGER tr_metric_renamed AFTER UPDATE OF name ON metrics BEGIN
+  INSERT OR IGNORE INTO metric_defs(name, label, unit)
+    VALUES (NEW.name, upper(substr(NEW.name, 1, 1)) || replace(substr(NEW.name, 2), '_', ' '), NEW.unit);
+END;
 
 -- ---------- Files and links produced ---------------------------------
 
@@ -606,9 +722,11 @@ CREATE TABLE artifacts (
 
 -- ---------- History of everything that changes state ------------------
 
+-- Append-only (G-04): triggers refuse every UPDATE and DELETE on events (tr_events_no_update/no_delete).
 CREATE TABLE events (
   id          INTEGER PRIMARY KEY,
-  entity_type TEXT NOT NULL CHECK (entity_type IN ('review','issue','step','plan','decision','finding','gate')),
+  entity_type TEXT NOT NULL CHECK (entity_type IN ('review','issue','step','plan','decision','finding','gate',
+                                                   'relation','check','step-finding')),
   entity_id   INTEGER NOT NULL,
   event       TEXT NOT NULL,              -- status-changed, severity-changed, opened, seen, linked, note ...
   from_value  TEXT,
@@ -616,7 +734,7 @@ CREATE TABLE events (
   actor_id    INTEGER REFERENCES actors(id),
   review_id   INTEGER REFERENCES reviews(id),
   step_id     INTEGER REFERENCES steps(id),
-  commit_sha  TEXT,
+  commit_sha  TEXT CHECK (commit_sha IS NULL OR ((length(commit_sha) = 40 OR length(commit_sha) = 64) AND commit_sha NOT GLOB '*[^0-9a-f]*')),
   note        TEXT,
   at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
@@ -643,30 +761,147 @@ CREATE INDEX ix_events_entity        ON events(entity_type, entity_id, at);
 CREATE INDEX ix_metrics_name         ON metrics(name, scope);
 CREATE INDEX ix_runs_review          ON reviewer_runs(review_id);
 CREATE INDEX ix_gates_status         ON gates(status);
+-- Uniqueness the table constraints cannot express (schema 3): one metric per review, name, scope and repository
+-- even when repository_id is NULL; at most one primary location per finding; one repository per path.
+CREATE UNIQUE INDEX ux_metrics_key            ON metrics(review_id, name, scope, COALESCE(repository_id, 0));
+CREATE UNIQUE INDEX ux_locations_one_primary  ON finding_locations(finding_id) WHERE role = 'primary';
+CREATE UNIQUE INDEX ux_repositories_path      ON repositories(path);
+CREATE INDEX ix_fk_reviews_change_actor_id    ON reviews(change_actor_id);
+CREATE INDEX ix_fk_plans_change_actor_id      ON plans(change_actor_id);
+CREATE INDEX ix_fk_gates_change_actor_id      ON gates(change_actor_id);
+CREATE INDEX ix_fk_gates_answered_by_actor_id ON gates(answered_by_actor_id);
+-- A leading index for every foreign-key column (a parent delete or update checks its children through it, and
+-- views look gates up by step and decision); dev/tests/test_p4_views_indexes.py keeps the list complete.
+CREATE INDEX ix_fk_actors_parent_actor_id            ON actors(parent_actor_id);
+CREATE INDEX ix_fk_design_goals_superseded_by        ON design_goals(superseded_by);
+CREATE INDEX ix_fk_reviews_approved_by_actor_id      ON reviews(approved_by_actor_id);
+CREATE INDEX ix_fk_reviews_manager_actor_id          ON reviews(manager_actor_id);
+CREATE INDEX ix_fk_reviews_previous_review_id        ON reviews(previous_review_id);
+CREATE INDEX ix_fk_reviews_requested_by_actor_id     ON reviews(requested_by_actor_id);
+CREATE INDEX ix_fk_review_repositories_repository_id ON review_repositories(repository_id);
+CREATE INDEX ix_fk_review_goals_goal_id              ON review_goals(goal_id);
+CREATE INDEX ix_fk_review_domains_domain_code        ON review_domains(domain_code);
+CREATE INDEX ix_fk_reviewer_runs_actor_id            ON reviewer_runs(actor_id);
+CREATE INDEX ix_fk_reviewer_runs_domain_code         ON reviewer_runs(domain_code);
+CREATE INDEX ix_fk_review_actors_actor_id            ON review_actors(actor_id);
+CREATE INDEX ix_fk_requirements_first_review_id      ON requirements(first_review_id);
+CREATE INDEX ix_fk_requirements_superseded_by        ON requirements(superseded_by);
+CREATE INDEX ix_fk_issues_change_actor_id            ON issues(change_actor_id);
+CREATE INDEX ix_fk_issues_change_review_id           ON issues(change_review_id);
+CREATE INDEX ix_fk_issues_change_step_id             ON issues(change_step_id);
+CREATE INDEX ix_fk_issues_first_seen_review_id       ON issues(first_seen_review_id);
+CREATE INDEX ix_fk_issues_last_checked_review_id     ON issues(last_checked_review_id);
+CREATE INDEX ix_fk_issues_last_seen_review_id        ON issues(last_seen_review_id);
+CREATE INDEX ix_fk_issues_theme_code                 ON issues(theme_code);
+CREATE INDEX ix_fk_issue_relations_established_by_actor_id ON issue_relations(established_by_actor_id);
+CREATE INDEX ix_fk_issue_relations_established_in_review_id ON issue_relations(established_in_review_id);
+CREATE INDEX ix_findings_run                         ON findings(reviewer_run_id);
+CREATE INDEX ix_fk_findings_theme_code               ON findings(theme_code);
+CREATE INDEX ix_fk_findings_verified_by_actor_id     ON findings(verified_by_actor_id);
+CREATE INDEX ix_fk_findings_discovered_in_step_id    ON findings(discovered_in_step_id);
+CREATE INDEX ix_fk_finding_locations_repository_id   ON finding_locations(repository_id);
+CREATE INDEX ix_fk_finding_goals_goal_id             ON finding_goals(goal_id);
+CREATE INDEX ix_fk_finding_requirements_requirement_id ON finding_requirements(requirement_id);
+CREATE INDEX ix_fk_review_requirement_checks_finding_id ON review_requirement_checks(finding_id);
+CREATE INDEX ix_fk_review_requirement_checks_requirement_id ON review_requirement_checks(requirement_id);
+CREATE INDEX ix_fk_review_issue_checks_actor_id      ON review_issue_checks(actor_id);
+CREATE INDEX ix_ric_finding                          ON review_issue_checks(finding_id);
+CREATE INDEX ix_fk_decisions_asked_by_actor_id       ON decisions(asked_by_actor_id);
+CREATE INDEX ix_fk_decisions_decided_by_actor_id     ON decisions(decided_by_actor_id);
+CREATE INDEX ix_fk_decisions_review_id               ON decisions(review_id);
+CREATE INDEX ix_fk_decisions_step_id                 ON decisions(step_id);
+CREATE INDEX ix_fk_decision_issues_issue_id          ON decision_issues(issue_id);
+CREATE INDEX ix_gates_decision                       ON gates(decision_id);
+CREATE INDEX ix_fk_gates_issue_id                    ON gates(issue_id);
+CREATE INDEX ix_fk_gates_opened_by_actor_id          ON gates(opened_by_actor_id);
+CREATE INDEX ix_fk_gates_plan_id                     ON gates(plan_id);
+CREATE INDEX ix_fk_gates_review_id                   ON gates(review_id);
+CREATE INDEX ix_gates_step                           ON gates(step_id);
+CREATE INDEX ix_fk_plans_approved_by_actor_id        ON plans(approved_by_actor_id);
+CREATE INDEX ix_fk_plans_superseded_by               ON plans(superseded_by);
+CREATE INDEX ix_fk_plan_reviews_review_id            ON plan_reviews(review_id);
+CREATE INDEX ix_fk_steps_change_actor_id             ON steps(change_actor_id);
+CREATE INDEX ix_fk_step_commits_repository_id        ON step_commits(repository_id);
+CREATE INDEX ix_fk_guard_tests_last_confirmed_review_id ON guard_tests(last_confirmed_review_id);
+CREATE INDEX ix_fk_guard_tests_repository_id         ON guard_tests(repository_id);
+CREATE INDEX ix_fk_guard_tests_step_id               ON guard_tests(step_id);
+CREATE INDEX ix_fk_test_runs_repository_id           ON test_runs(repository_id);
+CREATE INDEX ix_fk_test_runs_review_id               ON test_runs(review_id);
+CREATE INDEX ix_fk_test_runs_step_id                 ON test_runs(step_id);
+CREATE INDEX ix_fk_metrics_domain_code               ON metrics(domain_code);
+CREATE INDEX ix_fk_metrics_repository_id             ON metrics(repository_id);
+CREATE INDEX ix_fk_artifacts_plan_id                 ON artifacts(plan_id);
+CREATE INDEX ix_fk_artifacts_review_id               ON artifacts(review_id);
+CREATE INDEX ix_fk_artifacts_reviewer_run_id         ON artifacts(reviewer_run_id);
+CREATE INDEX ix_fk_events_actor_id                   ON events(actor_id);
+CREATE INDEX ix_fk_events_review_id                  ON events(review_id);
+CREATE INDEX ix_fk_events_step_id                    ON events(step_id);
 
 -- ---------- Triggers ----------------------------------------------------
+-- (schema 3, plan steps 54-83) History is append-only, every tracked change writes an event, status and
+-- severity changes need fresh context (change_note) and clear it after logging, and the issue lifecycle,
+-- plan structure, review and plan approvals and gate answers are enforced here, not only in SKILL.md.
 
-CREATE TRIGGER tr_issue_opened AFTER INSERT ON issues BEGIN
-  INSERT INTO events(entity_type, entity_id, event, to_value, actor_id, review_id, note)
-  VALUES ('issue', NEW.id, 'opened', NEW.status, NEW.change_actor_id,
-          NEW.first_seen_review_id, NEW.change_note);
+-- ----- Issues
+
+-- Codes: the prefix and the next number, zero-padded to 4 digits (ISS-0001, ISS-0002 ...); never changed or reused.
+CREATE TRIGGER tr_issue_code BEFORE INSERT ON issues
+-- (a malformed code is left to the code CHECK, which names it)
+WHEN NEW.code GLOB 'ISS-[0-9][0-9][0-9][0-9]*' AND NEW.code NOT GLOB 'ISS-*[^0-9]*' AND (
+     NEW.code IS NOT 'ISS-' || printf('%04d', CAST(substr(NEW.code, 5) AS INTEGER))
+  OR CAST(substr(NEW.code, 5) AS INTEGER) < 1
+  OR (CAST(substr(NEW.code, 5) AS INTEGER) > 1 AND NOT EXISTS (SELECT 1 FROM issues
+        WHERE code = 'ISS-' || printf('%04d', CAST(substr(NEW.code, 5) AS INTEGER) - 1)))) BEGIN
+  SELECT RAISE(ABORT, 'issue codes are sequential: ISS- and the next number (ISS-0001, ISS-0002 ...)');
 END;
 
+CREATE TRIGGER tr_issue_code_fixed BEFORE UPDATE OF code ON issues WHEN OLD.code IS NOT NEW.code BEGIN
+  SELECT RAISE(ABORT, 'codes never change');
+END;
+
+CREATE TRIGGER tr_issue_domain_active BEFORE INSERT ON issues
+WHEN EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL) BEGIN
+  SELECT RAISE(ABORT, 'that domain is retired; use a current one');
+END;
+
+CREATE TRIGGER tr_issue_opened AFTER INSERT ON issues BEGIN
+  INSERT INTO events(entity_type, entity_id, event, to_value, actor_id, review_id, step_id, commit_sha, note)
+  VALUES ('issue', NEW.id, 'opened', NEW.status, NEW.change_actor_id,
+          NEW.first_seen_review_id, NEW.change_step_id, NEW.change_commit_sha, NEW.change_note);
+END;
+
+-- A status or severity change needs its reason in the same UPDATE (change_note), so history never logs a
+-- stale or empty context.
+CREATE TRIGGER tr_issue_change_needs_note BEFORE UPDATE OF status, severity ON issues
+WHEN (OLD.status IS NOT NEW.status OR OLD.severity IS NOT NEW.severity) AND NEW.change_note IS NULL BEGIN
+  SELECT RAISE(ABORT, 'give change_note with a status or severity change');
+END;
+
+-- Fixed means the after state is known.
+CREATE TRIGGER tr_issue_fixed_needs_after BEFORE UPDATE OF status ON issues
+WHEN NEW.status = 'fixed' AND OLD.status IS NOT 'fixed' AND NEW.after_state IS NULL BEGIN
+  SELECT RAISE(ABORT, 'an issue set fixed needs after_state (what the system does now)');
+END;
+
+-- resolved_at is set on entering a resolved status (kept from fixed to verified) and cleared on reopening;
+-- verified_at is set on verified and cleared on leaving it. A regression moves the old after_state into the
+-- event note and clears it.
 CREATE TRIGGER tr_issue_status AFTER UPDATE OF status ON issues
 WHEN OLD.status IS NOT NEW.status BEGIN
   INSERT INTO events(entity_type, entity_id, event, from_value, to_value,
                      actor_id, review_id, step_id, commit_sha, note)
   VALUES ('issue', NEW.id, 'status-changed', OLD.status, NEW.status,
-          NEW.change_actor_id, NEW.change_review_id, NEW.change_step_id,
-          NEW.change_commit_sha, NEW.change_note);
+          NEW.change_actor_id, NEW.change_review_id, NEW.change_step_id, NEW.change_commit_sha,
+          CASE WHEN NEW.status = 'regressed' AND NEW.after_state IS NOT NULL
+               THEN COALESCE(NEW.change_note || ' ', '') || '(after_state was: ' || NEW.after_state || ')'
+               ELSE NEW.change_note END);
   UPDATE issues SET
     resolved_at = CASE WHEN NEW.status IN ('fixed','accepted-risk','wont-fix','duplicate','obsolete')
                        THEN strftime('%Y-%m-%dT%H:%M:%fZ','now')
-                       WHEN NEW.status IN ('open','regressed','needs-decision') THEN NULL
-                       ELSE resolved_at END,
-    verified_at = CASE WHEN NEW.status = 'verified' THEN strftime('%Y-%m-%dT%H:%M:%fZ','now')
-                       WHEN NEW.status IN ('open','regressed') THEN NULL
-                       ELSE verified_at END
+                       WHEN NEW.status = 'verified' THEN COALESCE(resolved_at, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+                       ELSE NULL END,
+    verified_at = CASE WHEN NEW.status = 'verified' THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE NULL END,
+    after_state = CASE WHEN NEW.status = 'regressed' THEN NULL ELSE after_state END
   WHERE id = NEW.id;
 END;
 
@@ -679,93 +914,222 @@ WHEN OLD.severity IS NOT NEW.severity BEGIN
           NEW.change_commit_sha, NEW.change_note);
 END;
 
+-- Text edits are history too: one '<field>-changed' event with the old and new text.
+CREATE TRIGGER tr_issue_title_changed AFTER UPDATE OF title ON issues WHEN OLD.title IS NOT NEW.title BEGIN
+  INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id, step_id, note)
+  VALUES ('issue', NEW.id, 'title-changed', OLD.title, NEW.title, NEW.change_actor_id, NEW.change_review_id,
+          NEW.change_step_id, NEW.change_note);
+END;
+
+CREATE TRIGGER tr_issue_before_changed AFTER UPDATE OF before_state ON issues
+WHEN OLD.before_state IS NOT NEW.before_state BEGIN
+  INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id, step_id, note)
+  VALUES ('issue', NEW.id, 'before-state-changed', OLD.before_state, NEW.before_state, NEW.change_actor_id,
+          NEW.change_review_id, NEW.change_step_id, NEW.change_note);
+END;
+
+CREATE TRIGGER tr_issue_current_changed AFTER UPDATE OF current_state ON issues
+WHEN OLD.current_state IS NOT NEW.current_state BEGIN
+  INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id, step_id, note)
+  VALUES ('issue', NEW.id, 'current-state-changed', OLD.current_state, NEW.current_state, NEW.change_actor_id,
+          NEW.change_review_id, NEW.change_step_id, NEW.change_note);
+END;
+
+CREATE TRIGGER tr_issue_after_changed AFTER UPDATE OF after_state ON issues
+WHEN OLD.after_state IS NOT NEW.after_state BEGIN
+  INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id, step_id, note)
+  VALUES ('issue', NEW.id, 'after-state-changed', OLD.after_state, NEW.after_state, NEW.change_actor_id,
+          NEW.change_review_id, NEW.change_step_id, NEW.change_note);
+END;
+
+CREATE TRIGGER tr_issue_recommendation_changed AFTER UPDATE OF recommendation ON issues
+WHEN OLD.recommendation IS NOT NEW.recommendation BEGIN
+  INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id, step_id, note)
+  VALUES ('issue', NEW.id, 'recommendation-changed', OLD.recommendation, NEW.recommendation, NEW.change_actor_id,
+          NEW.change_review_id, NEW.change_step_id, NEW.change_note);
+END;
+
+CREATE TRIGGER tr_issue_resolution_changed AFTER UPDATE OF resolution ON issues
+WHEN OLD.resolution IS NOT NEW.resolution BEGIN
+  INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id, step_id, note)
+  VALUES ('issue', NEW.id, 'resolution-changed', OLD.resolution, NEW.resolution, NEW.change_actor_id,
+          NEW.change_review_id, NEW.change_step_id, NEW.change_note);
+END;
+
 CREATE TRIGGER tr_issue_touch AFTER UPDATE ON issues
 WHEN NEW.updated_at IS OLD.updated_at BEGIN
   UPDATE issues SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = NEW.id;
 END;
 
--- A fixed or verified issue that a new finding matches is a regression.
+-- After the events above are written (each reads NEW, so the order of triggers does not matter), the change
+-- context is cleared: a later change must give its own.
+CREATE TRIGGER tr_issue_context_cleared AFTER UPDATE ON issues
+WHEN NEW.change_actor_id IS NOT NULL OR NEW.change_review_id IS NOT NULL OR NEW.change_step_id IS NOT NULL
+  OR NEW.change_commit_sha IS NOT NULL OR NEW.change_note IS NOT NULL BEGIN
+  UPDATE issues SET change_actor_id = NULL, change_review_id = NULL, change_step_id = NULL,
+                    change_commit_sha = NULL, change_note = NULL WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER tr_issue_context_cleared_ins AFTER INSERT ON issues
+WHEN NEW.change_actor_id IS NOT NULL OR NEW.change_review_id IS NOT NULL OR NEW.change_step_id IS NOT NULL
+  OR NEW.change_commit_sha IS NOT NULL OR NEW.change_note IS NOT NULL BEGIN
+  UPDATE issues SET change_actor_id = NULL, change_review_id = NULL, change_step_id = NULL,
+                    change_commit_sha = NULL, change_note = NULL WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER tr_issue_no_delete BEFORE DELETE ON issues BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: issues cannot be deleted; close one with a status instead');
+END;
+
+-- ----- Findings and matching
+
+-- A finding is inserted unmatched and matched by an UPDATE of issue_id, so tr_finding_matched always runs.
+CREATE TRIGGER tr_finding_insert_unmatched BEFORE INSERT ON findings WHEN NEW.issue_id IS NOT NULL BEGIN
+  SELECT RAISE(ABORT, 'insert the finding first, then set issue_id (matching runs on that UPDATE)');
+END;
+
+-- Points are raised only once the owner approved the review.
+CREATE TRIGGER tr_finding_review_approved BEFORE INSERT ON findings
+WHEN (SELECT status IN ('planning','awaiting-approval','abandoned') OR approved_at IS NULL
+        FROM reviews WHERE id = NEW.review_id) BEGIN
+  SELECT RAISE(ABORT, 'findings need an approved review (approved_at set, status past awaiting-approval)');
+END;
+
+CREATE TRIGGER tr_finding_run_same_review BEFORE INSERT ON findings
+WHEN NEW.reviewer_run_id IS NOT NULL
+ AND (SELECT review_id FROM reviewer_runs WHERE id = NEW.reviewer_run_id) IS NOT NEW.review_id BEGIN
+  SELECT RAISE(ABORT, 'the reviewer run belongs to another review');
+END;
+
+CREATE TRIGGER tr_finding_domain_active BEFORE INSERT ON findings
+WHEN EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL) BEGIN
+  SELECT RAISE(ABORT, 'that domain is retired; use a current one');
+END;
+
+CREATE TRIGGER tr_finding_created AFTER INSERT ON findings BEGIN
+  INSERT INTO events(entity_type, entity_id, event, to_value, actor_id, review_id, note)
+  VALUES ('finding', NEW.id, 'created', NEW.point_id, NULL, NEW.review_id, NEW.summary);
+END;
+
+-- What a review saw stays as it saw it: only the matching (issue_id, match_*) and verification (verification*)
+-- columns of a finding change after it is written.
+CREATE TRIGGER tr_finding_immutable BEFORE UPDATE ON findings
+WHEN OLD.review_id IS NOT NEW.review_id OR OLD.reviewer_run_id IS NOT NEW.reviewer_run_id
+  OR OLD.point_id IS NOT NEW.point_id OR OLD.severity IS NOT NEW.severity OR OLD.kind IS NOT NEW.kind
+  OR OLD.domain_code IS NOT NEW.domain_code OR OLD.theme_code IS NOT NEW.theme_code OR OLD.sub IS NOT NEW.sub
+  OR OLD.summary IS NOT NEW.summary OR OLD.detail IS NOT NEW.detail OR OLD.before_state IS NOT NEW.before_state
+  OR OLD.recommendation IS NOT NEW.recommendation OR OLD.recommended_test IS NOT NEW.recommended_test
+  OR OLD.evidence IS NOT NEW.evidence OR OLD.where_report IS NOT NEW.where_report
+  OR OLD.fingerprint IS NOT NEW.fingerprint OR OLD.related_point_ids IS NOT NEW.related_point_ids
+  OR OLD.created_at IS NOT NEW.created_at BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: only issue_id, match_* and verification* of a finding can change');
+END;
+
+CREATE TRIGGER tr_finding_no_delete BEFORE DELETE ON findings BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: findings cannot be deleted; mark a wrong one verification = false');
+END;
+
+-- match_type 'regression' is for an issue that was fixed or verified (or already regressed in this review);
+-- a closed issue raised again is a 'recurrence'.
+CREATE TRIGGER tr_finding_regression_guard BEFORE UPDATE OF issue_id, match_type ON findings
+WHEN NEW.match_type = 'regression' AND NEW.issue_id IS NOT NULL
+ AND (SELECT status FROM issues WHERE id = NEW.issue_id) NOT IN ('fixed','verified','regressed') BEGIN
+  SELECT RAISE(ABORT, 'match_type regression needs a fixed or verified issue; use recurrence, still-present or changed');
+END;
+
+-- One review cannot both report an issue fixed (a check) and raise it again (a real finding): the result
+-- would depend on which was written first.
+CREATE TRIGGER tr_finding_match_vs_fixed_check BEFORE UPDATE OF issue_id ON findings
+WHEN NEW.issue_id IS NOT NULL AND OLD.issue_id IS NOT NEW.issue_id AND NEW.verification <> 'false'
+ AND EXISTS (SELECT 1 FROM review_issue_checks c WHERE c.review_id = NEW.review_id AND c.issue_id = NEW.issue_id
+               AND c.outcome = 'fixed') BEGIN
+  SELECT RAISE(ABORT, 'this review recorded the issue fixed; a finding of the same review cannot be matched to it');
+END;
+
+-- Matching (issue_id set or changed by an UPDATE). Both the issue it leaves and the issue it joins get
+-- times_seen, last_seen and last_checked recomputed from their real (not false) findings and checks, by review
+-- start time, so they never move backwards. On the joined issue: current_state follows the finding; a
+-- 'regression' match regresses a fixed or verified issue; a 'recurrence' or 'regression' match reopens an
+-- obsolete, wont-fix or duplicate issue (an accepted-risk one stays, with a 'recurred' event); a false finding
+-- changes nothing but its 'seen' event (to_value 'false'). The issue left behind gets an 'unlinked' event.
 CREATE TRIGGER tr_finding_matched AFTER UPDATE OF issue_id ON findings
-WHEN NEW.issue_id IS NOT NULL AND OLD.issue_id IS NOT NEW.issue_id BEGIN
+WHEN OLD.issue_id IS NOT NEW.issue_id BEGIN
   UPDATE issues SET
-    last_seen_review_id = NEW.review_id,
-    last_checked_review_id = NEW.review_id,
-    times_seen = (SELECT count(DISTINCT f.review_id) FROM findings f WHERE f.issue_id = NEW.issue_id),
-    current_state = COALESCE(NEW.before_state, current_state),
+    times_seen = max(1, (SELECT count(DISTINCT f.review_id) FROM findings f
+                          WHERE f.issue_id = OLD.issue_id AND f.verification <> 'false')),
+    last_seen_review_id = (SELECT f.review_id FROM findings f JOIN reviews r ON r.id = f.review_id
+                            WHERE f.issue_id = OLD.issue_id AND f.verification <> 'false'
+                            ORDER BY r.started_at DESC, r.id DESC LIMIT 1),
+    last_checked_review_id = (SELECT x.rid FROM (
+                                SELECT f.review_id AS rid FROM findings f
+                                 WHERE f.issue_id = OLD.issue_id AND f.verification <> 'false'
+                                UNION SELECT c.review_id FROM review_issue_checks c WHERE c.issue_id = OLD.issue_id) x
+                              JOIN reviews r ON r.id = x.rid ORDER BY r.started_at DESC, r.id DESC LIMIT 1)
+  WHERE OLD.issue_id IS NOT NULL AND id = OLD.issue_id;
+  INSERT INTO events(entity_type, entity_id, event, from_value, to_value, review_id, note)
+  SELECT 'issue', OLD.issue_id, 'unlinked', NEW.point_id, (SELECT code FROM issues WHERE id = NEW.issue_id),
+         NEW.review_id, 'finding ' || NEW.point_id || ' no longer matched to this issue'
+  WHERE OLD.issue_id IS NOT NULL;
+  INSERT INTO events(entity_type, entity_id, event, from_value, to_value, review_id, note)
+  SELECT 'issue', NEW.issue_id, 'recurred', status, NEW.match_type, NEW.review_id,
+         'raised again by finding ' || NEW.point_id || ' while ' || status
+    FROM issues WHERE NEW.issue_id IS NOT NULL AND id = NEW.issue_id AND status = 'accepted-risk'
+     AND NEW.verification <> 'false' AND NEW.match_type IN ('recurrence','regression');
+  UPDATE issues SET
+    times_seen = max(1, (SELECT count(DISTINCT f.review_id) FROM findings f
+                          WHERE f.issue_id = NEW.issue_id AND f.verification <> 'false')),
+    last_seen_review_id = COALESCE((SELECT f.review_id FROM findings f JOIN reviews r ON r.id = f.review_id
+                                     WHERE f.issue_id = NEW.issue_id AND f.verification <> 'false'
+                                     ORDER BY r.started_at DESC, r.id DESC LIMIT 1), last_seen_review_id),
+    last_checked_review_id = COALESCE((SELECT x.rid FROM (
+                                SELECT f.review_id AS rid FROM findings f
+                                 WHERE f.issue_id = NEW.issue_id AND f.verification <> 'false'
+                                UNION SELECT c.review_id FROM review_issue_checks c WHERE c.issue_id = NEW.issue_id) x
+                              JOIN reviews r ON r.id = x.rid ORDER BY r.started_at DESC, r.id DESC LIMIT 1),
+                              last_checked_review_id),
+    current_state = CASE WHEN NEW.verification = 'false' THEN current_state
+                         ELSE COALESCE(NEW.before_state, current_state) END,
     change_review_id = NEW.review_id,
     change_actor_id = NULL,
     change_step_id = NULL,
     change_commit_sha = NULL,
     change_note = 'matched by finding ' || NEW.point_id,
-    status = CASE WHEN status IN ('fixed','verified') THEN 'regressed' ELSE status END
-  WHERE id = NEW.issue_id;
-  INSERT INTO events(entity_type, entity_id, event, to_value, review_id, note)
-  VALUES ('issue', NEW.issue_id, 'seen', NEW.match_type, NEW.review_id, NEW.point_id);
-END;
-
-CREATE TRIGGER tr_step_status AFTER UPDATE OF status ON steps
-WHEN OLD.status IS NOT NEW.status BEGIN
-  INSERT INTO events(entity_type, entity_id, event, from_value, to_value,
-                     actor_id, step_id, commit_sha, note)
-  VALUES ('step', NEW.id, 'status-changed', OLD.status, NEW.status,
-          NEW.change_actor_id, NEW.id, NEW.change_commit_sha, NEW.progress_note);
-  UPDATE steps SET
-    started_at = CASE WHEN NEW.status = 'doing' AND started_at IS NULL
-                      THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE started_at END,
-    done_at    = CASE WHEN NEW.status = 'done' THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE NULL END
-  WHERE id = NEW.id;
-END;
-
-CREATE TRIGGER tr_step_touch AFTER UPDATE ON steps
-WHEN NEW.updated_at IS OLD.updated_at BEGIN
-  UPDATE steps SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = NEW.id;
-END;
-
-CREATE TRIGGER tr_review_status AFTER UPDATE OF status ON reviews
-WHEN OLD.status IS NOT NEW.status BEGIN
-  INSERT INTO events(entity_type, entity_id, event, from_value, to_value, review_id)
-  VALUES ('review', NEW.id, 'status-changed', OLD.status, NEW.status, NEW.id);
-  UPDATE reviews SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-    completed_at = CASE WHEN NEW.status IN ('handed-off','abandoned')
-                        THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE completed_at END
-  WHERE id = NEW.id;
-END;
-
-CREATE TRIGGER tr_plan_status AFTER UPDATE OF status ON plans
-WHEN OLD.status IS NOT NEW.status BEGIN
-  INSERT INTO events(entity_type, entity_id, event, from_value, to_value)
-  VALUES ('plan', NEW.id, 'status-changed', OLD.status, NEW.status);
-  UPDATE plans SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = NEW.id;
-END;
-
-CREATE TRIGGER tr_decision_status AFTER UPDATE OF status ON decisions
-WHEN OLD.status IS NOT NEW.status BEGIN
-  INSERT INTO events(entity_type, entity_id, event, from_value, to_value,
-                     actor_id, review_id, step_id, note)
-  VALUES ('decision', NEW.id, 'status-changed', OLD.status, NEW.status,
-          NEW.decided_by_actor_id, NEW.review_id, NEW.step_id, NEW.answer);
-END;
-
--- A review's verdict on a known issue moves the issue along:
--- reported fixed after a fix -> verified; reported fixed with no fix recorded -> fixed;
--- reported back -> regressed. Every check updates last_checked.
-CREATE TRIGGER tr_issue_checked AFTER INSERT ON review_issue_checks BEGIN
-  UPDATE issues SET
-    last_checked_review_id = NEW.review_id,
-    change_review_id = NEW.review_id,
-    change_actor_id = NEW.actor_id,
-    change_step_id = NULL,
-    change_commit_sha = NULL,
-    change_note = 'review check: ' || NEW.outcome || COALESCE(' — ' || NEW.evidence, ''),
     status = CASE
-      WHEN NEW.outcome = 'fixed' AND status = 'fixed' THEN 'verified'
-      WHEN NEW.outcome = 'fixed' AND status IN ('open','needs-decision','planned','in-progress','regressed') THEN 'fixed'
-      WHEN NEW.outcome = 'regressed' AND status IN ('fixed','verified') THEN 'regressed'
-      ELSE status END,
-    resolution = CASE WHEN NEW.outcome = 'fixed' AND status IN ('open','needs-decision','planned','in-progress','regressed')
-                      THEN COALESCE(resolution, 'Found fixed by a later review, with no plan step recorded.')
-                      ELSE resolution END
-  WHERE id = NEW.issue_id;
+      WHEN NEW.verification = 'false' THEN status
+      WHEN NEW.match_type = 'regression' AND status IN ('fixed','verified') THEN 'regressed'
+      WHEN NEW.match_type IN ('recurrence','regression') AND status IN ('obsolete','wont-fix','duplicate') THEN 'open'
+      ELSE status END
+  WHERE NEW.issue_id IS NOT NULL AND id = NEW.issue_id;
+  INSERT INTO events(entity_type, entity_id, event, to_value, review_id, note)
+  SELECT 'issue', NEW.issue_id, 'seen', CASE WHEN NEW.verification = 'false' THEN 'false' ELSE NEW.match_type END,
+         NEW.review_id, NEW.point_id
+  WHERE NEW.issue_id IS NOT NULL;
+END;
+
+-- A verification change is logged; turning a matched finding false (or back) recounts its issue.
+CREATE TRIGGER tr_finding_verification_changed AFTER UPDATE OF verification ON findings
+WHEN OLD.verification IS NOT NEW.verification BEGIN
+  INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id, note)
+  VALUES ('finding', NEW.id, 'verification-changed', OLD.verification, NEW.verification, NEW.verified_by_actor_id,
+          NEW.review_id, NEW.verification_note);
+  UPDATE issues SET
+    times_seen = max(1, (SELECT count(DISTINCT f.review_id) FROM findings f
+                          WHERE f.issue_id = NEW.issue_id AND f.verification <> 'false')),
+    last_seen_review_id = COALESCE((SELECT f.review_id FROM findings f JOIN reviews r ON r.id = f.review_id
+                                     WHERE f.issue_id = NEW.issue_id AND f.verification <> 'false'
+                                     ORDER BY r.started_at DESC, r.id DESC LIMIT 1), last_seen_review_id)
+  WHERE NEW.issue_id IS NOT NULL AND id = NEW.issue_id
+    AND (OLD.verification = 'false') <> (NEW.verification = 'false');
+END;
+
+-- ----- Locations
+
+-- A location's repository must be one its review looked at, so tr_location_commit always finds the commit.
+CREATE TRIGGER tr_location_repo_in_review BEFORE INSERT ON finding_locations
+WHEN NOT EXISTS (SELECT 1 FROM findings f
+                 JOIN review_repositories rr ON rr.review_id = f.review_id AND rr.repository_id = NEW.repository_id
+                 WHERE f.id = NEW.finding_id) BEGIN
+  SELECT RAISE(ABORT, 'the location''s repository is not among its review''s review_repositories');
 END;
 
 -- A location with no commit takes the commit its review looked at.
@@ -778,11 +1142,439 @@ WHEN NEW.commit_sha IS NULL BEGIN
   WHERE id = NEW.id;
 END;
 
+-- Where a point was found does not change; fill-refs may still fill lines, excerpt, blob and permalink.
+CREATE TRIGGER tr_location_immutable BEFORE UPDATE ON finding_locations
+WHEN OLD.finding_id IS NOT NEW.finding_id OR OLD.repository_id IS NOT NEW.repository_id
+  OR OLD.path IS NOT NEW.path OR OLD.symbol IS NOT NEW.symbol OR OLD.role IS NOT NEW.role
+  OR (OLD.commit_sha IS NOT NULL AND OLD.commit_sha IS NOT NEW.commit_sha) BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: a location''s finding, repository, commit, path, symbol and role cannot change');
+END;
+
+CREATE TRIGGER tr_location_no_delete BEFORE DELETE ON finding_locations BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: finding locations cannot be deleted');
+END;
+
+-- ----- Relations
+
+-- No relation stored both ways: directional ones and related-to (which is symmetric).
+CREATE TRIGGER tr_relation_noreverse_dup BEFORE INSERT ON issue_relations
+WHEN NEW.relation IN ('duplicate-of','continuation-of','regression-of','supersedes','merged-into','split-from',
+                      'caused-by','related-to')
+BEGIN
+  SELECT RAISE(ABORT, 'the reverse relation already exists')
+  WHERE EXISTS (SELECT 1 FROM issue_relations
+                WHERE from_issue_id = NEW.to_issue_id AND to_issue_id = NEW.from_issue_id
+                  AND relation = NEW.relation);
+END;
+
+CREATE TRIGGER tr_relation_noreverse_dup_upd BEFORE UPDATE OF from_issue_id, to_issue_id, relation ON issue_relations
+WHEN NEW.relation IN ('duplicate-of','continuation-of','regression-of','supersedes','merged-into','split-from',
+                      'caused-by','related-to')
+BEGIN
+  SELECT RAISE(ABORT, 'the reverse relation already exists')
+  WHERE EXISTS (SELECT 1 FROM issue_relations
+                WHERE from_issue_id = NEW.to_issue_id AND to_issue_id = NEW.from_issue_id
+                  AND relation = NEW.relation AND id <> NEW.id);
+END;
+
+-- No cycles of blocks, or of duplicate-of / merged-into (an issue cannot end up a duplicate of itself).
+CREATE TRIGGER tr_relation_no_cycle BEFORE INSERT ON issue_relations
+WHEN NEW.relation IN ('blocks','duplicate-of','merged-into') BEGIN
+  SELECT RAISE(ABORT, 'that relation would make a cycle')
+  WHERE EXISTS (WITH RECURSIVE reach(n) AS (
+                  SELECT NEW.to_issue_id
+                  UNION SELECT r.to_issue_id FROM issue_relations r JOIN reach ON r.from_issue_id = reach.n
+                   WHERE r.relation = NEW.relation
+                      OR (NEW.relation <> 'blocks' AND r.relation IN ('duplicate-of','merged-into')))
+                SELECT 1 FROM reach WHERE n = NEW.from_issue_id);
+END;
+
+CREATE TRIGGER tr_relation_no_cycle_upd BEFORE UPDATE OF from_issue_id, to_issue_id, relation ON issue_relations
+WHEN NEW.relation IN ('blocks','duplicate-of','merged-into') BEGIN
+  SELECT RAISE(ABORT, 'that relation would make a cycle')
+  WHERE EXISTS (WITH RECURSIVE reach(n) AS (
+                  SELECT NEW.to_issue_id
+                  UNION SELECT r.to_issue_id FROM issue_relations r JOIN reach ON r.from_issue_id = reach.n
+                   WHERE r.id <> NEW.id AND (r.relation = NEW.relation
+                      OR (NEW.relation <> 'blocks' AND r.relation IN ('duplicate-of','merged-into'))))
+                SELECT 1 FROM reach WHERE n = NEW.from_issue_id);
+END;
+
+CREATE TRIGGER tr_relation_created AFTER INSERT ON issue_relations BEGIN
+  INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id, note)
+  VALUES ('relation', NEW.id, 'created', (SELECT code FROM issues WHERE id = NEW.from_issue_id),
+          NEW.relation || ' ' || (SELECT code FROM issues WHERE id = NEW.to_issue_id),
+          NEW.established_by_actor_id, NEW.established_in_review_id, NEW.rationale);
+END;
+
+-- Recording that an active issue is a duplicate of (or merged into) another closes it as duplicate.
+CREATE TRIGGER tr_relation_closes_duplicate AFTER INSERT ON issue_relations
+WHEN NEW.relation IN ('duplicate-of','merged-into') BEGIN
+  UPDATE issues SET
+    status = 'duplicate',
+    resolution = COALESCE(resolution, NEW.relation || ' ' || (SELECT code FROM issues WHERE id = NEW.to_issue_id)),
+    change_actor_id = NEW.established_by_actor_id,
+    change_review_id = NEW.established_in_review_id,
+    change_step_id = NULL,
+    change_commit_sha = NULL,
+    change_note = NEW.relation || ' ' || (SELECT code FROM issues WHERE id = NEW.to_issue_id) || ': ' || NEW.rationale
+  WHERE id = NEW.from_issue_id AND status IN ('open','needs-decision','planned','in-progress','regressed');
+END;
+
+CREATE TRIGGER tr_relation_no_delete BEFORE DELETE ON issue_relations BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: relations cannot be deleted');
+END;
+
+-- ----- Review checks of known issues
+
+-- One check per review and issue, never replaced (INSERT OR REPLACE is refused too); not by the review that
+-- first found the issue; its finding must be from the same review; and 'fixed' cannot be recorded by a review
+-- that also raised the issue again.
+CREATE TRIGGER tr_check_guard BEFORE INSERT ON review_issue_checks BEGIN
+  SELECT RAISE(ABORT, 'checks are history: this review already recorded a check of this issue')
+  WHERE EXISTS (SELECT 1 FROM review_issue_checks WHERE review_id = NEW.review_id AND issue_id = NEW.issue_id);
+  SELECT RAISE(ABORT, 'a review cannot check an issue it first found')
+  WHERE (SELECT first_seen_review_id FROM issues WHERE id = NEW.issue_id) = NEW.review_id;
+  SELECT RAISE(ABORT, 'the check''s finding belongs to another review')
+  WHERE NEW.finding_id IS NOT NULL
+    AND (SELECT review_id FROM findings WHERE id = NEW.finding_id) IS NOT NEW.review_id;
+  SELECT RAISE(ABORT, 'this review raised the issue again in a finding; it cannot also record it fixed')
+  WHERE NEW.outcome = 'fixed'
+    AND EXISTS (SELECT 1 FROM findings f WHERE f.review_id = NEW.review_id AND f.issue_id = NEW.issue_id
+                  AND f.verification <> 'false');
+END;
+
+CREATE TRIGGER tr_check_no_update BEFORE UPDATE ON review_issue_checks BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: review checks cannot be changed');
+END;
+
+CREATE TRIGGER tr_check_no_delete BEFORE DELETE ON review_issue_checks BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: review checks cannot be deleted');
+END;
+
+-- A review's verdict on a known issue moves the issue along:
+--   fixed on a fixed issue -> verified; fixed on an active issue -> fixed (after_state from the evidence, and a
+--   resolution naming the plan step that is not done yet, if any);
+--   regressed, still-present or changed on a fixed or verified issue -> regressed;
+--   obsolete -> obsolete; not-checked, and anything else, leaves the status alone.
+-- Every check sets last_checked (never backwards in time) and writes a 'checked' event with the outcome.
+CREATE TRIGGER tr_issue_checked AFTER INSERT ON review_issue_checks BEGIN
+  UPDATE issues SET
+    last_checked_review_id = CASE
+      WHEN last_checked_review_id IS NULL
+        OR (SELECT started_at FROM reviews WHERE id = NEW.review_id)
+           >= (SELECT started_at FROM reviews WHERE id = last_checked_review_id)
+      THEN NEW.review_id ELSE last_checked_review_id END,
+    change_review_id = NEW.review_id,
+    change_actor_id = NEW.actor_id,
+    change_step_id = NULL,
+    change_commit_sha = NULL,
+    change_note = 'review check: ' || NEW.outcome || COALESCE(' — ' || NEW.evidence, ''),
+    status = CASE
+      WHEN NEW.outcome = 'fixed' AND status = 'fixed' THEN 'verified'
+      WHEN NEW.outcome = 'fixed' AND status IN ('open','needs-decision','planned','in-progress','regressed') THEN 'fixed'
+      WHEN NEW.outcome IN ('regressed','still-present','changed') AND status IN ('fixed','verified') THEN 'regressed'
+      WHEN NEW.outcome = 'obsolete' AND status <> 'duplicate' THEN 'obsolete'
+      ELSE status END,
+    after_state = CASE WHEN NEW.outcome = 'fixed' AND status IN ('open','needs-decision','planned','in-progress','regressed')
+                       THEN COALESCE(after_state, NEW.evidence,
+                                     'Found fixed by review ' || (SELECT code FROM reviews WHERE id = NEW.review_id) || '.')
+                       ELSE after_state END,
+    resolution = CASE
+      WHEN NEW.outcome = 'fixed' AND status IN ('open','needs-decision','planned','in-progress','regressed')
+      THEN COALESCE(resolution,
+             'Found fixed by a later review while plan step ' || (
+               SELECT p.code || ' #' || s.number FROM step_findings sf
+               JOIN steps s ON s.id = sf.step_id JOIN plans p ON p.id = s.plan_id
+               JOIN findings f ON f.id = sf.finding_id
+               WHERE f.issue_id = NEW.issue_id AND s.status NOT IN ('done','dropped')
+               ORDER BY s.number LIMIT 1) || ' was not done.',
+             'Found fixed by a later review, with no plan step recorded.')
+      WHEN NEW.outcome = 'obsolete' AND status <> 'duplicate'
+      THEN COALESCE(resolution, 'Found obsolete by review ' || (SELECT code FROM reviews WHERE id = NEW.review_id)
+                                || COALESCE(': ' || NEW.evidence, '.'))
+      ELSE resolution END
+  WHERE id = NEW.issue_id;
+  INSERT INTO events(entity_type, entity_id, event, to_value, actor_id, review_id, note)
+  VALUES ('issue', NEW.issue_id, 'checked', NEW.outcome, NEW.actor_id, NEW.review_id, NEW.evidence);
+END;
+
+-- ----- Reviews
+
+CREATE TRIGGER tr_review_code BEFORE INSERT ON reviews
+-- (a malformed code is left to the code CHECK, which names it)
+WHEN NEW.code GLOB 'R-[0-9][0-9][0-9][0-9]*' AND NEW.code NOT GLOB 'R-*[^0-9]*' AND (
+     NEW.code IS NOT 'R-' || printf('%04d', CAST(substr(NEW.code, 3) AS INTEGER))
+  OR CAST(substr(NEW.code, 3) AS INTEGER) < 1
+  OR (CAST(substr(NEW.code, 3) AS INTEGER) > 1 AND NOT EXISTS (SELECT 1 FROM reviews
+        WHERE code = 'R-' || printf('%04d', CAST(substr(NEW.code, 3) AS INTEGER) - 1)))) BEGIN
+  SELECT RAISE(ABORT, 'review codes are sequential: R- and the next number (R-0001, R-0002 ...)');
+END;
+
+CREATE TRIGGER tr_review_code_fixed BEFORE UPDATE OF code ON reviews WHEN OLD.code IS NOT NEW.code BEGIN
+  SELECT RAISE(ABORT, 'codes never change');
+END;
+
+CREATE TRIGGER tr_review_manager_kind BEFORE INSERT ON reviews
+WHEN NEW.manager_actor_id IS NOT NULL
+ AND (SELECT kind FROM actors WHERE id = NEW.manager_actor_id) IS NOT 'manager' BEGIN
+  SELECT RAISE(ABORT, 'manager_actor_id must be an actor of kind manager');
+END;
+
+CREATE TRIGGER tr_review_manager_kind_upd BEFORE UPDATE OF manager_actor_id ON reviews
+WHEN NEW.manager_actor_id IS NOT NULL
+ AND (SELECT kind FROM actors WHERE id = NEW.manager_actor_id) IS NOT 'manager' BEGIN
+  SELECT RAISE(ABORT, 'manager_actor_id must be an actor of kind manager');
+END;
+
+-- A review moves planning <-> awaiting-approval -> approved -> running -> verifying -> indexing ->
+-- consolidating -> handed-off. After approval it may skip ahead, and between running and consolidating it may
+-- also go back (to run or verify again). Any status may move to abandoned. Leaving handed-off or abandoned needs
+-- change_note. It leaves awaiting-approval only when no domain-approval gate of it is open or answered but not
+-- applied.
+CREATE TRIGGER tr_review_transition BEFORE UPDATE OF status ON reviews
+WHEN OLD.status IS NOT NEW.status BEGIN
+  SELECT RAISE(ABORT, 'a review leaves handed-off or abandoned only with change_note')
+  WHERE OLD.status IN ('handed-off','abandoned') AND NEW.change_note IS NULL;
+  SELECT RAISE(ABORT, 'a review moves planning, awaiting-approval, approved, running, verifying, indexing, consolidating, handed-off (or abandoned)')
+  WHERE OLD.status NOT IN ('handed-off','abandoned') AND NEW.status <> 'abandoned' AND NOT (
+       (OLD.status = 'planning' AND NEW.status = 'awaiting-approval')
+    OR (OLD.status = 'awaiting-approval' AND NEW.status IN ('planning','approved'))
+    OR (instr(',approved,running,verifying,indexing,consolidating,', ',' || OLD.status || ',') > 0
+        AND instr(',approved,running,verifying,indexing,consolidating,handed-off,', ',' || NEW.status || ',')
+            > instr(',approved,running,verifying,indexing,consolidating,handed-off,', ',' || OLD.status || ','))
+    OR (instr(',running,verifying,indexing,consolidating,', ',' || OLD.status || ',') > 0
+        AND instr(',running,verifying,indexing,consolidating,', ',' || NEW.status || ',') > 0));
+  SELECT RAISE(ABORT, 'a domain-approval gate of this review is not applied yet')
+  WHERE OLD.status = 'awaiting-approval' AND NEW.status <> 'abandoned'
+    AND EXISTS (SELECT 1 FROM gates g WHERE g.review_id = NEW.id AND g.kind = 'domain-approval'
+                  AND g.status IN ('open','answered'));
+END;
+
+CREATE TRIGGER tr_review_status AFTER UPDATE OF status ON reviews
+WHEN OLD.status IS NOT NEW.status BEGIN
+  INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id, note)
+  VALUES ('review', NEW.id, 'status-changed', OLD.status, NEW.status, NEW.change_actor_id, NEW.id, NEW.change_note);
+  UPDATE reviews SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+    completed_at = CASE WHEN NEW.status IN ('handed-off','abandoned')
+                        THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE NULL END
+  WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER tr_review_context_cleared AFTER UPDATE ON reviews
+WHEN NEW.change_actor_id IS NOT NULL OR NEW.change_note IS NOT NULL BEGIN
+  UPDATE reviews SET change_actor_id = NULL, change_note = NULL WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER tr_review_context_cleared_ins AFTER INSERT ON reviews
+WHEN NEW.change_actor_id IS NOT NULL OR NEW.change_note IS NOT NULL BEGIN
+  UPDATE reviews SET change_actor_id = NULL, change_note = NULL WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER tr_review_no_delete BEFORE DELETE ON reviews BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: reviews cannot be deleted; set status abandoned instead');
+END;
+
+-- Reviewers run only for an approved review, in a domain the review included.
+CREATE TRIGGER tr_run_review_approved BEFORE INSERT ON reviewer_runs BEGIN
+  SELECT RAISE(ABORT, 'reviewer runs need an approved review (approved_at set, status past awaiting-approval)')
+  WHERE (SELECT status IN ('planning','awaiting-approval','abandoned') OR approved_at IS NULL
+           FROM reviews WHERE id = NEW.review_id);
+  SELECT RAISE(ABORT, 'reviewer runs need the domain included in review_domains')
+  WHERE NOT EXISTS (SELECT 1 FROM review_domains WHERE review_id = NEW.review_id
+                      AND domain_code = NEW.domain_code AND decision = 'included');
+  SELECT RAISE(ABORT, 'that domain is retired; use a current one')
+  WHERE EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL);
+END;
+
+CREATE TRIGGER tr_run_created AFTER INSERT ON reviewer_runs BEGIN
+  INSERT INTO events(entity_type, entity_id, event, to_value, actor_id, review_id, note)
+  VALUES ('review', NEW.review_id, 'reviewer-run-created', NEW.label, NEW.actor_id, NEW.review_id,
+          NEW.domain_code || ': ' || NEW.scope);
+END;
+
+CREATE TRIGGER tr_review_domain_active BEFORE INSERT ON review_domains
+WHEN EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL) BEGIN
+  SELECT RAISE(ABORT, 'that domain is retired; use a current one');
+END;
+
+CREATE TRIGGER tr_metric_domain_active BEFORE INSERT ON metrics
+WHEN EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL) BEGIN
+  SELECT RAISE(ABORT, 'that domain is retired; use a current one');
+END;
+
+CREATE TRIGGER tr_metric_created AFTER INSERT ON metrics BEGIN
+  INSERT INTO events(entity_type, entity_id, event, to_value, review_id, note)
+  VALUES ('review', NEW.review_id, 'metric-recorded', CAST(NEW.value AS TEXT), NEW.review_id,
+          NEW.name || ' (' || NEW.scope || ')');
+END;
+
+-- ----- Actors, catalogs and standards
+
+CREATE TRIGGER tr_actor_parent_self BEFORE INSERT ON actors
+WHEN NEW.parent_actor_id IS NOT NULL AND NEW.parent_actor_id = NEW.id BEGIN
+  SELECT RAISE(ABORT, 'an actor cannot be its own parent');
+END;
+
+CREATE TRIGGER tr_actor_parent_cycle BEFORE UPDATE OF parent_actor_id ON actors
+WHEN NEW.parent_actor_id IS NOT NULL BEGIN
+  SELECT RAISE(ABORT, 'that parent would make a cycle of actors')
+  WHERE NEW.parent_actor_id = NEW.id
+     OR EXISTS (WITH RECURSIVE up(n) AS (
+                  SELECT NEW.parent_actor_id
+                  UNION SELECT a.parent_actor_id FROM actors a JOIN up ON a.id = up.n WHERE a.parent_actor_id IS NOT NULL)
+                SELECT 1 FROM up WHERE n = NEW.id);
+END;
+
+CREATE TRIGGER tr_design_goal_code BEFORE INSERT ON design_goals
+-- (a malformed code is left to the code CHECK, which names it)
+WHEN NEW.code GLOB 'G-[0-9][0-9]*' AND NEW.code NOT GLOB 'G-*[^0-9]*' AND (
+     NEW.code IS NOT 'G-' || printf('%02d', CAST(substr(NEW.code, 3) AS INTEGER))
+  OR CAST(substr(NEW.code, 3) AS INTEGER) < 1
+  OR (CAST(substr(NEW.code, 3) AS INTEGER) > 1 AND NOT EXISTS (SELECT 1 FROM design_goals
+        WHERE code = 'G-' || printf('%02d', CAST(substr(NEW.code, 3) AS INTEGER) - 1)))) BEGIN
+  SELECT RAISE(ABORT, 'design goal codes are sequential: G- and the next number (G-01, G-02 ...)');
+END;
+
+CREATE TRIGGER tr_design_goal_code_fixed BEFORE UPDATE OF code ON design_goals WHEN OLD.code IS NOT NEW.code BEGIN
+  SELECT RAISE(ABORT, 'codes never change');
+END;
+
+CREATE TRIGGER tr_requirement_code BEFORE INSERT ON requirements
+-- (a malformed code is left to the code CHECK, which names it)
+WHEN NEW.code GLOB 'REQ-[0-9][0-9][0-9][0-9]*' AND NEW.code NOT GLOB 'REQ-*[^0-9]*' AND (
+     NEW.code IS NOT 'REQ-' || printf('%04d', CAST(substr(NEW.code, 5) AS INTEGER))
+  OR CAST(substr(NEW.code, 5) AS INTEGER) < 1
+  OR (CAST(substr(NEW.code, 5) AS INTEGER) > 1 AND NOT EXISTS (SELECT 1 FROM requirements
+        WHERE code = 'REQ-' || printf('%04d', CAST(substr(NEW.code, 5) AS INTEGER) - 1)))) BEGIN
+  SELECT RAISE(ABORT, 'requirement codes are sequential: REQ- and the next number (REQ-0001, REQ-0002 ...)');
+END;
+
+CREATE TRIGGER tr_requirement_code_fixed BEFORE UPDATE OF code ON requirements WHEN OLD.code IS NOT NEW.code BEGIN
+  SELECT RAISE(ABORT, 'codes never change');
+END;
+
+-- ----- Decisions
+
+CREATE TRIGGER tr_decision_code BEFORE INSERT ON decisions
+-- (a malformed code is left to the code CHECK, which names it)
+WHEN NEW.code GLOB 'D-[0-9][0-9][0-9][0-9]*' AND NEW.code NOT GLOB 'D-*[^0-9]*' AND (
+     NEW.code IS NOT 'D-' || printf('%04d', CAST(substr(NEW.code, 3) AS INTEGER))
+  OR CAST(substr(NEW.code, 3) AS INTEGER) < 1
+  OR (CAST(substr(NEW.code, 3) AS INTEGER) > 1 AND NOT EXISTS (SELECT 1 FROM decisions
+        WHERE code = 'D-' || printf('%04d', CAST(substr(NEW.code, 3) AS INTEGER) - 1)))) BEGIN
+  SELECT RAISE(ABORT, 'decision codes are sequential: D- and the next number (D-0001, D-0002 ...)');
+END;
+
+CREATE TRIGGER tr_decision_code_fixed BEFORE UPDATE OF code ON decisions WHEN OLD.code IS NOT NEW.code BEGIN
+  SELECT RAISE(ABORT, 'codes never change');
+END;
+
+-- A new decision is logged, also one inserted already decided; decided_at is filled when a decision is decided.
+CREATE TRIGGER tr_decision_created AFTER INSERT ON decisions BEGIN
+  INSERT INTO events(entity_type, entity_id, event, to_value, actor_id, review_id, step_id, note)
+  VALUES ('decision', NEW.id, 'created', NEW.status,
+          CASE WHEN NEW.status = 'decided' THEN COALESCE(NEW.decided_by_actor_id, NEW.asked_by_actor_id)
+               ELSE NEW.asked_by_actor_id END,
+          NEW.review_id, NEW.step_id, CASE WHEN NEW.status = 'decided' THEN NEW.answer ELSE NEW.question END);
+  UPDATE decisions SET decided_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+  WHERE id = NEW.id AND NEW.status = 'decided' AND NEW.decided_at IS NULL;
+END;
+
+CREATE TRIGGER tr_decision_status AFTER UPDATE OF status ON decisions
+WHEN OLD.status IS NOT NEW.status BEGIN
+  INSERT INTO events(entity_type, entity_id, event, from_value, to_value,
+                     actor_id, review_id, step_id, note)
+  VALUES ('decision', NEW.id, 'status-changed', OLD.status, NEW.status,
+          NEW.decided_by_actor_id, NEW.review_id, NEW.step_id, NEW.answer);
+  UPDATE decisions SET decided_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+  WHERE id = NEW.id AND NEW.status = 'decided' AND (NEW.decided_at IS NULL OR NEW.decided_at IS OLD.decided_at);
+END;
+
+-- A recorded answer that is replaced keeps the old one in history.
+CREATE TRIGGER tr_decision_answer AFTER UPDATE OF answer ON decisions
+WHEN OLD.answer IS NOT NULL AND OLD.answer IS NOT NEW.answer BEGIN
+  INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id, step_id, note)
+  VALUES ('decision', NEW.id, 'answer-changed', OLD.answer, NEW.answer, NEW.decided_by_actor_id, NEW.review_id,
+          NEW.step_id, NEW.rationale);
+END;
+
+CREATE TRIGGER tr_decision_no_delete BEFORE DELETE ON decisions BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: decisions cannot be deleted; set status revisit instead');
+END;
+
+-- ----- Gates
+
+CREATE TRIGGER tr_gate_code BEFORE INSERT ON gates
+-- (a malformed code is left to the code CHECK, which names it)
+WHEN NEW.code GLOB 'GATE-[0-9][0-9][0-9][0-9]*' AND NEW.code NOT GLOB 'GATE-*[^0-9]*' AND (
+     NEW.code IS NOT 'GATE-' || printf('%04d', CAST(substr(NEW.code, 6) AS INTEGER))
+  OR CAST(substr(NEW.code, 6) AS INTEGER) < 1
+  OR (CAST(substr(NEW.code, 6) AS INTEGER) > 1 AND NOT EXISTS (SELECT 1 FROM gates
+        WHERE code = 'GATE-' || printf('%04d', CAST(substr(NEW.code, 6) AS INTEGER) - 1)))) BEGIN
+  SELECT RAISE(ABORT, 'gate codes are sequential: GATE- and the next number (GATE-0001, GATE-0002 ...)');
+END;
+
+CREATE TRIGGER tr_gate_code_fixed BEFORE UPDATE OF code ON gates WHEN OLD.code IS NOT NEW.code BEGIN
+  SELECT RAISE(ABORT, 'codes never change');
+END;
+
+-- Options are objects with a text value and label (description optional).
+CREATE TRIGGER tr_gate_options_shape BEFORE INSERT ON gates
+WHEN NEW.options IS NOT NULL AND json_valid(NEW.options) AND json_type(NEW.options) = 'array'
+ AND EXISTS (SELECT 1 FROM json_each(NEW.options) j
+             WHERE j.type <> 'object' OR json_type(j.value, '$.value') IS NOT 'text'
+                OR json_type(j.value, '$.label') IS NOT 'text'
+                OR json_type(j.value, '$.description') NOT IN ('text','null')) BEGIN
+  SELECT RAISE(ABORT, 'gate options must be objects with a text value and label (and an optional description)');
+END;
+
+CREATE TRIGGER tr_gate_options_shape_upd BEFORE UPDATE OF options ON gates
+WHEN NEW.options IS NOT NULL AND json_valid(NEW.options) AND json_type(NEW.options) = 'array'
+ AND EXISTS (SELECT 1 FROM json_each(NEW.options) j
+             WHERE j.type <> 'object' OR json_type(j.value, '$.value') IS NOT 'text'
+                OR json_type(j.value, '$.label') IS NOT 'text'
+                OR json_type(j.value, '$.description') NOT IN ('text','null')) BEGIN
+  SELECT RAISE(ABORT, 'gate options must be objects with a text value and label (and an optional description)');
+END;
+
+-- The same answer rules as the viewer, for answers written as SQL: answer_value is one of the option values,
+-- and a gate without free text needs an option chosen.
+CREATE TRIGGER tr_gate_answer_rules BEFORE UPDATE OF status, answer_value, answer_text ON gates
+WHEN NEW.status = 'answered' AND (OLD.status IS NOT 'answered' OR OLD.answer_value IS NOT NEW.answer_value
+                                  OR OLD.answer_text IS NOT NEW.answer_text) BEGIN
+  SELECT RAISE(ABORT, 'answer_value must be one of the gate''s option values')
+  WHERE NEW.answer_value IS NOT NULL
+    AND NOT EXISTS (SELECT 1 FROM json_each(COALESCE(NEW.options, '[]')) j
+                    WHERE json_extract(j.value, '$.value') = NEW.answer_value);
+  SELECT RAISE(ABORT, 'this gate takes no free text: choose one of the options')
+  WHERE NEW.allow_text = 0 AND NEW.answer_value IS NULL;
+END;
+
+-- A gate moves open -> answered -> applied (or withdrawn); it cannot be applied before it is answered. Any
+-- status may go back to open (reopening, with the answer cleared: tr_gate_answer_final, tr_gate_answer_cleared).
+CREATE TRIGGER tr_gate_transition BEFORE UPDATE OF status ON gates
+WHEN OLD.status IS NOT NEW.status AND NEW.status <> 'open'
+ AND NOT ((OLD.status = 'open' AND NEW.status IN ('answered','withdrawn'))
+       OR (OLD.status = 'answered' AND NEW.status IN ('applied','withdrawn'))) BEGIN
+  SELECT RAISE(ABORT, 'a gate moves open -> answered -> applied (or withdrawn); answer it before applying it');
+END;
+
+CREATE TRIGGER tr_gate_created AFTER INSERT ON gates BEGIN
+  INSERT INTO events(entity_type, entity_id, event, to_value, actor_id, review_id, step_id, note)
+  VALUES ('gate', NEW.id, 'opened', NEW.status, NEW.opened_by_actor_id, NEW.review_id, NEW.step_id, NEW.title);
+END;
+
+-- Answered: the event carries who answered and 'value: text'; applied: who applied it and applied_note.
 CREATE TRIGGER tr_gate_status AFTER UPDATE OF status ON gates
 WHEN OLD.status IS NOT NEW.status BEGIN
-  INSERT INTO events(entity_type, entity_id, event, from_value, to_value, review_id, step_id, note)
-  VALUES ('gate', NEW.id, 'status-changed', OLD.status, NEW.status, NEW.review_id, NEW.step_id,
-          COALESCE(NEW.answer_value || ': ', '') || COALESCE(NEW.answer_text, NEW.applied_note, ''));
+  INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id, step_id, note)
+  VALUES ('gate', NEW.id, 'status-changed', OLD.status, NEW.status,
+          CASE WHEN NEW.status = 'answered' THEN COALESCE(NEW.answered_by_actor_id, NEW.change_actor_id)
+               ELSE NEW.change_actor_id END,
+          NEW.review_id, NEW.step_id,
+          CASE WHEN NEW.status = 'applied' THEN NEW.applied_note
+               ELSE COALESCE(NEW.answer_value || ': ', '') || COALESCE(NEW.answer_text, '') END);
   UPDATE gates SET
     answered_at = CASE WHEN NEW.status = 'answered' AND answered_at IS NULL
                        THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE answered_at END,
@@ -800,6 +1592,15 @@ WHEN OLD.status <> 'open'
   SELECT RAISE(ABORT, 'the answer of a gate that is no longer open cannot be changed; open a new gate');
 END;
 
+-- Likewise who answered, how and when (answered_at may still be filled once, by tr_gate_status).
+CREATE TRIGGER tr_gate_answered_by_final BEFORE UPDATE OF answered_by, answered_via, answered_by_actor_id, answered_at ON gates
+WHEN OLD.status <> 'open' AND NEW.status <> 'open'
+ AND (OLD.answered_by IS NOT NEW.answered_by OR OLD.answered_via IS NOT NEW.answered_via
+      OR OLD.answered_by_actor_id IS NOT NEW.answered_by_actor_id
+      OR (OLD.answered_at IS NOT NULL AND OLD.answered_at IS NOT NEW.answered_at)) BEGIN
+  SELECT RAISE(ABORT, 'who answered a gate, how and when cannot be changed once it is answered');
+END;
+
 CREATE TRIGGER tr_gate_answer_cleared AFTER UPDATE OF answer_value, answer_text ON gates
 WHEN OLD.status <> 'open' AND NEW.status = 'open'
  AND (OLD.answer_value IS NOT NULL OR OLD.answer_text IS NOT NULL) BEGIN
@@ -808,7 +1609,100 @@ WHEN OLD.status <> 'open' AND NEW.status = 'open'
           'reopened; the answer was: ' || COALESCE(OLD.answer_value || ': ', '') || COALESCE(OLD.answer_text, ''));
 END;
 
--- Plan rules enforced by the database.
+-- An answer replaced while the gate is still open is logged with the old and new answer.
+CREATE TRIGGER tr_gate_answer_changed AFTER UPDATE OF answer_value, answer_text ON gates
+WHEN OLD.status = 'open' AND (OLD.answer_value IS NOT NULL OR OLD.answer_text IS NOT NULL)
+ AND (OLD.answer_value IS NOT NEW.answer_value OR OLD.answer_text IS NOT NEW.answer_text) BEGIN
+  INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id, step_id, note)
+  VALUES ('gate', NEW.id, 'answer-changed', OLD.answer_value, NEW.answer_value, NEW.change_actor_id, NEW.review_id,
+          NEW.step_id, 'was: ' || COALESCE(OLD.answer_text, '') || '; now: ' || COALESCE(NEW.answer_text, ''));
+END;
+
+CREATE TRIGGER tr_gate_context_cleared AFTER UPDATE ON gates WHEN NEW.change_actor_id IS NOT NULL BEGIN
+  UPDATE gates SET change_actor_id = NULL WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER tr_gate_context_cleared_ins AFTER INSERT ON gates
+WHEN NEW.change_actor_id IS NOT NULL BEGIN
+  UPDATE gates SET change_actor_id = NULL WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER tr_gate_no_delete BEFORE DELETE ON gates BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: gates cannot be deleted; set status withdrawn instead');
+END;
+
+-- ----- Plans
+
+CREATE TRIGGER tr_plan_code BEFORE INSERT ON plans
+-- (a malformed code is left to the code CHECK, which names it)
+WHEN NEW.code GLOB 'P-[0-9][0-9][0-9][0-9]*' AND NEW.code NOT GLOB 'P-*[^0-9]*' AND (
+     NEW.code IS NOT 'P-' || printf('%04d', CAST(substr(NEW.code, 3) AS INTEGER))
+  OR CAST(substr(NEW.code, 3) AS INTEGER) < 1
+  OR (CAST(substr(NEW.code, 3) AS INTEGER) > 1 AND NOT EXISTS (SELECT 1 FROM plans
+        WHERE code = 'P-' || printf('%04d', CAST(substr(NEW.code, 3) AS INTEGER) - 1)))) BEGIN
+  SELECT RAISE(ABORT, 'plan codes are sequential: P- and the next number (P-0001, P-0002 ...)');
+END;
+
+CREATE TRIGGER tr_plan_code_fixed BEFORE UPDATE OF code ON plans WHEN OLD.code IS NOT NEW.code BEGIN
+  SELECT RAISE(ABORT, 'codes never change');
+END;
+
+CREATE TRIGGER tr_plan_created AFTER INSERT ON plans BEGIN
+  INSERT INTO events(entity_type, entity_id, event, to_value, actor_id, note)
+  VALUES ('plan', NEW.id, 'created', NEW.status, NEW.change_actor_id, NEW.title);
+END;
+
+-- A plan moves drafting <-> awaiting-approval -> approved -> in-progress <-> complete; any status but complete may
+-- move to superseded or abandoned (complete to superseded only); leaving superseded or abandoned needs
+-- change_note. It leaves awaiting-approval for approved only when no plan-approval gate of it is open or
+-- answered but not applied.
+CREATE TRIGGER tr_plan_transition BEFORE UPDATE OF status ON plans
+WHEN OLD.status IS NOT NEW.status BEGIN
+  SELECT RAISE(ABORT, 'a plan leaves superseded or abandoned only with change_note')
+  WHERE OLD.status IN ('superseded','abandoned') AND NEW.change_note IS NULL;
+  SELECT RAISE(ABORT, 'a plan moves drafting, awaiting-approval, approved, in-progress, complete (or superseded, abandoned)')
+  WHERE OLD.status NOT IN ('superseded','abandoned') AND NOT (
+       (OLD.status = 'drafting' AND NEW.status IN ('awaiting-approval','superseded','abandoned'))
+    OR (OLD.status = 'awaiting-approval' AND NEW.status IN ('drafting','approved','superseded','abandoned'))
+    OR (OLD.status = 'approved' AND NEW.status IN ('in-progress','drafting','superseded','abandoned'))
+    OR (OLD.status = 'in-progress' AND NEW.status IN ('complete','superseded','abandoned'))
+    OR (OLD.status = 'complete' AND NEW.status IN ('in-progress','superseded')));
+  SELECT RAISE(ABORT, 'a plan-approval gate of this plan is not applied yet')
+  WHERE OLD.status = 'awaiting-approval' AND NEW.status = 'approved'
+    AND EXISTS (SELECT 1 FROM gates g WHERE g.plan_id = NEW.id AND g.kind = 'plan-approval'
+                  AND g.status IN ('open','answered'));
+END;
+
+CREATE TRIGGER tr_plan_status AFTER UPDATE OF status ON plans
+WHEN OLD.status IS NOT NEW.status BEGIN
+  INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, note)
+  VALUES ('plan', NEW.id, 'status-changed', OLD.status, NEW.status, NEW.change_actor_id, NEW.change_note);
+  UPDATE plans SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER tr_plan_title_changed AFTER UPDATE OF title ON plans WHEN OLD.title IS NOT NEW.title BEGIN
+  INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, note)
+  VALUES ('plan', NEW.id, 'title-changed', OLD.title, NEW.title, NEW.change_actor_id, NEW.change_note);
+END;
+
+CREATE TRIGGER tr_plan_touch AFTER UPDATE ON plans
+WHEN NEW.updated_at IS OLD.updated_at BEGIN
+  UPDATE plans SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER tr_plan_context_cleared AFTER UPDATE ON plans
+WHEN NEW.change_actor_id IS NOT NULL OR NEW.change_note IS NOT NULL BEGIN
+  UPDATE plans SET change_actor_id = NULL, change_note = NULL WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER tr_plan_context_cleared_ins AFTER INSERT ON plans
+WHEN NEW.change_actor_id IS NOT NULL OR NEW.change_note IS NOT NULL BEGIN
+  UPDATE plans SET change_actor_id = NULL, change_note = NULL WHERE id = NEW.id;
+END;
+
+-- ----- Plan structure: phases, steps, dependencies, coverage links
+
+-- Plan rules enforced by the database, on INSERT and on UPDATE.
 CREATE TRIGGER tr_dep_order BEFORE INSERT ON step_dependencies BEGIN
   SELECT RAISE(ABORT, 'a step may only depend on an earlier step of the same plan')
   WHERE NOT EXISTS (
@@ -816,18 +1710,417 @@ CREATE TRIGGER tr_dep_order BEFORE INSERT ON step_dependencies BEGIN
     WHERE a.id = NEW.step_id AND b.id = NEW.depends_on_step_id AND b.number < a.number);
 END;
 
+CREATE TRIGGER tr_dep_order_upd BEFORE UPDATE ON step_dependencies BEGIN
+  SELECT RAISE(ABORT, 'a step may only depend on an earlier step of the same plan')
+  WHERE NOT EXISTS (
+    SELECT 1 FROM steps a JOIN steps b ON a.plan_id = b.plan_id
+    WHERE a.id = NEW.step_id AND b.id = NEW.depends_on_step_id AND b.number < a.number);
+END;
+
+CREATE TRIGGER tr_dep_created AFTER INSERT ON step_dependencies BEGIN
+  INSERT INTO events(entity_type, entity_id, event, to_value, step_id, note)
+  VALUES ('step', NEW.step_id, 'dependency-added',
+          CAST((SELECT number FROM steps WHERE id = NEW.depends_on_step_id) AS TEXT), NEW.step_id,
+          'depends on step ' || (SELECT number FROM steps WHERE id = NEW.depends_on_step_id));
+END;
+
 CREATE TRIGGER tr_step_phase_plan BEFORE INSERT ON steps BEGIN
   SELECT RAISE(ABORT, 'step phase belongs to another plan')
   WHERE (SELECT plan_id FROM phases WHERE id = NEW.phase_id) IS NOT NEW.plan_id;
 END;
 
-CREATE TRIGGER tr_relation_noreverse_dup BEFORE INSERT ON issue_relations
-WHEN NEW.relation IN ('duplicate-of','continuation-of','regression-of','supersedes','merged-into','split-from','caused-by')
-BEGIN
-  SELECT RAISE(ABORT, 'the reverse relation already exists')
-  WHERE EXISTS (SELECT 1 FROM issue_relations
-                WHERE from_issue_id = NEW.to_issue_id AND to_issue_id = NEW.from_issue_id
-                  AND relation = NEW.relation);
+CREATE TRIGGER tr_step_phase_plan_upd BEFORE UPDATE OF phase_id, plan_id ON steps BEGIN
+  SELECT RAISE(ABORT, 'step phase belongs to another plan')
+  WHERE (SELECT plan_id FROM phases WHERE id = NEW.phase_id) IS NOT NEW.plan_id;
+END;
+
+CREATE TRIGGER tr_phase_plan_upd BEFORE UPDATE OF plan_id ON phases
+WHEN OLD.plan_id IS NOT NEW.plan_id BEGIN
+  SELECT RAISE(ABORT, 'step phase belongs to another plan')
+  WHERE EXISTS (SELECT 1 FROM steps WHERE phase_id = NEW.id AND plan_id IS NOT NEW.plan_id);
+END;
+
+-- Renumbering or moving a step keeps every dependency of it and on it pointing at an earlier step of the same
+-- plan (renumber before loading dependencies, or renumber in an order that keeps them valid).
+CREATE TRIGGER tr_step_renumber BEFORE UPDATE OF number, plan_id ON steps
+WHEN OLD.number IS NOT NEW.number OR OLD.plan_id IS NOT NEW.plan_id BEGIN
+  SELECT RAISE(ABORT, 'a step may only depend on an earlier step of the same plan')
+  WHERE EXISTS (SELECT 1 FROM step_dependencies d JOIN steps b ON b.id = d.depends_on_step_id
+                WHERE d.step_id = NEW.id AND (b.plan_id IS NOT NEW.plan_id OR b.number >= NEW.number))
+     OR EXISTS (SELECT 1 FROM step_dependencies d JOIN steps a ON a.id = d.step_id
+                WHERE d.depends_on_step_id = NEW.id AND (a.plan_id IS NOT NEW.plan_id OR a.number <= NEW.number));
+END;
+
+-- A status change needs change_note (moving to waiting-owner, owner_question will do); a step cannot start or
+-- finish while a blocking gate on it is open or answered but not applied.
+CREATE TRIGGER tr_step_change_needs_note BEFORE UPDATE OF status ON steps
+WHEN OLD.status IS NOT NEW.status AND NEW.change_note IS NULL
+ AND NOT (NEW.status = 'waiting-owner' AND NEW.owner_question IS NOT NULL) BEGIN
+  SELECT RAISE(ABORT, 'give change_note with a step status change');
+END;
+
+CREATE TRIGGER tr_step_gate_blocks BEFORE UPDATE OF status ON steps
+WHEN OLD.status IS NOT NEW.status AND NEW.status IN ('doing','done')
+ AND EXISTS (SELECT 1 FROM gates g WHERE g.step_id = NEW.id AND g.blocking = 1 AND g.status IN ('open','answered')) BEGIN
+  SELECT RAISE(ABORT, 'a blocking gate on this step is not applied yet');
+END;
+
+CREATE TRIGGER tr_step_created AFTER INSERT ON steps BEGIN
+  INSERT INTO events(entity_type, entity_id, event, to_value, actor_id, step_id, note)
+  VALUES ('step', NEW.id, 'created', NEW.status, NEW.change_actor_id, NEW.id, NEW.title);
+END;
+
+-- started_at is set once, on doing or on a jump straight to done; done_at follows done.
+CREATE TRIGGER tr_step_status AFTER UPDATE OF status ON steps
+WHEN OLD.status IS NOT NEW.status BEGIN
+  INSERT INTO events(entity_type, entity_id, event, from_value, to_value,
+                     actor_id, step_id, commit_sha, note)
+  VALUES ('step', NEW.id, 'status-changed', OLD.status, NEW.status,
+          NEW.change_actor_id, NEW.id, NEW.change_commit_sha,
+          COALESCE(NEW.change_note, CASE WHEN NEW.status = 'waiting-owner' THEN NEW.owner_question END));
+  UPDATE steps SET
+    started_at = CASE WHEN NEW.status IN ('doing','done') AND started_at IS NULL
+                      THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE started_at END,
+    done_at    = CASE WHEN NEW.status = 'done' THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE NULL END
+  WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER tr_step_title_changed AFTER UPDATE OF title ON steps WHEN OLD.title IS NOT NEW.title BEGIN
+  INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, step_id, note)
+  VALUES ('step', NEW.id, 'title-changed', OLD.title, NEW.title, NEW.change_actor_id, NEW.id, NEW.change_note);
+END;
+
+CREATE TRIGGER tr_step_change_changed AFTER UPDATE OF change ON steps WHEN OLD.change IS NOT NEW.change BEGIN
+  INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, step_id, note)
+  VALUES ('step', NEW.id, 'change-text-changed', OLD.change, NEW.change, NEW.change_actor_id, NEW.id,
+          NEW.change_note);
+END;
+
+CREATE TRIGGER tr_step_proof_changed AFTER UPDATE OF proof ON steps WHEN OLD.proof IS NOT NEW.proof BEGIN
+  INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, step_id, note)
+  VALUES ('step', NEW.id, 'proof-changed', OLD.proof, NEW.proof, NEW.change_actor_id, NEW.id, NEW.change_note);
+END;
+
+CREATE TRIGGER tr_step_touch AFTER UPDATE ON steps
+WHEN NEW.updated_at IS OLD.updated_at BEGIN
+  UPDATE steps SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER tr_step_context_cleared AFTER UPDATE ON steps
+WHEN NEW.change_actor_id IS NOT NULL OR NEW.change_commit_sha IS NOT NULL OR NEW.change_note IS NOT NULL BEGIN
+  UPDATE steps SET change_actor_id = NULL, change_commit_sha = NULL, change_note = NULL WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER tr_step_context_cleared_ins AFTER INSERT ON steps
+WHEN NEW.change_actor_id IS NOT NULL OR NEW.change_commit_sha IS NOT NULL OR NEW.change_note IS NOT NULL BEGIN
+  UPDATE steps SET change_actor_id = NULL, change_commit_sha = NULL, change_note = NULL WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER tr_step_no_delete BEFORE DELETE ON steps BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: steps cannot be deleted; set status dropped instead');
+END;
+
+-- A step closes only findings of the reviews its plan covers.
+CREATE TRIGGER tr_step_finding_in_plan BEFORE INSERT ON step_findings
+WHEN NOT EXISTS (SELECT 1 FROM steps s JOIN findings f ON f.id = NEW.finding_id
+                 JOIN plan_reviews pr ON pr.plan_id = s.plan_id AND pr.review_id = f.review_id
+                 WHERE s.id = NEW.step_id) BEGIN
+  SELECT RAISE(ABORT, 'the finding''s review is not one of the step''s plan reviews (plan_reviews)');
+END;
+
+CREATE TRIGGER tr_step_finding_created AFTER INSERT ON step_findings BEGIN
+  INSERT INTO events(entity_type, entity_id, event, to_value, step_id, review_id, note)
+  VALUES ('step-finding', NEW.finding_id, 'linked', (SELECT point_id FROM findings WHERE id = NEW.finding_id),
+          NEW.step_id, (SELECT review_id FROM findings WHERE id = NEW.finding_id),
+          'closed by step ' || (SELECT number FROM steps WHERE id = NEW.step_id) || COALESCE(': ' || NEW.multi_reason, ''));
+END;
+
+-- ----- Events
+
+CREATE TRIGGER tr_events_no_update BEFORE UPDATE ON events BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: events cannot be changed');
+END;
+
+CREATE TRIGGER tr_events_no_delete BEFORE DELETE ON events BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: events cannot be deleted');
+END;
+
+-- One time format (plan step 75): every time column holds UTC text with milliseconds, exactly what
+-- strftime('%Y-%m-%dT%H:%M:%fZ', ...) writes (2026-11-10T09:30:00.000Z), so times compare correctly as text
+-- and as julianday(). Any other form (no milliseconds, a space, an offset like +02:00) is refused; convert
+-- with strftime('%Y-%m-%dT%H:%M:%fZ', value) first.
+CREATE TRIGGER tr_time_schema_migrations_ins BEFORE INSERT ON schema_migrations
+WHEN (NEW.applied_at IS NOT NULL AND (NEW.applied_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.applied_at) IS NOT NEW.applied_at)) BEGIN
+  SELECT RAISE(ABORT, 'schema_migrations: applied_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_schema_migrations_upd BEFORE UPDATE OF applied_at ON schema_migrations
+WHEN (NEW.applied_at IS NOT NULL AND (NEW.applied_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.applied_at) IS NOT NEW.applied_at)) BEGIN
+  SELECT RAISE(ABORT, 'schema_migrations: applied_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_repositories_ins BEFORE INSERT ON repositories
+WHEN (NEW.created_at IS NOT NULL AND (NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at) IS NOT NEW.created_at)) BEGIN
+  SELECT RAISE(ABORT, 'repositories: created_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_repositories_upd BEFORE UPDATE OF created_at ON repositories
+WHEN (NEW.created_at IS NOT NULL AND (NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at) IS NOT NEW.created_at)) BEGIN
+  SELECT RAISE(ABORT, 'repositories: created_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_actors_ins BEFORE INSERT ON actors
+WHEN (NEW.created_at IS NOT NULL AND (NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at) IS NOT NEW.created_at)) BEGIN
+  SELECT RAISE(ABORT, 'actors: created_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_actors_upd BEFORE UPDATE OF created_at ON actors
+WHEN (NEW.created_at IS NOT NULL AND (NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at) IS NOT NEW.created_at)) BEGIN
+  SELECT RAISE(ABORT, 'actors: created_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_domains_ins BEFORE INSERT ON domains
+WHEN (NEW.retired_at IS NOT NULL AND (NEW.retired_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.retired_at) IS NOT NEW.retired_at)) BEGIN
+  SELECT RAISE(ABORT, 'domains: retired_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_domains_upd BEFORE UPDATE OF retired_at ON domains
+WHEN (NEW.retired_at IS NOT NULL AND (NEW.retired_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.retired_at) IS NOT NEW.retired_at)) BEGIN
+  SELECT RAISE(ABORT, 'domains: retired_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_themes_ins BEFORE INSERT ON themes
+WHEN (NEW.retired_at IS NOT NULL AND (NEW.retired_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.retired_at) IS NOT NEW.retired_at)) BEGIN
+  SELECT RAISE(ABORT, 'themes: retired_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_themes_upd BEFORE UPDATE OF retired_at ON themes
+WHEN (NEW.retired_at IS NOT NULL AND (NEW.retired_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.retired_at) IS NOT NEW.retired_at)) BEGIN
+  SELECT RAISE(ABORT, 'themes: retired_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_design_goals_ins BEFORE INSERT ON design_goals
+WHEN (NEW.adopted_at IS NOT NULL AND (NEW.adopted_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.adopted_at) IS NOT NEW.adopted_at))
+     OR (NEW.retired_at IS NOT NULL AND (NEW.retired_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.retired_at) IS NOT NEW.retired_at)) BEGIN
+  SELECT RAISE(ABORT, 'design_goals: adopted_at, retired_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_design_goals_upd BEFORE UPDATE OF adopted_at, retired_at ON design_goals
+WHEN (NEW.adopted_at IS NOT NULL AND (NEW.adopted_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.adopted_at) IS NOT NEW.adopted_at))
+     OR (NEW.retired_at IS NOT NULL AND (NEW.retired_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.retired_at) IS NOT NEW.retired_at)) BEGIN
+  SELECT RAISE(ABORT, 'design_goals: adopted_at, retired_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_reviews_ins BEFORE INSERT ON reviews
+WHEN (NEW.approved_at IS NOT NULL AND (NEW.approved_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.approved_at) IS NOT NEW.approved_at))
+     OR (NEW.started_at IS NOT NULL AND (NEW.started_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.started_at) IS NOT NEW.started_at))
+     OR (NEW.completed_at IS NOT NULL AND (NEW.completed_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.completed_at) IS NOT NEW.completed_at))
+     OR (NEW.updated_at IS NOT NULL AND (NEW.updated_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.updated_at) IS NOT NEW.updated_at)) BEGIN
+  SELECT RAISE(ABORT, 'reviews: approved_at, started_at, completed_at, updated_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_reviews_upd BEFORE UPDATE OF approved_at, started_at, completed_at, updated_at ON reviews
+WHEN (NEW.approved_at IS NOT NULL AND (NEW.approved_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.approved_at) IS NOT NEW.approved_at))
+     OR (NEW.started_at IS NOT NULL AND (NEW.started_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.started_at) IS NOT NEW.started_at))
+     OR (NEW.completed_at IS NOT NULL AND (NEW.completed_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.completed_at) IS NOT NEW.completed_at))
+     OR (NEW.updated_at IS NOT NULL AND (NEW.updated_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.updated_at) IS NOT NEW.updated_at)) BEGIN
+  SELECT RAISE(ABORT, 'reviews: approved_at, started_at, completed_at, updated_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_review_repositories_ins BEFORE INSERT ON review_repositories
+WHEN (NEW.commit_time IS NOT NULL AND (NEW.commit_time NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.commit_time) IS NOT NEW.commit_time)) BEGIN
+  SELECT RAISE(ABORT, 'review_repositories: commit_time must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_review_repositories_upd BEFORE UPDATE OF commit_time ON review_repositories
+WHEN (NEW.commit_time IS NOT NULL AND (NEW.commit_time NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.commit_time) IS NOT NEW.commit_time)) BEGIN
+  SELECT RAISE(ABORT, 'review_repositories: commit_time must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_reviewer_runs_ins BEFORE INSERT ON reviewer_runs
+WHEN (NEW.started_at IS NOT NULL AND (NEW.started_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.started_at) IS NOT NEW.started_at))
+     OR (NEW.finished_at IS NOT NULL AND (NEW.finished_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.finished_at) IS NOT NEW.finished_at)) BEGIN
+  SELECT RAISE(ABORT, 'reviewer_runs: started_at, finished_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_reviewer_runs_upd BEFORE UPDATE OF started_at, finished_at ON reviewer_runs
+WHEN (NEW.started_at IS NOT NULL AND (NEW.started_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.started_at) IS NOT NEW.started_at))
+     OR (NEW.finished_at IS NOT NULL AND (NEW.finished_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.finished_at) IS NOT NEW.finished_at)) BEGIN
+  SELECT RAISE(ABORT, 'reviewer_runs: started_at, finished_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_requirements_ins BEFORE INSERT ON requirements
+WHEN (NEW.stated_at IS NOT NULL AND (NEW.stated_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.stated_at) IS NOT NEW.stated_at))
+     OR (NEW.created_at IS NOT NULL AND (NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at) IS NOT NEW.created_at)) BEGIN
+  SELECT RAISE(ABORT, 'requirements: stated_at, created_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_requirements_upd BEFORE UPDATE OF stated_at, created_at ON requirements
+WHEN (NEW.stated_at IS NOT NULL AND (NEW.stated_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.stated_at) IS NOT NEW.stated_at))
+     OR (NEW.created_at IS NOT NULL AND (NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at) IS NOT NEW.created_at)) BEGIN
+  SELECT RAISE(ABORT, 'requirements: stated_at, created_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_issues_ins BEFORE INSERT ON issues
+WHEN (NEW.opened_at IS NOT NULL AND (NEW.opened_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.opened_at) IS NOT NEW.opened_at))
+     OR (NEW.resolved_at IS NOT NULL AND (NEW.resolved_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.resolved_at) IS NOT NEW.resolved_at))
+     OR (NEW.verified_at IS NOT NULL AND (NEW.verified_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.verified_at) IS NOT NEW.verified_at))
+     OR (NEW.updated_at IS NOT NULL AND (NEW.updated_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.updated_at) IS NOT NEW.updated_at)) BEGIN
+  SELECT RAISE(ABORT, 'issues: opened_at, resolved_at, verified_at, updated_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_issues_upd BEFORE UPDATE OF opened_at, resolved_at, verified_at, updated_at ON issues
+WHEN (NEW.opened_at IS NOT NULL AND (NEW.opened_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.opened_at) IS NOT NEW.opened_at))
+     OR (NEW.resolved_at IS NOT NULL AND (NEW.resolved_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.resolved_at) IS NOT NEW.resolved_at))
+     OR (NEW.verified_at IS NOT NULL AND (NEW.verified_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.verified_at) IS NOT NEW.verified_at))
+     OR (NEW.updated_at IS NOT NULL AND (NEW.updated_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.updated_at) IS NOT NEW.updated_at)) BEGIN
+  SELECT RAISE(ABORT, 'issues: opened_at, resolved_at, verified_at, updated_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_issue_relations_ins BEFORE INSERT ON issue_relations
+WHEN (NEW.created_at IS NOT NULL AND (NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at) IS NOT NEW.created_at)) BEGIN
+  SELECT RAISE(ABORT, 'issue_relations: created_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_issue_relations_upd BEFORE UPDATE OF created_at ON issue_relations
+WHEN (NEW.created_at IS NOT NULL AND (NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at) IS NOT NEW.created_at)) BEGIN
+  SELECT RAISE(ABORT, 'issue_relations: created_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_findings_ins BEFORE INSERT ON findings
+WHEN (NEW.verified_at IS NOT NULL AND (NEW.verified_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.verified_at) IS NOT NEW.verified_at))
+     OR (NEW.created_at IS NOT NULL AND (NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at) IS NOT NEW.created_at)) BEGIN
+  SELECT RAISE(ABORT, 'findings: verified_at, created_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_findings_upd BEFORE UPDATE OF verified_at, created_at ON findings
+WHEN (NEW.verified_at IS NOT NULL AND (NEW.verified_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.verified_at) IS NOT NEW.verified_at))
+     OR (NEW.created_at IS NOT NULL AND (NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at) IS NOT NEW.created_at)) BEGIN
+  SELECT RAISE(ABORT, 'findings: verified_at, created_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_review_issue_checks_ins BEFORE INSERT ON review_issue_checks
+WHEN (NEW.checked_at IS NOT NULL AND (NEW.checked_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.checked_at) IS NOT NEW.checked_at)) BEGIN
+  SELECT RAISE(ABORT, 'review_issue_checks: checked_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_review_issue_checks_upd BEFORE UPDATE OF checked_at ON review_issue_checks
+WHEN (NEW.checked_at IS NOT NULL AND (NEW.checked_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.checked_at) IS NOT NEW.checked_at)) BEGIN
+  SELECT RAISE(ABORT, 'review_issue_checks: checked_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_decisions_ins BEFORE INSERT ON decisions
+WHEN (NEW.asked_at IS NOT NULL AND (NEW.asked_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.asked_at) IS NOT NEW.asked_at))
+     OR (NEW.decided_at IS NOT NULL AND (NEW.decided_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.decided_at) IS NOT NEW.decided_at)) BEGIN
+  SELECT RAISE(ABORT, 'decisions: asked_at, decided_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_decisions_upd BEFORE UPDATE OF asked_at, decided_at ON decisions
+WHEN (NEW.asked_at IS NOT NULL AND (NEW.asked_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.asked_at) IS NOT NEW.asked_at))
+     OR (NEW.decided_at IS NOT NULL AND (NEW.decided_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.decided_at) IS NOT NEW.decided_at)) BEGIN
+  SELECT RAISE(ABORT, 'decisions: asked_at, decided_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_gates_ins BEFORE INSERT ON gates
+WHEN (NEW.answered_at IS NOT NULL AND (NEW.answered_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.answered_at) IS NOT NEW.answered_at))
+     OR (NEW.applied_at IS NOT NULL AND (NEW.applied_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.applied_at) IS NOT NEW.applied_at))
+     OR (NEW.created_at IS NOT NULL AND (NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at) IS NOT NEW.created_at)) BEGIN
+  SELECT RAISE(ABORT, 'gates: answered_at, applied_at, created_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_gates_upd BEFORE UPDATE OF answered_at, applied_at, created_at ON gates
+WHEN (NEW.answered_at IS NOT NULL AND (NEW.answered_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.answered_at) IS NOT NEW.answered_at))
+     OR (NEW.applied_at IS NOT NULL AND (NEW.applied_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.applied_at) IS NOT NEW.applied_at))
+     OR (NEW.created_at IS NOT NULL AND (NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at) IS NOT NEW.created_at)) BEGIN
+  SELECT RAISE(ABORT, 'gates: answered_at, applied_at, created_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_plans_ins BEFORE INSERT ON plans
+WHEN (NEW.approved_at IS NOT NULL AND (NEW.approved_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.approved_at) IS NOT NEW.approved_at))
+     OR (NEW.created_at IS NOT NULL AND (NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at) IS NOT NEW.created_at))
+     OR (NEW.updated_at IS NOT NULL AND (NEW.updated_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.updated_at) IS NOT NEW.updated_at)) BEGIN
+  SELECT RAISE(ABORT, 'plans: approved_at, created_at, updated_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_plans_upd BEFORE UPDATE OF approved_at, created_at, updated_at ON plans
+WHEN (NEW.approved_at IS NOT NULL AND (NEW.approved_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.approved_at) IS NOT NEW.approved_at))
+     OR (NEW.created_at IS NOT NULL AND (NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at) IS NOT NEW.created_at))
+     OR (NEW.updated_at IS NOT NULL AND (NEW.updated_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.updated_at) IS NOT NEW.updated_at)) BEGIN
+  SELECT RAISE(ABORT, 'plans: approved_at, created_at, updated_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_steps_ins BEFORE INSERT ON steps
+WHEN (NEW.started_at IS NOT NULL AND (NEW.started_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.started_at) IS NOT NEW.started_at))
+     OR (NEW.done_at IS NOT NULL AND (NEW.done_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.done_at) IS NOT NEW.done_at))
+     OR (NEW.updated_at IS NOT NULL AND (NEW.updated_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.updated_at) IS NOT NEW.updated_at)) BEGIN
+  SELECT RAISE(ABORT, 'steps: started_at, done_at, updated_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_steps_upd BEFORE UPDATE OF started_at, done_at, updated_at ON steps
+WHEN (NEW.started_at IS NOT NULL AND (NEW.started_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.started_at) IS NOT NEW.started_at))
+     OR (NEW.done_at IS NOT NULL AND (NEW.done_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.done_at) IS NOT NEW.done_at))
+     OR (NEW.updated_at IS NOT NULL AND (NEW.updated_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.updated_at) IS NOT NEW.updated_at)) BEGIN
+  SELECT RAISE(ABORT, 'steps: started_at, done_at, updated_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_step_commits_ins BEFORE INSERT ON step_commits
+WHEN (NEW.committed_at IS NOT NULL AND (NEW.committed_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.committed_at) IS NOT NEW.committed_at)) BEGIN
+  SELECT RAISE(ABORT, 'step_commits: committed_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_step_commits_upd BEFORE UPDATE OF committed_at ON step_commits
+WHEN (NEW.committed_at IS NOT NULL AND (NEW.committed_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.committed_at) IS NOT NEW.committed_at)) BEGIN
+  SELECT RAISE(ABORT, 'step_commits: committed_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_guard_tests_ins BEFORE INSERT ON guard_tests
+WHEN (NEW.created_at IS NOT NULL AND (NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at) IS NOT NEW.created_at)) BEGIN
+  SELECT RAISE(ABORT, 'guard_tests: created_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_guard_tests_upd BEFORE UPDATE OF created_at ON guard_tests
+WHEN (NEW.created_at IS NOT NULL AND (NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at) IS NOT NEW.created_at)) BEGIN
+  SELECT RAISE(ABORT, 'guard_tests: created_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_test_runs_ins BEFORE INSERT ON test_runs
+WHEN (NEW.started_at IS NOT NULL AND (NEW.started_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.started_at) IS NOT NEW.started_at)) BEGIN
+  SELECT RAISE(ABORT, 'test_runs: started_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_test_runs_upd BEFORE UPDATE OF started_at ON test_runs
+WHEN (NEW.started_at IS NOT NULL AND (NEW.started_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.started_at) IS NOT NEW.started_at)) BEGIN
+  SELECT RAISE(ABORT, 'test_runs: started_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_metrics_ins BEFORE INSERT ON metrics
+WHEN (NEW.recorded_at IS NOT NULL AND (NEW.recorded_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.recorded_at) IS NOT NEW.recorded_at)) BEGIN
+  SELECT RAISE(ABORT, 'metrics: recorded_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_metrics_upd BEFORE UPDATE OF recorded_at ON metrics
+WHEN (NEW.recorded_at IS NOT NULL AND (NEW.recorded_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.recorded_at) IS NOT NEW.recorded_at)) BEGIN
+  SELECT RAISE(ABORT, 'metrics: recorded_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_artifacts_ins BEFORE INSERT ON artifacts
+WHEN (NEW.created_at IS NOT NULL AND (NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at) IS NOT NEW.created_at)) BEGIN
+  SELECT RAISE(ABORT, 'artifacts: created_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_artifacts_upd BEFORE UPDATE OF created_at ON artifacts
+WHEN (NEW.created_at IS NOT NULL AND (NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at) IS NOT NEW.created_at)) BEGIN
+  SELECT RAISE(ABORT, 'artifacts: created_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_events_ins BEFORE INSERT ON events
+WHEN (NEW.at IS NOT NULL AND (NEW.at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.at) IS NOT NEW.at)) BEGIN
+  SELECT RAISE(ABORT, 'events: at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_events_upd BEFORE UPDATE OF at ON events
+WHEN (NEW.at IS NOT NULL AND (NEW.at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.at) IS NOT NEW.at)) BEGIN
+  SELECT RAISE(ABORT, 'events: at must be UTC times like 2026-11-10T09:30:00.000Z');
 END;
 
 -- ---------- Views ---------------------------------------------------------
@@ -848,12 +2141,20 @@ WHERE i.status IN ('open','needs-decision','planned','in-progress','regressed')
 ORDER BY CASE i.severity WHEN 'H' THEN 0 WHEN 'M' THEN 1 WHEN 'L' THEN 2 ELSE 3 END,
          fr.started_at;
 
--- Known issues to hand each reviewer in the brief, by domain.
+-- Known issues to hand each reviewer in the brief, by domain: with where they were seen (primary locations, as in
+-- v_open_issues) and the owner's standing decisions on them (decided or to revisit).
 CREATE VIEW v_known_issues_for_brief AS
 SELECT i.domain_code, i.code, i.title, i.severity, i.status, i.current_state,
        i.recommendation, i.resolution,
        (SELECT group_concat(test_path || '::' || test_name, '; ')
-          FROM guard_tests g WHERE g.issue_id = i.id AND g.still_exists = 1) AS guard_tests
+          FROM guard_tests g WHERE g.issue_id = i.id AND g.still_exists = 1) AS guard_tests,
+       (SELECT group_concat(DISTINCT fl.path || COALESCE('#' || fl.symbol, ''))
+          FROM findings f JOIN finding_locations fl ON fl.finding_id = f.id
+         WHERE f.issue_id = i.id AND fl.role = 'primary') AS locations,
+       (SELECT group_concat(x.line, '; ') FROM
+          (SELECT d.code || ' (' || d.status || '): ' || d.question || COALESCE(' -> ' || d.answer, '') AS line
+             FROM decision_issues di JOIN decisions d ON d.id = di.decision_id
+            WHERE di.issue_id = i.id AND d.status IN ('decided','revisit') ORDER BY d.code) x) AS decisions
 FROM issues i
 WHERE i.status NOT IN ('duplicate','obsolete')
 ORDER BY i.domain_code, i.code;
@@ -891,7 +2192,8 @@ JOIN issues a ON a.id = r.from_issue_id
 JOIN issues b ON b.id = r.to_issue_id
 LEFT JOIN reviews rv ON rv.id = r.established_in_review_id;
 
--- Per review and domain: counts by severity, verified and false.
+-- Per review and domain: counts by severity, verified and false. r.code is a GROUP BY term so that a WHERE
+-- review = ? filter is pushed into the findings scan (one review's findings, not every review's).
 CREATE VIEW v_review_summary AS
 SELECT r.code AS review, r.started_at, f.domain_code,
        count(*) AS points,
@@ -899,31 +2201,35 @@ SELECT r.code AS review, r.started_at, f.domain_code,
        sum(f.severity = 'L') AS low,  sum(f.severity = 'T') AS tests,
        sum(f.verification = 'confirmed') AS confirmed,
        sum(f.verification = 'false') AS false_findings,
-       sum(f.match_type = 'new') AS new_issues,
-       sum(f.match_type IN ('still-present','changed','continuation')) AS carried_over,
+       sum(f.match_type IN ('new','continuation')) AS new_issues,  -- a continuation opens a new issue
+       sum(f.match_type IN ('still-present','changed')) AS carried_over,
        sum(f.match_type IN ('recurrence','regression')) AS came_back
 FROM findings f JOIN reviews r ON r.id = f.review_id
-GROUP BY r.id, f.domain_code
+GROUP BY r.id, r.code, f.domain_code
 ORDER BY r.started_at, f.domain_code;
 
--- Findings not yet matched to an issue (must be empty before consolidating).
+-- Findings not yet matched to an issue (must be empty before consolidating). False findings too: a false finding
+-- is matched to an issue closed as obsolete, so the ledger keeps what was claimed and why it was wrong.
 CREATE VIEW v_unmatched_findings AS
 SELECT r.code AS review, f.point_id, f.severity, f.summary
 FROM findings f JOIN reviews r ON r.id = f.review_id
-WHERE f.issue_id IS NULL AND f.verification <> 'false';
+WHERE f.issue_id IS NULL;
 
--- Known issues in domains that ran, with no check recorded (must be empty).
+-- Known issues in domains that ran, with no check recorded (must be empty). Known = first seen in another review
+-- and opened before this one started, compared as julianday() values (an instant, not text).
 CREATE VIEW v_unchecked_known_issues AS
 SELECT r.code AS review, i.code AS issue, i.domain_code, i.title
 FROM reviews r
 JOIN review_domains rd ON rd.review_id = r.id AND rd.decision = 'included'
 JOIN issues i ON i.domain_code = rd.domain_code
 WHERE i.first_seen_review_id <> r.id
-  AND i.opened_at < r.started_at
+  AND julianday(i.opened_at) < julianday(r.started_at)
   AND i.status NOT IN ('duplicate','obsolete')
   AND NOT EXISTS (SELECT 1 FROM review_issue_checks c WHERE c.review_id = r.id AND c.issue_id = i.id);
 
--- Coverage: findings of a plan's reviews closed by no step (must be empty).
+-- Coverage: findings of a plan's reviews closed by no step (must be empty). A finding is covered by a step of
+-- this plan, or by a done step of a plan this plan supersedes (work already finished under the old plan). The
+-- probe goes from the finding to its steps (ix_step_findings_find), never over a whole plan's steps per finding.
 CREATE VIEW v_uncovered_findings AS
 SELECT p.code AS plan, r.code AS review, f.point_id, f.severity, f.summary
 FROM plans p
@@ -932,7 +2238,9 @@ JOIN reviews r ON r.id = pr.review_id
 JOIN findings f ON f.review_id = r.id
 WHERE f.verification <> 'false'
   AND NOT EXISTS (SELECT 1 FROM step_findings sf JOIN steps s ON s.id = sf.step_id
-                  WHERE sf.finding_id = f.id AND s.plan_id = p.id);
+                    JOIN plans sp ON sp.id = +s.plan_id
+                  WHERE sf.finding_id = f.id
+                    AND (sp.id = p.id OR (sp.superseded_by = p.id AND s.status = 'done')));
 
 -- Coverage: steps that close nothing, and multi-closed findings with no reason.
 CREATE VIEW v_coverage_problems AS
@@ -959,20 +2267,26 @@ GROUP BY ph.id ORDER BY p.code, ph.number;
 
 -- The owner's to-do list: open gates, answered gates the agent has not
 -- acted on yet, and anything else waiting on the owner without a gate.
+-- Each thing once: a step or decision with an open or answered gate (on it, or for a decision on its step) is
+-- listed as that gate. A step's question falls back to its progress note, then to its change text, so it is never
+-- blank; it is blocking when an unfinished step depends on it.
 CREATE VIEW v_owner_queue AS
 SELECT 'gate' AS kind, g.code AS ref, g.kind AS need, g.title, g.question,
        g.status, g.blocking, g.created_at
 FROM gates g WHERE g.status IN ('open','answered')
 UNION ALL
 SELECT 'step', p.code || ' #' || s.number, s.owner_need, s.title,
-       COALESCE(s.owner_question, s.progress_note), 'open', 1, s.updated_at
+       COALESCE(NULLIF(trim(s.owner_question), ''), NULLIF(trim(s.progress_note), ''), s.change), 'open',
+       EXISTS (SELECT 1 FROM step_dependencies sd JOIN steps ds ON ds.id = sd.step_id
+               WHERE sd.depends_on_step_id = s.id AND ds.status NOT IN ('done','dropped')), s.updated_at
 FROM steps s JOIN plans p ON p.id = s.plan_id
 WHERE s.status = 'waiting-owner'
   AND NOT EXISTS (SELECT 1 FROM gates g WHERE g.step_id = s.id AND g.status IN ('open','answered'))
 UNION ALL
 SELECT 'decision', d.code, 'decision', d.question, d.revisit_when, d.status, 0, d.asked_at
 FROM decisions d WHERE d.status IN ('open','revisit')
-  AND NOT EXISTS (SELECT 1 FROM gates g WHERE g.decision_id = d.id AND g.status IN ('open','answered'));
+  AND NOT EXISTS (SELECT 1 FROM gates g WHERE g.decision_id = d.id AND g.status IN ('open','answered'))
+  AND NOT EXISTS (SELECT 1 FROM gates g WHERE g.step_id = d.step_id AND g.status IN ('open','answered'));
 
 -- Every code reference with what is needed to get back to the exact lines.
 CREATE VIEW v_code_refs AS
@@ -994,19 +2308,51 @@ JOIN repositories rp ON rp.id = fl.repository_id
 LEFT JOIN review_repositories rr ON rr.review_id = f.review_id AND rr.repository_id = fl.repository_id
 LEFT JOIN issues i ON i.id = f.issue_id;
 
--- References that could not be traced back (must be empty after indexing).
+-- References that could not be traced back (must be empty after indexing). A whole-file reference (whole_file = 1)
+-- needs no symbol; a not-text one (binary or not UTF-8) needs no excerpt. An excerpt whose line count differs from
+-- its line range (lines past the end of the file, or a hand-written excerpt) is a problem, except a whole-file
+-- excerpt cut at 200 lines (excerpt_status 'truncated').
 CREATE VIEW v_untraceable_refs AS
-SELECT r.code AS review, f.point_id, fl.path,
-       CASE WHEN fl.commit_sha IS NULL THEN 'no commit'
-            WHEN fl.line_start IS NULL AND fl.symbol IS NULL THEN 'no lines or symbol'
-            WHEN fl.excerpt IS NULL THEN 'no excerpt'
-            WHEN rr.tag_name IS NULL THEN 'commit not tagged' END AS problem
-FROM finding_locations fl
-JOIN findings f ON f.id = fl.finding_id
+SELECT review, point_id, path, problem FROM (
+  SELECT r.code AS review, f.point_id, fl.path,
+         CASE WHEN fl.commit_sha IS NULL THEN 'no commit'
+              WHEN fl.line_start IS NULL AND fl.whole_file = 0 AND fl.symbol IS NULL THEN 'no lines or symbol'
+              WHEN fl.line_start IS NULL AND fl.whole_file = 0 THEN 'symbol not resolved to lines'
+              WHEN fl.excerpt IS NULL AND fl.excerpt_status IS NOT 'not-text' THEN 'no excerpt'
+              WHEN fl.excerpt = '' THEN 'empty excerpt'
+              -- line count = newlines + 1 (an excerpt may also end with one extra newline)
+              WHEN fl.excerpt_status IS NULL AND fl.line_start IS NOT NULL
+                   AND length(fl.excerpt) - length(replace(fl.excerpt, char(10), '')) + 1
+                       <> COALESCE(fl.line_end, fl.line_start) - fl.line_start + 1
+                   AND NOT (substr(fl.excerpt, -1) = char(10)
+                            AND length(fl.excerpt) - length(replace(fl.excerpt, char(10), ''))
+                                = COALESCE(fl.line_end, fl.line_start) - fl.line_start + 1)
+                THEN 'excerpt does not cover its lines (past the end of the file?)'
+              WHEN rr.tag_name IS NULL THEN 'commit not tagged' END AS problem
+  FROM finding_locations fl
+  JOIN findings f ON f.id = fl.finding_id
+  JOIN reviews r ON r.id = f.review_id
+  LEFT JOIN review_repositories rr ON rr.review_id = f.review_id AND rr.repository_id = fl.repository_id
+) WHERE problem IS NOT NULL;
+
+-- Defects found during fix work (findings.discovered_in_step_id) that no plan step closes yet while their issue is
+-- still open (must be empty): a discovery goes through the same process as a review finding. A step closes it when
+-- it is linked (step_findings, step not dropped) to the finding itself or to another finding of the same issue.
+CREATE VIEW v_unplanned_discoveries AS
+SELECT p.code AS plan, s.number AS found_in_step, r.code AS review, f.point_id, i.code AS issue,
+       i.status AS issue_status, f.summary
+FROM findings f
+JOIN steps s ON s.id = f.discovered_in_step_id
+JOIN plans p ON p.id = s.plan_id
 JOIN reviews r ON r.id = f.review_id
-LEFT JOIN review_repositories rr ON rr.review_id = f.review_id AND rr.repository_id = fl.repository_id
-WHERE fl.commit_sha IS NULL OR (fl.line_start IS NULL AND fl.symbol IS NULL)
-   OR fl.excerpt IS NULL OR rr.tag_name IS NULL;
+LEFT JOIN issues i ON i.id = f.issue_id
+WHERE f.verification <> 'false'
+  AND (i.id IS NULL OR i.status IN ('open','needs-decision','planned','in-progress','regressed'))
+  AND NOT EXISTS (SELECT 1 FROM step_findings sf JOIN steps cs ON cs.id = sf.step_id
+                  WHERE sf.finding_id = f.id AND cs.status <> 'dropped')
+  AND NOT EXISTS (SELECT 1 FROM findings f2 JOIN step_findings sf ON sf.finding_id = f2.id
+                  JOIN steps cs ON cs.id = sf.step_id
+                  WHERE f.issue_id IS NOT NULL AND f2.issue_id = f.issue_id AND cs.status <> 'dropped');
 
 -- Fixed issues with no guard test, or whose guard test has disappeared.
 CREATE VIEW v_unguarded_fixes AS
@@ -1017,12 +2363,16 @@ FROM issues i
 WHERE i.status IN ('fixed','verified') AND i.kind NOT IN ('docs','design')
   AND NOT EXISTS (SELECT 1 FROM guard_tests g WHERE g.issue_id = i.id AND g.still_exists = 1);
 
--- Trend of each metric across reviews.
+-- Trend of each metric across reviews, with its label and direction from metric_defs (the unit falls back to the
+-- catalog's).
 CREATE VIEW v_metric_trends AS
 SELECT m.name, m.scope, COALESCE(rp.name, 'all') AS repository, r.code AS review,
-       r.started_at, m.value, m.unit, m.method
+       r.started_at, m.value, COALESCE(m.unit, md.unit) AS unit, m.method,
+       COALESCE(md.label, upper(substr(m.name, 1, 1)) || replace(substr(m.name, 2), '_', ' ')) AS label,
+       COALESCE(md.better, 'none') AS better
 FROM metrics m JOIN reviews r ON r.id = m.review_id
 LEFT JOIN repositories rp ON rp.id = m.repository_id
+LEFT JOIN metric_defs md ON md.name = m.name
 ORDER BY m.name, m.scope, r.started_at;
 
 -- Hotspot memory: files that keep producing issues.
@@ -1039,6 +2389,74 @@ SELECT d.code, d.question, d.answer, d.rationale, d.revisit_when, d.decided_at,
        (SELECT group_concat(i.code, ', ') FROM decision_issues di
           JOIN issues i ON i.id = di.issue_id WHERE di.decision_id = d.id) AS issues
 FROM decisions d WHERE d.status = 'decided';
+
+-- What a plan step closes: each finding it closes and that finding's issue with its status (Step 9 "its issues").
+CREATE VIEW v_step_issues AS
+SELECT p.code AS plan, s.number AS step, s.title AS step_title, s.status AS step_status,
+       r.code AS review, f.point_id, i.code AS issue, i.title AS issue_title, i.status AS issue_status
+FROM steps s
+JOIN plans p ON p.id = s.plan_id
+JOIN step_findings sf ON sf.step_id = s.id
+JOIN findings f ON f.id = sf.finding_id
+JOIN reviews r ON r.id = f.review_id
+LEFT JOIN issues i ON i.id = f.issue_id
+ORDER BY p.code, s.number, r.code, f.point_id;
+
+-- Steps still to do (in a plan that is not superseded or abandoned) whose issues are all closed already, e.g. by a
+-- review's check of 'fixed': mark the step done or dropped. Listed by `ledger.py gates`; not a must-be-empty check.
+CREATE VIEW v_stale_steps AS
+SELECT p.code AS plan, s.number AS step, s.title, s.status,
+       (SELECT group_concat(x.issue, ', ') FROM
+          (SELECT DISTINCT i.code || ' ' || i.status AS issue FROM step_findings sf
+             JOIN findings f ON f.id = sf.finding_id JOIN issues i ON i.id = f.issue_id
+            WHERE sf.step_id = s.id ORDER BY 1) x) AS issues
+FROM steps s JOIN plans p ON p.id = s.plan_id
+WHERE s.status NOT IN ('done','dropped')
+  AND p.status NOT IN ('superseded','abandoned')
+  AND EXISTS (SELECT 1 FROM step_findings sf WHERE sf.step_id = s.id)
+  AND NOT EXISTS (SELECT 1 FROM step_findings sf JOIN findings f ON f.id = sf.finding_id
+                  LEFT JOIN issues i ON i.id = f.issue_id
+                  WHERE sf.step_id = s.id
+                    AND (i.id IS NULL OR i.status NOT IN
+                         ('fixed','verified','accepted-risk','wont-fix','duplicate','obsolete')));
+
+-- Per repository, the commit the latest finished (handed-off) review looked at: the start of the next review's
+-- `git log <commit>..HEAD`.
+CREATE VIEW v_last_reviewed_commit AS
+SELECT rp.name AS repository, rp.path AS repo_path, r.code AS review, rr.commit_sha, rr.branch, rr.tag_name,
+       r.completed_at
+FROM repositories rp
+JOIN review_repositories rr ON rr.repository_id = rp.id
+JOIN reviews r ON r.id = rr.review_id
+WHERE r.id = (SELECT r2.id FROM review_repositories rr2 JOIN reviews r2 ON r2.id = rr2.review_id
+              WHERE rr2.repository_id = rp.id AND r2.status = 'handed-off'
+              ORDER BY COALESCE(r2.completed_at, r2.started_at) DESC, r2.id DESC LIMIT 1)
+ORDER BY rp.name;
+
+-- The requirement trace of each review: every verdict, with the count of that verdict in that review.
+CREATE VIEW v_requirement_trace AS
+SELECT r.code AS review, q.code AS requirement, q.text, c.verdict, c.where_implemented, c.tested,
+       f.point_id, c.evidence,
+       (SELECT count(*) FROM review_requirement_checks c2
+         WHERE c2.review_id = c.review_id AND c2.verdict = c.verdict) AS verdict_count
+FROM review_requirement_checks c
+JOIN reviews r ON r.id = c.review_id
+JOIN requirements q ON q.id = c.requirement_id
+LEFT JOIN findings f ON f.id = c.finding_id
+ORDER BY r.code, q.code;
+
+-- Every agent that worked on a review: its manager, each reviewer run's agent and the agents in review_actors.
+CREATE VIEW v_review_agents AS
+SELECT r.code AS review, x.role, a.id AS actor_id, a.kind, a.name, a.model, a.harness, a.session_ref,
+       pa.name AS parent
+FROM (SELECT id AS review_id, manager_actor_id AS actor_id, 'manager' AS role FROM reviews
+       WHERE manager_actor_id IS NOT NULL
+      UNION SELECT review_id, actor_id, label FROM reviewer_runs
+      UNION SELECT review_id, actor_id, role_label FROM review_actors) x
+JOIN reviews r ON r.id = x.review_id
+JOIN actors a ON a.id = x.actor_id
+LEFT JOIN actors pa ON pa.id = a.parent_actor_id
+ORDER BY r.code, CASE a.kind WHEN 'manager' THEN 0 WHEN 'reviewer' THEN 1 ELSE 2 END, x.role, a.id;
 
 -- ---------- Catalog seed (extend with custom domains/themes as needed) ---
 
@@ -1089,9 +2507,71 @@ INSERT INTO themes(code, name) VALUES
  ('docs-repo','Repo developer docs'),('docs-user','End-user docs'),('handover','Handover and ownership'),
  ('localization','Localization'),('verify','Verify'),('other','Other');
 
-INSERT INTO meta(key, value) VALUES ('schema_version','2');
+-- Each domain's one-line "applies when" sentence from SKILL.md's domain catalog.
+WITH applies(code, text) AS (VALUES
+ ('spec','Applies whenever there are stated requirements anywhere.'),
+ ('tests','Almost always applies.'),
+ ('test-quality','Applies when there is a meaningful test suite.'),
+ ('time-concurrency','Applies to anything with dates, schedules, deadlines, expiries, or more than one writer.'),
+ ('resilience','Applies whenever there are external calls, jobs, or multi-step writes.'),
+ ('compatibility','Applies whenever there is stored data, saved settings, public APIs, or deployed clients.'),
+ ('decision-placement','Applies when the system has business rules.'),
+ ('contracts','Applies when there is more than one component.'),
+ ('server','Applies when there is a server.'),
+ ('database','Applies when there is a database.'),
+ ('client-api','Applies when a client talks to a backend.'),
+ ('abstraction','Almost always applies.'),
+ ('hotspots','Applies when there is git history worth mining (a few months or more).'),
+ ('ui','Applies when there are screens.'),
+ ('walkthroughs','Applies when users complete multi-step tasks.'),
+ ('notifications','Applies when the system sends email, SMS, push or calendar feeds.'),
+ ('localization','Applies only if other languages, regions or conventions are plausible.'),
+ ('security','Almost always applies.'),
+ ('privacy','Applies whenever personal data is handled.'),
+ ('logging','Almost always applies.'),
+ ('operations','Applies when the system is deployed.'),
+ ('dependencies','Almost always applies.'),
+ ('performance','Applies when speed or scale matters to users or cost.'),
+ ('cost','Applies when the system runs on paid infrastructure or services.'),
+ ('docs-developer','Almost always applies.'),
+ ('docs-user','Applies when the system has users other than its developers.'),
+ ('handover','Applies whenever someone other than the current author may need to run or change the system.'))
+UPDATE domains SET description = (SELECT text FROM applies WHERE applies.code = domains.code)
+ WHERE description IS NULL AND code IN (SELECT code FROM applies);
+
+-- The metric names the domains ask for (keep names stable between reviews so they trend).
+INSERT OR IGNORE INTO metric_defs(name, label, unit, better) VALUES
+ ('mutation_score','Mutation score','%','higher'),
+ ('line_coverage','Line coverage','%','higher'),
+ ('branch_coverage','Branch coverage','%','higher'),
+ ('test_cases_asserted','Test cases asserted','cases','higher'),
+ ('test_cases_needed','Test cases needed','cases','none'),
+ ('tests_missing_named','Missing tests named','tests','lower'),
+ ('flaky_tests','Flaky tests','tests','lower'),
+ ('test_suite_seconds','Test suite run time','s','lower'),
+ ('page_weight','Page weight','KB','lower'),
+ ('queries_per_page','Queries per page','queries','lower'),
+ ('p95_job_ms','Job time, 95th percentile','ms','lower'),
+ ('dependency_count','Dependencies','packages','lower'),
+ ('vulnerable_dependencies','Dependencies with known vulnerabilities','packages','lower');
+
+-- The checks `ledger.py check` runs (see ledger_checks).
+INSERT OR IGNORE INTO ledger_checks(view, label, tier, position) VALUES
+ ('v_unmatched_findings','Findings not matched to an issue','error',10),
+ ('v_unchecked_known_issues','Known issues in a domain that ran, with no check recorded','error',20),
+ ('v_untraceable_refs','Code references that cannot be traced to exact lines','error',30),
+ ('v_uncovered_findings','Findings no step of their plan closes','error',40),
+ ('v_coverage_problems','Steps closing nothing, or findings closed twice without a reason','error',50),
+ ('v_unguarded_fixes','Fixed issues with no guard test, or whose guard test is gone','warning',100);
+
+INSERT INTO ledger_checks(view, label, tier, position) VALUES
+ ('v_unplanned_discoveries','Defects found during fix work that no plan step closes','error',60);
+INSERT INTO meta(key, value) VALUES ('schema_version','5');
 INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger schema'),
-  (2, 'url, path, hash and code checks; repositories.allow_outside_root; finding_locations.excerpt_redacted');
+  (2, 'url, path, hash and code checks; repositories.allow_outside_root; finding_locations.excerpt_redacted'),
+  (3, 'integrity rules: codes, hashes, checks, append-only history, owner actor on gate answers'),
+  (4, 'check registry, requirement trace, review agents, metric catalog, domain descriptions, foreign-key indexes'),
+  (5, 'one UTC time format; whole-file and not-text references; report, plan narrative and fix-time discoveries');
 """
 PAGE = r"""<!doctype html>
 <html lang="en">
@@ -1164,6 +2644,7 @@ dl.kv dt{color:var(--muted);font-size:13px}dl.kv dd{margin:0;overflow-wrap:anywh
 .code td.ln{color:var(--muted);text-align:right;user-select:none;width:1%}
 .code tr.hit td{background:var(--warn-soft)}
 .note{font-size:13px;color:var(--muted)}
+.mdtext{white-space:pre-wrap;overflow-wrap:anywhere;max-height:480px;overflow:auto;font-size:14px}
 .status{padding:10px 12px;border-radius:6px;background:var(--accent-soft);color:var(--accent)}
 .status.err{background:var(--crit-soft);color:var(--crit)}
 .cols{display:grid;grid-template-columns:270px minmax(0,1fr);gap:24px;align-items:start}
@@ -1258,7 +2739,7 @@ const L = {
   scope:{full:"Full review",partial:"Partial review",targeted:"Targeted review",second:"Second review","fix-verification":"Fix check"},
   step:{"not-started":"Not started",doing:"In progress","waiting-owner":"Waiting on you",done:"Done",dropped:"Dropped"},
   need:{none:"",decision:"Your decision",confirm:"Your confirmation",review:"Your review",production:"Production action"},
-  gate:{"domain-approval":"Approve review domains","plan-approval":"Approve fix plan",decision:"Decision","step-input":"Input on a step","confirm-false-finding":"Confirm a false finding","accept-risk":"Accept a risk","production-action":"Production action","review-handoff":"Review hand-off",other:"Question"},
+  gate:{"domain-approval":"Approve review domains","plan-approval":"Approve fix plan",decision:"Decision","step-input":"Input on a step","confirm-false-finding":"Confirm a false finding","accept-risk":"Accept a risk","production-action":"Production action","review-handoff":"Review hand-off",confirm:"Confirm",other:"Question"},
   gstat:{open:"Waiting on you",answered:"Answered, waiting for the agent",applied:"Done",withdrawn:"Withdrawn"},
   rel:{"duplicate-of":"Duplicate of","continuation-of":"Continues","regression-of":"Regression of","related-to":"Related to","caused-by":"Caused by",blocks:"Blocks",supersedes:"Supersedes","split-from":"Split from","merged-into":"Merged into"},
   relIn:{"duplicate-of":"Has duplicate","continuation-of":"Continued by","regression-of":"Came back as","related-to":"Related to","caused-by":"Causes",blocks:"Blocked by",supersedes:"Superseded by","split-from":"Split into","merged-into":"Absorbed"},
@@ -1451,6 +2932,7 @@ VIEWS.reviews = async () => {
           list, r => go("#/review/" + r.code)));
 };
 
+const REQ_VERDICT = {matches:"matches", differs:"differs", partly:"partly matches", missing:"missing", untested:"not tested"};
 VIEWS.review = async ([code]) => {
   const d = await api("review/" + encodeURIComponent(code)); const r = d.review;
   const fs = d.findings;
@@ -1473,12 +2955,13 @@ VIEWS.review = async ([code]) => {
     h("h1", null, `${r.code} · ${r.title}`),
     h("p", {class:"lede"}, `${lab("scope", r.scope)} · ${lab("review", r.status)} · started ${when(r.started_at)}` + (r.completed_at ? ` · finished ${when(r.completed_at)}` : "")),
     h("div", {class:"facts"}, h("div", null, h("b", null, fs.length), h("span", null, "points")), ["H","M","L","T"].map(s => h("div", null, h("b", null, sumBy(s)), h("span", null, lab("sev", s)))),
-      h("div", null, h("b", null, fs.filter(f => f.match_type === "new").length), h("span", null, "new issues")),
+      h("div", null, h("b", null, fs.filter(f => ["new","continuation"].includes(f.match_type)).length), h("span", null, "new issues")),
       h("div", null, h("b", null, fs.filter(f => ["recurrence","regression"].includes(f.match_type)).length), h("span", null, "came back"))),
     d.gates.length ? h("div", {class:"card"}, h("h2", null, "Questions asked during this review"), table([{label:"About", get:g => lab("gate", g.kind)}, {label:"Title", key:"title"}, {label:"Status", get:g => lab("gstat", g.status)}, {label:"Answer", get:g => [g.answer_value || "", " ", g.answer_text || ""]}], d.gates, () => go("#/inbox"))) : null,
     h("div", {class:"card"}, kv([["Verdict", r.verdict], ["Summary", r.summary], ["What was asked", r.request_text], ["Run by", r.manager ? `${r.manager}${r.manager_model ? " (" + r.manager_model + ")" : ""}` : null],
       ["Domains approved by", r.approved_by ? `${r.approved_by}, ${when(r.approved_at)}` : null], ["Follows", r.previous_code ? h("a", {href:"#/review/" + r.previous_code}, r.previous_code) : null],
       ["Write-up", r.summary_doc_url ? extLink(r.summary_doc_url, "Open the review document") : null]])),
+    r.report_md ? h("div", {class:"card"}, h("h2", null, "The review document"), h("div", {class:"mdtext"}, r.report_md)) : null,
     h("h3", null, "Code reviewed"),
     table([{label:"Repository", key:"name"}, {label:"Branch", key:"branch"}, {label:"Commit", get:x => [h("code", null, short(x.commit_sha)), " ", copyBtn(x.commit_sha, "Copy")]},
            {label:"Commit message", key:"commit_subject"}, {label:"Kept by tag", get:x => x.tag_name ? x.tag_name + (x.tag_pushed ? "" : " (not pushed)") : "Not tagged"},
@@ -1490,10 +2973,16 @@ VIEWS.review = async ([code]) => {
     h("h3", null, "Reviewers"),
     table([{label:"Reviewer", key:"label"}, {label:"Area", get:x => domainName(x.domain_code)}, {label:"Agent", get:x => x.model ? `${x.actor} (${x.model})` : x.actor},
            {label:"Status", get:x => lab("run", x.status)}, {label:"Items", key:"items_reviewed", num:1}, {label:"High", key:"high_count", num:1}, {label:"Medium", key:"medium_count", num:1}, {label:"Low", key:"low_count", num:1}], d.runs),
+    d.agents.length ? [h("h3", null, "Agents"),
+      table([{label:"Agent", key:"name"}, {label:"Did", key:"role"}, {label:"Kind", get:x => words(x.kind)}, {label:"Model", key:"model"}, {label:"Run in", key:"harness"}, {label:"Started by", key:"parent"}], d.agents)] : null,
+    d.requirements.length ? [h("h3", null, "Requirements"),
+      h("p", {class:"note"}, [...new Map(d.requirements.map(x => [x.verdict, x.verdict_count]))].map(([v, n]) => `${n} ${REQ_VERDICT[v] || words(v)}`).join(" · ")),
+      table([{label:"Requirement", key:"requirement"}, {label:"Says", key:"text"}, {label:"Found", get:x => REQ_VERDICT[x.verdict] || words(x.verdict)}, {label:"Where", key:"where_implemented"},
+             {label:"Tested", get:x => words(x.tested)}, {label:"Point", key:"point_id"}, {label:"Evidence", key:"evidence"}], d.requirements)] : null,
     d.checks.length ? [h("h3", null, "Earlier issues this review looked for"),
       table([{label:"Issue", key:"issue_code"}, {label:"Title", key:"title"}, {label:"Found", get:x => lab("check", x.outcome)}, {label:"Evidence", key:"evidence"}, {label:"Now", get:x => issueTag(x.status)}],
             d.checks, x => go("#/issue/" + x.issue_code))] : null,
-    d.metrics.length ? [h("h3", null, "Measurements"), table([{label:"Measure", get:m => words(m.name)}, {label:"Of", key:"scope"}, {label:"Value", get:m => `${m.value}${m.unit ? " " + m.unit : ""}`, num:1}, {label:"How", get:m => words(m.method)}, {label:"Note", key:"note"}], d.metrics)] : null,
+    d.metrics.length ? [h("h3", null, "Measurements"), table([{label:"Measure", get:m => m.label || words(m.name)}, {label:"Of", key:"scope"}, {label:"Value", get:m => `${m.value}${m.unit ? " " + m.unit : ""}`, num:1}, {label:"How", get:m => words(m.method)}, {label:"Note", key:"note"}], d.metrics)] : null,
     h("h3", null, "Points raised"),
     h("div", {class:"tools"}, q, fd, fsv, fm, fv), listBox);
   draw();
@@ -1524,6 +3013,8 @@ VIEWS.issues = async (_, params) => {
 
 VIEWS.issue = async ([code]) => {
   const d = await api("issue/" + encodeURIComponent(code)); const i = d.issue;
+  const cont = d.relations.find(x => x.dir === "out" && x.relation === "continuation-of");
+  const continues = "Raised as a new issue that continues " + (cont ? cont.other : "an earlier issue");
   setView(
     h("h1", null, `${i.code} · ${i.title}`),
     h("div", null, sevTag(i.severity), issueTag(i.status), h("span", {class:"tag"}, domainName(i.domain_code)), i.theme_code ? h("span", {class:"tag"}, themeName(i.theme_code)) : null),
@@ -1547,7 +3038,7 @@ VIEWS.issue = async ([code]) => {
     h("h3", null, "History"),
     d.timeline.length ? h("div", {class:"timeline"}, d.timeline.map(e => h("div", null, h("b", null, when(e.at)), " — ",
       e.event === "status-changed" ? `${lab("issue", e.from_value)} → ${lab("issue", e.to_value)}` : e.event === "severity-changed" ? `Severity ${lab("sev", e.from_value)} → ${lab("sev", e.to_value)}`
-      : e.event === "seen" ? (e.to_value === "new" ? "Raised as a new issue" : `Raised again (${lab("match", e.to_value)})`) : e.event === "opened" ? "Opened" : words(e.event),
+      : e.event === "seen" ? (e.to_value === "new" ? "Raised as a new issue" : e.to_value === "continuation" ? continues : `Raised again (${lab("match", e.to_value)})`) : e.event === "opened" ? "Opened" : words(e.event),
       e.review ? ` · ${e.review}` : "", e.step ? ` · step ${e.step}` : "", e.commit_sha ? [" · ", h("code", null, short(e.commit_sha))] : "", e.actor ? ` · ${e.actor}` : "",
       e.note ? h("div", {class:"note", style:"padding:0;border:0"}, e.note) : null))) : empty("No history recorded."));
 };
@@ -1608,6 +3099,7 @@ VIEWS.plan = async ([code, , phaseArg]) => {
     h("div", {class:"facts"}, h("div", null, h("b", null, steps.length), h("span", null, "steps")), h("div", null, h("b", null, phases.length), h("span", null, "phases")),
       h("div", null, h("b", null, new Set(steps.flatMap(s => s.closes.map(c => c.review + c.point_id))).size), h("span", null, "points closed"))),
     progressBar(count("done"), count("doing"), count("waiting-owner"), steps.length),
+    pl.narrative_md ? h("div", {class:"card"}, h("h2", null, "About this plan"), h("div", {class:"mdtext"}, pl.narrative_md)) : null,
     h("div", {class:"tools"}, q, f), h("div", {class:"cols"}, nav, main));
   draw();
 };
@@ -1639,7 +3131,8 @@ VIEWS.trends = async () => {
            {label:"New", key:"new_issues", num:1}, {label:"Carried over", key:"carried_over", num:1}, {label:"Came back", key:"came_back", num:1}, {label:"False", key:"false_findings", num:1}], d.reviews, r => go("#/review/" + r.review)),
     h("h3", null, "Measurements"),
     Object.keys(groups).length ? h("div", {class:"grid2"}, Object.entries(groups).map(([k, pts]) => { const [n, sc, repo] = k.split("|");
-      return h("div", {class:"card"}, h("b", null, words(n)), h("div", {class:"note"}, [sc !== "all" ? sc : "", repo !== "all" ? repo : ""].filter(Boolean).join(" · ") || "Whole system"), lineChart(pts, pts[0].unit)); }))
+      const better = {higher:"higher is better", lower:"lower is better"}[pts[0].better];
+      return h("div", {class:"card"}, h("b", null, pts[0].label || words(n)), h("div", {class:"note"}, [[sc !== "all" ? sc : "", repo !== "all" ? repo : ""].filter(Boolean).join(" · ") || "Whole system", better].filter(Boolean).join(" · ")), lineChart(pts, pts[0].unit)); }))
       : empty("No measurements recorded yet."),
     h("h3", null, "Issues that keep coming back"),
     table([{label:"Issue", key:"code"}, {label:"Title", key:"title"}, {label:"Severity", get:i => sevTag(i.severity)}, {label:"Status", get:i => issueTag(i.status)}, {label:"Reviews", key:"times_seen", num:1}, {label:"Came back after a fix", key:"regressions", num:1}, {label:"Raised in", key:"reviews"}],
@@ -1867,6 +3360,691 @@ INSERT INTO step_commits_new(id, step_id, repository_id, commit_sha, branch, pr_
   SELECT id, step_id, repository_id, commit_sha, branch, pr_url, summary, committed_at FROM step_commits;
 DROP TABLE step_commits;
 ALTER TABLE step_commits_new RENAME TO step_commits;
+-- migration: 0003-integrity.sql
+-- integrity rules: codes, hashes, checks, append-only history, owner actor on gate answers
+-- Plan P-0001 steps 54-64, 70-74, 79-83. Fourteen tables are rebuilt with SQLite's recipe (create <table>_new,
+-- copy the rows, drop the old table, rename the new one, re-create its indexes) to add CHECKs and NOT NULLs:
+-- code formats, full lowercase commit hashes on every commit column, issue domain and kind required,
+-- times_seen >= 1, non-negative run counts, a match type only with its issue, no line_end without line_start,
+-- answerable gates with an array of options, answered gates with an answer and applied gates with a note,
+-- decided decisions with an answer, consistent supersede columns, approved reviews and plans with approved_at.
+-- New columns: reviews/plans change_actor_id and change_note, gates answered_by_actor_id and change_actor_id,
+-- steps change_note. A row that breaks a new rule makes this migration fail and change nothing; the error
+-- names the rule (fix the row, then run migrate again). The rules that triggers enforce (sequence of codes,
+-- transitions, append-only history, events) are in references/schema.sql: migrate re-creates every trigger.
+
+CREATE TABLE design_goals_new (
+  id            INTEGER PRIMARY KEY,
+  code          TEXT NOT NULL UNIQUE
+                  CHECK (code GLOB 'G-[0-9][0-9]*' AND code NOT GLOB 'G-*[^0-9]*'),
+  text          TEXT NOT NULL,
+  source        TEXT,
+  adopted_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  retired_at    TEXT,
+  superseded_by INTEGER REFERENCES design_goals(id),
+  CHECK (superseded_by IS NULL OR retired_at IS NOT NULL)
+);
+INSERT INTO design_goals_new(id, code, text, source, adopted_at, retired_at, superseded_by)
+  SELECT id, code, text, source, adopted_at, retired_at, superseded_by FROM design_goals;
+DROP TABLE design_goals;
+ALTER TABLE design_goals_new RENAME TO design_goals;
+
+CREATE TABLE reviews_new (
+  id                    INTEGER PRIMARY KEY,
+  code                  TEXT NOT NULL UNIQUE
+                          CHECK (code GLOB 'R-[0-9][0-9][0-9][0-9]*' AND code NOT GLOB 'R-*[^0-9]*'),
+  title                 TEXT NOT NULL,
+  scope                 TEXT NOT NULL CHECK (scope IN
+                          ('full','partial','targeted','second','fix-verification')),
+  status                TEXT NOT NULL DEFAULT 'planning' CHECK (status IN
+                          ('planning','awaiting-approval','approved','running','verifying',
+                           'indexing','consolidating','handed-off','abandoned'))
+                          CHECK (status IN ('planning','awaiting-approval','abandoned') OR approved_at IS NOT NULL),
+  request_text          TEXT,
+  requested_by_actor_id INTEGER REFERENCES actors(id),
+  manager_actor_id      INTEGER REFERENCES actors(id),
+  approved_by_actor_id  INTEGER REFERENCES actors(id),
+  approved_at           TEXT,
+  previous_review_id    INTEGER REFERENCES reviews(id),
+  skill_version         TEXT,
+  review_folder         TEXT,
+  summary_doc_url       TEXT CHECK (summary_doc_url IS NULL OR summary_doc_url GLOB 'https://*'
+                                    OR summary_doc_url GLOB 'http://*'),
+  verdict               TEXT,
+  summary               TEXT,
+  started_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  completed_at          TEXT CHECK (completed_at IS NULL OR julianday(started_at) <= julianday(completed_at)),
+  updated_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  change_actor_id       INTEGER REFERENCES actors(id),
+  change_note           TEXT
+);
+INSERT INTO reviews_new(id, code, title, scope, status, request_text, requested_by_actor_id, manager_actor_id, approved_by_actor_id, approved_at, previous_review_id, skill_version, review_folder, summary_doc_url, verdict, summary, started_at, completed_at, updated_at)
+  SELECT id, code, title, scope, status, request_text, requested_by_actor_id, manager_actor_id, approved_by_actor_id, approved_at, previous_review_id, skill_version, review_folder, summary_doc_url, verdict, summary, started_at, completed_at, updated_at FROM reviews;
+DROP TABLE reviews;
+ALTER TABLE reviews_new RENAME TO reviews;
+
+CREATE TABLE reviewer_runs_new (
+  id             INTEGER PRIMARY KEY,
+  review_id      INTEGER NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
+  domain_code    TEXT NOT NULL REFERENCES domains(code),
+  actor_id       INTEGER NOT NULL REFERENCES actors(id),
+  label          TEXT NOT NULL,
+  scope          TEXT NOT NULL,
+  prompt         TEXT,
+  report_path    TEXT,
+  report_sha256  TEXT,
+  status         TEXT NOT NULL DEFAULT 'queued' CHECK (status IN
+                   ('queued','running','finished','failed','cancelled')),
+  items_reviewed INTEGER CHECK (items_reviewed IS NULL OR items_reviewed >= 0),
+  high_count     INTEGER CHECK (high_count IS NULL OR high_count >= 0),
+  medium_count   INTEGER CHECK (medium_count IS NULL OR medium_count >= 0),
+  low_count      INTEGER CHECK (low_count IS NULL OR low_count >= 0),
+  test_count     INTEGER CHECK (test_count IS NULL OR test_count >= 0),
+  final_message  TEXT,
+  started_at     TEXT,
+  finished_at    TEXT,
+  UNIQUE (review_id, label)
+);
+INSERT INTO reviewer_runs_new(id, review_id, domain_code, actor_id, label, scope, prompt, report_path, report_sha256, status, items_reviewed, high_count, medium_count, low_count, test_count, final_message, started_at, finished_at)
+  SELECT id, review_id, domain_code, actor_id, label, scope, prompt, report_path, report_sha256, status, items_reviewed, high_count, medium_count, low_count, test_count, final_message, started_at, finished_at FROM reviewer_runs;
+DROP TABLE reviewer_runs;
+ALTER TABLE reviewer_runs_new RENAME TO reviewer_runs;
+CREATE INDEX ix_runs_review          ON reviewer_runs(review_id);
+
+CREATE TABLE requirements_new (
+  id              INTEGER PRIMARY KEY,
+  code            TEXT NOT NULL UNIQUE
+                    CHECK (code GLOB 'REQ-[0-9][0-9][0-9][0-9]*' AND code NOT GLOB 'REQ-*[^0-9]*'),
+  text            TEXT NOT NULL,
+  source          TEXT NOT NULL,
+  source_location TEXT,
+  stated_at       TEXT,
+  status          TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','superseded','withdrawn')),
+  superseded_by   INTEGER REFERENCES requirements(id)
+                    CHECK ((status = 'superseded') = (superseded_by IS NOT NULL)),
+  first_review_id INTEGER REFERENCES reviews(id),
+  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+INSERT INTO requirements_new(id, code, text, source, source_location, stated_at, status, superseded_by, first_review_id, created_at)
+  SELECT id, code, text, source, source_location, stated_at, status, superseded_by, first_review_id, created_at FROM requirements;
+DROP TABLE requirements;
+ALTER TABLE requirements_new RENAME TO requirements;
+
+CREATE TABLE issues_new (
+  id                     INTEGER PRIMARY KEY,
+  code                   TEXT NOT NULL UNIQUE
+                           CHECK (code GLOB 'ISS-[0-9][0-9][0-9][0-9]*' AND code NOT GLOB 'ISS-*[^0-9]*'),
+  title                  TEXT NOT NULL,
+  domain_code            TEXT NOT NULL REFERENCES domains(code),
+  theme_code             TEXT REFERENCES themes(code),
+  sub                    TEXT,
+  kind                   TEXT NOT NULL CHECK (kind IN
+                           ('defect','test','validation','refactor','feature','design','docs',
+                            'logging','perf','security','ops','verify')),
+  severity               TEXT NOT NULL CHECK (severity IN ('H','M','L','T')),
+  status                 TEXT NOT NULL DEFAULT 'open' CHECK (status IN
+                           ('open','needs-decision','planned','in-progress','fixed','verified',
+                            'regressed','accepted-risk','wont-fix','duplicate','obsolete')),
+  fingerprint            TEXT,
+  before_state           TEXT,
+  current_state          TEXT,
+  after_state            TEXT,
+  recommendation         TEXT,
+  resolution             TEXT,
+  first_seen_review_id   INTEGER NOT NULL REFERENCES reviews(id),
+  last_seen_review_id    INTEGER REFERENCES reviews(id),
+  last_checked_review_id INTEGER REFERENCES reviews(id),
+  times_seen             INTEGER NOT NULL DEFAULT 1 CHECK (times_seen >= 1),
+  opened_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  resolved_at            TEXT,
+  verified_at            TEXT,
+  updated_at             TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  change_actor_id        INTEGER REFERENCES actors(id),
+  change_review_id       INTEGER REFERENCES reviews(id),
+  change_step_id         INTEGER REFERENCES steps(id),
+  change_commit_sha      TEXT CHECK (change_commit_sha IS NULL OR ((length(change_commit_sha) = 40
+                                     OR length(change_commit_sha) = 64) AND change_commit_sha NOT GLOB '*[^0-9a-f]*')),
+  change_note            TEXT
+);
+INSERT INTO issues_new(id, code, title, domain_code, theme_code, sub, kind, severity, status, fingerprint, before_state, current_state, after_state, recommendation, resolution, first_seen_review_id, last_seen_review_id, last_checked_review_id, times_seen, opened_at, resolved_at, verified_at, updated_at, change_actor_id, change_review_id, change_step_id, change_commit_sha, change_note)
+  SELECT id, code, title, domain_code, theme_code, sub, kind, severity, status, fingerprint, before_state, current_state, after_state, recommendation, resolution, first_seen_review_id, last_seen_review_id, last_checked_review_id, times_seen, opened_at, resolved_at, verified_at, updated_at, change_actor_id, change_review_id, change_step_id, change_commit_sha, change_note FROM issues;
+DROP TABLE issues;
+ALTER TABLE issues_new RENAME TO issues;
+CREATE INDEX ix_issues_fingerprint   ON issues(fingerprint);
+CREATE INDEX ix_issues_slug          ON issues(domain_code, theme_code, sub);
+CREATE INDEX ix_issues_status        ON issues(status);
+
+CREATE TABLE findings_new (
+  id                   INTEGER PRIMARY KEY,
+  review_id            INTEGER NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
+  reviewer_run_id      INTEGER REFERENCES reviewer_runs(id),
+  point_id             TEXT NOT NULL,
+  issue_id             INTEGER REFERENCES issues(id),
+  match_type           TEXT CHECK (match_type IN
+                         ('new','still-present','changed','recurrence','regression','continuation'))
+                         CHECK (match_type IS NULL OR issue_id IS NOT NULL),
+  match_confidence     TEXT CHECK (match_confidence IN ('certain','likely','possible')),
+  match_rationale      TEXT,
+  severity             TEXT NOT NULL CHECK (severity IN ('H','M','L','T')),
+  kind                 TEXT NOT NULL CHECK (kind IN
+                         ('defect','test','validation','refactor','feature','design','docs',
+                          'logging','perf','security','ops','verify')),
+  domain_code          TEXT NOT NULL REFERENCES domains(code),
+  theme_code           TEXT REFERENCES themes(code),
+  sub                  TEXT NOT NULL,
+  summary              TEXT NOT NULL,
+  detail               TEXT,
+  before_state         TEXT,
+  recommendation       TEXT,
+  recommended_test     TEXT,
+  evidence             TEXT,
+  where_report         TEXT,
+  fingerprint          TEXT,
+  related_point_ids    TEXT CHECK (related_point_ids IS NULL OR json_valid(related_point_ids)),
+  verification         TEXT NOT NULL DEFAULT 'unverified' CHECK (verification IN
+                         ('unverified','confirmed','partly','false','not-checkable')),
+  verified_by_actor_id INTEGER REFERENCES actors(id),
+  verified_at          TEXT,
+  verification_note    TEXT,
+  created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  UNIQUE (review_id, point_id)
+);
+INSERT INTO findings_new(id, review_id, reviewer_run_id, point_id, issue_id, match_type, match_confidence, match_rationale, severity, kind, domain_code, theme_code, sub, summary, detail, before_state, recommendation, recommended_test, evidence, where_report, fingerprint, related_point_ids, verification, verified_by_actor_id, verified_at, verification_note, created_at)
+  SELECT id, review_id, reviewer_run_id, point_id, issue_id, match_type, match_confidence, match_rationale, severity, kind, domain_code, theme_code, sub, summary, detail, before_state, recommendation, recommended_test, evidence, where_report, fingerprint, related_point_ids, verification, verified_by_actor_id, verified_at, verification_note, created_at FROM findings;
+DROP TABLE findings;
+ALTER TABLE findings_new RENAME TO findings;
+CREATE INDEX ix_findings_fingerprint ON findings(fingerprint);
+CREATE INDEX ix_findings_issue       ON findings(issue_id);
+CREATE INDEX ix_findings_review      ON findings(review_id);
+CREATE INDEX ix_findings_slug        ON findings(domain_code, theme_code, sub);
+
+CREATE TABLE finding_locations_new (
+  id             INTEGER PRIMARY KEY,
+  finding_id     INTEGER NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
+  repository_id  INTEGER NOT NULL REFERENCES repositories(id),
+  commit_sha     TEXT CHECK (commit_sha IS NULL OR ((length(commit_sha) = 40 OR length(commit_sha) = 64)
+                                                    AND commit_sha NOT GLOB '*[^0-9a-f]*')),
+  path           TEXT NOT NULL,
+  line_start     INTEGER CHECK (line_start IS NULL OR line_start >= 1),
+  line_end       INTEGER CHECK (line_end IS NULL OR line_start IS NOT NULL),
+  symbol         TEXT,
+  blob_sha       TEXT,
+  excerpt        TEXT,
+  excerpt_sha256 TEXT,
+  permalink      TEXT CHECK (permalink IS NULL OR permalink GLOB 'https://*' OR permalink GLOB 'http://*'),
+  role           TEXT NOT NULL DEFAULT 'primary' CHECK (role IN ('primary','also','test','doc','config')),
+  excerpt_redacted INTEGER NOT NULL DEFAULT 0 CHECK (excerpt_redacted IN (0,1)),
+  CHECK (line_end IS NULL OR line_start IS NULL OR line_end >= line_start),
+  CHECK (length(path) > 0 AND path NOT GLOB '/*' AND path NOT GLOB '-*' AND path NOT GLOB '*\*'
+         AND path <> '..' AND path NOT GLOB '../*' AND path NOT GLOB '*/../*' AND path NOT GLOB '*/..'
+         AND (path NOT GLOB '*[' || char(1) || '-' || char(31) || char(127) || ']*'))
+);
+INSERT INTO finding_locations_new(id, finding_id, repository_id, commit_sha, path, line_start, line_end, symbol, blob_sha, excerpt, excerpt_sha256, permalink, role, excerpt_redacted)
+  SELECT id, finding_id, repository_id, commit_sha, path, line_start, line_end, symbol, blob_sha, excerpt, excerpt_sha256, permalink, role, excerpt_redacted FROM finding_locations;
+DROP TABLE finding_locations;
+ALTER TABLE finding_locations_new RENAME TO finding_locations;
+CREATE INDEX ix_locations_finding    ON finding_locations(finding_id);
+CREATE INDEX ix_locations_path       ON finding_locations(path, symbol);
+
+CREATE TABLE decisions_new (
+  id                  INTEGER PRIMARY KEY,
+  code                TEXT NOT NULL UNIQUE
+                        CHECK (code GLOB 'D-[0-9][0-9][0-9][0-9]*' AND code NOT GLOB 'D-*[^0-9]*'),
+  question            TEXT NOT NULL,
+  options             TEXT CHECK (options IS NULL OR json_valid(options)),
+  answer              TEXT,
+  rationale           TEXT,
+  status              TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','decided','revisit'))
+                        CHECK (status <> 'decided' OR answer IS NOT NULL),
+  revisit_when        TEXT,
+  review_id           INTEGER REFERENCES reviews(id),
+  step_id             INTEGER REFERENCES steps(id),
+  asked_by_actor_id   INTEGER REFERENCES actors(id),
+  decided_by_actor_id INTEGER REFERENCES actors(id),
+  asked_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  decided_at          TEXT
+);
+INSERT INTO decisions_new(id, code, question, options, answer, rationale, status, revisit_when, review_id, step_id, asked_by_actor_id, decided_by_actor_id, asked_at, decided_at)
+  SELECT id, code, question, options, answer, rationale, status, revisit_when, review_id, step_id, asked_by_actor_id, decided_by_actor_id, asked_at, decided_at FROM decisions;
+DROP TABLE decisions;
+ALTER TABLE decisions_new RENAME TO decisions;
+
+CREATE TABLE gates_new (
+  id              INTEGER PRIMARY KEY,
+  code            TEXT NOT NULL UNIQUE
+                    CHECK (code GLOB 'GATE-[0-9][0-9][0-9][0-9]*' AND code NOT GLOB 'GATE-*[^0-9]*'),
+  kind            TEXT NOT NULL CHECK (kind IN
+                    ('domain-approval','plan-approval','decision','step-input',
+                     'confirm-false-finding','accept-risk','production-action',
+                     'review-handoff','confirm','other')),
+  title           TEXT NOT NULL,
+  question        TEXT NOT NULL,
+  context         TEXT,
+  options         TEXT CHECK (options IS NULL OR json_valid(options))
+                    CHECK (options IS NULL OR json_type(options) = 'array'),
+  allow_text      INTEGER NOT NULL DEFAULT 1 CHECK (allow_text IN (0,1))
+                    CHECK (allow_text = 1 OR (options IS NOT NULL AND json_array_length(options) > 0)),
+  blocking        INTEGER NOT NULL DEFAULT 1 CHECK (blocking IN (0,1)),
+  status          TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','answered','applied','withdrawn'))
+                    CHECK (status <> 'answered' OR answer_value IS NOT NULL OR answer_text IS NOT NULL)
+                    CHECK (status <> 'applied' OR applied_note IS NOT NULL),
+  answer_value    TEXT,
+  answer_text     TEXT,
+  answered_by     TEXT,
+  answered_via    TEXT CHECK (answered_via IS NULL OR answered_via IN ('chat','viewer','other')),
+  answered_at     TEXT,
+  applied_note    TEXT,
+  applied_at      TEXT,
+  review_id       INTEGER REFERENCES reviews(id),
+  plan_id         INTEGER REFERENCES plans(id),
+  step_id         INTEGER REFERENCES steps(id),
+  issue_id        INTEGER REFERENCES issues(id),
+  decision_id     INTEGER REFERENCES decisions(id),
+  opened_by_actor_id INTEGER REFERENCES actors(id),
+  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  answered_by_actor_id INTEGER REFERENCES actors(id),
+  change_actor_id INTEGER REFERENCES actors(id)
+);
+INSERT INTO gates_new(id, code, kind, title, question, context, options, allow_text, blocking, status, answer_value, answer_text, answered_by, answered_via, answered_at, applied_note, applied_at, review_id, plan_id, step_id, issue_id, decision_id, opened_by_actor_id, created_at)
+  SELECT id, code, kind, title, question, context, options, allow_text, blocking, status, answer_value, answer_text, answered_by, answered_via, answered_at, applied_note, applied_at, review_id, plan_id, step_id, issue_id, decision_id, opened_by_actor_id, created_at FROM gates;
+DROP TABLE gates;
+ALTER TABLE gates_new RENAME TO gates;
+CREATE INDEX ix_gates_status         ON gates(status);
+
+CREATE TABLE plans_new (
+  id                   INTEGER PRIMARY KEY,
+  code                 TEXT NOT NULL UNIQUE
+                         CHECK (code GLOB 'P-[0-9][0-9][0-9][0-9]*' AND code NOT GLOB 'P-*[^0-9]*'),
+  title                TEXT NOT NULL,
+  status               TEXT NOT NULL DEFAULT 'drafting' CHECK (status IN
+                         ('drafting','awaiting-approval','approved','in-progress','complete',
+                          'superseded','abandoned'))
+                         CHECK (status IN ('drafting','awaiting-approval','superseded','abandoned')
+                                OR approved_at IS NOT NULL),
+  approved_by_actor_id INTEGER REFERENCES actors(id),
+  approved_at          TEXT,
+  superseded_by        INTEGER REFERENCES plans(id),
+  doc_url              TEXT,
+  page_url             TEXT,
+  created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  change_actor_id      INTEGER REFERENCES actors(id),
+  change_note          TEXT
+);
+INSERT INTO plans_new(id, code, title, status, approved_by_actor_id, approved_at, superseded_by, doc_url, page_url, created_at, updated_at)
+  SELECT id, code, title, status, approved_by_actor_id, approved_at, superseded_by, doc_url, page_url, created_at, updated_at FROM plans;
+DROP TABLE plans;
+ALTER TABLE plans_new RENAME TO plans;
+
+CREATE TABLE steps_new (
+  id                INTEGER PRIMARY KEY,
+  plan_id           INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+  phase_id          INTEGER NOT NULL REFERENCES phases(id),
+  number            INTEGER NOT NULL,
+  section           TEXT,
+  title             TEXT NOT NULL,
+  change            TEXT NOT NULL,
+  proof             TEXT NOT NULL,
+  owner_need        TEXT NOT NULL DEFAULT 'none' CHECK (owner_need IN
+                      ('none','decision','confirm','review','production')),
+  owner_question    TEXT,
+  behavior_change   INTEGER NOT NULL DEFAULT 0 CHECK (behavior_change IN (0,1)),
+  behavior_note     TEXT,
+  status            TEXT NOT NULL DEFAULT 'not-started' CHECK (status IN
+                      ('not-started','doing','waiting-owner','done','dropped')),
+  progress_note     TEXT,
+  drafter_key       TEXT,
+  started_at        TEXT,
+  done_at           TEXT,
+  updated_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  change_actor_id   INTEGER REFERENCES actors(id),
+  change_commit_sha TEXT CHECK (change_commit_sha IS NULL OR ((length(change_commit_sha) = 40 OR length(change_commit_sha) = 64) AND change_commit_sha NOT GLOB '*[^0-9a-f]*')),
+  change_note       TEXT,
+  UNIQUE (plan_id, number)
+);
+INSERT INTO steps_new(id, plan_id, phase_id, number, section, title, change, proof, owner_need, owner_question, behavior_change, behavior_note, status, progress_note, drafter_key, started_at, done_at, updated_at, change_actor_id, change_commit_sha)
+  SELECT id, plan_id, phase_id, number, section, title, change, proof, owner_need, owner_question, behavior_change, behavior_note, status, progress_note, drafter_key, started_at, done_at, updated_at, change_actor_id, change_commit_sha FROM steps;
+DROP TABLE steps;
+ALTER TABLE steps_new RENAME TO steps;
+CREATE INDEX ix_steps_phase          ON steps(phase_id);
+CREATE INDEX ix_steps_status         ON steps(plan_id, status);
+
+CREATE TABLE guard_tests_new (
+  id                      INTEGER PRIMARY KEY,
+  issue_id                INTEGER NOT NULL REFERENCES issues(id),
+  repository_id           INTEGER REFERENCES repositories(id),
+  test_path               TEXT NOT NULL,
+  test_name               TEXT NOT NULL,
+  step_id                 INTEGER REFERENCES steps(id),
+  added_commit_sha        TEXT CHECK (added_commit_sha IS NULL OR ((length(added_commit_sha) = 40 OR length(added_commit_sha) = 64) AND added_commit_sha NOT GLOB '*[^0-9a-f]*')),
+  failed_before_fix       INTEGER CHECK (failed_before_fix IN (0,1)),
+  passes_after_fix        INTEGER CHECK (passes_after_fix IN (0,1)),
+  still_exists            INTEGER NOT NULL DEFAULT 1 CHECK (still_exists IN (0,1)),
+  last_confirmed_review_id INTEGER REFERENCES reviews(id),
+  created_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  UNIQUE (issue_id, test_path, test_name)
+);
+INSERT INTO guard_tests_new(id, issue_id, repository_id, test_path, test_name, step_id, added_commit_sha, failed_before_fix, passes_after_fix, still_exists, last_confirmed_review_id, created_at)
+  SELECT id, issue_id, repository_id, test_path, test_name, step_id, added_commit_sha, failed_before_fix, passes_after_fix, still_exists, last_confirmed_review_id, created_at FROM guard_tests;
+DROP TABLE guard_tests;
+ALTER TABLE guard_tests_new RENAME TO guard_tests;
+CREATE INDEX ix_guard_issue          ON guard_tests(issue_id);
+
+CREATE TABLE test_runs_new (
+  id            INTEGER PRIMARY KEY,
+  review_id     INTEGER REFERENCES reviews(id),
+  step_id       INTEGER REFERENCES steps(id),
+  repository_id INTEGER REFERENCES repositories(id),
+  commit_sha    TEXT CHECK (commit_sha IS NULL OR ((length(commit_sha) = 40 OR length(commit_sha) = 64) AND commit_sha NOT GLOB '*[^0-9a-f]*')),
+  command       TEXT NOT NULL,
+  purpose       TEXT NOT NULL CHECK (purpose IN
+                  ('baseline','targeted','flake-check','mutation','before-fix','after-fix','ci')),
+  passed        INTEGER,
+  failed        INTEGER,
+  skipped       INTEGER,
+  errored       INTEGER,
+  exit_code     INTEGER,
+  duration_ms   INTEGER,
+  output_path   TEXT,
+  notes         TEXT,
+  started_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+INSERT INTO test_runs_new(id, review_id, step_id, repository_id, commit_sha, command, purpose, passed, failed, skipped, errored, exit_code, duration_ms, output_path, notes, started_at)
+  SELECT id, review_id, step_id, repository_id, commit_sha, command, purpose, passed, failed, skipped, errored, exit_code, duration_ms, output_path, notes, started_at FROM test_runs;
+DROP TABLE test_runs;
+ALTER TABLE test_runs_new RENAME TO test_runs;
+
+CREATE TABLE events_new (
+  id          INTEGER PRIMARY KEY,
+  entity_type TEXT NOT NULL CHECK (entity_type IN ('review','issue','step','plan','decision','finding','gate',
+                                                   'relation','check','step-finding')),
+  entity_id   INTEGER NOT NULL,
+  event       TEXT NOT NULL,
+  from_value  TEXT,
+  to_value    TEXT,
+  actor_id    INTEGER REFERENCES actors(id),
+  review_id   INTEGER REFERENCES reviews(id),
+  step_id     INTEGER REFERENCES steps(id),
+  commit_sha  TEXT CHECK (commit_sha IS NULL OR ((length(commit_sha) = 40 OR length(commit_sha) = 64) AND commit_sha NOT GLOB '*[^0-9a-f]*')),
+  note        TEXT,
+  at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+INSERT INTO events_new(id, entity_type, entity_id, event, from_value, to_value, actor_id, review_id, step_id, commit_sha, note, at)
+  SELECT id, entity_type, entity_id, event, from_value, to_value, actor_id, review_id, step_id, commit_sha, note, at FROM events;
+DROP TABLE events;
+ALTER TABLE events_new RENAME TO events;
+CREATE INDEX ix_events_entity        ON events(entity_type, entity_id, at);
+
+-- Who answered: viewer answers were stored as the text 'owner'; point them at the project's owner actor.
+UPDATE gates SET answered_by_actor_id = (SELECT min(id) FROM actors WHERE kind = 'owner')
+  WHERE answered_by = 'owner' AND answered_by_actor_id IS NULL;
+
+CREATE UNIQUE INDEX ux_metrics_key            ON metrics(review_id, name, scope, COALESCE(repository_id, 0));
+CREATE UNIQUE INDEX ux_locations_one_primary  ON finding_locations(finding_id) WHERE role = 'primary';
+CREATE UNIQUE INDEX ux_repositories_path      ON repositories(path);
+CREATE INDEX ix_fk_reviews_change_actor_id    ON reviews(change_actor_id);
+CREATE INDEX ix_fk_plans_change_actor_id      ON plans(change_actor_id);
+CREATE INDEX ix_fk_gates_change_actor_id      ON gates(change_actor_id);
+CREATE INDEX ix_fk_gates_answered_by_actor_id ON gates(answered_by_actor_id);
+-- migration: 0004-views.sql
+-- check registry, requirement trace, review agents, metric catalog, domain descriptions, foreign-key indexes
+-- Plan P-0001 steps 66, 69, 85-91, 93 and 94. New tables: ledger_checks (the checks `ledger.py check` runs, with an
+-- error or warning tier), review_actors (every non-reviewer agent of a review), review_requirement_checks (the
+-- requirement trace) and metric_defs (metric labels, units, direction; rows added for names already in metrics).
+-- domains.description is filled from SKILL.md's "applies when" lines where it is empty, and every foreign-key
+-- column gets a leading index. Views and triggers need nothing here: migrate drops them all and re-creates the
+-- shipped ones after the last migration.
+
+CREATE TABLE ledger_checks (
+  view     TEXT PRIMARY KEY,
+  label    TEXT NOT NULL,
+  tier     TEXT NOT NULL CHECK (tier IN ('error','warning')),
+  position INTEGER NOT NULL UNIQUE
+);
+
+CREATE TABLE review_actors (
+  review_id  INTEGER NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
+  actor_id   INTEGER NOT NULL REFERENCES actors(id),
+  role_label TEXT NOT NULL,                -- what it did here: 'indexer for security.md', 'matcher'
+  PRIMARY KEY (review_id, actor_id)
+);
+
+CREATE TABLE review_requirement_checks (
+  id                INTEGER PRIMARY KEY,
+  review_id         INTEGER NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
+  requirement_id    INTEGER NOT NULL REFERENCES requirements(id),
+  verdict           TEXT NOT NULL CHECK (verdict IN ('matches','differs','partly','missing','untested')),
+  where_implemented TEXT,                  -- file, function or page that implements it
+  tested            TEXT CHECK (tested IS NULL OR tested IN ('yes','partly','no')),
+  finding_id        INTEGER REFERENCES findings(id),   -- the finding raised for it, if any
+  evidence          TEXT,
+  UNIQUE (review_id, requirement_id)
+);
+
+CREATE TABLE metric_defs (
+  name   TEXT PRIMARY KEY,                 -- the stable key used in metrics.name
+  label  TEXT NOT NULL,
+  unit   TEXT,
+  better TEXT NOT NULL DEFAULT 'none' CHECK (better IN ('higher','lower','none'))
+);
+
+CREATE INDEX ix_fk_actors_parent_actor_id            ON actors(parent_actor_id);
+CREATE INDEX ix_fk_design_goals_superseded_by        ON design_goals(superseded_by);
+CREATE INDEX ix_fk_reviews_approved_by_actor_id      ON reviews(approved_by_actor_id);
+CREATE INDEX ix_fk_reviews_manager_actor_id          ON reviews(manager_actor_id);
+CREATE INDEX ix_fk_reviews_previous_review_id        ON reviews(previous_review_id);
+CREATE INDEX ix_fk_reviews_requested_by_actor_id     ON reviews(requested_by_actor_id);
+CREATE INDEX ix_fk_review_repositories_repository_id ON review_repositories(repository_id);
+CREATE INDEX ix_fk_review_goals_goal_id              ON review_goals(goal_id);
+CREATE INDEX ix_fk_review_domains_domain_code        ON review_domains(domain_code);
+CREATE INDEX ix_fk_reviewer_runs_actor_id            ON reviewer_runs(actor_id);
+CREATE INDEX ix_fk_reviewer_runs_domain_code         ON reviewer_runs(domain_code);
+CREATE INDEX ix_fk_review_actors_actor_id            ON review_actors(actor_id);
+CREATE INDEX ix_fk_requirements_first_review_id      ON requirements(first_review_id);
+CREATE INDEX ix_fk_requirements_superseded_by        ON requirements(superseded_by);
+CREATE INDEX ix_fk_issues_change_actor_id            ON issues(change_actor_id);
+CREATE INDEX ix_fk_issues_change_review_id           ON issues(change_review_id);
+CREATE INDEX ix_fk_issues_change_step_id             ON issues(change_step_id);
+CREATE INDEX ix_fk_issues_first_seen_review_id       ON issues(first_seen_review_id);
+CREATE INDEX ix_fk_issues_last_checked_review_id     ON issues(last_checked_review_id);
+CREATE INDEX ix_fk_issues_last_seen_review_id        ON issues(last_seen_review_id);
+CREATE INDEX ix_fk_issues_theme_code                 ON issues(theme_code);
+CREATE INDEX ix_fk_issue_relations_established_by_actor_id ON issue_relations(established_by_actor_id);
+CREATE INDEX ix_fk_issue_relations_established_in_review_id ON issue_relations(established_in_review_id);
+CREATE INDEX ix_findings_run                         ON findings(reviewer_run_id);
+CREATE INDEX ix_fk_findings_theme_code               ON findings(theme_code);
+CREATE INDEX ix_fk_findings_verified_by_actor_id     ON findings(verified_by_actor_id);
+CREATE INDEX ix_fk_finding_locations_repository_id   ON finding_locations(repository_id);
+CREATE INDEX ix_fk_finding_goals_goal_id             ON finding_goals(goal_id);
+CREATE INDEX ix_fk_finding_requirements_requirement_id ON finding_requirements(requirement_id);
+CREATE INDEX ix_fk_review_requirement_checks_finding_id ON review_requirement_checks(finding_id);
+CREATE INDEX ix_fk_review_requirement_checks_requirement_id ON review_requirement_checks(requirement_id);
+CREATE INDEX ix_fk_review_issue_checks_actor_id      ON review_issue_checks(actor_id);
+CREATE INDEX ix_ric_finding                          ON review_issue_checks(finding_id);
+CREATE INDEX ix_fk_decisions_asked_by_actor_id       ON decisions(asked_by_actor_id);
+CREATE INDEX ix_fk_decisions_decided_by_actor_id     ON decisions(decided_by_actor_id);
+CREATE INDEX ix_fk_decisions_review_id               ON decisions(review_id);
+CREATE INDEX ix_fk_decisions_step_id                 ON decisions(step_id);
+CREATE INDEX ix_fk_decision_issues_issue_id          ON decision_issues(issue_id);
+CREATE INDEX ix_gates_decision                       ON gates(decision_id);
+CREATE INDEX ix_fk_gates_issue_id                    ON gates(issue_id);
+CREATE INDEX ix_fk_gates_opened_by_actor_id          ON gates(opened_by_actor_id);
+CREATE INDEX ix_fk_gates_plan_id                     ON gates(plan_id);
+CREATE INDEX ix_fk_gates_review_id                   ON gates(review_id);
+CREATE INDEX ix_gates_step                           ON gates(step_id);
+CREATE INDEX ix_fk_plans_approved_by_actor_id        ON plans(approved_by_actor_id);
+CREATE INDEX ix_fk_plans_superseded_by               ON plans(superseded_by);
+CREATE INDEX ix_fk_plan_reviews_review_id            ON plan_reviews(review_id);
+CREATE INDEX ix_fk_steps_change_actor_id             ON steps(change_actor_id);
+CREATE INDEX ix_fk_step_commits_repository_id        ON step_commits(repository_id);
+CREATE INDEX ix_fk_guard_tests_last_confirmed_review_id ON guard_tests(last_confirmed_review_id);
+CREATE INDEX ix_fk_guard_tests_repository_id         ON guard_tests(repository_id);
+CREATE INDEX ix_fk_guard_tests_step_id               ON guard_tests(step_id);
+CREATE INDEX ix_fk_test_runs_repository_id           ON test_runs(repository_id);
+CREATE INDEX ix_fk_test_runs_review_id               ON test_runs(review_id);
+CREATE INDEX ix_fk_test_runs_step_id                 ON test_runs(step_id);
+CREATE INDEX ix_fk_metrics_domain_code               ON metrics(domain_code);
+CREATE INDEX ix_fk_metrics_repository_id             ON metrics(repository_id);
+CREATE INDEX ix_fk_artifacts_plan_id                 ON artifacts(plan_id);
+CREATE INDEX ix_fk_artifacts_review_id               ON artifacts(review_id);
+CREATE INDEX ix_fk_artifacts_reviewer_run_id         ON artifacts(reviewer_run_id);
+CREATE INDEX ix_fk_events_actor_id                   ON events(actor_id);
+CREATE INDEX ix_fk_events_review_id                  ON events(review_id);
+CREATE INDEX ix_fk_events_step_id                    ON events(step_id);
+
+-- Each domain's one-line "applies when" sentence from SKILL.md's domain catalog.
+WITH applies(code, text) AS (VALUES
+ ('spec','Applies whenever there are stated requirements anywhere.'),
+ ('tests','Almost always applies.'),
+ ('test-quality','Applies when there is a meaningful test suite.'),
+ ('time-concurrency','Applies to anything with dates, schedules, deadlines, expiries, or more than one writer.'),
+ ('resilience','Applies whenever there are external calls, jobs, or multi-step writes.'),
+ ('compatibility','Applies whenever there is stored data, saved settings, public APIs, or deployed clients.'),
+ ('decision-placement','Applies when the system has business rules.'),
+ ('contracts','Applies when there is more than one component.'),
+ ('server','Applies when there is a server.'),
+ ('database','Applies when there is a database.'),
+ ('client-api','Applies when a client talks to a backend.'),
+ ('abstraction','Almost always applies.'),
+ ('hotspots','Applies when there is git history worth mining (a few months or more).'),
+ ('ui','Applies when there are screens.'),
+ ('walkthroughs','Applies when users complete multi-step tasks.'),
+ ('notifications','Applies when the system sends email, SMS, push or calendar feeds.'),
+ ('localization','Applies only if other languages, regions or conventions are plausible.'),
+ ('security','Almost always applies.'),
+ ('privacy','Applies whenever personal data is handled.'),
+ ('logging','Almost always applies.'),
+ ('operations','Applies when the system is deployed.'),
+ ('dependencies','Almost always applies.'),
+ ('performance','Applies when speed or scale matters to users or cost.'),
+ ('cost','Applies when the system runs on paid infrastructure or services.'),
+ ('docs-developer','Almost always applies.'),
+ ('docs-user','Applies when the system has users other than its developers.'),
+ ('handover','Applies whenever someone other than the current author may need to run or change the system.'))
+UPDATE domains SET description = (SELECT text FROM applies WHERE applies.code = domains.code)
+ WHERE description IS NULL AND code IN (SELECT code FROM applies);
+
+-- The metric names the domains ask for (keep names stable between reviews so they trend).
+INSERT OR IGNORE INTO metric_defs(name, label, unit, better) VALUES
+ ('mutation_score','Mutation score','%','higher'),
+ ('line_coverage','Line coverage','%','higher'),
+ ('branch_coverage','Branch coverage','%','higher'),
+ ('test_cases_asserted','Test cases asserted','cases','higher'),
+ ('test_cases_needed','Test cases needed','cases','none'),
+ ('tests_missing_named','Missing tests named','tests','lower'),
+ ('flaky_tests','Flaky tests','tests','lower'),
+ ('test_suite_seconds','Test suite run time','s','lower'),
+ ('page_weight','Page weight','KB','lower'),
+ ('queries_per_page','Queries per page','queries','lower'),
+ ('p95_job_ms','Job time, 95th percentile','ms','lower'),
+ ('dependency_count','Dependencies','packages','lower'),
+ ('vulnerable_dependencies','Dependencies with known vulnerabilities','packages','lower');
+
+-- The checks `ledger.py check` runs (see ledger_checks).
+INSERT OR IGNORE INTO ledger_checks(view, label, tier, position) VALUES
+ ('v_unmatched_findings','Findings not matched to an issue','error',10),
+ ('v_unchecked_known_issues','Known issues in a domain that ran, with no check recorded','error',20),
+ ('v_untraceable_refs','Code references that cannot be traced to exact lines','error',30),
+ ('v_uncovered_findings','Findings no step of their plan closes','error',40),
+ ('v_coverage_problems','Steps closing nothing, or findings closed twice without a reason','error',50),
+ ('v_unguarded_fixes','Fixed issues with no guard test, or whose guard test is gone','warning',100);
+
+-- Metric names already recorded get a catalog row too (label = the name with spaces, capitalized; a unit seen).
+INSERT OR IGNORE INTO metric_defs(name, label, unit)
+  SELECT name, upper(substr(name, 1, 1)) || replace(substr(name, 2), '_', ' '), min(unit)
+    FROM metrics GROUP BY name;
+-- migration: 0005-records.sql
+-- one UTC time format; whole-file and not-text references; report, plan narrative and fix-time discoveries
+-- Plan P-0001 steps 75, 81, 96 and 97 (step 84's view change and the time triggers come with the shipped views and
+-- triggers, which migrate re-creates). Every stored time becomes strftime('%Y-%m-%dT%H:%M:%fZ', value): UTC with
+-- milliseconds, so a time with an offset (a git commit time like 2026-11-10T10:00:00+02:00) is converted to UTC
+-- and a time without milliseconds or with a space gains them. A stored time that is not a date at all makes this
+-- migration fail and change nothing (the error names the constraint below; fix the row, then run migrate again).
+-- From now on the tr_time_* triggers refuse any other format. No table is rebuilt: the new columns are added at
+-- the end of their tables.
+
+UPDATE schema_migrations SET applied_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', applied_at), applied_at);
+UPDATE repositories SET created_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', created_at), created_at);
+UPDATE actors SET created_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', created_at), created_at);
+UPDATE domains SET retired_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', retired_at), retired_at);
+UPDATE themes SET retired_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', retired_at), retired_at);
+UPDATE design_goals SET adopted_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', adopted_at), adopted_at), retired_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', retired_at), retired_at);
+UPDATE reviews SET approved_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', approved_at), approved_at), started_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', started_at), started_at), completed_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', completed_at), completed_at), updated_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', updated_at), updated_at);
+UPDATE review_repositories SET commit_time = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', commit_time), commit_time);
+UPDATE reviewer_runs SET started_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', started_at), started_at), finished_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', finished_at), finished_at);
+UPDATE requirements SET stated_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', stated_at), stated_at), created_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', created_at), created_at);
+UPDATE issues SET opened_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', opened_at), opened_at), resolved_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', resolved_at), resolved_at), verified_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', verified_at), verified_at), updated_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', updated_at), updated_at);
+UPDATE issue_relations SET created_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', created_at), created_at);
+UPDATE findings SET verified_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', verified_at), verified_at), created_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', created_at), created_at);
+UPDATE review_issue_checks SET checked_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', checked_at), checked_at);
+UPDATE decisions SET asked_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', asked_at), asked_at), decided_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', decided_at), decided_at);
+UPDATE gates SET answered_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', answered_at), answered_at), applied_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', applied_at), applied_at), created_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', created_at), created_at);
+UPDATE plans SET approved_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', approved_at), approved_at), created_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', created_at), created_at), updated_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', updated_at), updated_at);
+UPDATE steps SET started_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', started_at), started_at), done_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', done_at), done_at), updated_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', updated_at), updated_at);
+UPDATE step_commits SET committed_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', committed_at), committed_at);
+UPDATE guard_tests SET created_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', created_at), created_at);
+UPDATE test_runs SET started_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', started_at), started_at);
+UPDATE metrics SET recorded_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', recorded_at), recorded_at);
+UPDATE artifacts SET created_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', created_at), created_at);
+UPDATE events SET at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', at), at);
+
+CREATE TEMP TABLE p0005_unreadable_times (what TEXT CONSTRAINT a_stored_time_is_not_a_date_fix_the_row_then_migrate_again CHECK (what IS NULL));
+INSERT INTO p0005_unreadable_times(what)
+  SELECT 'schema_migrations.applied_at: ' || applied_at FROM schema_migrations WHERE applied_at IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', applied_at) IS NOT applied_at
+  UNION ALL SELECT 'repositories.created_at: ' || created_at FROM repositories WHERE created_at IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', created_at) IS NOT created_at
+  UNION ALL SELECT 'actors.created_at: ' || created_at FROM actors WHERE created_at IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', created_at) IS NOT created_at
+  UNION ALL SELECT 'domains.retired_at: ' || retired_at FROM domains WHERE retired_at IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', retired_at) IS NOT retired_at
+  UNION ALL SELECT 'themes.retired_at: ' || retired_at FROM themes WHERE retired_at IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', retired_at) IS NOT retired_at
+  UNION ALL SELECT 'design_goals.adopted_at: ' || adopted_at FROM design_goals WHERE adopted_at IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', adopted_at) IS NOT adopted_at
+  UNION ALL SELECT 'design_goals.retired_at: ' || retired_at FROM design_goals WHERE retired_at IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', retired_at) IS NOT retired_at
+  UNION ALL SELECT 'reviews.approved_at: ' || approved_at FROM reviews WHERE approved_at IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', approved_at) IS NOT approved_at
+  UNION ALL SELECT 'reviews.started_at: ' || started_at FROM reviews WHERE started_at IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', started_at) IS NOT started_at
+  UNION ALL SELECT 'reviews.completed_at: ' || completed_at FROM reviews WHERE completed_at IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', completed_at) IS NOT completed_at
+  UNION ALL SELECT 'reviews.updated_at: ' || updated_at FROM reviews WHERE updated_at IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', updated_at) IS NOT updated_at
+  UNION ALL SELECT 'review_repositories.commit_time: ' || commit_time FROM review_repositories WHERE commit_time IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', commit_time) IS NOT commit_time
+  UNION ALL SELECT 'reviewer_runs.started_at: ' || started_at FROM reviewer_runs WHERE started_at IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', started_at) IS NOT started_at
+  UNION ALL SELECT 'reviewer_runs.finished_at: ' || finished_at FROM reviewer_runs WHERE finished_at IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', finished_at) IS NOT finished_at
+  UNION ALL SELECT 'requirements.stated_at: ' || stated_at FROM requirements WHERE stated_at IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', stated_at) IS NOT stated_at
+  UNION ALL SELECT 'requirements.created_at: ' || created_at FROM requirements WHERE created_at IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', created_at) IS NOT created_at
+  UNION ALL SELECT 'issues.opened_at: ' || opened_at FROM issues WHERE opened_at IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', opened_at) IS NOT opened_at
+  UNION ALL SELECT 'issues.resolved_at: ' || resolved_at FROM issues WHERE resolved_at IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', resolved_at) IS NOT resolved_at
+  UNION ALL SELECT 'issues.verified_at: ' || verified_at FROM issues WHERE verified_at IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', verified_at) IS NOT verified_at
+  UNION ALL SELECT 'issues.updated_at: ' || updated_at FROM issues WHERE updated_at IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', updated_at) IS NOT updated_at
+  UNION ALL SELECT 'issue_relations.created_at: ' || created_at FROM issue_relations WHERE created_at IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', created_at) IS NOT created_at
+  UNION ALL SELECT 'findings.verified_at: ' || verified_at FROM findings WHERE verified_at IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', verified_at) IS NOT verified_at
+  UNION ALL SELECT 'findings.created_at: ' || created_at FROM findings WHERE created_at IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', created_at) IS NOT created_at
+  UNION ALL SELECT 'review_issue_checks.checked_at: ' || checked_at FROM review_issue_checks WHERE checked_at IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', checked_at) IS NOT checked_at
+  UNION ALL SELECT 'decisions.asked_at: ' || asked_at FROM decisions WHERE asked_at IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', asked_at) IS NOT asked_at
+  UNION ALL SELECT 'decisions.decided_at: ' || decided_at FROM decisions WHERE decided_at IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', decided_at) IS NOT decided_at
+  UNION ALL SELECT 'gates.answered_at: ' || answered_at FROM gates WHERE answered_at IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', answered_at) IS NOT answered_at
+  UNION ALL SELECT 'gates.applied_at: ' || applied_at FROM gates WHERE applied_at IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', applied_at) IS NOT applied_at
+  UNION ALL SELECT 'gates.created_at: ' || created_at FROM gates WHERE created_at IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', created_at) IS NOT created_at
+  UNION ALL SELECT 'plans.approved_at: ' || approved_at FROM plans WHERE approved_at IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', approved_at) IS NOT approved_at
+  UNION ALL SELECT 'plans.created_at: ' || created_at FROM plans WHERE created_at IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', created_at) IS NOT created_at
+  UNION ALL SELECT 'plans.updated_at: ' || updated_at FROM plans WHERE updated_at IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', updated_at) IS NOT updated_at
+  UNION ALL SELECT 'steps.started_at: ' || started_at FROM steps WHERE started_at IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', started_at) IS NOT started_at
+  UNION ALL SELECT 'steps.done_at: ' || done_at FROM steps WHERE done_at IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', done_at) IS NOT done_at
+  UNION ALL SELECT 'steps.updated_at: ' || updated_at FROM steps WHERE updated_at IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', updated_at) IS NOT updated_at
+  UNION ALL SELECT 'step_commits.committed_at: ' || committed_at FROM step_commits WHERE committed_at IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', committed_at) IS NOT committed_at
+  UNION ALL SELECT 'guard_tests.created_at: ' || created_at FROM guard_tests WHERE created_at IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', created_at) IS NOT created_at
+  UNION ALL SELECT 'test_runs.started_at: ' || started_at FROM test_runs WHERE started_at IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', started_at) IS NOT started_at
+  UNION ALL SELECT 'metrics.recorded_at: ' || recorded_at FROM metrics WHERE recorded_at IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', recorded_at) IS NOT recorded_at
+  UNION ALL SELECT 'artifacts.created_at: ' || created_at FROM artifacts WHERE created_at IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', created_at) IS NOT created_at
+  UNION ALL SELECT 'events.at: ' || at FROM events WHERE at IS NOT NULL AND strftime('%Y-%m-%dT%H:%M:%fZ', at) IS NOT at;
+DROP TABLE p0005_unreadable_times;
+UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ', value)
+  WHERE key = 'created_at' AND strftime('%Y-%m-%dT%H:%M:%fZ', value) IS NOT NULL;
+
+ALTER TABLE reviews ADD COLUMN report_md TEXT;
+ALTER TABLE plans ADD COLUMN narrative_md TEXT;
+ALTER TABLE findings ADD COLUMN discovered_in_step_id INTEGER REFERENCES steps(id);
+CREATE INDEX ix_fk_findings_discovered_in_step_id    ON findings(discovered_in_step_id);
+ALTER TABLE finding_locations ADD COLUMN whole_file INTEGER NOT NULL DEFAULT 0 CHECK (whole_file IN (0,1));
+ALTER TABLE finding_locations ADD COLUMN excerpt_status TEXT
+  CHECK (excerpt_status IS NULL OR excerpt_status IN ('truncated','not-text'));
+
+INSERT INTO ledger_checks(view, label, tier, position) VALUES
+ ('v_unplanned_discoveries','Defects found during fix work that no plan step closes','error',60);
 """
 
 
@@ -2443,6 +4621,7 @@ def _init(root, db, force, copy_tool, gitignore):
     if fresh:
         build_ledger(root, db)
         set_wal(db)
+        optimize_db(db)
         print(f"created {db}")
         print(f"ledger at {db} (created)")
     else:
@@ -2471,6 +4650,7 @@ def _init(root, db, force, copy_tool, gitignore):
             sys.exit(f"init: could not update {db}: {e}")
         con.close()
         set_wal(db)
+        optimize_db(db)
         for note in notes:
             print(f"note: {note}")
         if moved:
@@ -2626,22 +4806,53 @@ def find_root(start, explicit=False, script=None):
     return resolve_root(start, explicit, script)[0]
 
 
+TIME_FORMAT = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$")  # what the tr_time_* triggers accept
+_ISO_TIME = re.compile(r"^(\d{4})-(\d\d)-(\d\d)[T ](\d\d):(\d\d)(?::(\d\d)(?:\.(\d+))?)?\s*(Z|z|[+-]\d\d:?\d\d)?$")
+
+
 def now():
+    """The current time as the ledger stores every time: UTC with milliseconds, the same text as SQLite's
+    strftime('%Y-%m-%dT%H:%M:%fZ','now')."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
-# Twin of the must-be-empty list in SKILL.md (Rules for the ledger / check) and of the 'must be empty' comments in
-# references/schema.sql; change all three together. dev/tests/test_check.py enforces that they agree.
-MUST_BE_EMPTY = [
-    ("v_unmatched_findings", "Findings not matched to an issue"),
-    ("v_unchecked_known_issues", "Known issues in a domain that ran, with no check recorded"),
-    ("v_untraceable_refs", "Code references that cannot be traced to exact lines"),
-    ("v_uncovered_findings", "Findings no step of their plan closes"),
-    ("v_coverage_problems", "Steps closing nothing, or findings closed twice without a reason"),
-]
+def utc_time(text):
+    """An ISO-8601 time with any offset (git's %cI: 2026-11-10T10:00:00+02:00, or ...Z) in the ledger's format,
+    converted to UTC (2026-11-10T08:00:00.000Z). A time without an offset is taken as UTC. ValueError if unreadable."""
+    m = _ISO_TIME.match((text or "").strip())
+    if not m:
+        raise ValueError(f"not an ISO-8601 time: {text!r}")
+    y, mo, d, h, mi, sec, frac, zone = m.groups()
+    t = datetime(int(y), int(mo), int(d), int(h), int(mi), int(sec or 0),
+                 int(((frac or "") + "000000")[:6]), tzinfo=timezone.utc)
+    if zone and zone not in ("Z", "z"):
+        sign = -1 if zone[0] == "-" else 1
+        hh, mm = zone[1:3], zone[-2:]
+        t -= sign * timedelta(hours=int(hh), minutes=int(mm))
+    return t.strftime("%Y-%m-%dT%H:%M:%S.") + f"{t.microsecond // 1000:03d}Z"
+
+
+# The checks live in the ledger's ledger_checks table (view, label, tier, position): tier 'error' views must be empty
+# (check exits 1 otherwise), tier 'warning' views are listed but do not fail. The error tier is the twin of the
+# must-be-empty list in SKILL.md (Rules for the ledger / check) and of the 'must be empty' comments in
+# references/schema.sql; dev/tests/test_check.py enforces that they agree.
+def ledger_checks(con, tier=None):
+    """[(view, label, tier)] of the ledger's ledger_checks rows in position order (only `tier` if given); None when
+    the ledger has no ledger_checks table (an older schema, which check_schema reports)."""
+    try:
+        got = [tuple(r) for r in con.execute("SELECT view, label, tier FROM ledger_checks ORDER BY position, view")]
+    except sqlite3.Error:
+        return None
+    return [c for c in got if tier is None or c[2] == tier]
+
+
+def count_view(con, view):
+    return con.execute(f"SELECT count(*) FROM {quote_name(view)}").fetchone()[0]
 
 
 def check(con, quiet=False):
+    """Print what check finds; return the number of failed checks (integrity, foreign keys, schema, each non-empty
+    error-tier view). A non-empty warning-tier view is printed with 'warning' and does not count."""
     bad = 0
     ic = con.execute("PRAGMA integrity_check").fetchone()[0]
     if ic != "ok":
@@ -2650,21 +4861,49 @@ def check(con, quiet=False):
     if fk:
         print(f"foreign_key_check: {len(fk)} broken references"); bad += 1
     bad += check_schema(con)
-    for view, label in MUST_BE_EMPTY:
+    checks = ledger_checks(con)
+    if checks is None:
+        print("ledger_checks: the ledger has no ledger_checks table, so its views were not checked "
+              "(run: python3 ledger.py migrate)")
+        return bad + 1
+    for view, label, tier in checks:
+        warn = "  warning" if tier == "warning" else ""
         try:
-            n = con.execute(f"SELECT count(*) FROM {view}").fetchone()[0]
+            n = count_view(con, view)
         except sqlite3.Error as e:
-            bad += 1
-            print(f"  ERR  {label}  ({view}): {e}")
+            bad += tier == "error"
+            print(f"  ERR  {label}  ({view}){warn}: {e}")
             continue
         if n:
-            bad += 1
-            print(f"{n:5d}  {label}  ({view})")
-            for r in rows(con, f"SELECT * FROM {view} LIMIT 5"):
+            bad += tier == "error"
+            print(f"{n:5d}  {label}  ({view}){warn}")
+            for r in rows(con, f"SELECT * FROM {quote_name(view)} LIMIT 5"):
                 print("       ", json.dumps(r, ensure_ascii=False)[:200])
         elif not quiet:
             print(f"    0  {label}")
+    optimize(con)
     return bad
+
+
+def optimize_db(db):
+    """PRAGMA optimize on the ledger file (after init)."""
+    try:
+        con = connect(db)
+    except sqlite3.Error:
+        return
+    try:
+        optimize(con)
+    finally:
+        con.close()
+
+
+def optimize(con):
+    """PRAGMA optimize: lets SQLite gather the statistics its query planner uses (cheap; skipped on a read-only
+    connection or a busy ledger)."""
+    try:
+        con.execute("PRAGMA optimize")
+    except sqlite3.Error:
+        pass
 
 
 def check_schema(con):
@@ -2715,14 +4954,15 @@ def git(cwd, *args, timeout=15):
     return p.stdout
 
 
-def file_at(root, repo_path, sha, path, allow_outside=False):
-    """The file's text at commit sha. A refused path gives the fixed error 'bad path' before git runs, so no message
-    says whether some file outside the repository exists."""
+def file_at(root, repo_path, sha, path, allow_outside=False, raw=False):
+    """The file's text at commit sha (raw=True: its bytes). A refused path gives the fixed error 'bad path' before
+    git runs, so no message says whether some file outside the repository exists."""
     if not HEX.match(sha or ""):
         raise RuntimeError("commit is not a hex hash")
     if bad_location_path(path or ""):
         raise RuntimeError("bad path")
-    return git(repo_dir(root, repo_path, allow_outside), "show", f"{sha}:{path}").decode("utf-8", "replace")
+    data = git(repo_dir(root, repo_path, allow_outside), "show", f"{sha}:{path}")
+    return data if raw else data.decode("utf-8", "replace")
 
 
 def location(con, loc_id):
@@ -2810,11 +5050,55 @@ def source(root, con, loc_id, context=8):
     return out
 
 
+WHOLE_FILE_EXCERPT_LINES = 200  # a whole-file reference keeps at most this many lines (excerpt_status 'truncated')
+_DEFINITION = (r"(?i:\b(?:def|class|function|interface|struct|enum|fn|func|"
+               r"CREATE\s+(?:UNIQUE\s+)?(?:TABLE|VIEW|TRIGGER|INDEX)(?:\s+IF\s+NOT\s+EXISTS)?))\s+")
+
+
+def symbol_line(lines, symbol):
+    """(line number, None) for the one line that defines symbol, else (None, why). A definition is a def, class,
+    function, interface, struct, enum, fn, func or SQL CREATE TABLE/VIEW/TRIGGER/INDEX followed by the symbol as a
+    whole word; with no definition, the one line holding the symbol as a whole word. Several candidates, or none,
+    leave the reference unlined (the caller counts it as failed)."""
+    word = r"(?<![\w$])" + re.escape(symbol) + r"(?![\w$])"
+    hits = [i for i, t in enumerate(lines, 1) if re.search(_DEFINITION + word, t)]
+    if len(hits) == 1:
+        return hits[0], None
+    if hits:
+        return None, (f"symbol {symbol!r} is defined on {len(hits)} lines "
+                      f"({', '.join(map(str, hits[:5]))}); give the lines")
+    hits = [i for i, t in enumerate(lines, 1) if re.search(word, t)]
+    if len(hits) == 1:
+        return hits[0], None
+    if not hits:
+        return None, f"symbol {symbol!r} not found"
+    return None, (f"symbol {symbol!r} is on {len(hits)} lines ({', '.join(map(str, hits[:5]))}) and defined on "
+                  f"none; give the lines")
+
+
+def permalink_for(template, sha, path, a, b):
+    """The permalink from repositories.permalink_template, or None. With no lines (a whole file), the #fragment that
+    holds {start} or {end} is dropped and any other {start}/{end} is left out of the link."""
+    link = template.replace("{sha}", sha).replace("{path}", path)
+    if a is None:
+        head, sep, frag = link.partition("#")
+        if "{start}" in frag or "{end}" in frag:
+            link = head
+        if "{start}" in link or "{end}" in link:
+            return None
+        return link
+    return link.replace("{start}", str(a)).replace("{end}", str(b or a))
+
+
 def fill_refs(root, con, review_code=None):
+    """Fill excerpt, excerpt_sha256, blob_sha and permalink (and lines from a symbol) of each reference from git.
+    Never overwrites an excerpt. A failure (file unreadable, lines past the end, a symbol not found or ambiguous, an
+    empty file) writes nothing for that reference and is counted; returns the count."""
     sql = """SELECT fl.id FROM finding_locations fl JOIN findings f ON f.id = fl.finding_id
              JOIN reviews r ON r.id = f.review_id
-             WHERE fl.commit_sha IS NOT NULL AND (fl.excerpt IS NULL OR fl.blob_sha IS NULL
-                   OR fl.permalink IS NULL OR (fl.line_start IS NULL AND fl.symbol IS NOT NULL))"""
+             WHERE fl.commit_sha IS NOT NULL
+               AND ((fl.excerpt IS NULL AND fl.excerpt_status IS NOT 'not-text') OR fl.blob_sha IS NULL
+                    OR fl.permalink IS NULL OR (fl.line_start IS NULL AND fl.whole_file = 0))"""
     args = ()
     if review_code:
         sql += " AND r.code = ?"; args = (review_code,)
@@ -2825,29 +5109,47 @@ def fill_refs(root, con, review_code=None):
         where = f"ref {lid} {loc['path']}@{loc['commit_sha'][:10]}"
         outside = bool(loc["allow_outside_root"])
         try:
-            text = file_at(root, loc["repo_path"], loc["commit_sha"], loc["path"], outside)
+            data = file_at(root, loc["repo_path"], loc["commit_sha"], loc["path"], outside, raw=True)
         except Exception as e:
             print(f"{where}: {e}"); failed += 1; continue
-        lines = text.splitlines()
+        try:
+            text = None if b"\0" in data else data.decode("utf-8")
+        except UnicodeDecodeError:
+            text = None
         a, b = loc["line_start"], loc["line_end"]
-        if a is None and loc["symbol"]:
-            for i, t in enumerate(lines, 1):
-                if loc["symbol"] in t:
-                    a = b = i; break
-            else:
-                print(f"{where}: symbol {loc['symbol']!r} not found"); failed += 1; continue
-        if a and (b or a) > len(lines):
-            print(f"{where}: lines {a}-{b or a} are past the end of the file ({len(lines)} lines)")
-            failed += 1; continue
-        upd = {}
-        if a:
+        if a is None and b is not None:
+            print(f"{where}: line_end {b} without line_start"); failed += 1; continue
+        whole = bool(loc["whole_file"]) or (a is None and not loc["symbol"])
+        upd = {"whole_file": 1} if whole and not loc["whole_file"] else {}
+        if text is None:  # binary or not UTF-8: no lossy excerpt; the hash is of the file's bytes
+            if loc["excerpt"] is None and loc["excerpt_status"] != "not-text":
+                upd.update(excerpt_status="not-text", excerpt_sha256=hashlib.sha256(data).hexdigest())
+            if a is None and not whole:
+                print(f"{where}: not a text file; symbol {loc['symbol']!r} cannot be looked up"); failed += 1; continue
+        else:
+            lines = text.splitlines()
+            if whole and a is None:
+                if not lines:
+                    print(f"{where}: the file is empty; nothing to cite"); failed += 1; continue
+                a, b = 1, len(lines)
+            elif a is None:
+                a, why = symbol_line(lines, loc["symbol"])
+                if a is None:
+                    print(f"{where}: {why}"); failed += 1; continue
+                b = a
             b = b or a
-            excerpt = "\n".join(lines[a - 1:b])
+            if b > len(lines):
+                print(f"{where}: lines {a}-{b} are past the end of the file ({len(lines)} lines)")
+                failed += 1; continue
             upd.update(line_start=a, line_end=b)
             if loc["excerpt"] is None:
+                cut = whole and b - a + 1 > WHOLE_FILE_EXCERPT_LINES
+                excerpt = "\n".join(lines[a - 1:(a - 1 + WHOLE_FILE_EXCERPT_LINES) if cut else b])
                 shown, masked = mask_secrets(excerpt)
                 upd.update(excerpt=shown, excerpt_sha256=hashlib.sha256(excerpt.encode()).hexdigest(),
                            excerpt_redacted=1 if masked else 0)
+                if cut:
+                    upd["excerpt_status"] = "truncated"
         if loc["blob_sha"] is None:
             try:
                 upd["blob_sha"] = git(repo_dir(root, loc["repo_path"], outside), "rev-parse",
@@ -2855,10 +5157,9 @@ def fill_refs(root, con, review_code=None):
             except Exception:
                 pass
         if loc["permalink"] is None and loc["permalink_template"]:
-            link = (loc["permalink_template"].replace("{sha}", loc["commit_sha"])
-                    .replace("{path}", loc["path"]).replace("{start}", str(a or 1))
-                    .replace("{end}", str(b or a or 1)))
-            if SAFE_URL.match(link):
+            link = permalink_for(loc["permalink_template"], loc["commit_sha"], loc["path"],
+                                 None if whole else a, None if whole else b)
+            if link and SAFE_URL.match(link):
                 upd["permalink"] = link
             else:
                 print(f"{where}: the permalink template does not give an http(s) link; no permalink written")
@@ -2925,15 +5226,85 @@ def tag_review(root, con, code):
         except (RuntimeError, OSError, subprocess.SubprocessError) as e:
             print(f"{r['name']}: not tagged: {e}", file=sys.stderr)
             left += 1; continue
-        # recorded right away, in its own short transaction, so a later repository's failure cannot lose it
-        con.execute("UPDATE review_repositories SET tag_name=? WHERE review_id=? AND repository_id=?",
-                    (tag, rv["id"], r["repository_id"]))
+        # recorded right away, in its own short transaction, so a later repository's failure cannot lose it; an
+        # empty commit_time is filled from git, in UTC like every time in the ledger
+        try:
+            when = utc_time(git(d, "show", "-s", "--format=%cI", sha).decode().strip())
+        except (RuntimeError, ValueError, OSError, subprocess.SubprocessError):
+            when = None
+        con.execute("UPDATE review_repositories SET tag_name=?, commit_time=COALESCE(commit_time, ?) "
+                    "WHERE review_id=? AND repository_id=?", (tag, when, rv["id"], r["repository_id"]))
         con.commit()
         hint = f"git -C {shlex.quote(r['path'] or '.')} push origin {shlex.quote(tag)}"
         print(f"{r['name']}: {tag} -> {sha[:10]}  (push with: {hint})")
     if left:
         print(f"tag-review {code}: {left} of {len(repos)} repositories not tagged", file=sys.stderr)
     return 1 if left else 0
+
+
+def check_git_refs(root, con, quiet=False):
+    """Part of `check`: each reviewed commit must exist in its repository (git cat-file -e) and each recorded review
+    tag must point at it (refs/tags/<tag>). A repository folder that is not here (the ledger was copied elsewhere)
+    is noted and not counted. Returns the number of problems."""
+    bad = skipped = 0
+    try:
+        found = rows(con, """SELECT rv.code, rp.name, rp.path, rp.allow_outside_root, rr.commit_sha, rr.tag_name
+                             FROM review_repositories rr JOIN reviews rv ON rv.id = rr.review_id
+                             JOIN repositories rp ON rp.id = rr.repository_id ORDER BY rv.id, rp.id""")
+    except sqlite3.Error as e:  # an older schema (check_schema has already reported it)
+        print(f"    note: reviewed commits and tags were not checked ({e})")
+        return 0
+    for r in found:
+        try:
+            d = repo_dir(root, r["path"], bool(r["allow_outside_root"]))
+            if not d.is_dir():
+                raise FileNotFoundError(d)
+            git(d, "rev-parse", "--git-dir")
+        except (RuntimeError, OSError, subprocess.SubprocessError):
+            skipped += 1
+            continue
+        what = f"{r['code']} {r['name']} {r['commit_sha'][:10]}"
+        try:
+            git(d, "cat-file", "-e", f"{r['commit_sha']}^{{commit}}")
+        except (RuntimeError, subprocess.SubprocessError):
+            print(f"git: {what}: the reviewed commit is not in the repository"); bad += 1
+            continue
+        if r["tag_name"]:
+            try:
+                at = existing_tag(d, r["tag_name"])
+            except (RuntimeError, subprocess.SubprocessError) as e:
+                at = f"unreadable ({e})"
+            if at != r["commit_sha"]:
+                print(f"git: {what}: tag {r['tag_name']} " + ("is missing" if at is None else f"points at {at[:10]}"))
+                bad += 1
+    if skipped and not quiet:
+        print(f"    note: {skipped} reviewed repositories are not here; their commits and tags were not checked")
+    elif not bad and not quiet:
+        print("    0  Reviewed commits missing or review tags moved")
+    return bad
+
+
+TEXT_TARGETS = {"set-report": ("reviews", "report_md", "review", REVIEW_CODE),
+                "set-narrative": ("plans", "narrative_md", "plan", re.compile(r"P-[0-9]{4,}"))}
+
+
+def set_text(con, cmd, code, source):
+    """set-report R-0007 FILE / set-narrative P-0001 FILE: store the review document or the plan's narrative
+    (Markdown, UTF-8; FILE '-' reads standard input) in the ledger, where the viewer shows it. Returns 0."""
+    table, column, what, pattern = TEXT_TARGETS[cmd]
+    if not pattern.fullmatch(code or ""):
+        sys.exit(f"{cmd}: {code!r} is not a {what} code")
+    try:
+        text = sys.stdin.read() if source == "-" else Path(source).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        sys.exit(f"{cmd}: cannot read {source}: {e}")
+    cur = con.execute(f"UPDATE {table} SET {column}=? WHERE code=?", (text, code))
+    if cur.rowcount != 1:
+        con.rollback()
+        sys.exit(f"{cmd}: no {what} {code}")
+    con.commit()
+    print(f"{code}: stored {len(text):,} characters in {table}.{column}")
+    return 0
 
 
 DUMP_HEADER = "-- ledger.py dump: a text copy of the ledger for diffs; rebuild with: sqlite3 new.sqlite < ledger.sql"
@@ -3053,9 +5424,14 @@ def answer_gate(db, code, body):
                 return {"error": "Choose an option or write an answer."}, 400
             if txt and not g["allow_text"] and val is None:
                 return {"error": "Choose one of the options."}, 400
+            # who answered, as an actor (schema 3): the project's owner, made on first use if the ledger has none
+            owner = w.execute("SELECT min(id) FROM actors WHERE kind='owner'").fetchone()[0]
+            if owner is None:
+                owner = w.execute("INSERT INTO actors(kind, name) VALUES ('owner', 'owner')").lastrowid
             cur = w.execute("""UPDATE gates SET status='answered', answer_value=?, answer_text=?,
-                               answered_by='owner', answered_via='viewer' WHERE id=? AND status='open'""",
-                            (val, txt, g["id"]))
+                               answered_by='owner', answered_via='viewer', answered_by_actor_id=?
+                               WHERE id=? AND status='open'""",
+                            (val, txt, owner, g["id"]))
             if cur.rowcount != 1:
                 return {"error": "This question was already answered."}, 409
             w.execute("COMMIT")
@@ -3100,8 +5476,8 @@ def route(root, db, con, path, qs, body):
                 sum(s.status='done') done, sum(s.status='waiting-owner') waiting
                 FROM plans p LEFT JOIN steps s ON s.plan_id=p.id GROUP BY p.id ORDER BY p.created_at DESC"""),
             "recurring": one(con, "SELECT count(*) n FROM v_recurring_issues")["n"],
-            "checks": [{"label": label, "view": v, "n": con.execute(f"SELECT count(*) FROM {v}").fetchone()[0]}
-                       for v, label in MUST_BE_EMPTY],
+            "checks": [{"label": label, "view": v, "tier": tier, "n": count_view(con, v)}
+                       for v, label, tier in (ledger_checks(con) or [])],
             "labels": {t: {r["code"]: r["name"] for r in rows(con, f"SELECT code, name FROM {t}")} for t in LABEL_TABLES},
         }
 
@@ -3131,7 +5507,7 @@ def route(root, db, con, path, qs, body):
             (SELECT count(*) FROM findings f WHERE f.review_id=r.id AND f.severity='H') high,
             (SELECT count(*) FROM findings f WHERE f.review_id=r.id AND f.severity='M') medium,
             (SELECT count(*) FROM findings f WHERE f.review_id=r.id AND f.severity='L') low,
-            (SELECT count(*) FROM findings f WHERE f.review_id=r.id AND f.match_type='new') new_issues,
+            (SELECT count(*) FROM findings f WHERE f.review_id=r.id AND f.match_type IN ('new','continuation')) new_issues,
             (SELECT count(*) FROM findings f WHERE f.review_id=r.id AND f.match_type IN ('recurrence','regression')) came_back
             FROM reviews r ORDER BY r.started_at DESC""")
 
@@ -3168,7 +5544,12 @@ def route(root, db, con, path, qs, body):
                                    FROM review_issue_checks c JOIN issues i ON i.id=c.issue_id WHERE c.review_id=?
                                    ORDER BY c.outcome, i.code""", (rid,)),
             "summary": rows(con, "SELECT * FROM v_review_summary WHERE review=?", (p[1],)),
-            "metrics": rows(con, "SELECT name, scope, value, unit, method, note FROM metrics WHERE review_id=? ORDER BY name, scope", (rid,)),
+            "agents": rows(con, "SELECT * FROM v_review_agents WHERE review=?", (p[1],)),
+            "requirements": rows(con, "SELECT * FROM v_requirement_trace WHERE review=?", (p[1],)),
+            "metrics": rows(con, """SELECT m.name, m.scope, m.value, COALESCE(m.unit, md.unit) unit, m.method, m.note,
+                COALESCE(md.label, upper(substr(m.name, 1, 1)) || replace(substr(m.name, 2), '_', ' ')) label,
+                COALESCE(md.better, 'none') better
+                FROM metrics m LEFT JOIN metric_defs md ON md.name=m.name WHERE m.review_id=? ORDER BY m.name, m.scope""", (rid,)),
             "artifacts": rows(con, "SELECT kind, path, url FROM artifacts WHERE review_id=? ORDER BY kind", (rid,)),
             "gates": rows(con, "SELECT code, kind, title, status, answer_value, answer_text FROM gates WHERE review_id=? ORDER BY created_at", (rid,)),
             "findings": findings,
@@ -3270,7 +5651,8 @@ def route(root, db, con, path, qs, body):
 
     if p == ["tables"]:
         out = []
-        for t in rows(con, "SELECT name, type FROM sqlite_master WHERE type IN ('table','view') ORDER BY type, name"):
+        for t in rows(con, """SELECT name, type FROM sqlite_master WHERE type IN ('table','view')
+                              AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY type, name"""):
             cols = [c["name"] for c in rows(con, "SELECT name FROM pragma_table_info(?)", (t["name"],))]
             n = con.execute(f"SELECT count(*) FROM {quote_name(t['name'])}").fetchone()[0]
             out.append({**t, "columns": cols, "count": n})
@@ -3509,6 +5891,10 @@ def main():
     sub.add_parser("check")
     s = sub.add_parser("fill-refs"); s.add_argument("review", nargs="?")
     s = sub.add_parser("tag-review"); s.add_argument("review")
+    s = sub.add_parser("set-report", help="store the review document (Markdown) shown in the viewer")
+    s.add_argument("review"); s.add_argument("file", help="Markdown file, or - for standard input")
+    s = sub.add_parser("set-narrative", help="store the plan's narrative (Markdown) shown in the viewer")
+    s.add_argument("plan"); s.add_argument("file", help="Markdown file, or - for standard input")
     s = sub.add_parser("show"); s.add_argument("location", type=int)
     sub.add_parser("gates")
     sub.add_parser("dump")
@@ -3541,8 +5927,8 @@ def main():
         migrate(db); return
     # Writes refuse an older ledger; serve, gates and the writes also refuse a schema that differs from the shipped
     # one (a forged trigger could answer gates). show and dump still read it, for diagnosis; check reports it.
-    con = open_ledger(db, write=a.cmd in ("serve", "fill-refs", "tag-review"),
-                      verify=a.cmd in ("serve", "gates", "fill-refs", "tag-review"))
+    con = open_ledger(db, write=a.cmd in ("serve", "fill-refs", "tag-review", "set-report", "set-narrative"),
+                      verify=a.cmd in ("serve", "gates", "fill-refs", "tag-review", "set-report", "set-narrative"))
     if a.cmd == "serve":
         con.close(); serve(root, db, a.port, not a.no_open)
     elif a.cmd == "check":
@@ -3550,11 +5936,15 @@ def main():
         if was and was[0] != str(db.parent):
             print(f"warning: this ledger was set up at {was[0]} and is now used from {db.parent} (fine after a move; "
                   f"init records the new place)", file=sys.stderr)
-        sys.exit(1 if check(con) else 0)
+        bad = check(con)
+        bad += check_git_refs(root, con)
+        sys.exit(1 if bad else 0)
     elif a.cmd == "fill-refs":
         sys.exit(1 if fill_refs(root, con, a.review) else 0)
     elif a.cmd == "tag-review":
         sys.exit(tag_review(root, con, a.review))
+    elif a.cmd in ("set-report", "set-narrative"):
+        sys.exit(set_text(con, a.cmd, a.review if a.cmd == "set-report" else a.plan, a.file))
     elif a.cmd == "show":
         s = source(root, con, a.location, context=0)
         if s.get("error"):
@@ -3571,6 +5961,13 @@ def main():
         for g in rows(con, "SELECT * FROM gates WHERE status IN ('open','answered') ORDER BY created_at"):
             ans = f" -> {g['answer_value'] or ''} {g['answer_text'] or ''}".rstrip() if g["status"] == "answered" else ""
             print(f"{g['code']}  [{g['status']}] {g['kind']}: {g['title']}{ans}")
+        try:
+            stale = rows(con, "SELECT * FROM v_stale_steps ORDER BY plan, step")
+        except sqlite3.Error:
+            stale = []  # an older ledger (gates warned already): migrate adds the view
+        for s in stale:
+            print(f"stale step {s['plan']} #{s['step']} [{s['status']}] {s['title']}: its issues are all closed "
+                  f"({s['issues']}); mark it done or dropped")
     elif a.cmd == "dump":
         dump(con, db)
 

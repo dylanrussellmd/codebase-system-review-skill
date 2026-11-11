@@ -216,7 +216,9 @@ def build(proj, scale=1, reviews=5, files=300, reports=None, ledger_py=None, see
         rid = lastid()
         review_ids.append(rid)
         for st in ("awaiting-approval", "approved", "running", "verifying", "indexing"):
-            x("UPDATE reviews SET status=? WHERE id=?", (st, rid))
+            # schema 3: a review past awaiting-approval has approved_at
+            x("UPDATE reviews SET status=?, approved_at=CASE WHEN ?='approved' THEN ? ELSE approved_at END WHERE id=?",
+              (st, st, _ts(day, 60), rid))
         x("INSERT INTO review_repositories(review_id,repository_id,commit_sha,branch,commit_subject) "
           "VALUES (?,1,?,'main',?)", (rid, sha, f"commit {k}"))
         for j in range(1, 9):
@@ -286,7 +288,8 @@ def build(proj, scale=1, reviews=5, files=300, reports=None, ledger_py=None, see
         t0 = time.perf_counter()
         x("BEGIN")
         issues = [tuple(r) for r in x("SELECT id, domain_code, status FROM issues")]
-        known = [i for i in issues if i[1] in inc and i[2] not in ("duplicate", "obsolete")]
+        # every known issue, duplicate and obsolete ones too: a recurrence matched below may reopen them (schema 3)
+        known = [i for i in issues if i[1] in inc]
         for (iid, dom, st) in known:
             outc = rnd.choices(["still-present", "fixed", "not-checked", "changed", "regressed"], (6, 2, 1, 1, 0.3))[0]
             x("INSERT INTO review_issue_checks(review_id,issue_id,outcome,evidence,actor_id) VALUES (?,?,?,?,?)",
@@ -302,7 +305,7 @@ def build(proj, scale=1, reviews=5, files=300, reports=None, ledger_py=None, see
         t0 = time.perf_counter()
         created = []
         for (fid, dom) in fids[:nnew]:
-            code = f"ISS-{next_iss:05d}"
+            code = f"ISS-{next_iss:04d}"   # canonical and sequential (schema 3)
             next_iss += 1
             sev = x("SELECT severity FROM findings WHERE id=?", (fid,)).fetchone()[0]
             x("""INSERT INTO issues(code,title,domain_code,theme_code,sub,kind,severity,fingerprint,before_state,
@@ -314,12 +317,19 @@ def build(proj, scale=1, reviews=5, files=300, reports=None, ledger_py=None, see
               "WHERE id=?", (iid, text(15), fid))
             created.append((iid, dom, "open"))
         T.add("match_new_issue", time.perf_counter() - t0, nnew)
-        pool = issues + created
+        # schema 3: a review that recorded an issue fixed cannot also raise it, and 'regression' is only for an
+        # issue that was fixed or verified
+        fixed_here = {r[0] for r in x("SELECT issue_id FROM review_issue_checks WHERE review_id=? AND outcome='fixed'",
+                                      (rid,))}
+        pool = [i for i in issues + created if i[0] not in fixed_here]
         t0 = time.perf_counter()
         for (fid, dom) in fids[nnew:]:
             iid = rnd.choice(pool)[0]
             mt = rnd.choices(["still-present", "changed", "recurrence", "regression", "continuation"],
                              (6, 2, 1, 1, 1))[0]
+            if mt == "regression" and x("SELECT status FROM issues WHERE id=?", (iid,)).fetchone()[0] not in (
+                    "fixed", "verified", "regressed"):
+                mt = "recurrence"
             x("UPDATE findings SET issue_id=?, match_type=?, match_confidence='likely', match_rationale=? WHERE id=?",
               (iid, mt, text(15), fid))
         T.add("match_existing_issue", time.perf_counter() - t0, len(fids) - nnew)
@@ -454,13 +464,14 @@ def _build_plan(con, rnd, text, review_ids, all_findings, n_steps, head_sha, T):
     t0 = time.perf_counter()
     nupd = 0
     x("BEGIN")
-    x("UPDATE plans SET status='approved' WHERE id=?", (plan_id,))
+    x("UPDATE plans SET status='awaiting-approval' WHERE id=?", (plan_id,))
+    x("UPDATE plans SET status='approved', approved_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?", (plan_id,))
     x("UPDATE plans SET status='in-progress' WHERE id=?", (plan_id,))
     for sid in step_ids:
         r = rnd.random()
         if r < 0.4:
-            x("UPDATE steps SET status='doing', change_actor_id=? WHERE id=?", (agent, sid))
-            x("UPDATE steps SET status='done', progress_note=?, change_commit_sha=? WHERE id=?",
+            x("UPDATE steps SET status='doing', change_actor_id=?, change_note='started' WHERE id=?", (agent, sid))
+            x("UPDATE steps SET status='done', progress_note=?, change_commit_sha=?, change_note='done' WHERE id=?",
               (text(30), head_sha, sid))
             x("INSERT INTO step_commits(step_id,repository_id,commit_sha,branch,summary) VALUES (?,1,?,'main',?)",
               (sid, head_sha, text(8)))
@@ -474,7 +485,7 @@ def _build_plan(con, rnd, text, review_ids, all_findings, n_steps, head_sha, T):
                   (iid, f"tests/test_{iid % 50}.py", f"test_issue_{iid}", sid, head_sha))
                 nupd += 1
         elif r < 0.5:
-            x("UPDATE steps SET status='doing', change_actor_id=? WHERE id=?", (agent, sid))
+            x("UPDATE steps SET status='doing', change_actor_id=?, change_note='started' WHERE id=?", (agent, sid))
         elif r < 0.55:
             x("UPDATE steps SET status='waiting-owner', owner_question=? WHERE id=?", (text(12), sid))
     x("COMMIT")
@@ -546,12 +557,14 @@ def _git_growth(info, rnd, commits=5, ledger_py=None):
             rnd.shuffle(steps)
         with con:
             for sid in steps[c * 30:(c + 1) * 30]:
-                con.execute("UPDATE steps SET status='doing' WHERE id=? AND status='planned'", (sid,))
-                con.execute("UPDATE steps SET status='done', progress_note=? WHERE id=?", (prose.text(30), sid))
-            if checks is None:
-                checks = [r[0] for r in con.execute("SELECT rowid FROM review_issue_checks ORDER BY rowid")]
+                con.execute("UPDATE steps SET status='doing', change_note='started' WHERE id=? AND status='planned'",
+                            (sid,))
+                con.execute("UPDATE steps SET status='done', progress_note=?, change_note='done' WHERE id=?",
+                            (prose.text(30), sid))
+            if checks is None:  # review checks are append-only (schema 3): edit issue text instead
+                checks = [r[0] for r in con.execute("SELECT id FROM issues ORDER BY id")]
             for cid in rnd.sample(checks, min(20, len(checks))):
-                con.execute("UPDATE review_issue_checks SET evidence=? WHERE rowid=?", (prose.text(20), cid))
+                con.execute("UPDATE issues SET recommendation=? WHERE id=?", (prose.text(20), cid))
         try:
             con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         finally:

@@ -1,7 +1,7 @@
 ---
 name: codebase-system-review
 description: Run a managed, read-only, multi-reviewer audit of any codebase (tests, security, performance, architecture, UI, API, DB, docs, logging), verify findings, record every point in a per-project SQLite ledger tracked across reviews, then turn every point into a tracked fix plan.
-version: 1.2.1
+version: 1.3.0
 ---
 
 # Comprehensive review of a software system
@@ -60,6 +60,8 @@ python3 .code-review/ledger.py serve              # the owner's local viewer at 
 python3 .code-review/ledger.py check              # integrity + must-be-empty checks; exit 1 on any problem
 python3 .code-review/ledger.py fill-refs R-0007   # copy cited lines, blob ids, permalinks from git
 python3 .code-review/ledger.py tag-review R-0007  # tag each reviewed commit (review/R-0007) so it stays reachable
+python3 .code-review/ledger.py set-report R-0007 review.md    # store the review document (Step 6) for the viewer
+python3 .code-review/ledger.py set-narrative P-0001 plan.md   # store the plan's narrative (Step 8) for the viewer
 python3 .code-review/ledger.py show <location id> # print the cited lines at their commit
 python3 .code-review/ledger.py gates              # questions open or answered (poll this for owner answers)
 python3 .code-review/ledger.py dump               # write .code-review/ledger.sql, a text copy for diffs
@@ -118,14 +120,18 @@ their logic.
 - **Views:** `v_owner_queue`, `v_open_issues`, `v_known_issues_for_brief`, `v_recurring_issues`, `v_issue_timeline`,
   `v_issue_graph`, `v_review_summary`, `v_code_refs`, `v_plan_progress`, `v_metric_trends`, `v_file_hotspots`,
   `v_standing_decisions`, `v_unguarded_fixes`, and the must-be-empty checks `v_unmatched_findings`,
-  `v_unchecked_known_issues`, `v_untraceable_refs`, `v_uncovered_findings`, `v_coverage_problems`.
+  `v_unchecked_known_issues`, `v_untraceable_refs`, `v_uncovered_findings`, `v_coverage_problems`,
+  `v_unplanned_discoveries` (a defect found during fix work, recorded as a finding with `discovered_in_step_id`, whose
+  issue is open and that no plan step closes).
 
 ### Rules for the ledger
 
 - **One writer.** Only the manager writes to the ledger. Reviewers, indexers, matchers and drafters read it read-only
   (`sqlite3 -readonly`, or Python with `file:...?mode=ro`) and hand their output back as files.
 - **Codes** are sequential and never reused: `R-0001` reviews, `ISS-0001` issues, `P-0001` plans, `D-0001` decisions,
-  `GATE-0001` gates. Finding `point_id`s are the index ids (e.g. `SEC-H3`), unique within a review.
+  `GATE-0001` gates, `REQ-0001` requirements, `G-01` design goals. The ledger refuses a malformed code, a gap, a reused
+  code and a changed one: take the next number (`max` + 1). Finding `point_id`s are the index ids (e.g. `SEC-H3`),
+  unique within a review. Every commit column takes the full 40- (or 64-) character lowercase hash.
 - **Every reference must lead back to the exact lines.** Record each repo's full 40-character commit hash in
   `review_repositories` before reviewers start. If the working tree has uncommitted changes, say so, save `git diff` to
   `.code-review/patches/R-0007-<repo>.patch` and record it, or ask the owner to commit first. After indexing, run
@@ -133,18 +139,46 @@ their logic.
   branches can't make it unreachable) and `fill-refs` (copies the cited lines verbatim into `excerpt`, plus the blob id
   and a permalink). `v_untraceable_refs` must then be empty. Both exit 1 when anything was left undone (a repository
   left untagged, a review with no repositories, a reference past the end of its file or whose symbol is not found):
-  read what they printed. Tags are local; pushing them is the owner's call: list the push commands. fill-refs stores
+  read what they printed. A reference with a symbol and no lines gets the one line that defines the symbol (`def`,
+  `class`, `function`, `interface`, `struct`, `enum`, `fn`, `func` or SQL `CREATE TABLE/VIEW/TRIGGER/INDEX`, then the
+  symbol as a whole word), else the one line holding the symbol as a whole word; several candidates or none leave it
+  unlined and counted as failed (give the lines). A reference with neither lines nor symbol (location form
+  `repo:path`) is about the whole file: fill-refs sets `whole_file`, lines 1..n, an excerpt of at most the first 200
+  lines (`excerpt_status` truncated) and a permalink without a line anchor. A binary or non-UTF-8 file gets no
+  excerpt: `excerpt_status` not-text and the hash of its bytes. Existing excerpts are never overwritten.
+  `check` also confirms each reviewed commit is in its repository and each recorded review tag still points at it.
+  **Times** are UTC text with milliseconds, `strftime('%Y-%m-%dT%H:%M:%fZ', ...)` (2026-11-10T09:30:00.000Z); the
+  ledger refuses any other form, so convert with that strftime (git's `%cI` has an offset). Leave
+  `review_repositories.commit_time` NULL and tag-review fills it in UTC. Tags are local; pushing them is the owner's call: list the push commands. fill-refs stores
   only `http(s)` permalinks; the schema refuses any other scheme in `permalink`, `summary_doc_url`, `pr_url` and
   `permalink_template`, and refuses location paths that are absolute, contain `..`, a backslash, a control character or
   start with `-`.
-- **Status and severity changes carry context.** When you update an issue's `status` or `severity`, set all five
-  `change_*` columns in the same UPDATE (actor, review, step, commit, note; NULL the ones that don't apply). Triggers
-  write the history from them. Steps likewise take `change_actor_id` and `change_commit_sha`.
+- **Status and severity changes carry context.** When you update an issue's `status` or `severity`, give
+  `change_note` (why) in the same UPDATE, with `change_actor_id`, `change_review_id`, `change_step_id` and
+  `change_commit_sha` where they apply; the ledger refuses the change without `change_note`. Triggers write the history
+  from them and then clear all five, so nothing carries over to the next change. Steps take `change_note` (on
+  `waiting-owner` the `owner_question` will do), `change_actor_id` and `change_commit_sha`; reviews and plans take
+  `change_actor_id` and `change_note`, gates `change_actor_id`. Setting an issue `fixed` needs `after_state`; a
+  regression moves the old `after_state` into the event and clears it.
+- **Statuses move in order.** A review goes planning, awaiting-approval, approved (set `approved_at` in the same
+  UPDATE), running, verifying, indexing, consolidating, handed-off; after approval it may skip ahead, and between
+  running and consolidating it may go back; anything may become abandoned. It leaves awaiting-approval only once its
+  domain-approval gate is applied, and reviewer runs and findings are refused until it is approved. A plan goes
+  drafting, awaiting-approval, approved (with `approved_at`, once its plan-approval gate is applied), in-progress,
+  complete. Leaving handed-off, abandoned or superseded needs `change_note`. A step cannot start or finish while a
+  blocking gate on it is open or answered but not applied.
 - **Absence is not a fix.** An issue that a review did not raise again is not fixed. Only a `review_issue_checks` row
-  with outcome `fixed` (with evidence) or a done plan step moves it. Triggers then do the rest: a fixed issue reported
-  fixed again becomes verified; a fixed or verified issue matched by a new finding becomes regressed.
-- **Never edit or delete history** (findings, events, checks, decisions) to make a number look better. Correct with a
-  new row or a status change that says why.
+  with outcome `fixed` (with evidence) or a done plan step moves it. Triggers then do the rest: `fixed` on a fixed issue
+  verifies it, on an active one marks it fixed (the evidence becomes `after_state`; the resolution names a plan step
+  that is not done yet); `regressed`, `still-present` or `changed` on a fixed or verified issue regresses it;
+  `obsolete` closes it as obsolete. A review cannot check an issue it first found, records one check per issue, and
+  cannot both report an issue `fixed` and raise it again.
+- **History is append-only, and the ledger enforces it.** Events and review checks cannot be changed or deleted;
+  findings, locations, issues, relations, reviews, decisions, gates and steps cannot be deleted; a finding's text is
+  fixed once written (only its matching and verification columns change) and a location keeps its finding,
+  repository, commit, path, symbol and role. Correct with a new row or a status change that says why: abandon a review,
+  drop a step, withdraw a gate, close an issue. Every tracked change writes an event (text edits as
+  `<field>-changed` with the old and new text, created rows, every review check as `checked`).
 - **Keep it in the repo** (unless it is kept outside with `CODE_REVIEW_DIR`, see above). The ledger, `ledger.py`,
   `ledger.sql` (run `dump` after each writing session) and saved patches live in `.code-review/` (owner-only files). Writing there is the one change to the repository this skill makes during a review.
   Commit it only when the owner agrees (or has a standing instruction), in its own commit. If a merge conflicts on the
@@ -170,11 +204,14 @@ open a gate: a `gates` row with a plain-language title, question, the context ne
 also answer in the viewer. A blocking gate stops the work that depends on it.
 
 - Answer given in chat: record it on the gate in one statement that only touches an open gate,
-  `UPDATE gates SET status='answered', answer_value=?, answer_text=?, answered_via='chat' WHERE code=? AND
-  status='open'`, and check that it changed one row (`cur.rowcount == 1`, or `SELECT changes()`); if not, the owner
+  `UPDATE gates SET status='answered', answer_value=?, answer_text=?, answered_via='chat', answered_by_actor_id=<the
+  owner's actors id> WHERE code=? AND status='open'`, and check that it changed one row (`cur.rowcount == 1`, or `SELECT changes()`); if not, the owner
   already answered in the viewer: read that answer with `ledger.py gates` instead. Once a gate is not open its answer
   cannot be changed (a trigger refuses it); to ask again, open a new gate, or reopen this one (`status='open'` with
-  both answer columns NULL; the cleared answer is kept in `events`).
+  both answer columns NULL; the cleared answer is kept in `events`). The ledger applies the viewer's rules to chat
+  answers too: `answer_value` must be one of the option values, a gate without free text needs an option, and options
+  are objects with a text `value` and `label`. A gate moves open, answered, applied (with `applied_note`: what you did)
+  or withdrawn; it cannot be applied before it is answered.
 - A `production-action` or `accept-risk` answer that arrived through the viewer is confirmed by the owner in the chat
   before you act on it (anyone on the machine who can reach the viewer could have answered).
 - Answer given in the viewer: you find it with `ledger.py gates`. Check before resuming any paused work and at the
@@ -278,7 +315,8 @@ Write `BRIEF.md` in the review folder. Every reviewer reads it first. It contain
   belong to another domain (note it in a "for other reviewers" section rather than reviewing it).
 - **Known issues** for each domain, from `v_known_issues_for_brief`: code, title, status, last known state, where
   (paths, symbols), guard tests, and any standing decision about it. Each reviewer must report on every known issue in
-  its domain in a "Known issues" table: still present / changed / fixed / came back / no longer applies / not checked,
+  its domain in a "Known issues" table with one of the outcomes the ledger records: `still-present`, `changed`,
+  `fixed`, `regressed` (came back), `obsolete` (no longer applies) or `not-checked`,
   with evidence. A new finding that continues, repeats or relates to a known issue names that issue's code.
 - **Rules for reviewers:**
   - Read-only. Do not edit, create or delete anything inside the repositories. Do not commit, push or deploy. No
@@ -593,7 +631,7 @@ Columns (tab separated, no header): id (PREFIX plus the report's own id, else se
 pure missing test); kind (defect, test, validation, refactor, feature, design, docs, logging, perf, security, ops,
 verify); theme (one code from the ledger's `themes` table); sub (a short slug naming the specific thing, so the same
 thing in different reports and different reviews gets the same slug; reuse the slug of a known issue when it is the
-same thing); locations (one or more `repo:path:start-end#symbol`, separated by `;`); where_report (line numbers);
+same thing); locations (one or more `repo:path:start-end#symbol`, or `repo:path` for a whole file, separated by `;`); where_report (line numbers);
 summary (one self-contained sentence); before (what the code does now); fix; test; related (ids in the same file);
 known_issue (an `ISS-` code if the report named one).
 
@@ -608,7 +646,8 @@ reviewed commit (`git cat-file -e <sha>:<path>`). Fix gaps by sending the indexe
 
 ### 5c. Load the ledger
 
-In one transaction per report: insert `findings` (with `verification` from Step 4, `before_state`, `recommendation`,
+In one transaction per report: insert `findings` unmatched (`issue_id` NULL: the ledger refuses an insert that sets
+it; matching is the UPDATE in 5d, which runs the bookkeeping), with `verification` from Step 4, `before_state`, `recommendation`,
 `recommended_test`, `fingerprint` = `domain:theme:sub[:symbol]`), `finding_locations` (repository, path, lines, symbol;
 the commit fills itself from the review), `finding_goals`, `finding_requirements`, and the reviewer's known-issue
 verdicts into `review_issue_checks` (outcome, evidence, the reviewer's actor). Record `metrics` and any `test_runs`
@@ -621,11 +660,16 @@ and symbol, or overlapping lines after following renames with `git log --follow`
 `excerpt_sha256` (identical code). At scale, give matching to read-only matcher subagents by domain, each returning a
 TSV of (point id, issue code or NEW, match type, confidence, rationale, extra relations); you check their work.
 
+- Match by `UPDATE findings SET issue_id=?, match_type=?, ...`. Re-pointing a finding to another issue recounts both
+  issues and logs an `unlinked` event on the old one.
 - Same problem, still there → link to the issue, `still-present` (or `changed` if its shape or severity changed:
-  update the issue's severity and `current_state`, with context).
-- An issue that was fixed or verified and is back → link it, `regression` (the trigger marks the issue regressed).
+  update the issue's severity and `current_state`, with context). These never regress a fixed issue: a changed or
+  still-present finding on a fixed or verified issue means it came back, so match it as `regression`.
+- An issue that was fixed or verified and is back → link it, `regression` (the trigger marks the issue regressed; the
+  ledger refuses `regression` for an issue that was not fixed or verified).
   Add a regression note: which guard test failed to catch it, or that there was none.
-- The same problem, closed earlier as obsolete or won't-fix, or a recurrence after a long gap → `recurrence`.
+- The same problem, closed earlier as obsolete or won't-fix, or a recurrence after a long gap → `recurrence` (the
+  trigger reopens an obsolete, wont-fix or duplicate issue; an accepted risk stays accepted, with a `recurred` event).
 - A new problem that grows out of an earlier one (a fix that moved the bug, a follow-on) → new issue, `continuation`,
   plus an `issue_relations` row `continuation-of`.
 - Otherwise → new issue (`ISS-` next code, `before_state` from the finding, `recommendation`, `first_seen_review_id`),
@@ -634,7 +678,11 @@ TSV of (point id, issue code or NEW, match type, confidence, rationale, extra re
 - A finding about an issue with a standing decision (accepted risk, won't fix): link it, leave the status, and list it
   for the owner only if something material changed (open a `confirm` gate in that case).
 - False findings stay in the ledger (verification `false`) and are still matched, so a later review that raises them
-  again sees they were checked and why they were wrong.
+  again sees they were checked and why they were wrong. A false finding never regresses an issue, moves its
+  `current_state` or counts as a sighting (`times_seen`, `last_seen`). One that matches no existing issue gets its own
+  issue created with status `obsolete` and resolution `false finding: <why>`, so it never shows as open.
+- `duplicate-of` and `merged-into` relations close their (active) source issue as `duplicate`; the ledger refuses a
+  relation stored both ways (related-to included) and any cycle of `blocks`, `duplicate-of` or `merged-into`.
 
 Every known issue in a domain that ran gets a `review_issue_checks` row (use `not-checked` honestly when the reviewer
 did not look). Run `check`: `v_unmatched_findings`, `v_unchecked_known_issues` and `v_untraceable_refs` must be empty.
@@ -663,7 +711,9 @@ did not run):
    logging and operations, documentation and handover; plus any decision the owner must make.
 
 Attach the full reviewer reports as files and record them, the brief and the document in `artifacts` (set
-`summary_doc_url` and `verdict`/`summary` on the review). Check every number in the document against the ledger.
+`summary_doc_url` and `verdict`/`summary` on the review). Store the document's Markdown in the ledger with
+`ledger.py set-report R-0007 review.md` (it fills `reviews.report_md`, which the viewer shows on the review page).
+Check every number in the document against the ledger.
 
 ## Step 7: Hand off
 
@@ -684,7 +734,9 @@ parallel drafting in 8b and plan directly.
 Create the `plans` row (`P-` next code, status `drafting`) and its `plan_reviews`. Plans may cover several reviews,
 and may include still-open issues from older plans (close those plans as `superseded` when their open steps move
 over). Create a separate living document ("Fix Plan"), outline only: how to read it, phase overview, phases with steps,
-coverage. Open it for the owner before drafting starts.
+coverage. Open it for the owner before drafting starts. Its narrative (how to read the plan, why this order) also
+goes into the ledger with `ledger.py set-narrative P-0001 plan.md` (`plans.narrative_md`, shown on the plan page);
+run it again whenever the narrative changes.
 
 ### 8b. Build the plan (you, the manager)
 
@@ -701,8 +753,9 @@ At full-review scale (about 2,000 points) one pass is too large, so draft in par
   cluster, and must show every point of its cluster closed before handing back.
 - Merge: read every step title phase by phase; fold steps that are the same fix into one (union of points, both texts
   kept); move steps whose dependency sits in a later phase; order sections inside a phase with verification and pinning
-  tests first; renumber globally. Load `steps`, `step_dependencies` (the ledger refuses a dependency on a later step)
-  and `step_findings`.
+  tests first; renumber globally. Load `steps`, `step_dependencies` (the ledger refuses a dependency on a later step,
+  and later renumbering that would break one: renumber before loading dependencies) and `step_findings` (only findings
+  of the plan's `plan_reviews`).
 - Count the steps that need the owner by kind (decision, confirm, review, production action) and the steps that change
   behavior on purpose.
 

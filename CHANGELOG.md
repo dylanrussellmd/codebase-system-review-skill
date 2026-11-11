@@ -2,6 +2,22 @@
 
 The tool version is `version:` in SKILL.md's frontmatter; `ledger.py --version` prints it with the schema version.
 
+## 1.3.0 (schema 5)
+
+- Schema 3 (migration 0003, integrity): history is append-only; findings are inserted unmatched and matched by
+  UPDATE; status and severity changes need a `change_note`; a fixed issue needs `after_state`; only a `regression`
+  match regresses an issue and false findings count for nothing; the review-check outcome matrix is enforced and checks
+  are immutable; codes are sequential and canonical and commit columns hold full hashes; review, plan, gate and step
+  transitions, approvals and blocking gates are enforced; gate answers must be one of the gate's options; every tracked
+  change writes an event; gate kind `confirm`.
+- Schema 4 (migration 0004, views): `ledger_checks` drives `check` (error and warning tiers) and the overview; an index
+  on every foreign-key column; requirement verdicts per review (`v_requirement_trace`); agents per review
+  (`review_actors`); plan helper views; a metric catalog; faster coverage and summary views; `PRAGMA optimize`.
+- Schema 5 (migration 0005, records): every stored time is UTC with milliseconds; fill-refs resolves symbols by
+  definition, refuses out-of-range lines and supports whole-file references; continuations count as new issues;
+  `reviews.report_md` and `plans.narrative_md` with `set-report` and `set-narrative`; `findings.discovered_in_step_id`
+  and the `v_unplanned_discoveries` check.
+
 ## 1.2.1 (schema 2)
 
 - `migrate` writes its `ledger.sqlite.bak-v<N>` backup owner-only (0600), and `init` makes existing backups private.
