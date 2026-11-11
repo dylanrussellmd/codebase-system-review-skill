@@ -15,7 +15,7 @@ what is waiting on the owner. Standard library only (Python 3.9+).
 Options: --root DIR (project root; default: the nearest folder upward with a ledger, else the
 top of the current git repository, else the current directory), --db FILE.
 """
-import argparse, hashlib, html, json, os, re, secrets, sqlite3, subprocess, sys, threading
+import argparse, hashlib, json, re, secrets, sqlite3, subprocess, sys, threading
 import webbrowser
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer

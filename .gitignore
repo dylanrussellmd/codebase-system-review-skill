@@ -1,3 +1,4 @@
 __pycache__/
 *.pyc
-.code-review/ledger.sqlite-journal
+# The review ledger of this repository stays local (decision D-0001).
+.code-review/
