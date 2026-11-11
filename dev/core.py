@@ -218,6 +218,8 @@ _shipped = {}
 CREATE_OBJECT = re.compile(r"^CREATE (?:UNIQUE |TEMP |TEMPORARY )?(TABLE|INDEX|VIEW|TRIGGER) (?:IF NOT EXISTS )?"
                            r"([A-Za-z_][A-Za-z0-9_]*)", re.I)
 
+LEADING_COMMENTS = re.compile(r"(?:\s+|--[^\n]*(?:\n|$)|/\*.*?\*/)*", re.S)
+
 
 def shipped_objects():
     """[(type, name, tbl_name, sql)] of the shipped schema in creation order: each CREATE statement of SCHEMA, read
@@ -228,7 +230,8 @@ def shipped_objects():
         for stmt in split_sql(SCHEMA):
             m = CREATE_OBJECT.match(normalize_sql(stmt))
             if m:
-                sql = stmt[stmt.upper().index("CREATE"):].rstrip().rstrip(";").rstrip()
+                lead = LEADING_COMMENTS.match(stmt)  # skip comments above the statement, which may say "create"
+                sql = stmt[lead.end():].rstrip().rstrip(";").rstrip()
                 out.append((m.group(1).lower(), m.group(2), None, sql))
         _shipped.clear()
         _shipped[SCHEMA] = out

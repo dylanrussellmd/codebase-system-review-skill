@@ -106,6 +106,20 @@ class CheckDrift(unittest.TestCase):
 
 
 class ShippedObjects(unittest.TestCase):
+    def test_shipped_objects_ignores_create_in_comments(self):
+        """A comment above a statement that says 'create' (any case) is not taken as the statement's start."""
+        mod = fixtures.load_ledger_module()
+        schema = ("-- Created rows are logged below.\n/* we create one table */\nCREATE TABLE t (a INTEGER);\n"
+                  "-- create an index\nCREATE INDEX t_a ON t (a);\n")
+        saved = mod.SCHEMA
+        try:
+            mod.SCHEMA = schema
+            got = [(t, n, s) for t, n, _, s in mod.shipped_objects()]
+        finally:
+            mod.SCHEMA = saved
+            mod._shipped.clear()
+        self.assertEqual(got, [("table", "t", "CREATE TABLE t (a INTEGER)"), ("index", "t_a", "CREATE INDEX t_a ON t (a)")])
+
     def test_shipped_objects_match_sqlite(self):
         """shipped_objects() reads the CREATE statements from SCHEMA's text (no extra connection); it must list
         exactly what SQLite stores in sqlite_master when SCHEMA runs, in the same order and with the same SQL."""

@@ -25,7 +25,7 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 TOOL_VERSION = "1.3.0"  # stamped by dev/build.py from `version:` in SKILL.md's frontmatter
-TOOL_HASH = "892eabf1173ca02c8cd674c88bfe77bec422085db1602b4336b885be0d460eda"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
+TOOL_HASH = "118784c92a97bc14827d023daab287d16dd6199d766e18c44b3964788dfda9e0"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
 SCHEMA = r"""-- =====================================================================
 -- Code review ledger — schema version 5
 -- One SQLite file per project: <project root>/.code-review/ledger.sqlite
@@ -4235,6 +4235,8 @@ _shipped = {}
 CREATE_OBJECT = re.compile(r"^CREATE (?:UNIQUE |TEMP |TEMPORARY )?(TABLE|INDEX|VIEW|TRIGGER) (?:IF NOT EXISTS )?"
                            r"([A-Za-z_][A-Za-z0-9_]*)", re.I)
 
+LEADING_COMMENTS = re.compile(r"(?:\s+|--[^\n]*(?:\n|$)|/\*.*?\*/)*", re.S)
+
 
 def shipped_objects():
     """[(type, name, tbl_name, sql)] of the shipped schema in creation order: each CREATE statement of SCHEMA, read
@@ -4245,7 +4247,8 @@ def shipped_objects():
         for stmt in split_sql(SCHEMA):
             m = CREATE_OBJECT.match(normalize_sql(stmt))
             if m:
-                sql = stmt[stmt.upper().index("CREATE"):].rstrip().rstrip(";").rstrip()
+                lead = LEADING_COMMENTS.match(stmt)  # skip comments above the statement, which may say "create"
+                sql = stmt[lead.end():].rstrip().rstrip(";").rstrip()
                 out.append((m.group(1).lower(), m.group(2), None, sql))
         _shipped.clear()
         _shipped[SCHEMA] = out
