@@ -161,7 +161,7 @@ const words = s => s == null ? "" : String(s).replace(/[-_]/g," ").replace(/^./,
 const ENUM_OF = {sev:"severity", issue:"issue_status", match:"match_type", verif:"verification", review:"review_status",
   scope:"review_scope", step:"step_status", need:"owner_need", gate:"gate_kind", gstat:"gate_status", rel:"relation_type",
   relIn:"relation_type_inverse", check:"check_outcome", kind:"issue_kind", run:"run_status", plan:"plan_status",
-  decision:"decision_status"};
+  decision:"decision_status", goal:"goal_status", via:"answered_via"};
 const FALLBACK = {sev:{H:"High",M:"Medium",L:"Low",T:"Missing test"}, need:{none:""}};
 let L = {};
 const setLabels = enums => { L = Object.fromEntries(Object.entries(ENUM_OF).map(([k, e]) =>
@@ -293,7 +293,7 @@ VIEWS.inbox = async () => {
     open.length ? open.map(gateCard) : empty("Nothing is waiting on you right now."),
     answered.length ? [h("h3", null, "Answered, waiting for the agent to act"), answered.map(gateCard)] : null,
     d.other.length ? [h("h3", null, "Also waiting on you (answer in the chat)"),
-      table([{label:"What", get:r => r.kind === "step" ? "Plan step " + r.ref : "Decision " + r.ref}, {label:"Needs", get:r => lab("need", r.need) || "Your input"},
+      table([{label:"What", get:r => (r.kind === "step" ? "Plan step " : r.kind === "goal" ? "Design goal " : "Decision ") + r.ref}, {label:"Needs", get:r => lab("need", r.need) || "Your input"},
              {label:"Title", key:"title"}, {label:"Question", key:"question"}], d.other)] : null,
     h("p", null, h("a", {href:"#/history"}, "See every question and answer so far")));
 };
@@ -385,6 +385,8 @@ VIEWS.review = async ([code]) => {
            {label:"Commit message", key:"commit_subject"}, {label:"Kept by tag", get:x => x.tag_name ? x.tag_name + (x.tag_pushed ? "" : " (not pushed)") : "Not tagged"},
            {label:"Uncommitted changes", get:x => x.is_dirty ? (x.dirty_note || "Yes") : "None"}], d.repos),
     d.goals.length ? [h("h3", null, "Design goals used"), h("ul", null, d.goals.map(g => h("li", null, g.text)))] : null,
+    (d.interview || []).length ? interviewSection(d.interview) : null,
+    (d.review_goals || []).length ? [h("h3", null, "Design goals from this interview"), goalsTable(d.review_goals)] : null,
     h("h3", null, "Areas reviewed and skipped"),
     table([{label:"Area", get:x => x.name}, {label:"", get:x => x.decision === "included" ? h("span", {class:"tag ok"}, "Reviewed") : h("span", {class:"tag"}, "Skipped")},
            {label:"Why", key:"reason"}, {label:"Your change", get:x => x.owner_change === "none" ? "" : words(x.owner_change)}, {label:"Reviewers", key:"reviewers_planned", num:1}], d.domains),
@@ -404,6 +406,38 @@ VIEWS.review = async ([code]) => {
     h("h3", null, "Points raised"),
     h("div", {class:"tools"}, q, fd, fsv, fm, fv), listBox);
   draw();
+};
+
+// ---------- the owner interview and design goals (schema 9)
+function byDomain(list){
+  const groups = new Map();
+  for (const x of list) { const k = x.domain || ""; if (!groups.has(k)) groups.set(k, []); groups.get(k).push(x); }
+  return [...groups].sort((a, b) => (a[0] === "" ? -1 : b[0] === "" ? 1 : domainName(a[0]).localeCompare(domainName(b[0]))));
+}
+const areaName = c => c ? domainName(c) : "Whole project";
+function interviewSection(qs){
+  return h("div", {class:"card interview"}, h("h2", null, "Interview"),
+    h("p", {class:"note"}, "What the agent asked you about the code and your plans for it, by area, and what you said."),
+    byDomain(qs).map(([dom, list]) => [h("h3", null, areaName(dom)),
+      list.map(q => h("div", {class:"iq", "data-code":q.code},
+        h("p", null, h("b", null, q.question)),
+        h("p", {class:"note"}, "Asked because: " + q.why_asked),
+        q.answers.length ? q.answers.map(a => h("p", {class:"answer"}, a.answer, h("span", {class:"note"}, ` (${lab("via", a.answered_via)}, ${when(a.answered_at)})`)))
+          : h("p", {class:"note"}, q.gate ? "Not answered yet: answer it under Waiting on you." : "Not answered yet.")))]));
+}
+function goalsTable(goals){
+  return table([{label:"Goal", key:"code"}, {label:"Area", get:g => areaName(g.domain)}, {label:"Statement", key:"text"},
+    {label:"Status", get:g => h("span", {class:"tag " + (g.status === "approved" ? "ok" : g.status === "proposed" ? "you" : "")}, lab("goal", g.status))},
+    {label:"From your answers to", get:g => g.sources.map(q => q.code + ": " + q.question).join("; ")},
+    {label:"Note", get:g => g.note || (g.status === "approved" && g.approved_at ? "Approved " + when(g.approved_at) : "")}], goals);
+}
+VIEWS.goals = async () => {
+  const d = await api("goals");
+  setView(h("h1", null, "Design goals"),
+    h("p", {class:"lede"}, "What you want the code to be, by area, written from your interview answers. Reviewers, fix plans and every agent work to the approved ones."),
+    d.goals.length ? byDomain(d.goals).map(([dom, list]) => [h("h3", null, areaName(dom)), goalsTable(list)])
+      : empty("No design goals yet."),
+    d.goals.some(g => g.status === "proposed") ? h("p", {class:"status"}, h("a", {href:"#/inbox"}, "Goals are waiting for your approval →")) : null);
 };
 
 VIEWS.issues = async (_, params) => {
@@ -595,7 +629,7 @@ VIEWS.explore = async ([name]) => {
 };
 
 // ---------- routing
-const TABS = [["home","#/","Overview"],["inbox","#/inbox","Waiting on you"],["reviews","#/reviews","Reviews"],["issues","#/issues","Issues"],["plans","#/plans","Fix plans"],["trends","#/trends","Over time"],["explore","#/explore","Explore"]];
+const TABS = [["home","#/","Overview"],["inbox","#/inbox","Waiting on you"],["reviews","#/reviews","Reviews"],["goals","#/goals","Design goals"],["issues","#/issues","Issues"],["plans","#/plans","Fix plans"],["trends","#/trends","Over time"],["explore","#/explore","Explore"]];
 function drawTabs(active){
   const n = OVERVIEW ? OVERVIEW.queue : 0;
   put(document.getElementById("tabs"), ...TABS.map(([k, href, t]) => h("a", {href, "aria-current": active === k ? "page" : null}, t, k === "inbox" && n ? h("span", {class:"badge"}, n) : null)));

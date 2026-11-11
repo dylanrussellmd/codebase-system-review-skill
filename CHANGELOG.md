@@ -2,6 +2,15 @@
 
 The tool version is `version:` in SKILL.md's frontmatter; `ledger.py --version` prints it with the schema version.
 
+## 1.6.0 (schema 9)
+
+- Owner interview and design goals by domain: `interview-ask`, `interview-answer`, `propose-goal`, `approve-goals`,
+  `reject-goal`, `link-step-goals`, and read-only `goals` and `interview`. Schema 9 (migration 0009).
+- Every write has a command: `new-plan`, `plan-status`, `add-requirement`, `add-domain`, `review-domain`,
+  `finish-run`, `verify`, `record-test-run`, `add-commit`, `add-guard`, `confirm-guard`, `set-verdict`, `add-metric`,
+  `add-artifact`, `tag-review --pushed`, `redact`.
+- SKILL.md runs on commands; detail lives in `references/`. Printed ledger text is stripped of terminal controls.
+
 ## 1.5.0 (schema 8)
 
 - Commands that write the ledger, each in one transaction with `--actor`, refusing with one line and exit 1:

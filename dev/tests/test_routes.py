@@ -248,7 +248,8 @@ class Reviews(RouteCase):
     def test_review_detail_shape(self):
         d = self.ok("/api/review/R-0002")
         self.assertEqual(set(d), {"review", "repos", "goals", "domains", "runs", "checks", "summary", "metrics",
-                                  "artifacts", "gates", "findings", "agents", "requirements"})
+                                  "artifacts", "gates", "findings", "agents", "requirements",
+                                  "interview", "review_goals"})  # schema 9 (step 129)
         r = d["review"]
         self.assertEqual((r["code"], r["previous_code"], r["manager"], r["approved_by"]),
                          ("R-0002", "R-0001", "Review manager", fixtures.DEMO_OWNER))
@@ -574,7 +575,7 @@ CONTRACT = {
                  "high", "medium", "low", "new_issues", "came_back"}),
     "review": ("GET", "/api/review/R-0001", None, 200, dict,
                {"review", "repos", "goals", "domains", "runs", "checks", "summary", "metrics", "artifacts", "gates",
-                "findings", "agents", "requirements"}),
+                "findings", "agents", "requirements", "interview", "review_goals"}),
     "issues": ("GET", "/api/issues", None, 200, list,
                {"code", "title", "severity", "status", "domain_code", "theme_code", "times_seen", "opened_at",
                 "updated_at", "first_seen", "last_seen"}),
@@ -585,6 +586,7 @@ CONTRACT = {
                "reviews"}),
     "plan": ("GET", "/api/plan/P-0001", None, 200, dict, {"plan", "phases", "phase_rows", "steps"}),
     "trends": ("GET", "/api/trends", None, 200, dict, {"metrics", "reviews", "recurring", "hotspots"}),
+    "goals": ("GET", "/api/goals", None, 200, dict, {"goals"}),  # schema 9 (step 129)
     "tables": ("GET", "/api/tables", None, 200, list, {"name", "type", "columns", "count"}),
     "table": ("GET", "/api/table/issues", None, 200, dict, {"columns", "rows", "count", "offset", "limit"}),
     "sql": ("POST", "/api/sql", {"sql": "SELECT 1 AS one"}, 200, dict, {"columns", "rows", "truncated"}),

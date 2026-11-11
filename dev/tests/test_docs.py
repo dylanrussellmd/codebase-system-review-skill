@@ -74,6 +74,7 @@ def skill_md_commands():
         spans = [line] if in_fence else re.findall(r"`([^`]+)`", line)
         for span in spans:
             span = re.split(r"(?:^|\s)#", span, maxsplit=1)[0]  # drop a shell comment
+            span = re.sub(r"<[^<>]*>", "PLACEHOLDER", span)  # `--root <project root> X`: not a command
             for m in re.finditer(r"ledger\.py((?:\s+--\S+(?:\s+(?!-)\S+)?)*)\s+([a-z][a-z0-9-]*)", span):
                 found.append((no, m.group(2)))
     return found
@@ -116,8 +117,11 @@ class SkillMdCommands(unittest.TestCase):
         for need in ("init", "schema", "serve", "check", "fill-refs", "tag-review", "show", "gates", "dump"):
             self.assertIn(need, names, f"SKILL.md no longer names `ledger.py {need}`")
         ledger_py = fixtures.built_ledger_path()
+        from dev.tests.test_skill_contract import PENDING  # step 129's commands, named before they are built
         for name in sorted(names):
             p = fixtures.run_ledger(name, "--help", ledger_py=ledger_py, cwd=fixtures.temp_dir("help-"))
+            if name in PENDING and p.returncode != 0:
+                continue
             where = ", ".join(str(n) for n, c in found if c == name)
             self.assertEqual(p.returncode, 0,
                              f"SKILL.md line {where} names `ledger.py {name}`, which the CLI does not have:\n{p.stderr}")

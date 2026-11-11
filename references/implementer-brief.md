@@ -3,6 +3,8 @@
 Copy this into the brief of every agent that implements plan steps, and fill in the parts in angle brackets.
 
 ## Read first
+- The owner's approved design goals: `python3 .code-review/ledger.py goals` (or `goals --domain <D>` for your steps'
+  domains). Work to them, and read them from the ledger rather than from memory or this brief.
 - Your steps: <how to print each step's change, proof, dependencies and the points it closes, e.g.
   `python3 .code-review/ledger.py query --readonly "SELECT ... FROM v_step_issues WHERE step = N"`>.
 - The files you own: <files>. Other agents are editing other files at the same time; change only yours.

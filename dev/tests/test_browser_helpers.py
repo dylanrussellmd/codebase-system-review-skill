@@ -147,7 +147,7 @@ class Helpers(browser.ViewerTestCase):
 
     def test_page_router_tabs_and_unknown(self):
         page = self.open("#/")
-        self.assertEqual(page.texts(".tabs a"), ["Overview", "Waiting on you2", "Reviews", "Issues", "Fix plans",
+        self.assertEqual(page.texts(".tabs a"), ["Overview", "Waiting on you2", "Reviews", "Design goals", "Issues", "Fix plans",
                                                  "Over time", "Explore"])
         cases = [("#/inbox", "Waiting on you", "Waiting on you"), ("#/history", "Waiting on you", "Questions and answers"),
                  ("#/reviews", "Reviews", "Reviews"), ("#/review/R-0001", "Reviews", "R-0001 · Comprehensive review R-0001"),

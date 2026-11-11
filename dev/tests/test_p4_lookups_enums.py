@@ -44,6 +44,7 @@ COLUMN_ENUMS = {
     ("decisions", "status"): "decision_status",
     ("gates", "status"): "gate_status",
     ("gates", "answered_via"): "answered_via",
+    ("interview_answers", "answered_via"): "answered_via",   # schema 9 (step 129)
     ("plans", "status"): "plan_status",
     ("steps", "owner_need"): "owner_need",
     ("steps", "status"): "step_status",

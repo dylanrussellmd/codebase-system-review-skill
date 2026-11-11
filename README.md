@@ -3,35 +3,47 @@
 A skill for a managed, multi-reviewer code review, with a per-project SQLite ledger and a local viewer.
 
     codebase-system-review/
-    ├── SKILL.md               the instructions the agent follows
+    ├── SKILL.md               the instructions the agent follows (read in full on every use)
     ├── scripts/ledger.py      ledger tool + viewer (Python 3.9+, no dependencies)
-    └── references/schema.sql  the ledger schema, for reading
+    └── references/            read when SKILL.md says: domains.md, brief.md, indexing.md, fix-plan.md,
+                               recipes.md, implementer-brief.md, formats/ (file formats), schema.sql
 
 ## Install
 
-OpenCode, for every project:   unzip into ~/.config/opencode/skills/
-OpenCode, one project only:    unzip into <project>/.opencode/skills/
-Claude Code and OpenCode both: unzip into ~/.claude/skills/   (OpenCode reads this too)
+| harness | where to unzip |
+|---------|----------------|
+| OpenCode, every project | `~/.config/opencode/skills/` |
+| OpenCode, one project | `<project>/.opencode/skills/` |
+| Claude Code (OpenCode reads it too) | `~/.claude/skills/` |
+| others | the harness's skills folder |
 
 The folder name must stay `codebase-system-review` (it must match `name:` in SKILL.md).
-Restart OpenCode, then ask it to "run the comprehensive system review".
+Restart the harness, then ask the agent to "run the comprehensive system review".
 
 Each project keeps a copy of the tool at `.code-review/ledger.py`. Treat a change to that copy, or to the ledger's
 schema, in someone else's pull request like any other code change you must review: `ledger.py check` fails when the
-ledger's tables, views or triggers differ from the shipped schema, and the skill tells agents to prefer the skill's own
-`scripts/ledger.py`.
+ledger's tables, views or triggers differ from the shipped schema, and the skill tells agents to run the skill's own
+`scripts/ledger.py` and the project copy only right after `init` refreshed it.
 
 ## Use the viewer
 
-From the project root, after a review has started:
+After every review step and fix batch the agent writes the hub, the viewer as one file
+(`.code-review/hub.html`, `ledger.py progress-page`). Publishing it elsewhere is optional; answers given in a
+published copy come back with `ledger.py import-answers`. The live viewer, from the project root, with the skill's
+copy (or the project copy right after `init`):
 
-    python3 .code-review/ledger.py serve
+    python3 <skill folder>/scripts/ledger.py --root . serve
 
 ## Where the ledger lives
 
-By default `<project root>/.code-review/` (owner-only: the folder 0700, the files 0600). To keep review data out of
-the repository, set `CODE_REVIEW_DIR=/some/folder` for every command (or pass `--db FILE`): nothing is then written
-inside the repository.
+By default `<project root>/.code-review/` (owner-only: the folder 0700, the files 0600), holding the ledger, the copy
+of the tool, the dump, the hub page, saved patches and each review's brief, reports and indexes. Nothing in it is
+committed until the owner decides at the first review (keep it out, commit only `ledger.sql`, or commit only
+`ledger.sqlite`; about 7 MB of ledger and 5 MB of dump per 1,000 findings); until then the agent lists `.code-review/`
+in `.git/info/exclude`. Review tags (`review/R-0001`) stay local unless that decision says to push them. To keep
+review data out of the repository altogether, set `CODE_REVIEW_DIR=/some/folder` for every command (or pass
+`--db FILE`): nothing is then written inside the repository. This repository keeps its own ledger out (decision
+D-0001: `.code-review/` is in `.gitignore`).
 
 The ledger runs in SQLite's WAL mode (`init` sets it; `migrate` switches an existing ledger once), so the viewer's
 reads never block the agent's writes. While it is open, `ledger.sqlite-wal` and `ledger.sqlite-shm` sit beside it

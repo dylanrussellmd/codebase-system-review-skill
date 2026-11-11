@@ -1,5 +1,5 @@
 -- =====================================================================
--- Code review ledger — schema version 8
+-- Code review ledger — schema version 9
 -- One SQLite file per project: <project root>/.code-review/ledger.sqlite
 -- Every connection must run:  PRAGMA foreign_keys = ON;
 -- Times are UTC ISO-8601 text with milliseconds (strftime('%Y-%m-%dT%H:%M:%fZ','now')); the tr_time_*
@@ -83,6 +83,16 @@ CREATE TABLE gate_kinds (
   position INTEGER NOT NULL UNIQUE
 );
 
+-- The statuses of a design goal (schema 9): proposed from the owner interview, approved or rejected by the owner,
+-- retired once it no longer applies. served = given to reviewers, drafters and implementers (`ledger.py goals`,
+-- v_goals_for_brief, the goals a plan step may serve).
+CREATE TABLE goal_statuses (
+  value    TEXT PRIMARY KEY,
+  label    TEXT NOT NULL,
+  position INTEGER NOT NULL UNIQUE,
+  served   INTEGER NOT NULL CHECK (served IN (0,1))    -- given to reviewers, drafters and implementers (`goals`)
+);
+
 -- Labels of the words of every other word column (whose CHECK lists the allowed words). enum names the list:
 -- issue_kind is issues.kind and findings.kind, confidence is issue_relations.confidence and
 -- findings.match_confidence, verdict is the verdict of finding_requirements and review_requirement_checks.
@@ -155,16 +165,33 @@ CREATE TABLE themes (
 
 -- ---------- Standards the code is judged against ----------------------
 
+-- Design goals (schema 9, plan step 129): what the owner wants the code to be, by approved domain (domain_code;
+-- NULL = the whole project). Written from the owner interview as 'proposed' (`ledger.py propose-goal`, citing the
+-- interview questions it summarizes in goal_sources) and given to agents only once the owner approved it
+-- (`approve-goals`, or the confirm gate gate_id answered 'approve' in the viewer or hub; approved_by_actor_id and
+-- approved_at say who and when). A rejected goal keeps the owner's reason in note; an approved goal is never edited:
+-- it is retired (setting status 'retired' or retired_at sets the other) and a new one proposed (superseded_by).
+-- Goals recorded before schema 9 became approved whole-project goals.
 CREATE TABLE design_goals (
   id            INTEGER PRIMARY KEY,
   code          TEXT NOT NULL UNIQUE     -- G-01
                   CHECK (code GLOB 'G-[0-9][0-9]*' AND code NOT GLOB 'G-*[^0-9]*'),
-  text          TEXT NOT NULL,
+  text          TEXT NOT NULL,           -- one statement of one goal, in words the owner approved
   source        TEXT,                    -- where it came from (doc path, "owner, 2026-11-10")
-  adopted_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  adopted_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),  -- when it was written down
   retired_at    TEXT,
   superseded_by INTEGER REFERENCES design_goals(id),
-  CHECK (superseded_by IS NULL OR retired_at IS NOT NULL)   -- a superseded goal is retired
+  domain_code   TEXT REFERENCES domains(code),           -- NULL = a goal of the whole project
+  status        TEXT NOT NULL DEFAULT 'proposed' REFERENCES goal_statuses(value),
+  approved_by_actor_id INTEGER REFERENCES actors(id),   -- the owner (an actor of kind owner or human)
+  approved_at   TEXT,
+  review_id     INTEGER REFERENCES reviews(id),          -- the review whose interview it came from
+  gate_id       INTEGER REFERENCES gates(id),            -- the confirm gate that asks the owner to approve it
+  note          TEXT,                    -- why it was rejected or retired
+  change_actor_id INTEGER REFERENCES actors(id),        -- who makes the next status change; logged, then cleared
+  CHECK (superseded_by IS NULL OR retired_at IS NOT NULL),   -- a superseded goal is retired
+  CHECK (status <> 'approved' OR (approved_by_actor_id IS NOT NULL AND approved_at IS NOT NULL)),
+  CHECK (status <> 'rejected' OR length(trim(COALESCE(note, ''))) > 0)
 );
 
 -- ---------- Reviews -----------------------------------------------------
@@ -555,6 +582,42 @@ CREATE TABLE gates (
                                             -- copied into its event, then cleared
 );
 
+-- ---------- The owner interview (schema 9, plan step 129) --------------
+-- After the owner approves a review's domains the manager interviews them about the codebase and their vision:
+-- each question names the approved domain it is about (NULL = the whole project) and what in the code prompted it.
+-- Questions and answers are append-only; a question may get several answers (a later one adds to or corrects an
+-- earlier one). A question asked in the hub as well has gate_id: the owner's answer to that gate is recorded here
+-- (via 'viewer') by tr_gate_answers_question. `ledger.py interview` lists them.
+
+CREATE TABLE interview_questions (
+  id                INTEGER PRIMARY KEY,
+  code              TEXT NOT NULL UNIQUE    -- IQ-0001
+                      CHECK (code GLOB 'IQ-[0-9][0-9][0-9][0-9]*' AND code NOT GLOB 'IQ-*[^0-9]*'),
+  review_id         INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
+  domain_code       TEXT REFERENCES domains(code),   -- an approved domain of the review; NULL = the whole project
+  question          TEXT NOT NULL CHECK (length(trim(question)) > 0),
+  why_asked         TEXT NOT NULL CHECK (length(trim(why_asked)) > 0),  -- what in the code prompted it
+  asked_by_actor_id INTEGER REFERENCES actors(id),
+  gate_id           INTEGER REFERENCES gates(id),    -- asked in the hub too: the gate's answer is recorded here
+  asked_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+CREATE TABLE interview_answers (
+  id                   INTEGER PRIMARY KEY,
+  question_id          INTEGER NOT NULL REFERENCES interview_questions(id) ON DELETE RESTRICT,
+  answer               TEXT NOT NULL CHECK (length(trim(answer)) > 0),   -- the owner's words, verbatim
+  answered_via         TEXT NOT NULL DEFAULT 'chat' CHECK (answered_via IN ('chat','viewer')),
+  answered_by_actor_id INTEGER REFERENCES actors(id),   -- who recorded it
+  answered_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+-- Which interview questions a design goal summarizes.
+CREATE TABLE goal_sources (
+  goal_id     INTEGER NOT NULL REFERENCES design_goals(id) ON DELETE RESTRICT,
+  question_id INTEGER NOT NULL REFERENCES interview_questions(id) ON DELETE RESTRICT,
+  PRIMARY KEY (goal_id, question_id)
+);
+
 -- ---------- Fix plans -----------------------------------------------------
 
 CREATE TABLE plans (
@@ -648,6 +711,13 @@ CREATE TABLE step_findings (
   finding_id   INTEGER NOT NULL REFERENCES findings(id),
   multi_reason TEXT,          -- required when a finding is closed by more than one step
   PRIMARY KEY (step_id, finding_id)
+);
+
+-- Which approved design goals a plan step serves (schema 9): the plan is built against the owner's goals.
+CREATE TABLE step_goals (
+  step_id INTEGER NOT NULL REFERENCES steps(id) ON DELETE CASCADE,
+  goal_id INTEGER NOT NULL REFERENCES design_goals(id),
+  PRIMARY KEY (step_id, goal_id)
 );
 
 CREATE TABLE step_commits (
@@ -762,22 +832,23 @@ CREATE TABLE artifacts (
 -- Append-only (G-04): triggers refuse every UPDATE and DELETE on events (tr_events_no_update/no_delete).
 -- Which tables write events (plan step 73; a test keeps these two lists equal to the triggers and the tables):
 -- Logged: reviews, reviewer_runs, issues, issue_relations, findings, review_issue_checks, decisions, gates, plans,
--- steps, step_dependencies, step_findings, metrics.
+-- steps, step_dependencies, step_findings, metrics, design_goals, interview_questions, interview_answers,
+-- goal_sources, step_goals.
 -- Not logged: finding_locations, finding_goals, finding_requirements, review_requirement_checks, test_runs,
 -- artifacts, step_commits, guard_tests, decision_issues, plan_reviews, phases, review_repositories, review_goals,
--- review_domains, review_actors, actors, repositories, domains, themes, design_goals, requirements, metric_defs,
+-- review_domains, review_actors, actors, repositories, domains, themes, requirements, metric_defs,
 -- meta, schema_migrations, ledger_checks, issue_statuses, severities, match_types, relation_types, gate_kinds,
--- enum_labels.
+-- goal_statuses, enum_labels.
 -- Why not: finding_locations, finding_goals and finding_requirements belong to their finding (logged when it is
 -- created) and cannot change but for fill-refs; review_requirement_checks, test_runs and artifacts are themselves
 -- timestamped records written once; step_commits, guard_tests, decision_issues, plan_reviews and phases are plan
 -- and evidence links whose rows are their own record; the rest are setup and configuration (who, which
--- repositories, the catalogs and word lists, design goals and requirements, the schema's own bookkeeping), whose
+-- repositories, the catalogs and word lists, requirements, the schema's own bookkeeping), whose
 -- changes do not drive an issue's history.
 CREATE TABLE events (
   id          INTEGER PRIMARY KEY,
   entity_type TEXT NOT NULL CHECK (entity_type IN ('review','issue','step','plan','decision','finding','gate',
-                                                   'relation','check','step-finding')),
+                                                   'relation','check','step-finding','goal','question')),
   entity_id   INTEGER NOT NULL,
   event       TEXT NOT NULL,              -- status-changed, severity-changed, opened, seen, linked, note ...
   from_value  TEXT,
@@ -825,6 +896,20 @@ CREATE INDEX ix_fk_gates_answered_by_actor_id ON gates(answered_by_actor_id);
 -- views look gates up by step and decision); dev/tests/test_p4_views_indexes.py keeps the list complete.
 CREATE INDEX ix_fk_actors_parent_actor_id            ON actors(parent_actor_id);
 CREATE INDEX ix_fk_design_goals_superseded_by        ON design_goals(superseded_by);
+CREATE INDEX ix_fk_design_goals_domain_code          ON design_goals(domain_code);
+CREATE INDEX ix_fk_design_goals_status               ON design_goals(status);
+CREATE INDEX ix_fk_design_goals_approved_by_actor_id ON design_goals(approved_by_actor_id);
+CREATE INDEX ix_fk_design_goals_review_id            ON design_goals(review_id);
+CREATE INDEX ix_fk_design_goals_gate_id              ON design_goals(gate_id);
+CREATE INDEX ix_fk_design_goals_change_actor_id      ON design_goals(change_actor_id);
+CREATE INDEX ix_fk_interview_questions_review_id         ON interview_questions(review_id);
+CREATE INDEX ix_fk_interview_questions_domain_code       ON interview_questions(domain_code);
+CREATE INDEX ix_fk_interview_questions_asked_by_actor_id ON interview_questions(asked_by_actor_id);
+CREATE INDEX ix_fk_interview_questions_gate_id           ON interview_questions(gate_id);
+CREATE INDEX ix_fk_interview_answers_question_id          ON interview_answers(question_id);
+CREATE INDEX ix_fk_interview_answers_answered_by_actor_id ON interview_answers(answered_by_actor_id);
+CREATE INDEX ix_fk_goal_sources_question_id ON goal_sources(question_id);
+CREATE INDEX ix_fk_step_goals_goal_id ON step_goals(goal_id);
 CREATE INDEX ix_fk_reviews_approved_by_actor_id      ON reviews(approved_by_actor_id);
 CREATE INDEX ix_fk_reviews_manager_actor_id          ON reviews(manager_actor_id);
 CREATE INDEX ix_fk_reviews_previous_review_id        ON reviews(previous_review_id);
@@ -1549,6 +1634,212 @@ CREATE TRIGGER tr_requirement_code_fixed BEFORE UPDATE OF code ON requirements W
   SELECT RAISE(ABORT, 'codes never change');
 END;
 
+-- ----- Design goals and the owner interview (schema 9, plan step 129)
+
+-- A goal starts proposed (or approved, with its approver); it moves proposed -> approved, rejected or retired, and
+-- approved -> retired. An approved goal has an approver of kind owner or human (who approved it and when are kept);
+-- a rejected one keeps the owner's reason (note). An approved, rejected or retired goal is never edited: retire it
+-- and propose a new one. Every change writes an event ('goal').
+CREATE TRIGGER tr_goal_insert BEFORE INSERT ON design_goals
+WHEN NEW.status NOT IN ('proposed','approved') BEGIN
+  SELECT RAISE(ABORT, 'a design goal starts proposed (or approved, with its approver)');
+END;
+
+CREATE TRIGGER tr_goal_domain_active BEFORE INSERT ON design_goals
+WHEN EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL) BEGIN
+  SELECT RAISE(ABORT, 'that domain is retired; use a current one');
+END;
+
+CREATE TRIGGER tr_goal_approver BEFORE INSERT ON design_goals
+WHEN NEW.status = 'approved'
+ AND NOT EXISTS (SELECT 1 FROM actors WHERE id = NEW.approved_by_actor_id AND kind IN ('owner','human')) BEGIN
+  SELECT RAISE(ABORT, 'a design goal is approved by the owner: its approver (approved_by_actor_id) must be an actor of kind owner or human');
+END;
+
+CREATE TRIGGER tr_goal_approver_upd BEFORE UPDATE OF status, approved_by_actor_id ON design_goals
+WHEN NEW.status = 'approved'
+ AND NOT EXISTS (SELECT 1 FROM actors WHERE id = NEW.approved_by_actor_id AND kind IN ('owner','human')) BEGIN
+  SELECT RAISE(ABORT, 'a design goal is approved by the owner: its approver (approved_by_actor_id) must be an actor of kind owner or human');
+END;
+
+CREATE TRIGGER tr_goal_transition BEFORE UPDATE OF status ON design_goals
+WHEN OLD.status IS NOT NEW.status
+ AND NOT ((OLD.status = 'proposed' AND NEW.status IN ('approved','rejected','retired'))
+       OR (OLD.status = 'approved' AND NEW.status = 'retired')) BEGIN
+  SELECT RAISE(ABORT, 'a design goal moves proposed -> approved, rejected or retired, and approved -> retired; propose a new goal instead');
+END;
+
+CREATE TRIGGER tr_goal_fixed BEFORE UPDATE OF text, domain_code, review_id, approved_by_actor_id, approved_at ON design_goals
+WHEN OLD.status <> 'proposed'
+ AND (OLD.text IS NOT NEW.text OR OLD.domain_code IS NOT NEW.domain_code OR OLD.review_id IS NOT NEW.review_id
+      OR OLD.approved_by_actor_id IS NOT NEW.approved_by_actor_id OR OLD.approved_at IS NOT NEW.approved_at) BEGIN
+  SELECT RAISE(ABORT, 'an approved, rejected or retired design goal is not edited: retire it and propose a new one');
+END;
+
+CREATE TRIGGER tr_goal_created AFTER INSERT ON design_goals BEGIN
+  INSERT INTO events(entity_type, entity_id, event, to_value, actor_id, review_id, note)
+  VALUES ('goal', NEW.id, CASE NEW.status WHEN 'proposed' THEN 'proposed' ELSE 'recorded' END, NEW.status,
+          COALESCE(NEW.change_actor_id, NEW.approved_by_actor_id), NEW.review_id,
+          COALESCE(NEW.domain_code || ': ', 'whole project: ') || NEW.text);
+  INSERT OR IGNORE INTO review_goals(review_id, goal_id)
+    SELECT NEW.review_id, NEW.id WHERE NEW.status = 'approved' AND NEW.review_id IS NOT NULL;
+END;
+
+CREATE TRIGGER tr_goal_status AFTER UPDATE OF status ON design_goals
+WHEN OLD.status IS NOT NEW.status BEGIN
+  INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id, note)
+  VALUES ('goal', NEW.id, 'status-changed', OLD.status, NEW.status,
+          CASE WHEN NEW.status = 'approved' THEN COALESCE(NEW.change_actor_id, NEW.approved_by_actor_id)
+               ELSE NEW.change_actor_id END,
+          NEW.review_id, CASE WHEN NEW.status IN ('rejected','retired') THEN NEW.note END);
+  UPDATE design_goals SET retired_at = COALESCE(retired_at, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  WHERE id = NEW.id AND NEW.status = 'retired';
+  INSERT OR IGNORE INTO review_goals(review_id, goal_id)
+    SELECT NEW.review_id, NEW.id WHERE NEW.status = 'approved' AND NEW.review_id IS NOT NULL;
+END;
+
+-- Retiring by retired_at alone (the older way) sets the status too.
+CREATE TRIGGER tr_goal_retired_at AFTER UPDATE OF retired_at ON design_goals
+WHEN NEW.retired_at IS NOT NULL AND NEW.status <> 'retired' BEGIN
+  UPDATE design_goals SET status = 'retired' WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER tr_goal_text_changed AFTER UPDATE OF text ON design_goals WHEN OLD.text IS NOT NEW.text BEGIN
+  INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id)
+  VALUES ('goal', NEW.id, 'text-changed', OLD.text, NEW.text, NEW.change_actor_id, NEW.review_id);
+END;
+
+CREATE TRIGGER tr_goal_context_cleared AFTER UPDATE ON design_goals WHEN NEW.change_actor_id IS NOT NULL BEGIN
+  UPDATE design_goals SET change_actor_id = NULL WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER tr_goal_context_cleared_ins AFTER INSERT ON design_goals
+WHEN NEW.change_actor_id IS NOT NULL BEGIN
+  UPDATE design_goals SET change_actor_id = NULL WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER tr_goal_no_delete BEFORE DELETE ON design_goals BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: design goals cannot be deleted; retire it instead');
+END;
+
+-- The owner's answer to a goal-approval gate: 'approve' approves every goal still proposed on it, by whoever answered
+-- (the viewer and import-answers: the owner). Any other answer leaves them proposed for the manager to reword.
+CREATE TRIGGER tr_gate_approves_goals AFTER UPDATE OF status ON gates
+WHEN OLD.status = 'open' AND NEW.status = 'answered' AND NEW.answer_value = 'approve' BEGIN
+  UPDATE design_goals SET status = 'approved',
+    approved_by_actor_id = COALESCE(NEW.answered_by_actor_id, (SELECT min(id) FROM actors WHERE kind = 'owner')),
+    approved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+    change_actor_id = COALESCE(NEW.answered_by_actor_id, (SELECT min(id) FROM actors WHERE kind = 'owner'))
+  WHERE gate_id = NEW.id AND status = 'proposed';
+END;
+
+-- The owner's answer to an interview question asked in the hub is the question's answer.
+CREATE TRIGGER tr_gate_answers_question AFTER UPDATE OF status ON gates
+WHEN OLD.status = 'open' AND NEW.status = 'answered' AND length(trim(COALESCE(NEW.answer_text, ''))) > 0 BEGIN
+  INSERT INTO interview_answers(question_id, answer, answered_via, answered_by_actor_id)
+    SELECT q.id, NEW.answer_text, CASE NEW.answered_via WHEN 'viewer' THEN 'viewer' ELSE 'chat' END,
+           NEW.answered_by_actor_id
+    FROM interview_questions q WHERE q.gate_id = NEW.id;
+END;
+
+-- Codes: IQ- and the next number, zero-padded to 4 digits (IQ-0001 ...); never changed or reused.
+CREATE TRIGGER tr_question_code BEFORE INSERT ON interview_questions
+-- (a malformed code is left to the code CHECK, which names it)
+WHEN NEW.code GLOB 'IQ-[0-9][0-9][0-9][0-9]*' AND NEW.code NOT GLOB 'IQ-*[^0-9]*' AND (
+     NEW.code IS NOT 'IQ-' || printf('%04d', CAST(substr(NEW.code, 4) AS INTEGER))
+  OR CAST(substr(NEW.code, 4) AS INTEGER) < 1
+  OR (CAST(substr(NEW.code, 4) AS INTEGER) > 1 AND NOT EXISTS (SELECT 1 FROM interview_questions
+        WHERE code = 'IQ-' || printf('%04d', CAST(substr(NEW.code, 4) AS INTEGER) - 1)))) BEGIN
+  SELECT RAISE(ABORT, 'interview question codes are sequential: IQ- and the next number (IQ-0001, IQ-0002 ...)');
+END;
+
+-- The interview comes after the owner approved the review's domains, and asks about an approved domain (or the
+-- whole project).
+CREATE TRIGGER tr_question_review_approved BEFORE INSERT ON interview_questions
+WHEN (SELECT approved_at FROM reviews WHERE id = NEW.review_id) IS NULL BEGIN
+  SELECT RAISE(ABORT, 'the interview comes after the owner approves the review''s domains (review-status <review> approved)');
+END;
+
+CREATE TRIGGER tr_question_domain_in_review BEFORE INSERT ON interview_questions
+WHEN NEW.domain_code IS NOT NULL
+ AND NOT EXISTS (SELECT 1 FROM review_domains WHERE review_id = NEW.review_id AND domain_code = NEW.domain_code
+                   AND decision = 'included') BEGIN
+  SELECT RAISE(ABORT, 'the review did not include that domain; ask about an approved domain, or leave the domain out for a whole-project question');
+END;
+
+CREATE TRIGGER tr_question_asked AFTER INSERT ON interview_questions BEGIN
+  INSERT INTO events(entity_type, entity_id, event, to_value, actor_id, review_id, note)
+  VALUES ('question', NEW.id, 'asked', NEW.code, NEW.asked_by_actor_id, NEW.review_id, NEW.question);
+END;
+
+CREATE TRIGGER tr_question_no_update BEFORE UPDATE ON interview_questions BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: an interview question is kept as asked; ask a new one');
+END;
+
+CREATE TRIGGER tr_question_no_delete BEFORE DELETE ON interview_questions BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: interview questions cannot be deleted');
+END;
+
+CREATE TRIGGER tr_answer_recorded AFTER INSERT ON interview_answers BEGIN
+  INSERT INTO events(entity_type, entity_id, event, to_value, actor_id, review_id, note)
+  VALUES ('question', NEW.question_id, 'answered', NEW.answered_via, NEW.answered_by_actor_id,
+          (SELECT review_id FROM interview_questions WHERE id = NEW.question_id), NEW.answer);
+END;
+
+CREATE TRIGGER tr_answer_no_update BEFORE UPDATE ON interview_answers BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: an answer is kept as given; record a new answer instead');
+END;
+
+CREATE TRIGGER tr_answer_no_delete BEFORE DELETE ON interview_answers BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: interview answers cannot be deleted');
+END;
+
+-- A goal cites the questions it summarizes while it is proposed: questions of its own domain or whole-project ones
+-- (a whole-project goal may cite any).
+CREATE TRIGGER tr_goal_source_rules BEFORE INSERT ON goal_sources BEGIN
+  SELECT RAISE(ABORT, 'a design goal names its sources when it is proposed')
+  WHERE (SELECT status FROM design_goals WHERE id = NEW.goal_id) IS NOT 'proposed';
+  SELECT RAISE(ABORT, 'a design goal cites questions of its own domain or whole-project ones')
+  WHERE EXISTS (SELECT 1 FROM design_goals g JOIN interview_questions q ON q.id = NEW.question_id
+                WHERE g.id = NEW.goal_id AND g.domain_code IS NOT NULL AND q.domain_code IS NOT NULL
+                  AND q.domain_code <> g.domain_code);
+END;
+
+CREATE TRIGGER tr_goal_source_linked AFTER INSERT ON goal_sources BEGIN
+  INSERT INTO events(entity_type, entity_id, event, to_value, review_id, note)
+  SELECT 'goal', NEW.goal_id, 'source-linked', q.code, q.review_id, q.question
+  FROM interview_questions q WHERE q.id = NEW.question_id;
+END;
+
+CREATE TRIGGER tr_goal_source_no_update BEFORE UPDATE ON goal_sources BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: a goal''s sources are kept as recorded');
+END;
+
+CREATE TRIGGER tr_goal_source_no_delete BEFORE DELETE ON goal_sources BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: a goal''s sources cannot be deleted');
+END;
+
+-- A plan step serves approved goals only (goal_statuses.served).
+CREATE TRIGGER tr_step_goal_served BEFORE INSERT ON step_goals
+WHEN NOT EXISTS (SELECT 1 FROM design_goals g JOIN goal_statuses s ON s.value = g.status
+                 WHERE g.id = NEW.goal_id AND s.served = 1) BEGIN
+  SELECT RAISE(ABORT, 'a plan step serves approved design goals only; ask the owner to approve the goal first');
+END;
+
+CREATE TRIGGER tr_step_goal_linked AFTER INSERT ON step_goals BEGIN
+  INSERT INTO events(entity_type, entity_id, event, to_value, step_id)
+  SELECT 'goal', NEW.goal_id, 'step-linked', p.code || ' #' || s.number, NEW.step_id
+  FROM steps s JOIN plans p ON p.id = s.plan_id WHERE s.id = NEW.step_id;
+END;
+
+CREATE TRIGGER tr_step_goal_no_update BEFORE UPDATE ON step_goals BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: link the step to another goal instead');
+END;
+
+CREATE TRIGGER tr_step_goal_no_delete BEFORE DELETE ON step_goals BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: a step''s goals cannot be unlinked');
+END;
+
 -- ----- Decisions
 
 CREATE TRIGGER tr_decision_code BEFORE INSERT ON decisions
@@ -1996,14 +2287,36 @@ END;
 
 CREATE TRIGGER tr_time_design_goals_ins BEFORE INSERT ON design_goals
 WHEN (NEW.adopted_at IS NOT NULL AND (NEW.adopted_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.adopted_at) IS NOT NEW.adopted_at))
-     OR (NEW.retired_at IS NOT NULL AND (NEW.retired_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.retired_at) IS NOT NEW.retired_at)) BEGIN
-  SELECT RAISE(ABORT, 'design_goals: adopted_at, retired_at must be UTC times like 2026-11-10T09:30:00.000Z');
+     OR (NEW.retired_at IS NOT NULL AND (NEW.retired_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.retired_at) IS NOT NEW.retired_at))
+     OR (NEW.approved_at IS NOT NULL AND (NEW.approved_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.approved_at) IS NOT NEW.approved_at)) BEGIN
+  SELECT RAISE(ABORT, 'design_goals: adopted_at, retired_at, approved_at must be UTC times like 2026-11-10T09:30:00.000Z');
 END;
 
-CREATE TRIGGER tr_time_design_goals_upd BEFORE UPDATE OF adopted_at, retired_at ON design_goals
+CREATE TRIGGER tr_time_design_goals_upd BEFORE UPDATE OF adopted_at, retired_at, approved_at ON design_goals
 WHEN (NEW.adopted_at IS NOT NULL AND (NEW.adopted_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.adopted_at) IS NOT NEW.adopted_at))
-     OR (NEW.retired_at IS NOT NULL AND (NEW.retired_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.retired_at) IS NOT NEW.retired_at)) BEGIN
-  SELECT RAISE(ABORT, 'design_goals: adopted_at, retired_at must be UTC times like 2026-11-10T09:30:00.000Z');
+     OR (NEW.retired_at IS NOT NULL AND (NEW.retired_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.retired_at) IS NOT NEW.retired_at))
+     OR (NEW.approved_at IS NOT NULL AND (NEW.approved_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.approved_at) IS NOT NEW.approved_at)) BEGIN
+  SELECT RAISE(ABORT, 'design_goals: adopted_at, retired_at, approved_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_interview_questions_ins BEFORE INSERT ON interview_questions
+WHEN (NEW.asked_at IS NOT NULL AND (NEW.asked_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.asked_at) IS NOT NEW.asked_at)) BEGIN
+  SELECT RAISE(ABORT, 'interview_questions: asked_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_interview_questions_upd BEFORE UPDATE OF asked_at ON interview_questions
+WHEN (NEW.asked_at IS NOT NULL AND (NEW.asked_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.asked_at) IS NOT NEW.asked_at)) BEGIN
+  SELECT RAISE(ABORT, 'interview_questions: asked_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_interview_answers_ins BEFORE INSERT ON interview_answers
+WHEN (NEW.answered_at IS NOT NULL AND (NEW.answered_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.answered_at) IS NOT NEW.answered_at)) BEGIN
+  SELECT RAISE(ABORT, 'interview_answers: answered_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_interview_answers_upd BEFORE UPDATE OF answered_at ON interview_answers
+WHEN (NEW.answered_at IS NOT NULL AND (NEW.answered_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.answered_at) IS NOT NEW.answered_at)) BEGIN
+  SELECT RAISE(ABORT, 'interview_answers: answered_at must be UTC times like 2026-11-10T09:30:00.000Z');
 END;
 
 CREATE TRIGGER tr_time_reviews_ins BEFORE INSERT ON reviews
@@ -2398,7 +2711,8 @@ LEFT JOIN steps s ON s.phase_id = ph.id
 GROUP BY ph.id ORDER BY p.code, ph.number;
 
 -- The owner's to-do list: open gates, answered gates the agent has not
--- acted on yet, and anything else waiting on the owner without a gate.
+-- acted on yet, and anything else waiting on the owner without a gate (steps, decisions, and design goals proposed
+-- for a review and not on an open approval gate).
 -- Each thing once: a step or decision with an open or answered gate (on it, or for a decision on its step) is
 -- listed as that gate. A step's question falls back to its progress note, then to its change text, so it is never
 -- blank; it is blocking when an unfinished step depends on it.
@@ -2418,7 +2732,11 @@ UNION ALL
 SELECT 'decision', d.code, 'decision', d.question, d.revisit_when, d.status, 0, d.asked_at
 FROM decisions d WHERE d.status IN ('open','revisit')
   AND NOT EXISTS (SELECT 1 FROM gates g WHERE g.decision_id = d.id AND g.status IN ('open','answered'))
-  AND NOT EXISTS (SELECT 1 FROM gates g WHERE g.step_id = d.step_id AND g.status IN ('open','answered'));
+  AND NOT EXISTS (SELECT 1 FROM gates g WHERE g.step_id = d.step_id AND g.status IN ('open','answered'))
+UNION ALL
+SELECT 'goal', g.code, 'confirm', 'Approve a design goal', g.text, g.status, 1, g.adopted_at
+FROM design_goals g WHERE g.status = 'proposed' AND g.review_id IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM gates x WHERE x.id = g.gate_id AND x.status IN ('open','answered'));
 
 -- Every code reference with what is needed to get back to the exact lines. commit_sha is the location's own
 -- commit, else its review's commit for that repository (commit_from says which: 'location', 'review', or NULL
@@ -2551,7 +2869,7 @@ LEFT JOIN issues i ON i.id = f.issue_id
 ORDER BY p.code, s.number, r.code, f.point_id;
 
 -- The next code of each coded table (plan step 98): the highest number + 1, zero-padded like the code triggers
--- require (ISS-0001 ... ; G-01 ...). Write commands take codes from here (ledger.py next-code ISS), never by hand.
+-- require (ISS-0001 ... ; G-01 ...; IQ-0001 ...). Write commands take codes from here (ledger.py next-code ISS), never by hand.
 CREATE VIEW v_next_codes AS
 SELECT 'ISS' AS prefix, 'ISS-' || printf('%04d', COALESCE(max(CAST(substr(code, 5) AS INTEGER)), 0) + 1) AS next_code
 FROM issues
@@ -2561,7 +2879,9 @@ UNION ALL SELECT 'D', 'D-' || printf('%04d', COALESCE(max(CAST(substr(code, 3) A
 UNION ALL SELECT 'GATE', 'GATE-' || printf('%04d', COALESCE(max(CAST(substr(code, 6) AS INTEGER)), 0) + 1) FROM gates
 UNION ALL SELECT 'REQ', 'REQ-' || printf('%04d', COALESCE(max(CAST(substr(code, 5) AS INTEGER)), 0) + 1)
 FROM requirements
-UNION ALL SELECT 'G', 'G-' || printf('%02d', COALESCE(max(CAST(substr(code, 3) AS INTEGER)), 0) + 1) FROM design_goals;
+UNION ALL SELECT 'G', 'G-' || printf('%02d', COALESCE(max(CAST(substr(code, 3) AS INTEGER)), 0) + 1) FROM design_goals
+UNION ALL SELECT 'IQ', 'IQ-' || printf('%04d', COALESCE(max(CAST(substr(code, 4) AS INTEGER)), 0) + 1)
+FROM interview_questions;
 
 -- Steps still to do (in a plan that is not superseded or abandoned) whose issues are all closed already, e.g. by a
 -- review's check of 'fixed': mark the step done or dropped. Listed by `ledger.py gates`; not a must-be-empty check.
@@ -2732,6 +3052,18 @@ JOIN findings f ON f.id = c.finding_id
 JOIN issues fi ON fi.id = f.issue_id
 WHERE f.issue_id <> c.issue_id;
 
+-- The owner's approved design goals for the brief and the reviewer prompts (schema 9, plan step 129), whole-project
+-- goals (domain_code NULL) first, then by domain: a reviewer of domain D gets the rows of D and the whole-project
+-- ones (`ledger.py goals --domain D`). sources: the interview questions each goal summarizes.
+CREATE VIEW v_goals_for_brief AS
+SELECT g.domain_code, g.code, g.text,
+       (SELECT group_concat(x.code, ', ') FROM
+          (SELECT q.code FROM goal_sources gs JOIN interview_questions q ON q.id = gs.question_id
+            WHERE gs.goal_id = g.id ORDER BY q.id) x) AS sources
+FROM design_goals g
+WHERE g.status IN (SELECT value FROM goal_statuses WHERE served = 1)
+ORDER BY g.domain_code IS NOT NULL, g.domain_code, g.id;
+
 -- ---------- Catalog seed (extend with custom domains/themes as needed) ---
 
 INSERT INTO domains(code, name, category, report_file) VALUES
@@ -2872,6 +3204,11 @@ INSERT INTO gate_kinds(value, label, position) VALUES
  ('review-handoff','Review hand-off',8),
  ('confirm','Confirm',9),
  ('other','Question',10);
+INSERT INTO goal_statuses(value, label, position, served) VALUES
+ ('proposed','Waiting for your approval',1,0),
+ ('approved','Approved',2,1),
+ ('rejected','Not approved',3,0),
+ ('retired','Retired',4,0);
 INSERT INTO enum_labels(enum, value, label, position) VALUES
  ('check_tier','error','Must be empty',1), ('check_tier','warning','Worth a look',2),
  ('actor_kind','owner','Owner',1), ('actor_kind','human','Person',2), ('actor_kind','manager','Manager agent',3),
@@ -2939,7 +3276,8 @@ INSERT INTO enum_labels(enum, value, label, position) VALUES
  ('entity_type','review','Review',1), ('entity_type','issue','Issue',2), ('entity_type','step','Plan step',3),
  ('entity_type','plan','Plan',4), ('entity_type','decision','Decision',5), ('entity_type','finding','Finding',6),
  ('entity_type','gate','Question for you',7), ('entity_type','relation','Relation',8), ('entity_type','check','Review check',9),
- ('entity_type','step-finding','Step coverage',10);
+ ('entity_type','step-finding','Step coverage',10),
+ ('entity_type','goal','Design goal',11), ('entity_type','question','Interview question',12);
 
 -- The checks `ledger.py check` runs (see ledger_checks).
 INSERT OR IGNORE INTO ledger_checks(view, label, tier, position) VALUES
@@ -2961,7 +3299,7 @@ INSERT INTO ledger_checks(view, label, tier, position) VALUES
  ('v_closed_without_reason','Issues accepted or declined with no reason recorded','error',78),
  ('v_relation_problems','Related-to pairs stored in both directions','error',80),
  ('v_check_finding_owner','Review checks citing a finding of another issue','error',82);
-INSERT INTO meta(key, value) VALUES ('schema_version','8');
+INSERT INTO meta(key, value) VALUES ('schema_version','9');
 INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger schema'),
   (2, 'url, path, hash and code checks; repositories.allow_outside_root; finding_locations.excerpt_redacted'),
   (3, 'integrity rules: codes, hashes, checks, append-only history, owner actor on gate answers'),
@@ -2969,4 +3307,5 @@ INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger s
   (5, 'one UTC time format; whole-file and not-text references; report, plan narrative and fix-time discoveries'),
   (6, 'lookup tables for the ledger''s words and labels; RESTRICT keys under reviews and findings; metrics.name catalogued'),
   (7, 'must-be-empty checks for history gaps, matches, off-plan and done-step coverage, closings, relations and checks; steps.no_findings_reason'),
-  (8, 'finding_locations.source (the reviewed text of a dirty working tree); v_next_codes for the write commands');
+  (8, 'finding_locations.source (the reviewed text of a dirty working tree); v_next_codes for the write commands'),
+  (9, 'owner interview (interview_questions, interview_answers) and per-domain design goals the owner approves');

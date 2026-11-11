@@ -24,10 +24,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
-TOOL_VERSION = "1.5.0"  # stamped by dev/build.py from `version:` in SKILL.md's frontmatter
-TOOL_HASH = "71cd766faaf13ad4b30cbb9912fc951a17ecb68a435d6a435bbd014ced33ec0e"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
+TOOL_VERSION = "1.6.0"  # stamped by dev/build.py from `version:` in SKILL.md's frontmatter
+TOOL_HASH = "057587b4ce84e40a76ab92b626bfa4c5d3c6ac19393eea7f994ac7ed0bc66718"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
 SCHEMA = r"""-- =====================================================================
--- Code review ledger — schema version 8
+-- Code review ledger — schema version 9
 -- One SQLite file per project: <project root>/.code-review/ledger.sqlite
 -- Every connection must run:  PRAGMA foreign_keys = ON;
 -- Times are UTC ISO-8601 text with milliseconds (strftime('%Y-%m-%dT%H:%M:%fZ','now')); the tr_time_*
@@ -111,6 +111,16 @@ CREATE TABLE gate_kinds (
   position INTEGER NOT NULL UNIQUE
 );
 
+-- The statuses of a design goal (schema 9): proposed from the owner interview, approved or rejected by the owner,
+-- retired once it no longer applies. served = given to reviewers, drafters and implementers (`ledger.py goals`,
+-- v_goals_for_brief, the goals a plan step may serve).
+CREATE TABLE goal_statuses (
+  value    TEXT PRIMARY KEY,
+  label    TEXT NOT NULL,
+  position INTEGER NOT NULL UNIQUE,
+  served   INTEGER NOT NULL CHECK (served IN (0,1))    -- given to reviewers, drafters and implementers (`goals`)
+);
+
 -- Labels of the words of every other word column (whose CHECK lists the allowed words). enum names the list:
 -- issue_kind is issues.kind and findings.kind, confidence is issue_relations.confidence and
 -- findings.match_confidence, verdict is the verdict of finding_requirements and review_requirement_checks.
@@ -183,16 +193,33 @@ CREATE TABLE themes (
 
 -- ---------- Standards the code is judged against ----------------------
 
+-- Design goals (schema 9, plan step 129): what the owner wants the code to be, by approved domain (domain_code;
+-- NULL = the whole project). Written from the owner interview as 'proposed' (`ledger.py propose-goal`, citing the
+-- interview questions it summarizes in goal_sources) and given to agents only once the owner approved it
+-- (`approve-goals`, or the confirm gate gate_id answered 'approve' in the viewer or hub; approved_by_actor_id and
+-- approved_at say who and when). A rejected goal keeps the owner's reason in note; an approved goal is never edited:
+-- it is retired (setting status 'retired' or retired_at sets the other) and a new one proposed (superseded_by).
+-- Goals recorded before schema 9 became approved whole-project goals.
 CREATE TABLE design_goals (
   id            INTEGER PRIMARY KEY,
   code          TEXT NOT NULL UNIQUE     -- G-01
                   CHECK (code GLOB 'G-[0-9][0-9]*' AND code NOT GLOB 'G-*[^0-9]*'),
-  text          TEXT NOT NULL,
+  text          TEXT NOT NULL,           -- one statement of one goal, in words the owner approved
   source        TEXT,                    -- where it came from (doc path, "owner, 2026-11-10")
-  adopted_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  adopted_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),  -- when it was written down
   retired_at    TEXT,
   superseded_by INTEGER REFERENCES design_goals(id),
-  CHECK (superseded_by IS NULL OR retired_at IS NOT NULL)   -- a superseded goal is retired
+  domain_code   TEXT REFERENCES domains(code),           -- NULL = a goal of the whole project
+  status        TEXT NOT NULL DEFAULT 'proposed' REFERENCES goal_statuses(value),
+  approved_by_actor_id INTEGER REFERENCES actors(id),   -- the owner (an actor of kind owner or human)
+  approved_at   TEXT,
+  review_id     INTEGER REFERENCES reviews(id),          -- the review whose interview it came from
+  gate_id       INTEGER REFERENCES gates(id),            -- the confirm gate that asks the owner to approve it
+  note          TEXT,                    -- why it was rejected or retired
+  change_actor_id INTEGER REFERENCES actors(id),        -- who makes the next status change; logged, then cleared
+  CHECK (superseded_by IS NULL OR retired_at IS NOT NULL),   -- a superseded goal is retired
+  CHECK (status <> 'approved' OR (approved_by_actor_id IS NOT NULL AND approved_at IS NOT NULL)),
+  CHECK (status <> 'rejected' OR length(trim(COALESCE(note, ''))) > 0)
 );
 
 -- ---------- Reviews -----------------------------------------------------
@@ -583,6 +610,42 @@ CREATE TABLE gates (
                                             -- copied into its event, then cleared
 );
 
+-- ---------- The owner interview (schema 9, plan step 129) --------------
+-- After the owner approves a review's domains the manager interviews them about the codebase and their vision:
+-- each question names the approved domain it is about (NULL = the whole project) and what in the code prompted it.
+-- Questions and answers are append-only; a question may get several answers (a later one adds to or corrects an
+-- earlier one). A question asked in the hub as well has gate_id: the owner's answer to that gate is recorded here
+-- (via 'viewer') by tr_gate_answers_question. `ledger.py interview` lists them.
+
+CREATE TABLE interview_questions (
+  id                INTEGER PRIMARY KEY,
+  code              TEXT NOT NULL UNIQUE    -- IQ-0001
+                      CHECK (code GLOB 'IQ-[0-9][0-9][0-9][0-9]*' AND code NOT GLOB 'IQ-*[^0-9]*'),
+  review_id         INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
+  domain_code       TEXT REFERENCES domains(code),   -- an approved domain of the review; NULL = the whole project
+  question          TEXT NOT NULL CHECK (length(trim(question)) > 0),
+  why_asked         TEXT NOT NULL CHECK (length(trim(why_asked)) > 0),  -- what in the code prompted it
+  asked_by_actor_id INTEGER REFERENCES actors(id),
+  gate_id           INTEGER REFERENCES gates(id),    -- asked in the hub too: the gate's answer is recorded here
+  asked_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+CREATE TABLE interview_answers (
+  id                   INTEGER PRIMARY KEY,
+  question_id          INTEGER NOT NULL REFERENCES interview_questions(id) ON DELETE RESTRICT,
+  answer               TEXT NOT NULL CHECK (length(trim(answer)) > 0),   -- the owner's words, verbatim
+  answered_via         TEXT NOT NULL DEFAULT 'chat' CHECK (answered_via IN ('chat','viewer')),
+  answered_by_actor_id INTEGER REFERENCES actors(id),   -- who recorded it
+  answered_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+-- Which interview questions a design goal summarizes.
+CREATE TABLE goal_sources (
+  goal_id     INTEGER NOT NULL REFERENCES design_goals(id) ON DELETE RESTRICT,
+  question_id INTEGER NOT NULL REFERENCES interview_questions(id) ON DELETE RESTRICT,
+  PRIMARY KEY (goal_id, question_id)
+);
+
 -- ---------- Fix plans -----------------------------------------------------
 
 CREATE TABLE plans (
@@ -676,6 +739,13 @@ CREATE TABLE step_findings (
   finding_id   INTEGER NOT NULL REFERENCES findings(id),
   multi_reason TEXT,          -- required when a finding is closed by more than one step
   PRIMARY KEY (step_id, finding_id)
+);
+
+-- Which approved design goals a plan step serves (schema 9): the plan is built against the owner's goals.
+CREATE TABLE step_goals (
+  step_id INTEGER NOT NULL REFERENCES steps(id) ON DELETE CASCADE,
+  goal_id INTEGER NOT NULL REFERENCES design_goals(id),
+  PRIMARY KEY (step_id, goal_id)
 );
 
 CREATE TABLE step_commits (
@@ -790,22 +860,23 @@ CREATE TABLE artifacts (
 -- Append-only (G-04): triggers refuse every UPDATE and DELETE on events (tr_events_no_update/no_delete).
 -- Which tables write events (plan step 73; a test keeps these two lists equal to the triggers and the tables):
 -- Logged: reviews, reviewer_runs, issues, issue_relations, findings, review_issue_checks, decisions, gates, plans,
--- steps, step_dependencies, step_findings, metrics.
+-- steps, step_dependencies, step_findings, metrics, design_goals, interview_questions, interview_answers,
+-- goal_sources, step_goals.
 -- Not logged: finding_locations, finding_goals, finding_requirements, review_requirement_checks, test_runs,
 -- artifacts, step_commits, guard_tests, decision_issues, plan_reviews, phases, review_repositories, review_goals,
--- review_domains, review_actors, actors, repositories, domains, themes, design_goals, requirements, metric_defs,
+-- review_domains, review_actors, actors, repositories, domains, themes, requirements, metric_defs,
 -- meta, schema_migrations, ledger_checks, issue_statuses, severities, match_types, relation_types, gate_kinds,
--- enum_labels.
+-- goal_statuses, enum_labels.
 -- Why not: finding_locations, finding_goals and finding_requirements belong to their finding (logged when it is
 -- created) and cannot change but for fill-refs; review_requirement_checks, test_runs and artifacts are themselves
 -- timestamped records written once; step_commits, guard_tests, decision_issues, plan_reviews and phases are plan
 -- and evidence links whose rows are their own record; the rest are setup and configuration (who, which
--- repositories, the catalogs and word lists, design goals and requirements, the schema's own bookkeeping), whose
+-- repositories, the catalogs and word lists, requirements, the schema's own bookkeeping), whose
 -- changes do not drive an issue's history.
 CREATE TABLE events (
   id          INTEGER PRIMARY KEY,
   entity_type TEXT NOT NULL CHECK (entity_type IN ('review','issue','step','plan','decision','finding','gate',
-                                                   'relation','check','step-finding')),
+                                                   'relation','check','step-finding','goal','question')),
   entity_id   INTEGER NOT NULL,
   event       TEXT NOT NULL,              -- status-changed, severity-changed, opened, seen, linked, note ...
   from_value  TEXT,
@@ -853,6 +924,20 @@ CREATE INDEX ix_fk_gates_answered_by_actor_id ON gates(answered_by_actor_id);
 -- views look gates up by step and decision); dev/tests/test_p4_views_indexes.py keeps the list complete.
 CREATE INDEX ix_fk_actors_parent_actor_id            ON actors(parent_actor_id);
 CREATE INDEX ix_fk_design_goals_superseded_by        ON design_goals(superseded_by);
+CREATE INDEX ix_fk_design_goals_domain_code          ON design_goals(domain_code);
+CREATE INDEX ix_fk_design_goals_status               ON design_goals(status);
+CREATE INDEX ix_fk_design_goals_approved_by_actor_id ON design_goals(approved_by_actor_id);
+CREATE INDEX ix_fk_design_goals_review_id            ON design_goals(review_id);
+CREATE INDEX ix_fk_design_goals_gate_id              ON design_goals(gate_id);
+CREATE INDEX ix_fk_design_goals_change_actor_id      ON design_goals(change_actor_id);
+CREATE INDEX ix_fk_interview_questions_review_id         ON interview_questions(review_id);
+CREATE INDEX ix_fk_interview_questions_domain_code       ON interview_questions(domain_code);
+CREATE INDEX ix_fk_interview_questions_asked_by_actor_id ON interview_questions(asked_by_actor_id);
+CREATE INDEX ix_fk_interview_questions_gate_id           ON interview_questions(gate_id);
+CREATE INDEX ix_fk_interview_answers_question_id          ON interview_answers(question_id);
+CREATE INDEX ix_fk_interview_answers_answered_by_actor_id ON interview_answers(answered_by_actor_id);
+CREATE INDEX ix_fk_goal_sources_question_id ON goal_sources(question_id);
+CREATE INDEX ix_fk_step_goals_goal_id ON step_goals(goal_id);
 CREATE INDEX ix_fk_reviews_approved_by_actor_id      ON reviews(approved_by_actor_id);
 CREATE INDEX ix_fk_reviews_manager_actor_id          ON reviews(manager_actor_id);
 CREATE INDEX ix_fk_reviews_previous_review_id        ON reviews(previous_review_id);
@@ -1577,6 +1662,212 @@ CREATE TRIGGER tr_requirement_code_fixed BEFORE UPDATE OF code ON requirements W
   SELECT RAISE(ABORT, 'codes never change');
 END;
 
+-- ----- Design goals and the owner interview (schema 9, plan step 129)
+
+-- A goal starts proposed (or approved, with its approver); it moves proposed -> approved, rejected or retired, and
+-- approved -> retired. An approved goal has an approver of kind owner or human (who approved it and when are kept);
+-- a rejected one keeps the owner's reason (note). An approved, rejected or retired goal is never edited: retire it
+-- and propose a new one. Every change writes an event ('goal').
+CREATE TRIGGER tr_goal_insert BEFORE INSERT ON design_goals
+WHEN NEW.status NOT IN ('proposed','approved') BEGIN
+  SELECT RAISE(ABORT, 'a design goal starts proposed (or approved, with its approver)');
+END;
+
+CREATE TRIGGER tr_goal_domain_active BEFORE INSERT ON design_goals
+WHEN EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL) BEGIN
+  SELECT RAISE(ABORT, 'that domain is retired; use a current one');
+END;
+
+CREATE TRIGGER tr_goal_approver BEFORE INSERT ON design_goals
+WHEN NEW.status = 'approved'
+ AND NOT EXISTS (SELECT 1 FROM actors WHERE id = NEW.approved_by_actor_id AND kind IN ('owner','human')) BEGIN
+  SELECT RAISE(ABORT, 'a design goal is approved by the owner: its approver (approved_by_actor_id) must be an actor of kind owner or human');
+END;
+
+CREATE TRIGGER tr_goal_approver_upd BEFORE UPDATE OF status, approved_by_actor_id ON design_goals
+WHEN NEW.status = 'approved'
+ AND NOT EXISTS (SELECT 1 FROM actors WHERE id = NEW.approved_by_actor_id AND kind IN ('owner','human')) BEGIN
+  SELECT RAISE(ABORT, 'a design goal is approved by the owner: its approver (approved_by_actor_id) must be an actor of kind owner or human');
+END;
+
+CREATE TRIGGER tr_goal_transition BEFORE UPDATE OF status ON design_goals
+WHEN OLD.status IS NOT NEW.status
+ AND NOT ((OLD.status = 'proposed' AND NEW.status IN ('approved','rejected','retired'))
+       OR (OLD.status = 'approved' AND NEW.status = 'retired')) BEGIN
+  SELECT RAISE(ABORT, 'a design goal moves proposed -> approved, rejected or retired, and approved -> retired; propose a new goal instead');
+END;
+
+CREATE TRIGGER tr_goal_fixed BEFORE UPDATE OF text, domain_code, review_id, approved_by_actor_id, approved_at ON design_goals
+WHEN OLD.status <> 'proposed'
+ AND (OLD.text IS NOT NEW.text OR OLD.domain_code IS NOT NEW.domain_code OR OLD.review_id IS NOT NEW.review_id
+      OR OLD.approved_by_actor_id IS NOT NEW.approved_by_actor_id OR OLD.approved_at IS NOT NEW.approved_at) BEGIN
+  SELECT RAISE(ABORT, 'an approved, rejected or retired design goal is not edited: retire it and propose a new one');
+END;
+
+CREATE TRIGGER tr_goal_created AFTER INSERT ON design_goals BEGIN
+  INSERT INTO events(entity_type, entity_id, event, to_value, actor_id, review_id, note)
+  VALUES ('goal', NEW.id, CASE NEW.status WHEN 'proposed' THEN 'proposed' ELSE 'recorded' END, NEW.status,
+          COALESCE(NEW.change_actor_id, NEW.approved_by_actor_id), NEW.review_id,
+          COALESCE(NEW.domain_code || ': ', 'whole project: ') || NEW.text);
+  INSERT OR IGNORE INTO review_goals(review_id, goal_id)
+    SELECT NEW.review_id, NEW.id WHERE NEW.status = 'approved' AND NEW.review_id IS NOT NULL;
+END;
+
+CREATE TRIGGER tr_goal_status AFTER UPDATE OF status ON design_goals
+WHEN OLD.status IS NOT NEW.status BEGIN
+  INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id, note)
+  VALUES ('goal', NEW.id, 'status-changed', OLD.status, NEW.status,
+          CASE WHEN NEW.status = 'approved' THEN COALESCE(NEW.change_actor_id, NEW.approved_by_actor_id)
+               ELSE NEW.change_actor_id END,
+          NEW.review_id, CASE WHEN NEW.status IN ('rejected','retired') THEN NEW.note END);
+  UPDATE design_goals SET retired_at = COALESCE(retired_at, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  WHERE id = NEW.id AND NEW.status = 'retired';
+  INSERT OR IGNORE INTO review_goals(review_id, goal_id)
+    SELECT NEW.review_id, NEW.id WHERE NEW.status = 'approved' AND NEW.review_id IS NOT NULL;
+END;
+
+-- Retiring by retired_at alone (the older way) sets the status too.
+CREATE TRIGGER tr_goal_retired_at AFTER UPDATE OF retired_at ON design_goals
+WHEN NEW.retired_at IS NOT NULL AND NEW.status <> 'retired' BEGIN
+  UPDATE design_goals SET status = 'retired' WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER tr_goal_text_changed AFTER UPDATE OF text ON design_goals WHEN OLD.text IS NOT NEW.text BEGIN
+  INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id)
+  VALUES ('goal', NEW.id, 'text-changed', OLD.text, NEW.text, NEW.change_actor_id, NEW.review_id);
+END;
+
+CREATE TRIGGER tr_goal_context_cleared AFTER UPDATE ON design_goals WHEN NEW.change_actor_id IS NOT NULL BEGIN
+  UPDATE design_goals SET change_actor_id = NULL WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER tr_goal_context_cleared_ins AFTER INSERT ON design_goals
+WHEN NEW.change_actor_id IS NOT NULL BEGIN
+  UPDATE design_goals SET change_actor_id = NULL WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER tr_goal_no_delete BEFORE DELETE ON design_goals BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: design goals cannot be deleted; retire it instead');
+END;
+
+-- The owner's answer to a goal-approval gate: 'approve' approves every goal still proposed on it, by whoever answered
+-- (the viewer and import-answers: the owner). Any other answer leaves them proposed for the manager to reword.
+CREATE TRIGGER tr_gate_approves_goals AFTER UPDATE OF status ON gates
+WHEN OLD.status = 'open' AND NEW.status = 'answered' AND NEW.answer_value = 'approve' BEGIN
+  UPDATE design_goals SET status = 'approved',
+    approved_by_actor_id = COALESCE(NEW.answered_by_actor_id, (SELECT min(id) FROM actors WHERE kind = 'owner')),
+    approved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+    change_actor_id = COALESCE(NEW.answered_by_actor_id, (SELECT min(id) FROM actors WHERE kind = 'owner'))
+  WHERE gate_id = NEW.id AND status = 'proposed';
+END;
+
+-- The owner's answer to an interview question asked in the hub is the question's answer.
+CREATE TRIGGER tr_gate_answers_question AFTER UPDATE OF status ON gates
+WHEN OLD.status = 'open' AND NEW.status = 'answered' AND length(trim(COALESCE(NEW.answer_text, ''))) > 0 BEGIN
+  INSERT INTO interview_answers(question_id, answer, answered_via, answered_by_actor_id)
+    SELECT q.id, NEW.answer_text, CASE NEW.answered_via WHEN 'viewer' THEN 'viewer' ELSE 'chat' END,
+           NEW.answered_by_actor_id
+    FROM interview_questions q WHERE q.gate_id = NEW.id;
+END;
+
+-- Codes: IQ- and the next number, zero-padded to 4 digits (IQ-0001 ...); never changed or reused.
+CREATE TRIGGER tr_question_code BEFORE INSERT ON interview_questions
+-- (a malformed code is left to the code CHECK, which names it)
+WHEN NEW.code GLOB 'IQ-[0-9][0-9][0-9][0-9]*' AND NEW.code NOT GLOB 'IQ-*[^0-9]*' AND (
+     NEW.code IS NOT 'IQ-' || printf('%04d', CAST(substr(NEW.code, 4) AS INTEGER))
+  OR CAST(substr(NEW.code, 4) AS INTEGER) < 1
+  OR (CAST(substr(NEW.code, 4) AS INTEGER) > 1 AND NOT EXISTS (SELECT 1 FROM interview_questions
+        WHERE code = 'IQ-' || printf('%04d', CAST(substr(NEW.code, 4) AS INTEGER) - 1)))) BEGIN
+  SELECT RAISE(ABORT, 'interview question codes are sequential: IQ- and the next number (IQ-0001, IQ-0002 ...)');
+END;
+
+-- The interview comes after the owner approved the review's domains, and asks about an approved domain (or the
+-- whole project).
+CREATE TRIGGER tr_question_review_approved BEFORE INSERT ON interview_questions
+WHEN (SELECT approved_at FROM reviews WHERE id = NEW.review_id) IS NULL BEGIN
+  SELECT RAISE(ABORT, 'the interview comes after the owner approves the review''s domains (review-status <review> approved)');
+END;
+
+CREATE TRIGGER tr_question_domain_in_review BEFORE INSERT ON interview_questions
+WHEN NEW.domain_code IS NOT NULL
+ AND NOT EXISTS (SELECT 1 FROM review_domains WHERE review_id = NEW.review_id AND domain_code = NEW.domain_code
+                   AND decision = 'included') BEGIN
+  SELECT RAISE(ABORT, 'the review did not include that domain; ask about an approved domain, or leave the domain out for a whole-project question');
+END;
+
+CREATE TRIGGER tr_question_asked AFTER INSERT ON interview_questions BEGIN
+  INSERT INTO events(entity_type, entity_id, event, to_value, actor_id, review_id, note)
+  VALUES ('question', NEW.id, 'asked', NEW.code, NEW.asked_by_actor_id, NEW.review_id, NEW.question);
+END;
+
+CREATE TRIGGER tr_question_no_update BEFORE UPDATE ON interview_questions BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: an interview question is kept as asked; ask a new one');
+END;
+
+CREATE TRIGGER tr_question_no_delete BEFORE DELETE ON interview_questions BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: interview questions cannot be deleted');
+END;
+
+CREATE TRIGGER tr_answer_recorded AFTER INSERT ON interview_answers BEGIN
+  INSERT INTO events(entity_type, entity_id, event, to_value, actor_id, review_id, note)
+  VALUES ('question', NEW.question_id, 'answered', NEW.answered_via, NEW.answered_by_actor_id,
+          (SELECT review_id FROM interview_questions WHERE id = NEW.question_id), NEW.answer);
+END;
+
+CREATE TRIGGER tr_answer_no_update BEFORE UPDATE ON interview_answers BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: an answer is kept as given; record a new answer instead');
+END;
+
+CREATE TRIGGER tr_answer_no_delete BEFORE DELETE ON interview_answers BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: interview answers cannot be deleted');
+END;
+
+-- A goal cites the questions it summarizes while it is proposed: questions of its own domain or whole-project ones
+-- (a whole-project goal may cite any).
+CREATE TRIGGER tr_goal_source_rules BEFORE INSERT ON goal_sources BEGIN
+  SELECT RAISE(ABORT, 'a design goal names its sources when it is proposed')
+  WHERE (SELECT status FROM design_goals WHERE id = NEW.goal_id) IS NOT 'proposed';
+  SELECT RAISE(ABORT, 'a design goal cites questions of its own domain or whole-project ones')
+  WHERE EXISTS (SELECT 1 FROM design_goals g JOIN interview_questions q ON q.id = NEW.question_id
+                WHERE g.id = NEW.goal_id AND g.domain_code IS NOT NULL AND q.domain_code IS NOT NULL
+                  AND q.domain_code <> g.domain_code);
+END;
+
+CREATE TRIGGER tr_goal_source_linked AFTER INSERT ON goal_sources BEGIN
+  INSERT INTO events(entity_type, entity_id, event, to_value, review_id, note)
+  SELECT 'goal', NEW.goal_id, 'source-linked', q.code, q.review_id, q.question
+  FROM interview_questions q WHERE q.id = NEW.question_id;
+END;
+
+CREATE TRIGGER tr_goal_source_no_update BEFORE UPDATE ON goal_sources BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: a goal''s sources are kept as recorded');
+END;
+
+CREATE TRIGGER tr_goal_source_no_delete BEFORE DELETE ON goal_sources BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: a goal''s sources cannot be deleted');
+END;
+
+-- A plan step serves approved goals only (goal_statuses.served).
+CREATE TRIGGER tr_step_goal_served BEFORE INSERT ON step_goals
+WHEN NOT EXISTS (SELECT 1 FROM design_goals g JOIN goal_statuses s ON s.value = g.status
+                 WHERE g.id = NEW.goal_id AND s.served = 1) BEGIN
+  SELECT RAISE(ABORT, 'a plan step serves approved design goals only; ask the owner to approve the goal first');
+END;
+
+CREATE TRIGGER tr_step_goal_linked AFTER INSERT ON step_goals BEGIN
+  INSERT INTO events(entity_type, entity_id, event, to_value, step_id)
+  SELECT 'goal', NEW.goal_id, 'step-linked', p.code || ' #' || s.number, NEW.step_id
+  FROM steps s JOIN plans p ON p.id = s.plan_id WHERE s.id = NEW.step_id;
+END;
+
+CREATE TRIGGER tr_step_goal_no_update BEFORE UPDATE ON step_goals BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: link the step to another goal instead');
+END;
+
+CREATE TRIGGER tr_step_goal_no_delete BEFORE DELETE ON step_goals BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: a step''s goals cannot be unlinked');
+END;
+
 -- ----- Decisions
 
 CREATE TRIGGER tr_decision_code BEFORE INSERT ON decisions
@@ -2024,14 +2315,36 @@ END;
 
 CREATE TRIGGER tr_time_design_goals_ins BEFORE INSERT ON design_goals
 WHEN (NEW.adopted_at IS NOT NULL AND (NEW.adopted_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.adopted_at) IS NOT NEW.adopted_at))
-     OR (NEW.retired_at IS NOT NULL AND (NEW.retired_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.retired_at) IS NOT NEW.retired_at)) BEGIN
-  SELECT RAISE(ABORT, 'design_goals: adopted_at, retired_at must be UTC times like 2026-11-10T09:30:00.000Z');
+     OR (NEW.retired_at IS NOT NULL AND (NEW.retired_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.retired_at) IS NOT NEW.retired_at))
+     OR (NEW.approved_at IS NOT NULL AND (NEW.approved_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.approved_at) IS NOT NEW.approved_at)) BEGIN
+  SELECT RAISE(ABORT, 'design_goals: adopted_at, retired_at, approved_at must be UTC times like 2026-11-10T09:30:00.000Z');
 END;
 
-CREATE TRIGGER tr_time_design_goals_upd BEFORE UPDATE OF adopted_at, retired_at ON design_goals
+CREATE TRIGGER tr_time_design_goals_upd BEFORE UPDATE OF adopted_at, retired_at, approved_at ON design_goals
 WHEN (NEW.adopted_at IS NOT NULL AND (NEW.adopted_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.adopted_at) IS NOT NEW.adopted_at))
-     OR (NEW.retired_at IS NOT NULL AND (NEW.retired_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.retired_at) IS NOT NEW.retired_at)) BEGIN
-  SELECT RAISE(ABORT, 'design_goals: adopted_at, retired_at must be UTC times like 2026-11-10T09:30:00.000Z');
+     OR (NEW.retired_at IS NOT NULL AND (NEW.retired_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.retired_at) IS NOT NEW.retired_at))
+     OR (NEW.approved_at IS NOT NULL AND (NEW.approved_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.approved_at) IS NOT NEW.approved_at)) BEGIN
+  SELECT RAISE(ABORT, 'design_goals: adopted_at, retired_at, approved_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_interview_questions_ins BEFORE INSERT ON interview_questions
+WHEN (NEW.asked_at IS NOT NULL AND (NEW.asked_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.asked_at) IS NOT NEW.asked_at)) BEGIN
+  SELECT RAISE(ABORT, 'interview_questions: asked_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_interview_questions_upd BEFORE UPDATE OF asked_at ON interview_questions
+WHEN (NEW.asked_at IS NOT NULL AND (NEW.asked_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.asked_at) IS NOT NEW.asked_at)) BEGIN
+  SELECT RAISE(ABORT, 'interview_questions: asked_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_interview_answers_ins BEFORE INSERT ON interview_answers
+WHEN (NEW.answered_at IS NOT NULL AND (NEW.answered_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.answered_at) IS NOT NEW.answered_at)) BEGIN
+  SELECT RAISE(ABORT, 'interview_answers: answered_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_interview_answers_upd BEFORE UPDATE OF answered_at ON interview_answers
+WHEN (NEW.answered_at IS NOT NULL AND (NEW.answered_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.answered_at) IS NOT NEW.answered_at)) BEGIN
+  SELECT RAISE(ABORT, 'interview_answers: answered_at must be UTC times like 2026-11-10T09:30:00.000Z');
 END;
 
 CREATE TRIGGER tr_time_reviews_ins BEFORE INSERT ON reviews
@@ -2426,7 +2739,8 @@ LEFT JOIN steps s ON s.phase_id = ph.id
 GROUP BY ph.id ORDER BY p.code, ph.number;
 
 -- The owner's to-do list: open gates, answered gates the agent has not
--- acted on yet, and anything else waiting on the owner without a gate.
+-- acted on yet, and anything else waiting on the owner without a gate (steps, decisions, and design goals proposed
+-- for a review and not on an open approval gate).
 -- Each thing once: a step or decision with an open or answered gate (on it, or for a decision on its step) is
 -- listed as that gate. A step's question falls back to its progress note, then to its change text, so it is never
 -- blank; it is blocking when an unfinished step depends on it.
@@ -2446,7 +2760,11 @@ UNION ALL
 SELECT 'decision', d.code, 'decision', d.question, d.revisit_when, d.status, 0, d.asked_at
 FROM decisions d WHERE d.status IN ('open','revisit')
   AND NOT EXISTS (SELECT 1 FROM gates g WHERE g.decision_id = d.id AND g.status IN ('open','answered'))
-  AND NOT EXISTS (SELECT 1 FROM gates g WHERE g.step_id = d.step_id AND g.status IN ('open','answered'));
+  AND NOT EXISTS (SELECT 1 FROM gates g WHERE g.step_id = d.step_id AND g.status IN ('open','answered'))
+UNION ALL
+SELECT 'goal', g.code, 'confirm', 'Approve a design goal', g.text, g.status, 1, g.adopted_at
+FROM design_goals g WHERE g.status = 'proposed' AND g.review_id IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM gates x WHERE x.id = g.gate_id AND x.status IN ('open','answered'));
 
 -- Every code reference with what is needed to get back to the exact lines. commit_sha is the location's own
 -- commit, else its review's commit for that repository (commit_from says which: 'location', 'review', or NULL
@@ -2579,7 +2897,7 @@ LEFT JOIN issues i ON i.id = f.issue_id
 ORDER BY p.code, s.number, r.code, f.point_id;
 
 -- The next code of each coded table (plan step 98): the highest number + 1, zero-padded like the code triggers
--- require (ISS-0001 ... ; G-01 ...). Write commands take codes from here (ledger.py next-code ISS), never by hand.
+-- require (ISS-0001 ... ; G-01 ...; IQ-0001 ...). Write commands take codes from here (ledger.py next-code ISS), never by hand.
 CREATE VIEW v_next_codes AS
 SELECT 'ISS' AS prefix, 'ISS-' || printf('%04d', COALESCE(max(CAST(substr(code, 5) AS INTEGER)), 0) + 1) AS next_code
 FROM issues
@@ -2589,7 +2907,9 @@ UNION ALL SELECT 'D', 'D-' || printf('%04d', COALESCE(max(CAST(substr(code, 3) A
 UNION ALL SELECT 'GATE', 'GATE-' || printf('%04d', COALESCE(max(CAST(substr(code, 6) AS INTEGER)), 0) + 1) FROM gates
 UNION ALL SELECT 'REQ', 'REQ-' || printf('%04d', COALESCE(max(CAST(substr(code, 5) AS INTEGER)), 0) + 1)
 FROM requirements
-UNION ALL SELECT 'G', 'G-' || printf('%02d', COALESCE(max(CAST(substr(code, 3) AS INTEGER)), 0) + 1) FROM design_goals;
+UNION ALL SELECT 'G', 'G-' || printf('%02d', COALESCE(max(CAST(substr(code, 3) AS INTEGER)), 0) + 1) FROM design_goals
+UNION ALL SELECT 'IQ', 'IQ-' || printf('%04d', COALESCE(max(CAST(substr(code, 4) AS INTEGER)), 0) + 1)
+FROM interview_questions;
 
 -- Steps still to do (in a plan that is not superseded or abandoned) whose issues are all closed already, e.g. by a
 -- review's check of 'fixed': mark the step done or dropped. Listed by `ledger.py gates`; not a must-be-empty check.
@@ -2760,6 +3080,18 @@ JOIN findings f ON f.id = c.finding_id
 JOIN issues fi ON fi.id = f.issue_id
 WHERE f.issue_id <> c.issue_id;
 
+-- The owner's approved design goals for the brief and the reviewer prompts (schema 9, plan step 129), whole-project
+-- goals (domain_code NULL) first, then by domain: a reviewer of domain D gets the rows of D and the whole-project
+-- ones (`ledger.py goals --domain D`). sources: the interview questions each goal summarizes.
+CREATE VIEW v_goals_for_brief AS
+SELECT g.domain_code, g.code, g.text,
+       (SELECT group_concat(x.code, ', ') FROM
+          (SELECT q.code FROM goal_sources gs JOIN interview_questions q ON q.id = gs.question_id
+            WHERE gs.goal_id = g.id ORDER BY q.id) x) AS sources
+FROM design_goals g
+WHERE g.status IN (SELECT value FROM goal_statuses WHERE served = 1)
+ORDER BY g.domain_code IS NOT NULL, g.domain_code, g.id;
+
 -- ---------- Catalog seed (extend with custom domains/themes as needed) ---
 
 INSERT INTO domains(code, name, category, report_file) VALUES
@@ -2900,6 +3232,11 @@ INSERT INTO gate_kinds(value, label, position) VALUES
  ('review-handoff','Review hand-off',8),
  ('confirm','Confirm',9),
  ('other','Question',10);
+INSERT INTO goal_statuses(value, label, position, served) VALUES
+ ('proposed','Waiting for your approval',1,0),
+ ('approved','Approved',2,1),
+ ('rejected','Not approved',3,0),
+ ('retired','Retired',4,0);
 INSERT INTO enum_labels(enum, value, label, position) VALUES
  ('check_tier','error','Must be empty',1), ('check_tier','warning','Worth a look',2),
  ('actor_kind','owner','Owner',1), ('actor_kind','human','Person',2), ('actor_kind','manager','Manager agent',3),
@@ -2967,7 +3304,8 @@ INSERT INTO enum_labels(enum, value, label, position) VALUES
  ('entity_type','review','Review',1), ('entity_type','issue','Issue',2), ('entity_type','step','Plan step',3),
  ('entity_type','plan','Plan',4), ('entity_type','decision','Decision',5), ('entity_type','finding','Finding',6),
  ('entity_type','gate','Question for you',7), ('entity_type','relation','Relation',8), ('entity_type','check','Review check',9),
- ('entity_type','step-finding','Step coverage',10);
+ ('entity_type','step-finding','Step coverage',10),
+ ('entity_type','goal','Design goal',11), ('entity_type','question','Interview question',12);
 
 -- The checks `ledger.py check` runs (see ledger_checks).
 INSERT OR IGNORE INTO ledger_checks(view, label, tier, position) VALUES
@@ -2989,7 +3327,7 @@ INSERT INTO ledger_checks(view, label, tier, position) VALUES
  ('v_closed_without_reason','Issues accepted or declined with no reason recorded','error',78),
  ('v_relation_problems','Related-to pairs stored in both directions','error',80),
  ('v_check_finding_owner','Review checks citing a finding of another issue','error',82);
-INSERT INTO meta(key, value) VALUES ('schema_version','8');
+INSERT INTO meta(key, value) VALUES ('schema_version','9');
 INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger schema'),
   (2, 'url, path, hash and code checks; repositories.allow_outside_root; finding_locations.excerpt_redacted'),
   (3, 'integrity rules: codes, hashes, checks, append-only history, owner actor on gate answers'),
@@ -2997,7 +3335,8 @@ INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger s
   (5, 'one UTC time format; whole-file and not-text references; report, plan narrative and fix-time discoveries'),
   (6, 'lookup tables for the ledger''s words and labels; RESTRICT keys under reviews and findings; metrics.name catalogued'),
   (7, 'must-be-empty checks for history gaps, matches, off-plan and done-step coverage, closings, relations and checks; steps.no_findings_reason'),
-  (8, 'finding_locations.source (the reviewed text of a dirty working tree); v_next_codes for the write commands');
+  (8, 'finding_locations.source (the reviewed text of a dirty working tree); v_next_codes for the write commands'),
+  (9, 'owner interview (interview_questions, interview_answers) and per-domain design goals the owner approves');
 """
 PAGE = r"""<!doctype html>
 <html lang="en">
@@ -3162,7 +3501,7 @@ const words = s => s == null ? "" : String(s).replace(/[-_]/g," ").replace(/^./,
 const ENUM_OF = {sev:"severity", issue:"issue_status", match:"match_type", verif:"verification", review:"review_status",
   scope:"review_scope", step:"step_status", need:"owner_need", gate:"gate_kind", gstat:"gate_status", rel:"relation_type",
   relIn:"relation_type_inverse", check:"check_outcome", kind:"issue_kind", run:"run_status", plan:"plan_status",
-  decision:"decision_status"};
+  decision:"decision_status", goal:"goal_status", via:"answered_via"};
 const FALLBACK = {sev:{H:"High",M:"Medium",L:"Low",T:"Missing test"}, need:{none:""}};
 let L = {};
 const setLabels = enums => { L = Object.fromEntries(Object.entries(ENUM_OF).map(([k, e]) =>
@@ -3294,7 +3633,7 @@ VIEWS.inbox = async () => {
     open.length ? open.map(gateCard) : empty("Nothing is waiting on you right now."),
     answered.length ? [h("h3", null, "Answered, waiting for the agent to act"), answered.map(gateCard)] : null,
     d.other.length ? [h("h3", null, "Also waiting on you (answer in the chat)"),
-      table([{label:"What", get:r => r.kind === "step" ? "Plan step " + r.ref : "Decision " + r.ref}, {label:"Needs", get:r => lab("need", r.need) || "Your input"},
+      table([{label:"What", get:r => (r.kind === "step" ? "Plan step " : r.kind === "goal" ? "Design goal " : "Decision ") + r.ref}, {label:"Needs", get:r => lab("need", r.need) || "Your input"},
              {label:"Title", key:"title"}, {label:"Question", key:"question"}], d.other)] : null,
     h("p", null, h("a", {href:"#/history"}, "See every question and answer so far")));
 };
@@ -3386,6 +3725,8 @@ VIEWS.review = async ([code]) => {
            {label:"Commit message", key:"commit_subject"}, {label:"Kept by tag", get:x => x.tag_name ? x.tag_name + (x.tag_pushed ? "" : " (not pushed)") : "Not tagged"},
            {label:"Uncommitted changes", get:x => x.is_dirty ? (x.dirty_note || "Yes") : "None"}], d.repos),
     d.goals.length ? [h("h3", null, "Design goals used"), h("ul", null, d.goals.map(g => h("li", null, g.text)))] : null,
+    (d.interview || []).length ? interviewSection(d.interview) : null,
+    (d.review_goals || []).length ? [h("h3", null, "Design goals from this interview"), goalsTable(d.review_goals)] : null,
     h("h3", null, "Areas reviewed and skipped"),
     table([{label:"Area", get:x => x.name}, {label:"", get:x => x.decision === "included" ? h("span", {class:"tag ok"}, "Reviewed") : h("span", {class:"tag"}, "Skipped")},
            {label:"Why", key:"reason"}, {label:"Your change", get:x => x.owner_change === "none" ? "" : words(x.owner_change)}, {label:"Reviewers", key:"reviewers_planned", num:1}], d.domains),
@@ -3405,6 +3746,38 @@ VIEWS.review = async ([code]) => {
     h("h3", null, "Points raised"),
     h("div", {class:"tools"}, q, fd, fsv, fm, fv), listBox);
   draw();
+};
+
+// ---------- the owner interview and design goals (schema 9)
+function byDomain(list){
+  const groups = new Map();
+  for (const x of list) { const k = x.domain || ""; if (!groups.has(k)) groups.set(k, []); groups.get(k).push(x); }
+  return [...groups].sort((a, b) => (a[0] === "" ? -1 : b[0] === "" ? 1 : domainName(a[0]).localeCompare(domainName(b[0]))));
+}
+const areaName = c => c ? domainName(c) : "Whole project";
+function interviewSection(qs){
+  return h("div", {class:"card interview"}, h("h2", null, "Interview"),
+    h("p", {class:"note"}, "What the agent asked you about the code and your plans for it, by area, and what you said."),
+    byDomain(qs).map(([dom, list]) => [h("h3", null, areaName(dom)),
+      list.map(q => h("div", {class:"iq", "data-code":q.code},
+        h("p", null, h("b", null, q.question)),
+        h("p", {class:"note"}, "Asked because: " + q.why_asked),
+        q.answers.length ? q.answers.map(a => h("p", {class:"answer"}, a.answer, h("span", {class:"note"}, ` (${lab("via", a.answered_via)}, ${when(a.answered_at)})`)))
+          : h("p", {class:"note"}, q.gate ? "Not answered yet: answer it under Waiting on you." : "Not answered yet.")))]));
+}
+function goalsTable(goals){
+  return table([{label:"Goal", key:"code"}, {label:"Area", get:g => areaName(g.domain)}, {label:"Statement", key:"text"},
+    {label:"Status", get:g => h("span", {class:"tag " + (g.status === "approved" ? "ok" : g.status === "proposed" ? "you" : "")}, lab("goal", g.status))},
+    {label:"From your answers to", get:g => g.sources.map(q => q.code + ": " + q.question).join("; ")},
+    {label:"Note", get:g => g.note || (g.status === "approved" && g.approved_at ? "Approved " + when(g.approved_at) : "")}], goals);
+}
+VIEWS.goals = async () => {
+  const d = await api("goals");
+  setView(h("h1", null, "Design goals"),
+    h("p", {class:"lede"}, "What you want the code to be, by area, written from your interview answers. Reviewers, fix plans and every agent work to the approved ones."),
+    d.goals.length ? byDomain(d.goals).map(([dom, list]) => [h("h3", null, areaName(dom)), goalsTable(list)])
+      : empty("No design goals yet."),
+    d.goals.some(g => g.status === "proposed") ? h("p", {class:"status"}, h("a", {href:"#/inbox"}, "Goals are waiting for your approval →")) : null);
 };
 
 VIEWS.issues = async (_, params) => {
@@ -3596,7 +3969,7 @@ VIEWS.explore = async ([name]) => {
 };
 
 // ---------- routing
-const TABS = [["home","#/","Overview"],["inbox","#/inbox","Waiting on you"],["reviews","#/reviews","Reviews"],["issues","#/issues","Issues"],["plans","#/plans","Fix plans"],["trends","#/trends","Over time"],["explore","#/explore","Explore"]];
+const TABS = [["home","#/","Overview"],["inbox","#/inbox","Waiting on you"],["reviews","#/reviews","Reviews"],["goals","#/goals","Design goals"],["issues","#/issues","Issues"],["plans","#/plans","Fix plans"],["trends","#/trends","Over time"],["explore","#/explore","Explore"]];
 function drawTabs(active){
   const n = OVERVIEW ? OVERVIEW.queue : 0;
   put(document.getElementById("tabs"), ...TABS.map(([k, href, t]) => h("a", {href, "aria-current": active === k ? "page" : null}, t, k === "inbox" && n ? h("span", {class:"badge"}, n) : null)));
@@ -5078,6 +5451,138 @@ ALTER TABLE finding_locations ADD COLUMN source TEXT NOT NULL DEFAULT 'commit' C
 INSERT INTO enum_labels(enum, value, label, position) VALUES
  ('location_source','commit','Read from the commit',1),
  ('location_source','working-tree','Read from the reviewed working tree',2);
+-- migration: 0009-interview-goals.sql
+-- owner interview (interview_questions, interview_answers) and per-domain design goals the owner approves
+-- Plan P-0001 step 129 (OWN-5). After the owner approves a review's domains, the manager interviews the owner;
+-- every question (with what in the code prompted it) and every answer is kept, append-only. Design goals gain a
+-- domain (NULL = the whole project), a status from the new lookup table goal_statuses (proposed, approved, rejected,
+-- retired), who approved them and when, the review and the confirm gate that asked for the approval, and a note;
+-- goal_sources links a goal to the interview questions it summarizes and step_goals a plan step to the goals it
+-- serves. events takes the entity types 'goal' and 'question'. Every goal recorded before schema 9 was the owner's
+-- already: it becomes an approved whole-project goal, approved by the project's owner actor (made here if the ledger
+-- has none) at the time it was adopted; a retired one keeps its retirement as status 'retired'.
+
+CREATE TABLE goal_statuses (
+  value    TEXT PRIMARY KEY,
+  label    TEXT NOT NULL,
+  position INTEGER NOT NULL UNIQUE,
+  served   INTEGER NOT NULL CHECK (served IN (0,1))    -- given to reviewers, drafters and implementers (`goals`)
+);
+INSERT INTO goal_statuses(value, label, position, served) VALUES
+ ('proposed','Waiting for your approval',1,0),
+ ('approved','Approved',2,1),
+ ('rejected','Not approved',3,0),
+ ('retired','Retired',4,0);
+
+INSERT INTO actors(kind, name)
+  SELECT 'owner', 'owner' WHERE EXISTS (SELECT 1 FROM design_goals)
+                            AND NOT EXISTS (SELECT 1 FROM actors WHERE kind = 'owner');
+
+CREATE TABLE design_goals_new (
+  id            INTEGER PRIMARY KEY,
+  code          TEXT NOT NULL UNIQUE     -- G-01
+                  CHECK (code GLOB 'G-[0-9][0-9]*' AND code NOT GLOB 'G-*[^0-9]*'),
+  text          TEXT NOT NULL,           -- one statement of one goal, in words the owner approved
+  source        TEXT,                    -- where it came from (doc path, "owner, 2026-11-10")
+  adopted_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),  -- when it was written down
+  retired_at    TEXT,
+  superseded_by INTEGER REFERENCES design_goals(id),
+  domain_code   TEXT REFERENCES domains(code),           -- NULL = a goal of the whole project
+  status        TEXT NOT NULL DEFAULT 'proposed' REFERENCES goal_statuses(value),
+  approved_by_actor_id INTEGER REFERENCES actors(id),   -- the owner (an actor of kind owner or human)
+  approved_at   TEXT,
+  review_id     INTEGER REFERENCES reviews(id),          -- the review whose interview it came from
+  gate_id       INTEGER REFERENCES gates(id),            -- the confirm gate that asks the owner to approve it
+  note          TEXT,                    -- why it was rejected or retired
+  change_actor_id INTEGER REFERENCES actors(id),        -- who makes the next status change; logged, then cleared
+  CHECK (superseded_by IS NULL OR retired_at IS NOT NULL),   -- a superseded goal is retired
+  CHECK (status <> 'approved' OR (approved_by_actor_id IS NOT NULL AND approved_at IS NOT NULL)),
+  CHECK (status <> 'rejected' OR length(trim(COALESCE(note, ''))) > 0)
+);
+INSERT INTO design_goals_new(id, code, text, source, adopted_at, retired_at, superseded_by, domain_code, status,
+                             approved_by_actor_id, approved_at)
+  SELECT id, code, text, source, adopted_at, retired_at, superseded_by, NULL,
+         CASE WHEN retired_at IS NULL THEN 'approved' ELSE 'retired' END,
+         (SELECT min(id) FROM actors WHERE kind = 'owner'), adopted_at
+  FROM design_goals;
+DROP TABLE design_goals;
+ALTER TABLE design_goals_new RENAME TO design_goals;
+CREATE INDEX ix_fk_design_goals_superseded_by        ON design_goals(superseded_by);
+CREATE INDEX ix_fk_design_goals_domain_code          ON design_goals(domain_code);
+CREATE INDEX ix_fk_design_goals_status               ON design_goals(status);
+CREATE INDEX ix_fk_design_goals_approved_by_actor_id ON design_goals(approved_by_actor_id);
+CREATE INDEX ix_fk_design_goals_review_id            ON design_goals(review_id);
+CREATE INDEX ix_fk_design_goals_gate_id              ON design_goals(gate_id);
+CREATE INDEX ix_fk_design_goals_change_actor_id      ON design_goals(change_actor_id);
+
+CREATE TABLE interview_questions (
+  id                INTEGER PRIMARY KEY,
+  code              TEXT NOT NULL UNIQUE    -- IQ-0001
+                      CHECK (code GLOB 'IQ-[0-9][0-9][0-9][0-9]*' AND code NOT GLOB 'IQ-*[^0-9]*'),
+  review_id         INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
+  domain_code       TEXT REFERENCES domains(code),   -- an approved domain of the review; NULL = the whole project
+  question          TEXT NOT NULL CHECK (length(trim(question)) > 0),
+  why_asked         TEXT NOT NULL CHECK (length(trim(why_asked)) > 0),  -- what in the code prompted it
+  asked_by_actor_id INTEGER REFERENCES actors(id),
+  gate_id           INTEGER REFERENCES gates(id),    -- asked in the hub too: the gate's answer is recorded here
+  asked_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX ix_fk_interview_questions_review_id         ON interview_questions(review_id);
+CREATE INDEX ix_fk_interview_questions_domain_code       ON interview_questions(domain_code);
+CREATE INDEX ix_fk_interview_questions_asked_by_actor_id ON interview_questions(asked_by_actor_id);
+CREATE INDEX ix_fk_interview_questions_gate_id           ON interview_questions(gate_id);
+
+CREATE TABLE interview_answers (
+  id                   INTEGER PRIMARY KEY,
+  question_id          INTEGER NOT NULL REFERENCES interview_questions(id) ON DELETE RESTRICT,
+  answer               TEXT NOT NULL CHECK (length(trim(answer)) > 0),   -- the owner's words, verbatim
+  answered_via         TEXT NOT NULL DEFAULT 'chat' CHECK (answered_via IN ('chat','viewer')),
+  answered_by_actor_id INTEGER REFERENCES actors(id),   -- who recorded it
+  answered_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX ix_fk_interview_answers_question_id          ON interview_answers(question_id);
+CREATE INDEX ix_fk_interview_answers_answered_by_actor_id ON interview_answers(answered_by_actor_id);
+
+CREATE TABLE goal_sources (
+  goal_id     INTEGER NOT NULL REFERENCES design_goals(id) ON DELETE RESTRICT,
+  question_id INTEGER NOT NULL REFERENCES interview_questions(id) ON DELETE RESTRICT,
+  PRIMARY KEY (goal_id, question_id)
+);
+CREATE INDEX ix_fk_goal_sources_question_id ON goal_sources(question_id);
+
+CREATE TABLE step_goals (
+  step_id INTEGER NOT NULL REFERENCES steps(id) ON DELETE CASCADE,
+  goal_id INTEGER NOT NULL REFERENCES design_goals(id),
+  PRIMARY KEY (step_id, goal_id)
+);
+CREATE INDEX ix_fk_step_goals_goal_id ON step_goals(goal_id);
+
+CREATE TABLE events_new (
+  id          INTEGER PRIMARY KEY,
+  entity_type TEXT NOT NULL CHECK (entity_type IN ('review','issue','step','plan','decision','finding','gate',
+                                                   'relation','check','step-finding','goal','question')),
+  entity_id   INTEGER NOT NULL,
+  event       TEXT NOT NULL,              -- status-changed, severity-changed, opened, seen, linked, note ...
+  from_value  TEXT,
+  to_value    TEXT,
+  actor_id    INTEGER REFERENCES actors(id),
+  review_id   INTEGER REFERENCES reviews(id),
+  step_id     INTEGER REFERENCES steps(id),
+  commit_sha  TEXT CHECK (commit_sha IS NULL OR ((length(commit_sha) = 40 OR length(commit_sha) = 64) AND commit_sha NOT GLOB '*[^0-9a-f]*')),
+  note        TEXT,
+  at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+INSERT INTO events_new(id, entity_type, entity_id, event, from_value, to_value, actor_id, review_id, step_id, commit_sha, note, at)
+  SELECT id, entity_type, entity_id, event, from_value, to_value, actor_id, review_id, step_id, commit_sha, note, at FROM events;
+DROP TABLE events;
+ALTER TABLE events_new RENAME TO events;
+CREATE INDEX ix_events_entity        ON events(entity_type, entity_id, at);
+CREATE INDEX ix_fk_events_actor_id                   ON events(actor_id);
+CREATE INDEX ix_fk_events_review_id                  ON events(review_id);
+CREATE INDEX ix_fk_events_step_id                    ON events(step_id);
+
+INSERT INTO enum_labels(enum, value, label, position) VALUES
+ ('entity_type','goal','Design goal',11), ('entity_type','question','Interview question',12);
 """
 
 
@@ -5308,8 +5813,11 @@ TYPE_ORDER = {"table": 0, "index": 1, "view": 2, "trigger": 3}
 def verify_schema(con):
     """Every difference between the ledger's stored schema and the shipped one, as lines naming the object: missing,
     extra (not in the shipped schema) or changed tables, indexes, views and triggers. Empty when they match."""
-    want = {(t, n): normalize_sql(s) for t, n, _, s in shipped_objects()}
-    have = {k: normalize_sql(s) for k, s in ledger_objects(con).items()}
+    shipped = {(t, n): s for t, n, _, s in shipped_objects()}
+    stored = ledger_objects(con)
+    # text SQLite stored exactly as shipped needs no normalizing (most objects; it is what makes this check slow)
+    want = {k: s if stored.get(k) == s else normalize_sql(s) for k, s in shipped.items()}
+    have = {k: s if shipped.get(k) == s else normalize_sql(s) for k, s in stored.items()}
     out = []
     for key in sorted(set(want) | set(have), key=lambda k: (TYPE_ORDER.get(k[0], 9), k[1])):
         t, n = key
@@ -6586,7 +7094,7 @@ def dump(con, db):
 LABEL_TABLES = ("domains", "themes")
 # The lookup tables of the ledger's words (schema 6), by the name their labels have in /api/overview labels.enums.
 LOOKUP_TABLES = (("issue_status", "issue_statuses"), ("severity", "severities"), ("match_type", "match_types"),
-                 ("relation_type", "relation_types"), ("gate_kind", "gate_kinds"))
+                 ("relation_type", "relation_types"), ("gate_kind", "gate_kinds"), ("goal_status", "goal_statuses"))
 ACTIVE = "(SELECT value FROM issue_statuses WHERE active = 1)"  # issue statuses still to fix
 
 
@@ -6597,6 +7105,9 @@ def enum_labels(con):
     out = {}
     try:
         for name, table in LOOKUP_TABLES:
+            if table == "goal_statuses" and not con.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='goal_statuses'").fetchone():
+                continue  # schema 9
             out[name] = {r[0]: r[1] for r in con.execute(f"SELECT value, label FROM {table} ORDER BY position, value")}
         out["relation_type_inverse"] = {r[0]: r[1] for r in con.execute(
             "SELECT value, inverse_label FROM relation_types ORDER BY position, value")}
@@ -6664,6 +7175,10 @@ def gate_answer_request(db, code, body, via="viewer"):
         raise
     finally:
         w.close()
+
+
+def has_table(con, name):
+    return con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() is not None
 
 
 def quote_name(name):
@@ -6772,6 +7287,8 @@ def route(root, db, con, path, qs, body):
                 FROM metrics m LEFT JOIN metric_defs md ON md.name=m.name WHERE m.review_id=? ORDER BY m.name, m.scope""", (rid,)),
             "artifacts": rows(con, "SELECT kind, path, url FROM artifacts WHERE review_id=? ORDER BY kind", (rid,)),
             "gates": rows(con, "SELECT code, kind, title, status, answer_value, answer_text FROM gates WHERE review_id=? ORDER BY created_at", (rid,)),
+            "interview": interview_list(con, p[1]) if has_table(con, "interview_questions") else [],
+            "review_goals": goals_list(con, include_all=True, review=p[1]) if has_table(con, "goal_statuses") else [],
             "findings": findings,
         }
 
@@ -6859,6 +7376,11 @@ def route(root, db, con, path, qs, body):
                 "phases": rows(con, "SELECT * FROM v_plan_progress WHERE plan=?", (p[1],)),
                 "phase_rows": rows(con, "SELECT number, title, goal, why FROM phases WHERE plan_id=? ORDER BY number", (pid,)),
                 "steps": steps}
+
+    if p == ["goals"]:  # every design goal by domain, with its status and sources (schema 9)
+        if not has_table(con, "goal_statuses"):
+            return {"goals": []}
+        return {"goals": goals_list(con, include_all=True)}
 
     if p == ["trends"]:
         return {"metrics": rows(con, "SELECT * FROM v_metric_trends"),
@@ -7419,7 +7941,7 @@ def hub_snapshot(root, db, con, start=None):
 
     R = {"overview": call("overview"), "gates?status=pending": call("gates?status=pending"),
          "gates?status=all": call("gates?status=all"), "reviews": call("reviews"), "plans": call("plans"),
-         "trends": call("trends")}
+         "trends": call("trends"), "goals": call("goals")}
     for r in R["reviews"]:
         R["review/" + r["code"]] = call("review/" + r["code"])
     for p in R["plans"]:
@@ -7611,7 +8133,8 @@ def restore(source, target):
 # events.entity_id names a row of these tables (by its rowid), by events.entity_type
 EVENT_ENTITY_TABLES = {"review": "reviews", "issue": "issues", "step": "steps", "plan": "plans",
                        "decision": "decisions", "finding": "findings", "gate": "gates", "relation": "issue_relations",
-                       "check": "review_issue_checks", "step-finding": "step_findings"}
+                       "check": "review_issue_checks", "step-finding": "step_findings", "goal": "design_goals",
+                       "question": "interview_questions"}
 _CREATED_COLUMNS = ("created_at", "started_at", "opened_at", "asked_at")  # when a row with a code was first made
 _KEEP_OURS_TABLES = ("meta", "schema_migrations")  # this ledger's own identity: never taken from the other one
 
@@ -7946,7 +8469,7 @@ def tool_command(a, root, db):
             if a.out:
                 out = Path(a.out)
                 out.parent.mkdir(parents=True, exist_ok=True)
-                write_atomic(out, text.encode("utf-8"), 0o644)
+                write_atomic(out, terminal_safe(text).encode("utf-8"), 0o644)  # read with cat as often as viewed
                 print(f"wrote {out}")
             else:
                 sys.stdout.write(text)
@@ -7988,11 +8511,11 @@ class GateRefused(Exception):
         self.status = status
 
 
-CODE_PREFIXES = ("ISS", "R", "P", "D", "GATE", "REQ", "G")
+CODE_PREFIXES = ("ISS", "R", "P", "D", "GATE", "REQ", "G", "IQ")
 
 
 def next_code(con, prefix):
-    """The next code for a prefix (ISS, R, P, D, GATE, REQ or G), from v_next_codes: the highest number + 1 in the
+    """The next code for a prefix (ISS, R, P, D, GATE, REQ, G or IQ), from v_next_codes: the highest number + 1 in the
     canonical format (ISS-0001, G-01). Codes are never reused, and the code triggers refuse anything else."""
     p = (prefix or "").upper().rstrip("-")
     if p not in CODE_PREFIXES:
@@ -8102,6 +8625,7 @@ class WriteContext:
         self.con, self.root, self.db, self.a = con, root, db, a
         self.actor_id = None
         self.files = []  # files written by the command, removed again if it fails
+        self.after = []  # callables run once the transaction is committed (redact: checkpoint the WAL)
 
     def x(self, sql, args=()):
         return self.con.execute(sql, args)
@@ -8111,9 +8635,10 @@ WRITE_COMMANDS = {}  # name -> handler(ctx) returning the lines to print once co
 READ_COMMANDS = {}   # name -> handler(con, a) for commands that only read (next-code)
 
 
-def run_write_command(con, root, db, a):
-    """Run the write command a.cmd in one BEGIN IMMEDIATE transaction. Prints its lines after COMMIT and returns 0;
-    on any refusal rolls back, removes the files it wrote, prints one line and returns 1."""
+def run_write_command(con, root, db, a, handler=None):
+    """Run the write command a.cmd (or handler, for a write behind another command's flag: tag-review --pushed) in
+    one BEGIN IMMEDIATE transaction. Prints its lines after COMMIT and returns 0; on any refusal rolls back, removes
+    the files it wrote, prints one line and returns 1."""
     if a.cmd in READ_COMMANDS:
         try:
             for line in READ_COMMANDS[a.cmd](con, a):
@@ -8122,7 +8647,7 @@ def run_write_command(con, root, db, a):
             print(f"{a.cmd}: {_one_line(e)}", file=sys.stderr)
             return 1
         return 0
-    handler = WRITE_COMMANDS[a.cmd]
+    handler = handler or WRITE_COMMANDS[a.cmd]
     ctx = WriteContext(con, root, db, a)
     if con.in_transaction:
         con.commit()
@@ -8158,6 +8683,11 @@ def run_write_command(con, root, db, a):
     if not ok:
         print(f"{a.cmd}: {msg}; nothing was written", file=sys.stderr)
         return 1
+    for f in ctx.after:
+        try:
+            f()
+        except sqlite3.Error:
+            pass
     for line in lines:
         print(line)
     return 0
@@ -8192,7 +8722,7 @@ def _need(value, what):
 
 # ----- next-code, add-repo, add-actor
 
-@_command("next-code", "print the next code for a prefix (ISS, R, P, D, GATE, REQ, G)",
+@_command("next-code", "print the next code for a prefix (ISS, R, P, D, GATE, REQ, G, IQ)",
           "ledger.py next-code ISS", read=True)
 def cmd_next_code(con, a):
     return [next_code(con, a.prefix)]
@@ -8481,9 +9011,11 @@ def cmd_issue_status(ctx):
 STEP_STATUSES = ('not-started', 'doing', 'waiting-owner', 'done', 'dropped')
 
 
-@_command("step-status", "change a plan step's status with its note (waiting-owner needs the owner's question)",
+@_command("step-status", "change a plan step's status with its note (waiting-owner needs the owner's question); "
+                         "--commit also records the step's commit, done --guard its guard tests",
           "ledger.py step-status 12|P-0001#12|KEY doing|waiting-owner|done|dropped|not-started --note TEXT "
-          "[--question TEXT] [--progress-note TEXT] [--commit FULLSHA] [--plan P-0001] [--actor A-0001]")
+          "[--question TEXT] [--progress-note TEXT] [--commit REF [--repo NAME]] "
+          "[--guard PATH::NAME|ISS-0001=PATH::NAME]... [--failed-before] [--plan P-0001] [--actor A-0001]")
 def cmd_step_status(ctx):
     a, con = ctx.a, ctx.con
     s = step_row(con, a.step, a.plan)
@@ -8493,17 +9025,34 @@ def cmd_step_status(ctx):
         raise WriteError("a step waiting on the owner needs --question (what the owner must answer)")
     if a.status != "waiting-owner" and not (a.note or "").strip():
         raise WriteError("give --note (why the status changes)")
-    if a.commit and not FULL_HEX.fullmatch(a.commit):
-        raise WriteError("--commit needs the full commit hash")
+    guards = [_guard_spec(g) for g in getattr(a, "guard", None) or []]
+    if guards and a.status != "done":
+        raise WriteError("--guard goes with done (the guard tests the finished step added)")
+    out = []
+    sha = None
+    if a.commit:  # recorded in step_commits too (add-commit)
+        sha, line = record_step_commit(ctx, s, a.commit, getattr(a, "repo", None))
+        out.append(line)
     sets = {"status": a.status, "change_note": (a.note or "").strip() or None, "change_actor_id": ctx.actor_id,
-            "change_commit_sha": a.commit}
+            "change_commit_sha": sha}
     if a.question:
         sets["owner_question"] = a.question
     progress = _text_arg(a.progress_note, "--progress-note")
     if progress or a.status == "done":
         sets["progress_note"] = progress or s["progress_note"] or a.note
     ctx.x(f"UPDATE steps SET {', '.join(k + '=?' for k in sets)} WHERE id=?", (*sets.values(), s["id"]))
-    return [f"step {s['number']}: {s['status']} -> {a.status}"]
+    if guards:
+        issues = rows(con, """SELECT DISTINCT i.* FROM step_findings sf JOIN findings f ON f.id = sf.finding_id
+                              JOIN issues i ON i.id = f.issue_id WHERE sf.step_id=? ORDER BY i.code""", (s["id"],))
+        repo = _one_repo(con, getattr(a, "repo", None))
+        for code, path, name in guards:
+            targets = [issue_row(con, code)] if code else issues
+            if not targets:
+                raise WriteError(f"step {s['number']} closes no matched issue; name it: --guard ISS-0001=PATH::NAME")
+            for iss in targets:
+                out.append(record_guard(ctx, iss, path, name, step=s, commit=sha,
+                                        failed_before=True if a.failed_before else None, repo=repo))
+    return [f"step {s['number']}: {s['status']} -> {a.status}"] + out
 
 
 OWNER_NEEDS = ('none', 'decision', 'confirm', 'review', 'production')
@@ -8828,6 +9377,341 @@ def cmd_apply_gate(ctx):
     ctx.x("UPDATE gates SET status='applied', applied_note=?, change_actor_id=? WHERE id=?",
           (note, ctx.actor_id, g["id"]))
     return [f"{a.gate}: applied"] + out
+
+
+# ----- the owner interview and design goals (step 129): interview-ask, interview-answer, propose-goal, approve-goals,
+# reject-goal, link-step-goals, and the read-only goals and interview any agent uses to look them up
+
+IQ_CODE = re.compile(r"IQ-[0-9]{4,}")
+GOAL_CODE = re.compile(r"G-[0-9]{2,}")
+
+
+def question_row(con, code):
+    if not IQ_CODE.fullmatch(code or ""):
+        raise WriteError(f"{code!r} is not an interview question code like IQ-0001")
+    r = one(con, "SELECT * FROM interview_questions WHERE code=?", (code,))
+    if not r:
+        raise WriteError(f"no question {code}")
+    return r
+
+
+def goal_row(con, code):
+    if not GOAL_CODE.fullmatch(code or ""):
+        raise WriteError(f"{code!r} is not a design goal code like G-01")
+    r = one(con, "SELECT * FROM design_goals WHERE code=?", (code,))
+    if not r:
+        raise WriteError(f"no design goal {code}")
+    return r
+
+
+def _goal_domain(con, rv, domain):
+    """None (the whole project) when no domain is given; else a catalog domain that review rv (if any) included."""
+    if domain is None or not str(domain).strip():
+        return None
+    d = str(domain).strip()
+    if not one(con, "SELECT 1 x FROM domains WHERE code=?", (d,)):
+        raise WriteError(f"no domain {d!r} in the catalog")
+    if rv is not None and not one(con, """SELECT 1 x FROM review_domains WHERE review_id=? AND domain_code=?
+                                          AND decision='included'""", (rv["id"], d)):
+        raise WriteError(f"{rv['code']} did not include domain {d!r}; use one of its approved domains, or leave "
+                         f"--domain out for the whole project")
+    return d
+
+
+def _domain_label(con, code):
+    if code is None:
+        return "Whole project"
+    r = one(con, "SELECT name FROM domains WHERE code=?", (code,))
+    return f"{code} ({r['name']})" if r else code
+
+
+def _served(con):
+    return [r[0] for r in con.execute("SELECT value FROM goal_statuses WHERE served = 1 ORDER BY position")]
+
+
+@_command("interview-ask", "record a question of the owner interview, about an approved domain or the whole project "
+                           "(prints its code)",
+          "ledger.py interview-ask --review R-0001 [--domain CODE] --why 'what in the code prompted it' 'QUESTION' "
+          "[--gate] [--actor A-0002]")
+def cmd_interview_ask(ctx):
+    a, con = ctx.a, ctx.con
+    rv = review_row(con, _need(a.review, "--review"))
+    if rv["approved_at"] is None:
+        raise WriteError(f"the interview comes after the owner approves the review's domains "
+                         f"(review-status {rv['code']} approved)")
+    dom = _goal_domain(con, rv, a.domain)
+    why = _need(_text_arg(a.why, "--why"), "--why (what in the code prompted the question)")
+    question = _need(_text_arg(a.question, "the question"), "the question")
+    gate_id, out = None, []
+    if a.gate:  # asked in the hub too: tr_gate_answers_question records the owner's answer there
+        gcode = next_code(con, "GATE")
+        gate_id = ctx.x("""INSERT INTO gates(code, kind, title, question, context, allow_text, blocking, review_id,
+                           opened_by_actor_id) VALUES (?, 'other', ?, ?, ?, 1, 1, ?, ?)""",
+                        (gcode, f"Interview: {_domain_label(con, dom)}", question, f"Why I ask: {why}", rv["id"],
+                         ctx.actor_id)).lastrowid
+        out.append(f"asked in the hub as {gcode}")
+    code = next_code(con, "IQ")
+    ctx.x("""INSERT INTO interview_questions(code, review_id, domain_code, question, why_asked, asked_by_actor_id,
+             gate_id) VALUES (?,?,?,?,?,?,?)""", (code, rv["id"], dom, question, why, ctx.actor_id, gate_id))
+    return [code] + out
+
+
+@_command("interview-answer", "record the owner's answer to an interview question, verbatim (append-only)",
+          "ledger.py interview-answer IQ-0001 'THE OWNER'S ANSWER' [--via chat|viewer] [--actor A-0002]")
+def cmd_interview_answer(ctx):
+    a, con = ctx.a, ctx.con
+    q = question_row(con, a.question)
+    answer = _need(_text_arg(a.answer, "the answer"), "the answer (the owner's words)")
+    if a.via not in ("chat", "viewer"):
+        raise WriteError(f"--via {a.via!r}: use chat or viewer")
+    ctx.x("INSERT INTO interview_answers(question_id, answer, answered_via, answered_by_actor_id) VALUES (?,?,?,?)",
+          (q["id"], answer, a.via, ctx.actor_id))
+    return [f"{q['code']}: answered"]
+
+
+def _goal_gate(ctx, rv, goal_id):
+    """Put the goal on the review's open goal-approval gate (one confirm gate listing them), opening one if there is
+    none, and rewrite the gate's context to list every goal on it. Returns the gate's code."""
+    con = ctx.con
+    g = one(con, """SELECT * FROM gates g WHERE g.review_id=? AND g.status='open'
+                    AND EXISTS (SELECT 1 FROM design_goals d WHERE d.gate_id=g.id) ORDER BY g.id DESC LIMIT 1""",
+            (rv["id"],))
+    if g is None:
+        code = next_code(con, "GATE")
+        opts = [{"value": "approve", "label": "Approve these goals"},
+                {"value": "change", "label": "Change some", "description": "say which, and how, in your note"}]
+        gid = ctx.x("""INSERT INTO gates(code, kind, title, question, options, allow_text, blocking, review_id,
+                       opened_by_actor_id) VALUES (?, 'confirm', ?, ?, ?, 1, 1, ?, ?)""",
+                    (code, f"Approve the design goals of {rv['code']}",
+                     "Do these statements say what you want the code to be? The reviewers, the plan and every agent "
+                     "after them will work to the goals you approve.", json.dumps(opts), rv["id"],
+                     ctx.actor_id)).lastrowid
+    else:
+        code, gid = g["code"], g["id"]
+    ctx.x("UPDATE design_goals SET gate_id=? WHERE id=?", (gid, goal_id))
+    lines = []
+    for d in rows(con, """SELECT d.code, d.domain_code, d.text, (SELECT group_concat(q.code, ', ') FROM goal_sources gs
+                          JOIN interview_questions q ON q.id=gs.question_id WHERE gs.goal_id=d.id) sources
+                          FROM design_goals d WHERE d.gate_id=? ORDER BY d.domain_code IS NOT NULL, d.domain_code, d.id""",
+                  (gid,)):
+        lines.append(f"{d['code']} ({_domain_label(con, d['domain_code'])}): {d['text']}"
+                     + (f" [from {d['sources']}]" if d["sources"] else ""))
+    ctx.x("UPDATE gates SET context=? WHERE id=?", ("\n".join(lines), gid))
+    return code
+
+
+@_command("propose-goal", "write one statement of one of the owner's design goals, for a domain or the whole "
+                          "project, citing the interview questions it summarizes (prints the goal's code)",
+          "ledger.py propose-goal [--domain CODE] [--from IQ-0001,IQ-0003] [--source 'README.md, section 2'] "
+          "'STATEMENT' [--review R-0001] [--gate] [--actor A-0002]")
+def cmd_propose_goal(ctx):
+    a, con = ctx.a, ctx.con
+    text = _need(_text_arg(a.statement, "the statement"), "the goal's statement")
+    qs = []
+    for c in (a.sources or "").split(","):
+        if c.strip() and c.strip() not in [q["code"] for q in qs]:
+            qs.append(question_row(con, c.strip()))
+    reviews = {q["review_id"] for q in qs}
+    if a.review:
+        reviews.add(review_row(con, a.review)["id"])
+    if len(reviews) > 1:
+        raise WriteError("the goal's questions and --review are from more than one review; propose it from one "
+                         "review's interview")
+    rv = one(con, "SELECT * FROM reviews WHERE id=?", (next(iter(reviews)),)) if reviews else None
+    if a.gate and rv is None:
+        raise WriteError("--gate asks for the approval in the review's hub: give --review R-0001 or --from a question")
+    dom = _goal_domain(con, rv, a.domain)
+    for q in qs:
+        if dom is not None and q["domain_code"] is not None and q["domain_code"] != dom:
+            raise WriteError(f"{q['code']} is about {q['domain_code']}, not {dom}; a goal cites questions of its own "
+                             f"domain or whole-project ones")
+    code = next_code(con, "G")
+    gid = ctx.x("""INSERT INTO design_goals(code, text, source, domain_code, status, review_id, change_actor_id)
+                   VALUES (?, ?, ?, ?, 'proposed', ?, ?)""",
+                (code, text, "; ".join(x for x in ((getattr(a, "source", None) or "").strip() or None,
+                                                   f"owner interview ({', '.join(q['code'] for q in qs)})" if qs
+                                                   else None) if x) or None, dom,
+                 rv["id"] if rv else None, ctx.actor_id)).lastrowid
+    for q in qs:
+        ctx.x("INSERT INTO goal_sources(goal_id, question_id) VALUES (?, ?)", (gid, q["id"]))
+    if a.gate:
+        return [code, f"waiting for the owner's approval in {_goal_gate(ctx, rv, gid)}"]
+    return [code]
+
+
+def _close_goal_gates(ctx, gate_ids, actor_id):
+    """Answer each open goal-approval gate none of whose goals is still proposed, as the owner decided in chat:
+    'approve' when all were approved, else 'change' with what was decided (through answer_gate(), its one set of
+    rules)."""
+    for gid in sorted(gate_ids):
+        g = one(ctx.con, "SELECT code, status FROM gates WHERE id=?", (gid,))
+        goals = rows(ctx.con, "SELECT code, status FROM design_goals WHERE gate_id=? ORDER BY id", (gid,))
+        if g["status"] != "open" or any(x["status"] == "proposed" for x in goals):
+            continue
+        all_ok = all(x["status"] == "approved" for x in goals)
+        answer_gate(ctx.con, g["code"], "approve" if all_ok else "change",
+                    "decided in chat: " + ", ".join(f"{x['code']} {x['status']}" for x in goals), "chat", actor_id)
+
+
+def _owner_decides(ctx, what):
+    if ctx.actor_id is None:
+        raise WriteError(f"give --actor: the owner who {what} (their A- code)")
+    kind = ctx.con.execute("SELECT kind FROM actors WHERE id=?", (ctx.actor_id,)).fetchone()[0]
+    if kind not in ("owner", "human"):
+        raise WriteError(f"{actor_code(ctx.actor_id)} is a {kind}; design goals are decided by the owner: give the "
+                         f"owner's code as --actor")
+    return ctx.actor_id
+
+
+@_command("approve-goals", "record the owner's approval of proposed design goals (answers their approval gate)",
+          "ledger.py approve-goals G-01 [G-02 ...] --actor A-0001 (the owner)")
+def cmd_approve_goals(ctx):
+    owner = _owner_decides(ctx, "approved them")
+    out, gates = [], set()
+    for code in dict.fromkeys(ctx.a.goals):
+        g = goal_row(ctx.con, code)
+        if g["status"] != "proposed":
+            raise WriteError(f"{code} is {g['status']}; only a proposed goal can be approved")
+        ctx.x("""UPDATE design_goals SET status='approved', approved_by_actor_id=?, approved_at=?, change_actor_id=?
+                 WHERE id=?""", (owner, now(), owner, g["id"]))
+        if g["gate_id"]:
+            gates.add(g["gate_id"])
+        out.append(f"{code}: approved")
+    _close_goal_gates(ctx, gates, owner)
+    return out
+
+
+@_command("reject-goal", "record that the owner did not approve a proposed design goal, with their reason",
+          "ledger.py reject-goal G-01 --note 'the owner's reason' [--actor A-0001]")
+def cmd_reject_goal(ctx):
+    a = ctx.a
+    note = _need(_text_arg(a.note, "--note"), "--note (the owner's reason)")
+    g = goal_row(ctx.con, a.goal)
+    if g["status"] != "proposed":
+        raise WriteError(f"{a.goal} is {g['status']}; only a proposed goal can be rejected")
+    ctx.x("UPDATE design_goals SET status='rejected', note=?, change_actor_id=? WHERE id=?", (note, ctx.actor_id, g["id"]))
+    if g["gate_id"]:
+        _close_goal_gates(ctx, {g["gate_id"]}, ctx.actor_id if ctx.actor_id is not None else owner_actor(ctx.con))
+    return [f"{a.goal}: rejected"]
+
+
+@_command("link-step-goals", "record which approved design goals a plan step serves",
+          "ledger.py link-step-goals 12|P-0001#12|KEY G-01 [G-02 ...] [--plan P-0001] [--actor A-0002]")
+def cmd_link_step_goals(ctx):
+    a, con = ctx.a, ctx.con
+    s = step_row(con, a.step, a.plan)
+    served, out = _served(con), []
+    for code in dict.fromkeys(a.goals):
+        g = goal_row(con, code)
+        if g["status"] not in served:
+            raise WriteError(f"{code} is {g['status']}; a plan step serves approved goals only")
+        cur = ctx.x("INSERT OR IGNORE INTO step_goals(step_id, goal_id) VALUES (?, ?)", (s["id"], g["id"]))
+        out.append(f"step {s['number']} serves {code}" + ("" if cur.rowcount else " already"))
+    return out
+
+
+def _goal_details(con, goals):
+    for g in goals:
+        g["sources"] = []
+        for q in rows(con, """SELECT q.id, q.code, q.domain_code domain, q.question FROM goal_sources gs
+                              JOIN interview_questions q ON q.id=gs.question_id WHERE gs.goal_id=? ORDER BY q.id""",
+                      (g["id"],)):
+            q["answers"] = [r[0] for r in con.execute(
+                "SELECT answer FROM interview_answers WHERE question_id=? ORDER BY id", (q.pop("id"),))]
+            g["sources"].append(q)
+        g["steps"] = [r[0] for r in con.execute("""SELECT p.code || ' #' || s.number FROM step_goals sg
+                      JOIN steps s ON s.id=sg.step_id JOIN plans p ON p.id=s.plan_id WHERE sg.goal_id=?
+                      ORDER BY p.code, s.number""", (g["id"],))]
+        g["approved_by"] = actor_code(g["approved_by"]) if g["approved_by"] is not None else None
+        g.pop("id")
+    return goals
+
+
+def goals_list(con, domain=None, include_all=False, review=None):
+    """The design goals (approved only, unless include_all), whole-project ones first, each with its sources (the
+    interview questions and their answers) and the plan steps that serve it. domain: that domain's goals and the
+    whole-project ones."""
+    where, args = [], []
+    if not include_all:
+        where.append("g.status IN (SELECT value FROM goal_statuses WHERE served = 1)")
+    if domain:
+        where.append("(g.domain_code = ? OR g.domain_code IS NULL)"); args.append(domain)
+    if review:
+        where.append("r.code = ?"); args.append(review)
+    goals = rows(con, f"""SELECT g.id, g.code, g.domain_code domain, g.text, g.status, gs.label status_label,
+        g.approved_by_actor_id approved_by, g.approved_at, r.code review, g.note, g.source, gt.code gate
+        FROM design_goals g JOIN goal_statuses gs ON gs.value=g.status LEFT JOIN reviews r ON r.id=g.review_id
+        LEFT JOIN gates gt ON gt.id=g.gate_id
+        WHERE {' AND '.join(where) or '1'} ORDER BY g.domain_code IS NOT NULL, g.domain_code, g.id""", args)
+    return _goal_details(con, goals)
+
+
+@_command("goals", "list the owner's approved design goals with their sources (read-only; --all adds proposed, "
+                   "rejected and retired ones)",
+          "ledger.py goals [--domain CODE] [--all] [--json]", read=True)
+def cmd_goals(con, a):
+    if a.domain and not one(con, "SELECT 1 x FROM domains WHERE code=?", (a.domain,)):
+        raise WriteError(f"no domain {a.domain!r} in the catalog")
+    goals = goals_list(con, a.domain, a.all)
+    if a.json:
+        return [json.dumps({"goals": goals}, ensure_ascii=False, indent=1)]
+    if not goals:
+        return ["no approved design goals" + ("" if a.all else " (goals --all lists proposed ones too)")]
+    out, last = [], object()
+    for g in goals:
+        if g["domain"] != last:
+            last = g["domain"]
+            out.append(("" if not out else "\n") + _domain_label(con, last))
+        out.append(f"  {g['code']}  {g['text']}" + (f"  [{g['status']}]" if a.all else ""))
+        for q in g["sources"]:
+            out.append(f"      from {q['code']}: {q['question']}")
+        if g["steps"]:
+            out.append(f"      served by {', '.join(g['steps'])}")
+    return out
+
+
+def interview_list(con, review=None, domain=None):
+    where, args = [], []
+    if review:
+        where.append("r.code = ?"); args.append(review)
+    if domain:
+        where.append("q.domain_code = ?"); args.append(domain)
+    qs = rows(con, f"""SELECT q.id, q.code, r.code review, q.domain_code domain, q.question, q.why_asked, q.asked_at,
+        q.asked_by_actor_id asked_by, gt.code gate FROM interview_questions q JOIN reviews r ON r.id=q.review_id
+        LEFT JOIN gates gt ON gt.id=q.gate_id WHERE {' AND '.join(where) or '1'}
+        ORDER BY q.id""", args)
+    for q in qs:
+        q["answers"] = rows(con, """SELECT answer, answered_via, answered_at FROM interview_answers WHERE question_id=?
+                                    ORDER BY id""", (q.pop("id"),))
+        q["asked_by"] = actor_code(q["asked_by"]) if q["asked_by"] is not None else None
+    return qs
+
+
+@_command("interview", "list the owner interview: each question (by review and domain, with what prompted it) and "
+                       "its answers (read-only)",
+          "ledger.py interview [--review R-0001] [--domain CODE] [--json]", read=True)
+def cmd_interview(con, a):
+    if a.review:
+        review_row(con, a.review)
+    qs = interview_list(con, a.review, a.domain)
+    if a.json:
+        return [json.dumps({"questions": qs}, ensure_ascii=False, indent=1)]
+    if not qs:
+        return ["no interview questions" + (" match" if a.review or a.domain else " yet")]
+    out, last = [], None
+    by_group = {}
+    for q in qs:  # grouped by review and domain (whole project first), each group in the order asked
+        by_group.setdefault((q["review"], q["domain"]), []).append(q)
+    for q in [q for k in sorted(by_group, key=lambda k: (k[0], k[1] is not None, k[1] or "")) for q in by_group[k]]:
+        if (q["review"], q["domain"]) != last:
+            last = (q["review"], q["domain"])
+            out.append(("" if not out else "\n") + f"{q['review']} · {_domain_label(con, q['domain'])}")
+        out.append(f"  {q['code']}  {q['question']}")
+        out.append(f"      why: {q['why_asked']}")
+        for ans in q["answers"] or [None]:
+            out.append(f"      answer ({ans['answered_via']}, {ans['answered_at']}): {ans['answer']}" if ans
+                       else "      not answered yet")
+    return out
 
 
 # ----- findings: import-findings, import-checks, load-index, match
@@ -9423,6 +10307,608 @@ def cmd_report_finding(ctx):
     return out
 
 
+# ----- the remaining writes of a review (step 131): plans, goals, requirements, domains, runs, verification, test
+# runs, step commits, guard tests, metrics, artifacts, pushed tags; and redact (step 132)
+
+PLAN_STATUSES = ('drafting', 'awaiting-approval', 'approved', 'in-progress', 'complete', 'superseded', 'abandoned')
+
+
+@_command("new-plan", "start a fix plan over one or more reviews (prints its P- code)",
+          "ledger.py new-plan --title T --review R-0001 [--review R-0002]... [--actor A-0001]")
+def cmd_new_plan(ctx):
+    a, con = ctx.a, ctx.con
+    title = _need(a.title, "--title")
+    if not a.review:
+        raise WriteError("give --review R-0001 for each review the plan covers")
+    reviews = [review_row(con, r) for r in dict.fromkeys(a.review)]
+    code = next_code(con, "P")
+    pid = ctx.x("INSERT INTO plans(code, title, change_actor_id) VALUES (?, ?, ?)",
+                (code, title, ctx.actor_id)).lastrowid
+    for rv in reviews:
+        ctx.x("INSERT INTO plan_reviews(plan_id, review_id) VALUES (?, ?)", (pid, rv["id"]))
+    return [code, f"{code}: drafting, covers {', '.join(r['code'] for r in reviews)}"]
+
+
+@_command("plan-status", "move a plan to its next status (approved only once its plan-approval gate is applied)",
+          "ledger.py plan-status P-0001 awaiting-approval|approved|in-progress|complete|drafting|superseded|abandoned "
+          "--note TEXT [--approved-by A-0001] [--superseded-by P-0002] [--actor A-0001]")
+def cmd_plan_status(ctx):
+    a, con = ctx.a, ctx.con
+    pl = plan_row(con, _need(a.plan, "the plan's code"))
+    if a.status not in PLAN_STATUSES:
+        raise WriteError(f"status {a.status!r} is not one of {', '.join(PLAN_STATUSES)}")
+    note = _need(_text_arg(a.note, "--note"), "--note (why the status changes)")
+    sets = {"status": a.status, "change_note": note, "change_actor_id": ctx.actor_id}
+    if a.status == "approved" and pl["status"] != "approved":
+        gates = rows(con, "SELECT * FROM gates WHERE plan_id=? AND kind='plan-approval' ORDER BY id", (pl["id"],))
+        pending = [g for g in gates if g["status"] in ("open", "answered")]
+        applied = [g for g in gates if g["status"] == "applied"]
+        if pending:
+            raise WriteError(f"the plan-approval gate {pending[0]['code']} of {pl['code']} is {pending[0]['status']}; "
+                             f"record the owner's answer and apply it first (apply-gate {pending[0]['code']})")
+        if not applied:
+            raise WriteError(f"{pl['code']} has no applied plan-approval gate; ask the owner first (open-gate "
+                             f"plan-approval --plan {pl['code']}, answer-gate, apply-gate)")
+        sets["approved_at"] = now()
+        sets["approved_by_actor_id"] = (resolve_actor(con, a.approved_by, "--approved-by") if a.approved_by
+                                        else applied[-1]["answered_by_actor_id"] or owner_actor(con))
+    if a.status == "complete":
+        left = rows(con, "SELECT number, status FROM steps WHERE plan_id=? AND status NOT IN ('done','dropped') "
+                         "ORDER BY number", (pl["id"],))
+        if left:
+            raise WriteError(f"step {left[0]['number']} of {pl['code']} is {left[0]['status']}"
+                             + (f" (and {len(left) - 1} more)" if len(left) > 1 else "")
+                             + "; a plan is complete when every step is done or dropped")
+    if a.superseded_by:
+        if a.status != "superseded":
+            raise WriteError("--superseded-by goes with status superseded")
+        nxt = plan_row(con, a.superseded_by)
+        if nxt["id"] == pl["id"]:
+            raise WriteError(f"{pl['code']} cannot supersede itself")
+        sets["superseded_by"] = nxt["id"]
+    ctx.x(f"UPDATE plans SET {', '.join(k + '=?' for k in sets)} WHERE id=?", (*sets.values(), pl["id"]))
+    return [f"{pl['code']}: {pl['status']} -> {a.status}"]
+
+
+def _table_columns(con, table):
+    return [r[1] for r in con.execute(f'PRAGMA table_info("{table}")')]
+
+
+@_command("add-requirement", "record a requirement with its source (prints its REQ- code)",
+          "ledger.py add-requirement TEXT --source docs/spec.md|URL|'owner, chat <date>' [--location 'section 2.1'] "
+          "[--stated-at TIME] [--review R-0001] [--actor A-0001]")
+def cmd_add_requirement(ctx):
+    a, con = ctx.a, ctx.con
+    text = _need(_text_arg(a.text, "the requirement"), "the requirement's text")
+    source = _need(a.source, "--source (a document path, an issue URL, or 'owner, chat <date>')")
+    rv = review_row(con, a.review) if a.review else None
+    code = next_code(con, "REQ")
+    ctx.x("""INSERT INTO requirements(code, text, source, source_location, stated_at, first_review_id)
+             VALUES (?,?,?,?,?,?)""", (code, text, source, a.location, a.stated_at, rv["id"] if rv else None))
+    return [code]
+
+
+DOMAIN_CATEGORIES = ('correctness', 'architecture', 'user-facing', 'security-operations', 'documentation', 'custom')
+
+
+@_command("add-domain", "add a domain the catalog lacks (category custom by default), with its theme",
+          "ledger.py add-domain CODE NAME --description 'Applies when ...' [--report-file F.md] "
+          "[--category custom] [--theme CODE=Name] [--actor A-0001]")
+def cmd_add_domain(ctx):
+    a, con = ctx.a, ctx.con
+    code = _need(a.code, "the domain's code")
+    if not re.fullmatch(r"[a-z][a-z0-9-]*", code):
+        raise WriteError(f"domain code {code!r}: use lowercase letters, digits and dashes (payments, data-export)")
+    if one(con, "SELECT 1 x FROM domains WHERE code=?", (code,)):
+        raise WriteError(f"domain {code} is already in the catalog")
+    desc = _need(a.description, "--description (when the domain applies)")
+    if a.category not in DOMAIN_CATEGORIES:
+        raise WriteError(f"category {a.category!r} is not one of {', '.join(DOMAIN_CATEGORIES)}")
+    ctx.x("INSERT INTO domains(code, name, category, description, report_file) VALUES (?,?,?,?,?)",
+          (code, _need(a.name, "the domain's name"), a.category, desc, a.report_file or f"{code}.md"))
+    out = f"domain {code} ({a.category})"
+    if a.theme:
+        tcode, sep, tname = a.theme.partition("=")
+        if not sep or not tcode.strip() or not tname.strip():
+            raise WriteError(f"--theme {a.theme!r}: write it as CODE=Name")
+        if not one(con, "SELECT 1 x FROM themes WHERE code=?", (tcode.strip(),)):
+            ctx.x("INSERT INTO themes(code, name) VALUES (?, ?)", (tcode.strip(), tname.strip()))
+        out += f", theme {tcode.strip()}"
+    return [out]
+
+
+OWNER_CHANGES = ('none', 'added-by-owner', 'removed-by-owner', 'modified-by-owner')
+
+
+@_command("review-domain", "include or skip a domain in a review, with the reason and the owner's change",
+          "ledger.py review-domain R-0001 DOMAIN include|skip --reason TEXT "
+          "[--owner-change added-by-owner|removed-by-owner|modified-by-owner] [--reviewers N] [--split-note TEXT] "
+          "[--actor A-0001]")
+def cmd_review_domain(ctx):
+    a, con = ctx.a, ctx.con
+    rv = review_row(con, a.review)
+    reason = _need(_text_arg(a.reason, "--reason"), "--reason (why the domain is in or out)")
+    decision = {"include": "included", "included": "included", "skip": "skipped", "skipped": "skipped"}.get(a.decision)
+    if not decision:
+        raise WriteError(f"{a.decision!r}: say include or skip")
+    if not one(con, "SELECT 1 x FROM domains WHERE code=?", (a.domain,)):
+        raise WriteError(f"no domain {a.domain!r} in the catalog (add it with: ledger.py add-domain)")
+    if a.owner_change is not None and a.owner_change not in OWNER_CHANGES:
+        raise WriteError(f"--owner-change {a.owner_change!r} is not one of {', '.join(OWNER_CHANGES)}")
+    if rv["status"] in ("handed-off", "abandoned"):
+        raise WriteError(f"{rv['code']} is {rv['status']}; its domains are settled")
+    run = one(con, "SELECT label FROM reviewer_runs WHERE review_id=? AND domain_code=? ORDER BY id LIMIT 1",
+              (rv["id"], a.domain))
+    if decision == "skipped" and run:
+        raise WriteError(f"{rv['code']} has a reviewer run in {a.domain} ({run['label']}); a domain with reviewer "
+                         f"runs cannot be skipped (cancel the run with finish-run --status cancelled instead)")
+    old = one(con, "SELECT * FROM review_domains WHERE review_id=? AND domain_code=?", (rv["id"], a.domain))
+    change = a.owner_change or (old["owner_change"] if old else "none")
+    if a.reviewers is not None and a.reviewers < 0:
+        raise WriteError("--reviewers is a count (0 or more)")
+    if old:
+        ctx.x("""UPDATE review_domains SET decision=?, reason=?, owner_change=?,
+                 reviewers_planned=COALESCE(?, reviewers_planned), split_note=COALESCE(?, split_note)
+                 WHERE review_id=? AND domain_code=?""",
+              (decision, reason, change, a.reviewers, a.split_note, rv["id"], a.domain))
+    else:
+        ctx.x("""INSERT INTO review_domains(review_id, domain_code, decision, reason, owner_change, reviewers_planned,
+                 split_note) VALUES (?,?,?,?,?,?,?)""",
+              (rv["id"], a.domain, decision, reason, change, a.reviewers, a.split_note))
+    return [f"{rv['code']} {a.domain}: {decision}" + (f" ({change})" if change != "none" else "")]
+
+
+def _ledger_file(ctx, path, what, must_exist=True):
+    """(stored path, sha256 or None) of a file that must be inside the ledger's folder: relative to the project root
+    when it is inside it, else absolute."""
+    p = Path(path).expanduser()
+    if not p.is_absolute():
+        p = (Path.cwd() / p) if (Path.cwd() / p).exists() else (Path(ctx.root) / p)
+    p = p.resolve()
+    folder = Path(ctx.db).parent.resolve()
+    if folder not in p.parents:
+        raise WriteError(f"{what} {path} is not inside the ledger's folder {folder}; copy it there first "
+                         f"(reviews/R-0001/...)")
+    if not p.is_file():
+        if must_exist:
+            raise WriteError(f"{what} {path}: no such file")
+        sha = None
+    else:
+        sha = hashlib.sha256(p.read_bytes()).hexdigest()
+    try:
+        stored = p.relative_to(Path(ctx.root).resolve()).as_posix()
+    except ValueError:
+        stored = str(p)
+    return stored, sha
+
+
+@_command("finish-run", "record a reviewer run's result: status, counts, report path and its sha256",
+          "ledger.py finish-run R-0001 LABEL [--status finished|failed|cancelled] --report FILE [--items N] "
+          "[--high N] [--medium N] [--low N] [--tests N] [--message TEXT|@file] [--actor A-0001]")
+def cmd_finish_run(ctx):
+    a, con = ctx.a, ctx.con
+    rv = review_row(con, a.review)
+    run = one(con, "SELECT * FROM reviewer_runs WHERE review_id=? AND label=?", (rv["id"], a.label))
+    if not run:
+        raise WriteError(f"no run {a.label!r} in {rv['code']} (add-run records it)")
+    if a.status not in ("finished", "failed", "cancelled"):
+        raise WriteError(f"status {a.status!r} is not one of finished, failed, cancelled")
+    if run["status"] in ("finished", "failed", "cancelled"):
+        raise WriteError(f"run {a.label} is already {run['status']}")
+    if a.status == "finished" and not a.report:
+        raise WriteError("a finished run needs --report (its report file, inside the ledger's folder)")
+    path, sha = _ledger_file(ctx, a.report, "the report") if a.report else (None, None)
+    for n in ("items", "high", "medium", "low", "tests"):
+        if getattr(a, n) is not None and getattr(a, n) < 0:
+            raise WriteError(f"--{n} is a count (0 or more)")
+    ctx.x("""UPDATE reviewer_runs SET status=?, report_path=COALESCE(?, report_path),
+             report_sha256=COALESCE(?, report_sha256), items_reviewed=?, high_count=?, medium_count=?, low_count=?,
+             test_count=?, final_message=?, finished_at=? WHERE id=?""",
+          (a.status, path, sha, a.items, a.high, a.medium, a.low, a.tests, _text_arg(a.message, "--message"), now(),
+           run["id"]))
+    out = [f"{a.label}: {run['status']} -> {a.status}" + (f", report {path} (sha256 {sha[:12]})" if path else "")]
+    if path:
+        ctx.x("INSERT INTO artifacts(review_id, reviewer_run_id, kind, path, sha256) VALUES (?,?,?,?,?)",
+              (rv["id"], run["id"], "report", path, sha))
+    return out
+
+
+VERIFICATIONS = ('confirmed', 'partly', 'false', 'not-checkable')
+
+
+def _live_review(con, what):
+    live = rows(con, "SELECT * FROM reviews WHERE status NOT IN ('handed-off','abandoned') ORDER BY id")
+    if len(live) != 1:
+        raise WriteError(f"{len(live)} reviews are in progress; {what}")
+    return live[0]
+
+
+@_command("verify", "record the manager's verification of a finding: confirmed, partly, false or not-checkable",
+          "ledger.py verify R-0001:SEC-M1|SEC-M1 confirmed|partly|false|not-checkable --note 'what you saw' "
+          "[--review R-0001] [--actor A-0001]")
+def cmd_verify(ctx):
+    a, con = ctx.a, ctx.con
+    m = re.fullmatch(r"(R-[0-9]{4,})[:/](.+)", a.point.strip())
+    rv = review_row(con, m.group(1)) if m else (review_row(con, a.review) if a.review else
+                                                 _live_review(con, "write the point as R-0001:SEC-M1"))
+    pid = m.group(2) if m else a.point.strip()
+    note = _need(_text_arg(a.note, "--note"), "--note (what you saw)")
+    if a.verdict not in VERIFICATIONS:
+        raise WriteError(f"verdict {a.verdict!r} is not one of {', '.join(VERIFICATIONS)}")
+    f = one(con, "SELECT id, verification FROM findings WHERE review_id=? AND point_id=?", (rv["id"], pid))
+    if not f:
+        raise WriteError(f"no point {pid} in {rv['code']}")
+    ctx.x("""UPDATE findings SET verification=?, verification_note=?, verified_by_actor_id=?, verified_at=?
+             WHERE id=?""", (a.verdict, note, ctx.actor_id, now(), f["id"]))
+    return [f"{rv['code']}:{pid}: {f['verification']} -> {a.verdict}"]
+
+
+TEST_PURPOSES = ('baseline', 'targeted', 'flake-check', 'mutation', 'before-fix', 'after-fix', 'ci')
+
+
+def _one_repo(con, name):
+    """The repository named, or the only one; None when the ledger has none and no name is given."""
+    if name:
+        r = one(con, "SELECT * FROM repositories WHERE name=?", (name,))
+        if not r:
+            raise WriteError(f"no repository named {name!r}")
+        return r
+    found = rows(con, "SELECT * FROM repositories ORDER BY id")
+    if len(found) > 1:
+        raise WriteError(f"the ledger has {len(found)} repositories; name one with --repo")
+    return found[0] if found else None
+
+
+def _repo_commit(ctx, repo, ref):
+    """(repository dir, full commit hash) of ref (default HEAD) in repo, from git."""
+    if repo is None:
+        raise WriteError("the ledger has no repositories; add one with: ledger.py add-repo NAME PATH")
+    d = repo_dir(ctx.root, repo["path"], bool(repo["allow_outside_root"]))
+    return d, full_commit(d, ref or "HEAD")
+
+
+@_command("record-test-run", "record a test run (baseline, before-fix, after-fix, ...) at its commit",
+          "ledger.py record-test-run --purpose baseline|targeted|flake-check|mutation|before-fix|after-fix|ci "
+          "--command 'python3 -m unittest' (--review R-0001 | --step 12 [--plan P-0001]) [--repo NAME] "
+          "[--commit REF (default HEAD)] [--passed N] [--failed N] [--skipped N] [--errored N] [--exit-code N] "
+          "[--duration-ms N] [--output FILE] [--note TEXT] [--actor A-0001]")
+def cmd_record_test_run(ctx):
+    a, con = ctx.a, ctx.con
+    if a.purpose not in TEST_PURPOSES:
+        raise WriteError(f"purpose {a.purpose!r} is not one of {', '.join(TEST_PURPOSES)}")
+    command = _need(a.command, "--command (what was run)")
+    if not a.review and not a.step:
+        raise WriteError("give --review or --step (what the test run belongs to)")
+    rv = review_row(con, a.review) if a.review else None
+    st = step_row(con, a.step, a.plan) if a.step else None
+    repo = _one_repo(con, a.repo)
+    sha = _repo_commit(ctx, repo, a.commit)[1] if repo is not None or a.commit else None
+    for n in ("passed", "failed", "skipped", "errored", "duration_ms"):
+        if getattr(a, n) is not None and getattr(a, n) < 0:
+            raise WriteError(f"--{n.replace('_', '-')} is a count (0 or more)")
+    tid = ctx.x("""INSERT INTO test_runs(review_id, step_id, repository_id, commit_sha, command, purpose, passed, failed,
+                   skipped, errored, exit_code, duration_ms, output_path, notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (rv["id"] if rv else None, st["id"] if st else None, repo["id"] if repo else None, sha, command,
+                 a.purpose, a.passed, a.failed, a.skipped, a.errored, a.exit_code, a.duration_ms, a.output,
+                 _text_arg(a.note, "--note"))).lastrowid
+    counts = ", ".join(f"{getattr(a, n)} {n}" for n in ("passed", "failed", "skipped", "errored")
+                       if getattr(a, n) is not None)
+    return [f"test run {tid}: {a.purpose}" + (f" at {sha[:10]}" if sha else "") + (f": {counts}" if counts else "")]
+
+
+def record_step_commit(ctx, step, ref, repo_name=None, pr=None, summary=None):
+    """Record (or refresh) the step_commits row of a step's commit, from git: the full hash, the current branch when
+    it contains the commit, the subject and commit time. Returns (full hash, the line to print)."""
+    if pr is not None and not SAFE_URL.match(pr):
+        raise WriteError("--pr must be the pull request's https:// address")
+    repo = _one_repo(ctx.con, repo_name)
+    d, sha = _repo_commit(ctx, repo, ref)
+    branch = None
+    try:
+        head = git(d, "symbolic-ref", "--short", "-q", "HEAD").decode().strip() or None
+        if head and subprocess.run(["git", "-C", str(d), "merge-base", "--is-ancestor", sha, "HEAD"],
+                                   capture_output=True, timeout=15).returncode == 0:
+            branch = head
+    except (RuntimeError, OSError, subprocess.SubprocessError):
+        pass
+    info = git(d, "show", "-s", "--format=%cI%n%s", sha).decode("utf-8", "replace").split("\n", 1)
+    subject = info[1].strip() if len(info) > 1 else None
+    ctx.x("""INSERT INTO step_commits(step_id, repository_id, commit_sha, branch, pr_url, summary, committed_at)
+             VALUES (?,?,?,?,?,?,?)
+             ON CONFLICT(step_id, commit_sha) DO UPDATE SET pr_url=COALESCE(excluded.pr_url, pr_url),
+               summary=COALESCE(?, summary), branch=COALESCE(branch, excluded.branch)""",
+          (step["id"], repo["id"], sha, branch, pr, summary or subject, utc_time(info[0].strip()), summary))
+    return sha, f"step {step['number']}: commit {sha[:10]}" + (f" on {branch}" if branch else "")
+
+
+@_command("add-commit", "record a plan step's commit (and its pull request) from git",
+          "ledger.py add-commit 12|P-0001#12|KEY COMMIT [--plan P-0001] [--repo NAME] [--pr URL] [--summary TEXT] "
+          "[--actor A-0001]")
+def cmd_add_commit(ctx):
+    a = ctx.a
+    s = step_row(ctx.con, a.step, a.plan)
+    return [record_step_commit(ctx, s, a.commit, a.repo, a.pr, a.summary)[1]]
+
+
+def record_guard(ctx, iss, path, name, *, step=None, commit=None, failed_before=None, repo=None):
+    if one(ctx.con, "SELECT 1 x FROM guard_tests WHERE issue_id=? AND test_path=? AND test_name=?",
+           (iss["id"], path, name)):
+        raise WriteError(f"{iss['code']} already has guard test {path}::{name}")
+    ctx.x("""INSERT INTO guard_tests(issue_id, repository_id, test_path, test_name, step_id, added_commit_sha,
+             failed_before_fix, passes_after_fix) VALUES (?,?,?,?,?,?,?,1)""",
+          (iss["id"], repo["id"] if repo else None, path, name, step["id"] if step else None, commit,
+           None if failed_before is None else int(bool(failed_before))))
+    return f"{iss['code']}: guard test {path}::{name}"
+
+
+def _guard_spec(spec):
+    """(issue code or None, test path, test name) from PATH::NAME or ISS-0001=PATH::NAME."""
+    m = re.fullmatch(r"(?:(ISS-[0-9]{4,})=)?(.+?)::(.+)", spec.strip())
+    if not m or not m.group(2).strip() or not m.group(3).strip():
+        raise WriteError(f"--guard {spec!r}: write it as PATH::NAME or ISS-0001=PATH::NAME")
+    return m.group(1), m.group(2).strip(), m.group(3).strip()
+
+
+@_command("add-guard", "record the test that guards a fixed issue (it passes now; --failed-before if it failed "
+                       "before the fix)",
+          "ledger.py add-guard ISS-0001 TEST_PATH TEST_NAME [--failed-before] [--step 12 [--plan P-0001]] "
+          "[--commit REF] [--repo NAME] [--actor A-0001]")
+def cmd_add_guard(ctx):
+    a, con = ctx.a, ctx.con
+    iss = issue_row(con, a.issue)
+    path, name = _need(a.test_path, "the test's path"), _need(a.test_name, "the test's name")
+    step = step_row(con, a.step, a.plan) if a.step else None
+    repo = _one_repo(con, a.repo)
+    commit = _repo_commit(ctx, repo, a.commit)[1] if a.commit else None
+    return [record_guard(ctx, iss, path, name, step=step, commit=commit,
+                         failed_before=True if a.failed_before else None, repo=repo)]
+
+
+@_command("confirm-guard", "record that a review checked fixed issues' guard tests: still there, or --gone",
+          "ledger.py confirm-guard R-0002 ISS-0001 [ISS-0002]... [--test PATH::NAME] [--gone] [--actor A-0001]")
+def cmd_confirm_guard(ctx):
+    a, con = ctx.a, ctx.con
+    rv = review_row(con, a.review)
+    test = _guard_spec(a.test)[1:] if a.test else None
+    out = []
+    for code in dict.fromkeys(a.issues):
+        iss = issue_row(con, code)
+        sql, args = "SELECT id, test_path, test_name FROM guard_tests WHERE issue_id=?", [iss["id"]]
+        if test:
+            sql += " AND test_path=? AND test_name=?"; args += list(test)
+        found = rows(con, sql, args)
+        if not found:
+            raise WriteError(f"{iss['code']} has no guard test{' ' + '::'.join(test) if test else ''} "
+                             f"(record one with add-guard)")
+        for g in found:
+            ctx.x("UPDATE guard_tests SET still_exists=?, last_confirmed_review_id=? WHERE id=?",
+                  (0 if a.gone else 1, rv["id"], g["id"]))
+            out.append(f"{iss['code']}: {g['test_path']}::{g['test_name']} "
+                       f"{'is gone' if a.gone else 'still guards it'} ({rv['code']})")
+    return out
+
+
+@_command("set-verdict", "store a review's one-line verdict and short summary (shown in the hub)",
+          "ledger.py set-verdict R-0001 --verdict TEXT [--summary TEXT|@file] [--actor A-0001]")
+def cmd_set_verdict(ctx):
+    a, con = ctx.a, ctx.con
+    rv = review_row(con, a.review)
+    verdict = _need(_text_arg(a.verdict, "--verdict"), "--verdict (the review's verdict in one sentence)")
+    ctx.x("UPDATE reviews SET verdict=?, summary=COALESCE(?, summary), change_actor_id=? WHERE id=?",
+          (verdict, _text_arg(a.summary, "--summary"), ctx.actor_id, rv["id"]))
+    return [f"{rv['code']}: verdict recorded"]
+
+
+@_command("add-metric", "record a measured, counted or estimated metric of a review",
+          "ledger.py add-metric R-0001 NAME VALUE --method measured|counted|estimated [--domain D] [--repo NAME] "
+          "[--scope all] [--unit U] [--note TEXT] [--actor A-0001]")
+def cmd_add_metric(ctx):
+    a, con = ctx.a, ctx.con
+    rv = review_row(con, a.review)
+    if a.method not in ("measured", "counted", "estimated"):
+        raise WriteError(f"method {a.method!r} is not one of measured, counted, estimated")
+    try:
+        value = float(a.value)
+    except (TypeError, ValueError):
+        raise WriteError(f"VALUE {a.value!r} is not a number")
+    if a.domain and not one(con, "SELECT 1 x FROM domains WHERE code=?", (a.domain,)):
+        raise WriteError(f"no domain {a.domain!r} in the catalog")
+    repo = _one_repo(con, a.repo) if a.repo else None
+    name = _need(a.name, "the metric's name")
+    ctx.x("""INSERT INTO metrics(review_id, domain_code, repository_id, name, scope, value, unit, method, note)
+             VALUES (?,?,?,?,?,?,?,?,?)""",
+          (rv["id"], a.domain, repo["id"] if repo else None, name, a.scope or "all", value, a.unit, a.method,
+           _text_arg(a.note, "--note")))
+    return [f"{rv['code']} {name} = {value:g}{' ' + a.unit if a.unit else ''} ({a.scope or 'all'})"]
+
+
+ARTIFACT_KINDS = ('brief', 'report', 'index', 'summary-doc', 'plan-file', 'progress-page', 'probe-script', 'other')
+
+
+@_command("add-artifact", "record a file of the review or plan (kept in the ledger's folder) or a published address",
+          "ledger.py add-artifact brief|report|index|summary-doc|plan-file|progress-page|probe-script|other "
+          "(--path FILE | --url URL) (--review R-0001 [--run LABEL] | --plan P-0001) [--actor A-0001]   "
+          "(progress-page with --plan and --url also sets the plan's page address)")
+def cmd_add_artifact(ctx):
+    a, con = ctx.a, ctx.con
+    if a.kind not in ARTIFACT_KINDS:
+        raise WriteError(f"kind {a.kind!r} is not one of {', '.join(ARTIFACT_KINDS)}")
+    if not a.path and not a.url:
+        raise WriteError("give --path or --url (where the artifact is)")
+    if a.url and not SAFE_URL.match(a.url):
+        raise WriteError("--url must be an https:// address")
+    if not a.review and not a.plan:
+        raise WriteError("give --review or --plan (what the artifact belongs to)")
+    rv = review_row(con, a.review) if a.review else None
+    pl = plan_row(con, a.plan) if a.plan else None
+    run = None
+    if a.run:
+        if not rv:
+            raise WriteError("--run needs --review (run labels are per review)")
+        run = one(con, "SELECT id FROM reviewer_runs WHERE review_id=? AND label=?", (rv["id"], a.run))
+        if not run:
+            raise WriteError(f"no run {a.run!r} in {rv['code']}")
+    path, sha = _ledger_file(ctx, a.path, "the artifact", must_exist=not a.url) if a.path else (None, None)
+    aid = ctx.x("INSERT INTO artifacts(review_id, plan_id, reviewer_run_id, kind, path, url, sha256) "
+                "VALUES (?,?,?,?,?,?,?)", (rv["id"] if rv else None, pl["id"] if pl else None,
+                                           run["id"] if run else None, a.kind, path, a.url, sha)).lastrowid
+    out = [f"artifact {aid}: {a.kind} {path or a.url}"]
+    if a.kind == "progress-page" and pl and a.url:
+        ctx.x("UPDATE plans SET page_url=? WHERE id=?", (a.url, pl["id"]))
+        out.append(f"{pl['code']}: page {a.url}")
+    return out
+
+
+def cmd_tag_review_pushed(ctx):
+    """tag-review R-0001 --pushed: record that the review's tags were pushed (after git push origin review/R-0001)."""
+    con = ctx.con
+    rv = review_row(con, ctx.a.review)
+    tagged = rows(con, """SELECT rr.repository_id, rr.tag_name, rr.tag_pushed, rp.name FROM review_repositories rr
+                          JOIN repositories rp ON rp.id = rr.repository_id
+                          WHERE rr.review_id=? AND rr.tag_name IS NOT NULL ORDER BY rp.id""", (rv["id"],))
+    if not tagged:
+        raise WriteError(f"{rv['code']} has no recorded tag; run tag-review {rv['code']} first, then push it")
+    out = []
+    for t in tagged:
+        if t["tag_pushed"]:
+            out.append(f"{t['name']}: {t['tag_name']} was already recorded as pushed")
+            continue
+        ctx.x("UPDATE review_repositories SET tag_pushed=1 WHERE review_id=? AND repository_id=?",
+              (rv["id"], t["repository_id"]))
+        ctx.x("""INSERT INTO events(entity_type, entity_id, event, to_value, note, actor_id, review_id)
+                 VALUES ('review', ?, 'tag-pushed', ?, ?, ?, ?)""",
+              (rv["id"], t["tag_name"], f"{t['name']}: git push origin {t['tag_name']}", ctx.actor_id, rv["id"]))
+        out.append(f"{t['name']}: {t['tag_name']} recorded as pushed")
+    return out
+
+
+cmd_tag_review_pushed.cli = ("", "")
+
+
+# ----- redact (step 132)
+
+REDACTED = "[redacted]"
+# The history entity a redaction is logged against, by table (else the row's own review, plan, step or issue).
+REDACT_ENTITIES = {"findings": "finding", "issues": "issue", "reviews": "review", "steps": "step", "plans": "plan",
+                   "decisions": "decision", "gates": "gate", "issue_relations": "relation",
+                   "review_issue_checks": "check", "step_findings": "step-finding", "design_goals": "goal",
+                   "interview_questions": "question"}
+
+
+def _redact_row(con, table, cols, ref):
+    """The rowid of the row named by ref: a row id, its code (ISS-0001, GATE-0001), or R-0001:POINT for a finding."""
+    ref = str(ref).strip()
+    if ref.isdigit():
+        r = con.execute(f'SELECT rowid FROM "{table}" WHERE rowid=?', (int(ref),)).fetchone()
+    else:
+        m = re.fullmatch(r"(R-[0-9]{4,})[:/](.+)", ref)
+        if m and table == "findings":
+            r = con.execute("SELECT f.id FROM findings f JOIN reviews r ON r.id = f.review_id "
+                            "WHERE r.code=? AND f.point_id=?", m.groups()).fetchone()
+        elif "code" in cols:
+            r = con.execute(f'SELECT rowid FROM "{table}" WHERE code=?', (ref,)).fetchone()
+        else:
+            r = None
+    if not r:
+        raise WriteError(f"no row {ref} in {table}")
+    return r[0]
+
+
+def _redactable(con, table, column, info):
+    """True for a free-text column: declared TEXT, not a key, not a reference, not unique, not a word from a list."""
+    col = info[column]
+    if "TEXT" not in (col["type"] or "").upper() or col["pk"]:
+        return False
+    if column in {r[3] for r in con.execute(f'PRAGMA foreign_key_list("{table}")')}:
+        return False
+    for ix in con.execute(f'PRAGMA index_list("{table}")'):
+        if ix[2] and column in [r[2] for r in con.execute(f'PRAGMA index_info("{ix[1]}")')]:
+            return False
+    sql = con.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()[0] or ""
+    return not re.search(rf"\b{re.escape(column)}\s+IN\s*\(", sql)
+
+
+@_command("redact", "replace a secret in the ledger's text with [redacted], everywhere it was copied, and log why",
+          "ledger.py redact TABLE.COLUMN ROW --reason TEXT [--only 'the secret part'] [--actor A-0001]   "
+          "(ROW: an id, a code like ISS-0001, or R-0001:SEC-H1 for a finding)")
+def cmd_redact(ctx):
+    a, con = ctx.a, ctx.con
+    table, sep, column = (a.field or "").partition(".")
+    if not sep or not table or not column:
+        raise WriteError(f"{a.field!r}: name the field as TABLE.COLUMN (findings.summary)")
+    tables = [r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table' "
+                                        "AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+    if table not in tables:
+        raise WriteError(f"no table {table!r} in the ledger")
+    info = {r[1]: {"type": r[2], "pk": r[5]} for r in con.execute(f'PRAGMA table_info("{table}")')}
+    if column not in info:
+        raise WriteError(f"no column {column!r} in {table}")
+    if not _redactable(con, table, column, info):
+        raise WriteError(f"{table}.{column} is not a text column that can be redacted (only free text: summaries, "
+                         f"notes, excerpts, answers)")
+    reason = _need(_text_arg(a.reason, "--reason"), "--reason (why the text is redacted; never the value)")
+    rowid = _redact_row(con, table, info, a.row)
+    value = con.execute(f'SELECT "{column}" FROM "{table}" WHERE rowid=?', (rowid,)).fetchone()[0]
+    if not isinstance(value, str) or not value.strip():
+        raise WriteError(f"{table}.{column} of {a.row} is empty; nothing to redact")
+    secret = value if a.only is None else a.only
+    if a.only is not None and a.only not in value:
+        raise WriteError(f"the text given with --only is not in {table}.{column} of {a.row}")
+    if len(secret.strip()) < 6:
+        raise WriteError("the text to redact is shorter than 6 characters: too short to find its copies safely")
+    if secret in reason:
+        raise WriteError("the --reason holds the redacted text; say why it is redacted, never the value")
+    # every copy: any text cell of any table holding the secret (events' values and notes, issue titles, ...)
+    hits = {}
+    for t in tables:
+        for c in _table_columns(con, t):
+            for (rid,) in con.execute(f'SELECT rowid FROM "{t}" WHERE typeof("{c}")=\'text\' AND instr("{c}", ?) > 0',
+                                      (secret,)):
+                hits.setdefault(t, []).append((c, rid))
+    # the append-only guards (and every other trigger) of those tables are lifted for these updates only: dropped
+    # and recreated from their own text in this one transaction, so the shipped schema is back before COMMIT
+    triggers = rows(con, "SELECT name, sql FROM sqlite_master WHERE type='trigger' AND tbl_name IN (%s) ORDER BY name"
+                    % ",".join("?" for _ in hits), list(hits))
+    for tr in triggers:
+        ctx.x(f'DROP TRIGGER "{tr["name"]}"')
+    for t, cells in hits.items():
+        for c, rid in cells:
+            ctx.x(f'UPDATE "{t}" SET "{c}" = replace("{c}", ?, ?) WHERE rowid=?', (secret, REDACTED, rid))
+    for tr in triggers:
+        ctx.x(tr["sql"])
+    entity = REDACT_ENTITIES.get(table)
+    row = one(con, f'SELECT * FROM "{table}" WHERE rowid=?', (rowid,))
+    review_id = row.get("review_id")
+    if table == "events":
+        entity, eid = row["entity_type"], row["entity_id"]
+    elif table == "finding_locations":
+        entity, eid = "finding", row["finding_id"]
+    elif entity:
+        eid = rowid
+    else:
+        for col, ent in (("finding_id", "finding"), ("issue_id", "issue"), ("step_id", "step"),
+                         ("review_id", "review"), ("first_review_id", "review"), ("plan_id", "plan")):
+            if row.get(col) is not None:
+                entity, eid = ent, row[col]
+                break
+        else:
+            raise WriteError(f"{table} rows have no history entry to log a redaction against")
+    copies = sum(len(v) for v in hits.values()) - 1
+    where = ", ".join(f"{t} ({len(v)})" for t, v in sorted(hits.items()))
+    ctx.x("""INSERT INTO events(entity_type, entity_id, event, to_value, note, actor_id, review_id)
+             VALUES (?, ?, 'redacted', ?, ?, ?, ?)""",
+          (entity, eid, f"{table}.{column}",
+           f"{table}.{column} of {a.row} redacted{' in part' if a.only is not None else ''}, with {copies} copies "
+           f"(cells by table: {where}): {reason}", ctx.actor_id, review_id))
+    con.execute("PRAGMA secure_delete = ON")
+    ctx.after.append(lambda: con.execute("PRAGMA wal_checkpoint(TRUNCATE)"))
+    out = [f"redacted {table}.{column} of {a.row} and {copies} copies: {where}"]
+    if Path(ctx.db).with_suffix(".sql").exists():
+        out.append("run `ledger.py dump` now: the old ledger.sql still holds the text")
+    out.append("a secret that reached git (a commit, a pushed dump) stays in its history: rotate it")
+    return out
+
+
 def add_write_commands(sub):
     """The write commands' subparsers (each one's --help gives its exact usage line)."""
     def p(name, *args, **kw):
@@ -9432,7 +10918,7 @@ def add_write_commands(sub):
             s.add_argument("--actor", help="who makes this change (A-0001, an actor id, or a unique actor name)")
         return s
 
-    s = p("next-code"); s.add_argument("prefix", help="ISS, R, P, D, GATE, REQ or G")
+    s = p("next-code"); s.add_argument("prefix", help="ISS, R, P, D, GATE, REQ, G or IQ")
     s = p("add-repo"); s.add_argument("name"); s.add_argument("path", help="relative to the project root ('.')")
     s.add_argument("--remote"); s.add_argument("--default-branch"); s.add_argument("--permalink-template")
     s.add_argument("--outside-root", action="store_true", help="the owner listed it as living outside the root")
@@ -9455,8 +10941,11 @@ def add_write_commands(sub):
     for o in ("--note", "--review", "--step", "--plan", "--commit", "--after", "--resolution"):
         s.add_argument(o)
     s = p("step-status"); s.add_argument("step"); s.add_argument("status")
-    for o in ("--note", "--question", "--progress-note", "--commit", "--plan"):
+    for o in ("--note", "--question", "--progress-note", "--commit", "--plan", "--repo"):
         s.add_argument(o)
+    s.add_argument("--guard", action="append", help="with done: PATH::NAME (each issue of the step) or "
+                                                    "ISS-0001=PATH::NAME, a guard test the step added")
+    s.add_argument("--failed-before", action="store_true", help="the --guard tests failed before the fix")
     s = p("import-steps"); s.add_argument("plan"); s.add_argument("file", help="JSON lines, or - for standard input")
     s = p("open-gate"); s.add_argument("kind")
     for o in ("--title", "--question", "--context", "--options-json", "--review", "--plan", "--step", "--issue",
@@ -9468,6 +10957,22 @@ def add_write_commands(sub):
     s = p("answer-gate"); s.add_argument("gate"); s.add_argument("--value"); s.add_argument("--text")
     s.add_argument("--via", default="chat", choices=("chat", "other")); s.add_argument("--by")
     s = p("apply-gate"); s.add_argument("gate"); s.add_argument("--note"); s.add_argument("--revisit-when")
+    s = p("interview-ask"); s.add_argument("question", nargs="?"); s.add_argument("--review"); s.add_argument("--domain")
+    s.add_argument("--why", help="what in the code prompted the question")
+    s.add_argument("--gate", action="store_true", help="ask it in the hub too (a gate whose answer is recorded)")
+    s = p("interview-answer"); s.add_argument("question"); s.add_argument("answer", nargs="?")
+    s.add_argument("--via", default="chat", help="chat or viewer")
+    s = p("propose-goal"); s.add_argument("statement", nargs="?"); s.add_argument("--domain", help="omit: whole project")
+    s.add_argument("--from", dest="sources", help="the interview questions it summarizes: IQ-0001,IQ-0003")
+    s.add_argument("--source", help="where a goal stated in a document comes from (a path, 'owner, chat <date>')")
+    s.add_argument("--review"); s.add_argument("--gate", action="store_true",
+                                               help="ask for the owner's approval in the hub (one confirm gate)")
+    s = p("approve-goals"); s.add_argument("goals", nargs="+")
+    s = p("reject-goal"); s.add_argument("goal"); s.add_argument("--note")
+    s = p("link-step-goals"); s.add_argument("step"); s.add_argument("goals", nargs="+"); s.add_argument("--plan")
+    s = p("goals"); s.add_argument("--domain"); s.add_argument("--all", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s = p("interview"); s.add_argument("--review"); s.add_argument("--domain"); s.add_argument("--json", action="store_true")
     s = p("import-findings"); s.add_argument("review"); s.add_argument("run"); s.add_argument("file")
     s = p("import-checks"); s.add_argument("review"); s.add_argument("file"); s.add_argument("--run")
     s = p("load-index"); s.add_argument("review"); s.add_argument("run"); s.add_argument("points")
@@ -9483,6 +10988,54 @@ def add_write_commands(sub):
     s.add_argument("--where", action="append", default=[], help="[repo:]path[:start[-end]][#symbol], at --commit")
     s.add_argument("--phase", type=int); s.add_argument("--new-issue", action="store_true")
     s.add_argument("--gate", action="store_true", help="ask the owner where to plan it (the default)")
+    add_write_commands_131(p)
+
+
+def add_write_commands_131(p):
+    """The subparsers of the step 131-132 writes (new-plan ... redact); p is add_write_commands' maker."""
+    s = p("new-plan"); s.add_argument("--title"); s.add_argument("--review", action="append")
+    s = p("plan-status"); s.add_argument("plan"); s.add_argument("status"); s.add_argument("--note")
+    s.add_argument("--approved-by"); s.add_argument("--superseded-by")
+    s = p("add-requirement"); s.add_argument("text", nargs="?"); s.add_argument("--source")
+    s.add_argument("--location"); s.add_argument("--stated-at"); s.add_argument("--review")
+    s = p("add-domain"); s.add_argument("code"); s.add_argument("name"); s.add_argument("--description")
+    s.add_argument("--report-file"); s.add_argument("--category", default="custom")
+    s.add_argument("--theme", help="CODE=Name (added when the catalog lacks it)")
+    s = p("review-domain"); s.add_argument("review"); s.add_argument("domain")
+    s.add_argument("decision", help="include or skip"); s.add_argument("--reason")
+    s.add_argument("--owner-change", help=", ".join(OWNER_CHANGES)); s.add_argument("--reviewers", type=int)
+    s.add_argument("--split-note")
+    s = p("finish-run"); s.add_argument("review"); s.add_argument("label")
+    s.add_argument("--status", default="finished"); s.add_argument("--report"); s.add_argument("--message")
+    for o in ("--items", "--high", "--medium", "--low", "--tests"):
+        s.add_argument(o, type=int)
+    s = p("verify"); s.add_argument("point", help="R-0001:SEC-M1, or SEC-M1 with --review")
+    s.add_argument("verdict", help=", ".join(VERIFICATIONS)); s.add_argument("--note"); s.add_argument("--review")
+    s = p("record-test-run")
+    for o in ("--purpose", "--command", "--review", "--step", "--plan", "--repo", "--commit", "--output", "--note"):
+        s.add_argument(o)
+    for o in ("--passed", "--failed", "--skipped", "--errored", "--exit-code", "--duration-ms"):
+        s.add_argument(o, type=int)
+    s = p("add-commit"); s.add_argument("step"); s.add_argument("commit", help="a full hash, or any git ref")
+    for o in ("--plan", "--repo", "--pr", "--summary"):
+        s.add_argument(o)
+    s = p("add-guard"); s.add_argument("issue"); s.add_argument("test_path"); s.add_argument("test_name")
+    s.add_argument("--failed-before", action="store_true", help="it failed before the fix")
+    for o in ("--step", "--plan", "--commit", "--repo"):
+        s.add_argument(o)
+    s = p("confirm-guard"); s.add_argument("review"); s.add_argument("issues", nargs="+")
+    s.add_argument("--test", help="PATH::NAME (default: every guard test of the issue)")
+    s.add_argument("--gone", action="store_true", help="the test no longer exists or no longer guards the issue")
+    s = p("set-verdict"); s.add_argument("review"); s.add_argument("--verdict"); s.add_argument("--summary")
+    s = p("add-metric"); s.add_argument("review"); s.add_argument("name"); s.add_argument("value")
+    for o in ("--method", "--domain", "--repo", "--scope", "--unit", "--note"):
+        s.add_argument(o)
+    s = p("add-artifact"); s.add_argument("kind", help=", ".join(ARTIFACT_KINDS))
+    for o in ("--path", "--url", "--review", "--plan", "--run"):
+        s.add_argument(o)
+    s = p("redact"); s.add_argument("field", help="TABLE.COLUMN, e.g. findings.summary")
+    s.add_argument("row", help="a row id, a code (ISS-0001), or R-0001:SEC-H1 for a finding")
+    s.add_argument("--reason"); s.add_argument("--only", help="redact only this part of the text (the secret)")
 
 
 # ----- the reviewed text of a dirty working tree (D-14, used by fill_refs)
@@ -9514,13 +11067,47 @@ def working_tree_bytes(root, con, loc, committed):
 
 _MAIN_CONNECTIONS = []  # the ledger connection main() opened, closed on every way out (FIX-4)
 
+# C0 controls except tab and newline, DEL, and the C1 controls (U+0080-U+009F, among them the one-character CSI U+009B).
+_TERMINAL_CONTROLS = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def terminal_safe(text):
+    """The one sanitizer for text the CLI prints (step 118). The ledger may have been written by someone else, so a
+    stored title, summary, answer or cited line could carry terminal escapes that clear the screen, retitle the
+    window or hide text. Every control character but newline and tab becomes a visible \\u00XX escape (valid inside
+    the JSON `query --json` prints, unambiguous in its TSV, where a literal backslash is doubled)."""
+    return _TERMINAL_CONTROLS.sub(lambda m: f"\\u{ord(m.group()):04x}", text)
+
+
+class _TerminalSafeStream:
+    """A text stream that writes through terminal_safe(): main() puts one over stdout and stderr, so every command's
+    output (show, gates, check, query, progress-md, the write commands' messages and refusals) is sanitized in one
+    place, whatever prints it."""
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, text):
+        return self._stream.write(terminal_safe(text))
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
 
 def main():
     """The CLI. Whatever way a command ends (return, sys.exit, an exception), the ledger connection it opened is
-    closed before main() returns or raises."""
+    closed before main() returns or raises. Everything it prints goes through terminal_safe(), the message of a
+    sys.exit("...") included (the interpreter prints that one after main() has returned)."""
+    out, err = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = _TerminalSafeStream(out), _TerminalSafeStream(err)
     try:
         return _main()
+    except SystemExit as e:
+        if isinstance(e.code, str):
+            raise SystemExit(terminal_safe(e.code)) from None
+        raise
     finally:
+        sys.stdout, sys.stderr = out, err
         while _MAIN_CONNECTIONS:
             try:
                 _MAIN_CONNECTIONS.pop().close()
@@ -9545,6 +11132,9 @@ def _main():
     s.add_argument("--quiet", action="store_true", help="print only failures and warnings (no 'ok' or zero lines)")
     s = sub.add_parser("fill-refs"); s.add_argument("review", nargs="?")
     s = sub.add_parser("tag-review"); s.add_argument("review")
+    s.add_argument("--pushed", action="store_true",
+                   help="record that the review's tags were pushed (after git push origin review/R-0001)")
+    s.add_argument("--actor", help="who records the push (A-0001)")
     s = sub.add_parser("set-report", help="store the review document (Markdown) shown in the viewer")
     s.add_argument("review"); s.add_argument("file", help="Markdown file, or - for standard input")
     s = sub.add_parser("set-narrative", help="store the plan's narrative (Markdown) shown in the viewer")
@@ -9605,6 +11195,8 @@ def _main():
         sys.exit(1 if bad else 0)
     elif a.cmd == "fill-refs":
         sys.exit(1 if fill_refs(root, con, a.review) else 0)
+    elif a.cmd == "tag-review" and a.pushed:
+        sys.exit(run_write_command(con, root, db, a, cmd_tag_review_pushed))
     elif a.cmd == "tag-review":
         sys.exit(tag_review(root, con, a.review))
     elif a.cmd in ("set-report", "set-narrative"):
