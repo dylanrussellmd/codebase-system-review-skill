@@ -344,6 +344,11 @@ Record the check again in the review its finding belongs to.
 
 A warning: record one with `add-guard` for each fixed issue listed.
 
+#### `v_artifacts_outside_ledger`
+
+A warning: copy the brief, report or index into `.code-review/reviews/R-0002/` and record it there with
+`add-artifact`. `check` also names a recorded file that is missing from disk.
+
 #### `quick_check`
 
 The file is damaged. Stop writing. `ledger.py restore .code-review/ledger.sql --to /tmp/check.sqlite` rebuilds the last

@@ -22,12 +22,12 @@ import webbrowser
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 
-TOOL_VERSION = "1.7.0"  # stamped by dev/build.py from `version:` in SKILL.md's frontmatter
-TOOL_HASH = "861ff85fb6f52b8049867c604361f7ceac6311c4438ac5c65d29d07e92a79878"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
+TOOL_VERSION = "1.8.0"  # stamped by dev/build.py from `version:` in SKILL.md's frontmatter
+TOOL_HASH = "b168eb4080e43536f145155968f3f8b11872ebe0c56bf48e8a6f1f4c9d39e5d7"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
 SCHEMA = r"""-- =====================================================================
--- Code review ledger — schema version 10
+-- Code review ledger — schema version 11
 -- One SQLite file per project: <project root>/.code-review/ledger.sqlite
 -- Every connection must run:  PRAGMA foreign_keys = ON;
 -- Times are UTC ISO-8601 text with milliseconds (strftime('%Y-%m-%dT%H:%M:%fZ','now')); the tr_time_*
@@ -979,6 +979,8 @@ CREATE TABLE events (
 -- ---------- Indexes -----------------------------------------------------
 
 CREATE INDEX ix_findings_review      ON findings(review_id);
+-- The columns the per-review counts read (v_review_totals), so a list of reviews never reads the findings themselves.
+CREATE INDEX ix_findings_review_counts ON findings(review_id, verification, severity, match_type);
 CREATE INDEX ix_findings_issue       ON findings(issue_id);
 CREATE INDEX ix_findings_fingerprint ON findings(fingerprint);
 CREATE INDEX ix_findings_slug        ON findings(domain_code, theme_code, sub);
@@ -2121,8 +2123,9 @@ WHEN NEW.options IS NOT NULL AND json_valid(NEW.options) AND json_type(NEW.optio
   SELECT RAISE(ABORT, 'gate options must be objects with a text value and label (and an optional description)');
 END;
 
--- The same answer rules as the viewer, for answers written as SQL: answer_value is one of the option values,
--- and a gate without free text needs an option chosen.
+-- The answer rules of answer_gate() (the viewer, answer-gate, import-answers), for answers written as SQL:
+-- answer_value is one of the option values; a gate without free text needs an option chosen and takes no note;
+-- a note is at most 10,000 characters.
 CREATE TRIGGER tr_gate_answer_rules BEFORE UPDATE OF status, answer_value, answer_text ON gates
 WHEN NEW.status = 'answered' AND (OLD.status IS NOT 'answered' OR OLD.answer_value IS NOT NEW.answer_value
                                   OR OLD.answer_text IS NOT NEW.answer_text) BEGIN
@@ -2132,6 +2135,10 @@ WHEN NEW.status = 'answered' AND (OLD.status IS NOT 'answered' OR OLD.answer_val
                     WHERE json_extract(j.value, '$.value') = NEW.answer_value);
   SELECT RAISE(ABORT, 'this gate takes no free text: choose one of the options')
   WHERE NEW.allow_text = 0 AND NEW.answer_value IS NULL;
+  SELECT RAISE(ABORT, 'this gate takes no free text: answer with the option alone')
+  WHERE NEW.allow_text = 0 AND NEW.answer_text IS NOT NULL;
+  SELECT RAISE(ABORT, 'answer_text is too long (over 10,000 characters)')
+  WHERE length(NEW.answer_text) > 10000;
 END;
 
 -- A gate moves open -> answered -> applied (or withdrawn); it cannot be applied before it is answered. Any
@@ -2996,26 +3003,29 @@ ORDER BY g.status = 'answered', g.blocking DESC, g.created_at;
 -- (steps, decisions, and design goals proposed for a review and not on an open approval gate). Each thing once: a
 -- step or decision with an open or answered gate (on it, or for a decision on its step) is listed as that gate. A
 -- step's question falls back to its progress note, then to its change text, so it is never blank; it is blocking
--- when an unfinished step depends on it.
+-- when an unfinished step depends on it. question is what the owner is asked; context is what helps answer it
+-- (a gate's context, what reopens a decision).
 CREATE VIEW v_owner_queue AS
 SELECT 'gate' AS kind, g.code AS ref, g.kind AS need, g.title, g.question,
-       g.status, g.blocking, g.created_at
+       g.status, g.blocking, g.created_at, g.context
 FROM gates g WHERE g.status IN ('open','answered')
 UNION ALL
 SELECT 'step', p.code || ' #' || s.number, s.owner_need, s.title,
        COALESCE(NULLIF(trim(s.owner_question), ''), NULLIF(trim(s.progress_note), ''), s.change), 'open',
        EXISTS (SELECT 1 FROM step_dependencies sd JOIN steps ds ON ds.id = sd.step_id
-               WHERE sd.depends_on_step_id = s.id AND ds.status NOT IN ('done','dropped')), s.updated_at
+               WHERE sd.depends_on_step_id = s.id AND ds.status NOT IN ('done','dropped')), s.updated_at, NULL
 FROM steps s JOIN plans p ON p.id = s.plan_id
 WHERE s.status = 'waiting-owner'
   AND NOT EXISTS (SELECT 1 FROM gates g WHERE g.step_id = s.id AND g.status IN ('open','answered'))
 UNION ALL
-SELECT 'decision', d.code, 'decision', d.question, d.revisit_when, d.status, 0, d.asked_at
+SELECT 'decision', d.code, 'decision',
+       CASE d.status WHEN 'revisit' THEN 'A decision to look at again' ELSE 'A decision to make' END,
+       d.question, d.status, 0, d.asked_at, d.revisit_when
 FROM decisions d WHERE d.status IN ('open','revisit')
   AND NOT EXISTS (SELECT 1 FROM gates g WHERE g.decision_id = d.id AND g.status IN ('open','answered'))
   AND NOT EXISTS (SELECT 1 FROM gates g WHERE g.step_id = d.step_id AND g.status IN ('open','answered'))
 UNION ALL
-SELECT 'goal', g.code, 'confirm', 'Approve a design goal', g.text, g.status, 1, g.adopted_at
+SELECT 'goal', g.code, 'confirm', 'Approve a design goal', g.text, g.status, 1, g.adopted_at, NULL
 FROM design_goals g WHERE g.status = 'proposed' AND g.review_id IS NOT NULL
   AND NOT EXISTS (SELECT 1 FROM gates x WHERE x.id = g.gate_id AND x.status IN ('open','answered'));
 
@@ -3101,6 +3111,18 @@ WHERE f.verification <> 'false'
   AND NOT EXISTS (SELECT 1 FROM findings f2 JOIN step_findings sf ON sf.finding_id = f2.id
                   JOIN steps cs ON cs.id = sf.step_id
                   WHERE f.issue_id IS NOT NULL AND f2.issue_id = f.issue_id AND cs.status <> 'dropped');
+
+-- Review files recorded outside the ledger's folder.
+-- A brief, report or index whose path is not under .code-review/ (or under the folder meta.ledger_location names,
+-- for a ledger kept elsewhere): it was left in a scratch folder and will not travel with the ledger. A warning;
+-- check also says when a recorded file is missing from disk.
+CREATE VIEW v_artifacts_outside_ledger AS
+SELECT r.code AS review, a.kind, a.path
+FROM artifacts a LEFT JOIN reviews r ON r.id = a.review_id
+WHERE a.path IS NOT NULL AND a.kind IN ('brief','report','index')
+  AND replace(a.path, char(92), '/') NOT LIKE '.code-review/%'
+  AND replace(a.path, char(92), '/') NOT LIKE
+      replace(COALESCE((SELECT value FROM meta WHERE key = 'ledger_location'), '.code-review'), char(92), '/') || '/%';
 
 -- Fixed issues with no test guarding the fix, or whose guard test is gone.
 -- Issues of kind docs or design need no guard test.
@@ -3594,7 +3616,42 @@ INSERT INTO ledger_checks(view, label, tier, position) VALUES
  ('v_closed_without_reason','Issues accepted or declined with no reason recorded','error',78),
  ('v_relation_problems','Related-to pairs stored in both directions','error',80),
  ('v_check_finding_owner','Review checks citing a finding of another issue','error',82);
-INSERT INTO meta(key, value) VALUES ('schema_version','10');
+-- The names the triggers give to events (events.event is free text: a name without a label is shown in words).
+INSERT INTO enum_labels(enum, value, label, position) VALUES
+ ('event','opened','Opened',1),
+ ('event','seen','Raised by a review',2),
+ ('event','recurred','Raised again after it was closed',3),
+ ('event','checked','Looked for by a review',4),
+ ('event','unlinked','A point was moved to another issue',5),
+ ('event','status-changed','Status changed',6),
+ ('event','severity-changed','Severity changed',7),
+ ('event','title-changed','Title changed',8),
+ ('event','before-state-changed','What it did before: text changed',9),
+ ('event','current-state-changed','What it does now: text changed',10),
+ ('event','after-state-changed','What it does after the fix: text changed',11),
+ ('event','recommendation-changed','Agreed fix changed',12),
+ ('event','resolution-changed','Resolution changed',13),
+ ('event','created','Created',14),
+ ('event','proof-changed','Proof changed',15),
+ ('event','change-text-changed','Change text changed',16),
+ ('event','answer-changed','Answer changed',17),
+ ('event','answer-cleared','Answer cleared',18),
+ ('event','verification-changed','Check by the manager changed',19),
+ ('event','text-changed','Text changed',20),
+ ('event','asked','Asked',21),
+ ('event','linked','Linked',22),
+ ('event','step-linked','Linked to a plan step',23),
+ ('event','source-linked','Linked to the interview answers it comes from',24),
+ ('event','dependency-added','A step it depends on was added',25),
+ ('event','proposed','Proposed',26),
+ ('event','reviewer-run-created','A reviewer was started',27),
+ ('event','metric-recorded','A measurement was recorded',28),
+ ('event','tag-pushed','The tag of the reviewed commit was pushed',29),
+ ('event','redacted','A secret was removed from the text',30);
+
+INSERT INTO ledger_checks(view, label, tier, position) VALUES
+ ('v_artifacts_outside_ledger','Review files recorded outside the ledger''s folder','warning',110);
+INSERT INTO meta(key, value) VALUES ('schema_version','11');
 INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger schema'),
   (2, 'url, path, hash and code checks; repositories.allow_outside_root; finding_locations.excerpt_redacted'),
   (3, 'integrity rules: codes, hashes, checks, append-only history, owner actor on gate answers'),
@@ -3604,7 +3661,8 @@ INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger s
   (7, 'must-be-empty checks for history gaps, matches, off-plan and done-step coverage, closings, relations and checks; steps.no_findings_reason'),
   (8, 'finding_locations.source (the reviewed text of a dirty working tree); v_next_codes for the write commands'),
   (9, 'owner interview (interview_questions, interview_answers) and per-domain design goals the owner approves'),
-  (10, 'v_plan_totals, v_review_totals and v_pending_gates: the counts the viewer''s lists show');
+  (10, 'v_plan_totals, v_review_totals and v_pending_gates: the counts the viewer''s lists show'),
+  (11, 'gate answer rules in the trigger, owner queue context, event labels, the artifact check');
 """
 PAGE = r"""<!doctype html>
 <html lang="en">
@@ -3669,13 +3727,13 @@ td:first-child{white-space:nowrap}tr.link{cursor:pointer}tr.link:hover td{backgr
 .tag{display:inline-block;font:500 11px/1.6 var(--mono);padding:0 7px;border-radius:999px;background:var(--line);color:var(--fg);white-space:nowrap;margin:0 4px 2px 0}
 .tag.H,.tag.crit{background:var(--crit-soft);color:var(--crit)}.tag.M,.tag.warn{background:var(--warn-soft);color:var(--warn)}
 .tag.info{background:var(--info-soft);color:var(--info)}.tag.ok{background:var(--accent-soft);color:var(--accent)}.tag.solid{background:var(--accent);color:var(--bg)}.tag.you{background:var(--warn);color:var(--bg)}
-details.item{background:var(--surface);border:1px solid var(--line);border-radius:8px}
-details.item>summary{cursor:pointer;list-style:none;display:grid;grid-template-columns:minmax(90px,auto) minmax(0,1fr) auto;gap:10px;padding:10px 12px;align-items:baseline}
-details.item>summary::-webkit-details-marker{display:none}
-details.item>summary .n{font:500 13px var(--mono);color:var(--muted)}
-details.item>summary .n::before{content:"▸ ";content:"▸ " / ""}details.item[open]>summary .n::before{content:"▾ ";content:"▾ " / ""}
-details.item>summary .t{font-weight:500;overflow-wrap:anywhere}
-details.item>summary .tags{display:flex;flex-wrap:wrap;justify-content:flex-end}
+details:is(.item,.run){background:var(--surface);border:1px solid var(--line);border-radius:8px}
+details:is(.item,.run)>summary{cursor:pointer;list-style:none;display:grid;grid-template-columns:minmax(90px,auto) minmax(0,1fr) auto;gap:10px;padding:10px 12px;align-items:baseline}
+details:is(.item,.run)>summary::-webkit-details-marker{display:none}
+details:is(.item,.run)>summary .n{font:500 13px var(--mono);color:var(--muted)}
+details:is(.item,.run)>summary .n::before{content:"▸ ";content:"▸ " / ""}details:is(.item,.run)[open]>summary .n::before{content:"▾ ";content:"▾ " / ""}
+details:is(.item,.run)>summary .t{font-weight:500;overflow-wrap:anywhere}
+details:is(.item,.run)>summary .tags{display:flex;flex-wrap:wrap;justify-content:flex-end}
 .body{padding:2px 14px 14px;display:flex;flex-direction:column;gap:10px}
 dl.kv{margin:0;display:grid;grid-template-columns:150px minmax(0,1fr);gap:6px 14px}
 dl.kv dt{color:var(--muted);font-size:13px}dl.kv dd{margin:0;overflow-wrap:anywhere;white-space:pre-wrap}
@@ -3688,7 +3746,11 @@ dl.kv dt{color:var(--muted);font-size:13px}dl.kv dd{margin:0;overflow-wrap:anywh
 .code tr.hit td{background:var(--warn-soft)}.code tr.hit td.ln{box-shadow:inset 3px 0 var(--warn);color:var(--fg)}
 .note{font-size:13px;color:var(--muted)}
 .mdtext{white-space:pre-wrap;overflow-wrap:anywhere;max-height:480px;overflow:auto;font-size:14px}
+.md{overflow-wrap:anywhere}.md p,.md ul,.md ol{margin:6px 0}
+.md h2,.md h3,.md h4{font:600 17px/1.25 var(--display);letter-spacing:normal;text-transform:none;color:inherit;margin:14px 0 4px}.md h2{font-size:19px}.md h4{font-size:15px}
 .status{padding:10px 12px;border-radius:6px;background:var(--accent-soft);color:var(--accent)}
+.callout{padding:10px 12px;border-radius:6px;border:1px solid var(--line);background:var(--surface);margin:0}
+.callout.you{border-color:var(--warn)}.callout.answer{border-color:var(--accent)}
 .status.err{background:var(--crit-soft);color:var(--crit)}
 .cols{display:grid;grid-template-columns:270px minmax(0,1fr);gap:24px;align-items:start}
 nav.rail{display:flex;flex-direction:column;gap:2px;position:sticky;top:var(--top,110px)}
@@ -3697,6 +3759,7 @@ nav.rail button:hover{background:var(--accent-soft)}
 nav.rail button:focus-visible,.tlist button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 nav.rail button[aria-current="true"]{background:var(--accent);color:var(--bg)}
 nav.rail .i,nav.rail .c{font:500 12px var(--mono);opacity:.8}
+nav.rail small{display:block;font-size:12px;opacity:.75}
 .bar{height:8px;border-radius:999px;background:var(--line);overflow:hidden;display:flex;max-width:520px}.bar i{display:block;height:100%}
 .bar .d{background:var(--accent)}.bar .y{background:var(--warn)}.bar .g{background:var(--info)}
 .gate{display:flex;flex-direction:column;gap:10px}
@@ -3710,14 +3773,16 @@ nav.rail .i,nav.rail .c{font:500 12px var(--mono);opacity:.8}
 .timeline>div{padding:4px 0 8px 14px;position:relative;font-size:14px}
 .timeline>div::before{content:"";position:absolute;left:-6px;top:10px;width:10px;height:10px;border-radius:50%;background:var(--accent)}
 .empty{color:var(--muted);padding:18px 0}
+.target{box-shadow:inset 3px 0 var(--accent)}tr.target td{background:var(--accent-soft)}.target:focus{outline:none}
 .chart svg{width:100%;height:auto;display:block}
 .split{display:grid;grid-template-columns:260px minmax(0,1fr);gap:20px;align-items:start}
 .tlist{display:flex;flex-direction:column;gap:1px;max-height:70vh;overflow:auto;padding:4px}
-.tlist button{all:unset;cursor:pointer;display:flex;justify-content:space-between;gap:8px;padding:5px 8px;border-radius:5px;font:13px var(--mono)}
+.tlist button{all:unset;cursor:pointer;display:flex;justify-content:space-between;gap:8px;padding:5px 8px;border-radius:5px;font-size:14px}
+.tlist small{display:block;font:11.5px var(--mono);opacity:.75;overflow-wrap:anywhere}
 .tlist button:hover{background:var(--accent-soft)}.tlist button[aria-current="true"]{background:var(--accent);color:var(--bg)}
 @media (max-width:600px){.tabs{flex-wrap:wrap;overflow-x:visible}.top{position:static}}
 @media (max-width:820px){.cols,.split{grid-template-columns:minmax(0,1fr)}nav.rail{position:static;flex-direction:row;overflow-x:auto;padding:4px}nav.rail button{grid-template-columns:auto auto auto;white-space:nowrap;border:1px solid var(--line)}
- details.item>summary{grid-template-columns:auto minmax(0,1fr)}details.item>summary .tags{grid-column:1/-1;justify-content:flex-start}dl.kv{grid-template-columns:minmax(0,1fr)}dl.kv dt{margin-top:6px}.tlist{max-height:220px}}
+ details:is(.item,.run)>summary{grid-template-columns:auto minmax(0,1fr)}details:is(.item,.run)>summary .tags{grid-column:1/-1;justify-content:flex-start}dl.kv{grid-template-columns:minmax(0,1fr)}dl.kv dt{margin-top:6px}.tlist{max-height:220px}}
 </style>
 </head>
 <body>
@@ -3774,19 +3839,35 @@ function currentPath(){
   return CUR_PATH;
 }
 function staticApi(path, body){
-  if (body !== undefined) return Promise.reject(new Error("This shared copy is read-only. Answer in the chat with Claude, or run the local viewer."));
+  if (body !== undefined) return Promise.reject(new Error("This shared copy is read-only. Answer in the chat with the agent, or run the local viewer."));
   const S = STATIC.responses, [p, q] = path.split("?"), qs = new URLSearchParams(q || "");
   const copy = v => JSON.parse(JSON.stringify(v));
+  // A paged list: the snapshot holds every row, and the page asked for is cut from the rows that match.
+  const paged = (all, key, extra) => {
+    const lim = Math.max(1, Math.min(500, Number(qs.get("limit")) || 200)), off = Math.max(0, Number(qs.get("offset")) || 0);
+    return Promise.resolve(copy({...extra, [key]: all.slice(off, off + lim), total: all.length, limit: lim, offset: off}));
+  };
   if (p === "issues") {
     const st = qs.get("status"), sv = qs.get("severity"), dm = qs.get("domain_code"), t = (qs.get("q") || "").toLowerCase();
-    return Promise.resolve(copy(S.issues.filter(i => (!st || (st === "active" ? ACTIVE.includes(i.status) : i.status === st))
-      && (!sv || i.severity === sv) && (!dm || i.domain_code === dm) && (!t || i.search.toLowerCase().includes(t)))));
+    return paged(S.issues.rows.filter(i => (!st || (st === "active" ? ACTIVE.includes(i.status) : i.status === st))
+      && (!sv || i.severity === sv) && (!dm || i.domain_code === dm) && (!t || i.search.toLowerCase().includes(t))), "rows");
   }
-  if (p === "gates") return Promise.resolve(copy(S["gates?status=" + (qs.get("status") || "pending")] || S["gates?status=all"]));
+  if (p === "gates") {
+    const st = qs.get("status") || "pending";
+    if (st === "pending") return Promise.resolve(copy(S["gates?status=pending"]));
+    const all = S["gates?status=all"].gates.filter(g => st === "all" || g.status === st), at = all.findIndex(g => g.code === qs.get("at"));
+    if (at > 0) qs.set("offset", at - at % 200);
+    return paged(all, "gates");
+  }
+  if (/^review\/[^/]+\/checks$/.test(p) && S[p]) return paged(S[p].rows, "rows");
+  if (p.startsWith("review/") && qs.get("q") && S[p]) {   // the search of a review's points, over each point in full
+    const t = qs.get("q").toLowerCase();
+    return Promise.resolve({match: S[p].findings.filter(f => JSON.stringify(S["finding/" + f.id] || f).toLowerCase().includes(t)).map(f => f.id)});
+  }
   if (p.startsWith("table/")) {
     const t = S[p]; if (!t) return Promise.reject(new Error("That table is not in this snapshot."));
     const off = Number(qs.get("offset")) || 0, lim = Number(qs.get("limit")) || 100;
-    return Promise.resolve({columns: t.columns, rows: copy(t.rows.slice(off, off + lim)), count: t.count, offset: off, limit: lim});
+    return Promise.resolve({columns: t.columns, rows: copy(t.rows.slice(off, off + lim)), count: t.count, total: t.total, more: off + lim < t.count, offset: off, limit: lim});
   }
   if (S[p] === undefined) return Promise.reject(new Error("This view is not in the snapshot."));
   return Promise.resolve(copy(S[p]));
@@ -3833,8 +3914,8 @@ function md(text){
 }
 function hubGateBody(card, g, hid){
   const saved = HUB.answers[g.code];
-  if (saved) { add(card, h("p", {class: "status"}, "You answered: ", answerText({options: g.options, ...saved}, true), ". Claude records it the next time it checks (or tell Claude in the chat to check now).")); return card; }
-  if (!HUB.db) { add(card, h("p", {class: "note"}, "Answer in the chat with Claude; answering here needs you signed in to claude.ai as this page's owner.")); return card; }
+  if (saved) { add(card, h("p", {class: "callout answer"}, "You answered: ", answerText({options: g.options, ...saved}, true), ". The agent records it the next time it checks (or tell it in the chat to check now).")); return card; }
+  if (!HUB.db) { add(card, h("p", {class: "note"}, "Answer in the chat with the agent; answering here needs you signed in as this page's owner.")); return card; }
   const nm = "opt-" + g.code;
   const opts = (g.options || []).length ? h("div", {class: "opts", role: "radiogroup", "aria-labelledby": hid},
     g.options.map(o => h("label", null, h("input", {type: "radio", name: nm, value: o.value}), h("span", null, o.label, o.description ? h("small", null, o.description) : null)))) : null;
@@ -3847,12 +3928,12 @@ function hubGateBody(card, g, hid){
     try {
       await HUB.db.doc("answers/" + g.code).set({gate: g.code, answer_value: val, answer_text: txt || null, answered_at: new Date().toISOString()});
       HUB.answers[g.code] = {answer_value: val, answer_text: txt || null};
-      put(form, h("p", {class: "status"}, "Saved. Claude records it the next time it checks (or tell Claude in the chat to check now)."));
+      put(form, h("p", {class: "status"}, "Saved. The agent records it the next time it checks (or tell it in the chat to check now)."));
       say("Answer saved.");
       drawTabs("inbox");
     } catch (e) { put(msg, errorBox("Your answer could not be saved here" + (e && e.code === "invalid_argument" ? ": only this page's owner can answer." : ". Try again, or answer in the chat."))); send.disabled = false; }
   }}, "Send answer");
-  add(form, opts, ta, h("div", null, send), msg); add(card, form); return card;
+  add(form, opts, ta, h("div", {class: "tools"}, send, h("span", {class: "note"}, FINAL)), msg); add(card, form); return card;
 }
 
 if (STATIC) document.addEventListener("click", e => {
@@ -3883,13 +3964,21 @@ function extLink(u, text){
 }
 function put(el, ...kids){ el.replaceChildren(...kids.flat(Infinity).filter(k => k != null && k !== false && k !== "").map(k => k instanceof Node ? k : document.createTextNode(String(k)))); return el; }
 function add(el, ...kids){ for (const k of kids.flat(Infinity)) if (k != null && k !== false && k !== "") el.append(k instanceof Node ? k : String(k)); return el; }
+// A request the viewer refused or could not answer: the sentence to show and the HTTP status (0: no answer at all).
+class ApiError extends Error { constructor(message, status){ super(message); this.status = status; } }
+const NOT_RUNNING = "The viewer is not running. Start it again with ledger.py serve and open the link it prints.";
+const RESTARTED = "The viewer was restarted. Copy anything you typed, then open the new link that ledger.py serve printed.";
+const NO_KEY = "This address is missing the viewer's key. Open the link that ledger.py serve printed.";
 async function api(path, body){
   if (STATIC) return staticApi(path, body);
   const opt = {headers:{"X-Ledger-Token":TOKEN}};
   if (body !== undefined) { opt.method = "POST"; opt.headers["Content-Type"] = "application/json"; opt.body = JSON.stringify(body); }
-  const r = await fetch("/api/" + path, opt);
-  const j = await r.json().catch(() => ({error:"The viewer sent back something unreadable."}));
-  if (!r.ok || (j && j.error && !Array.isArray(j))) throw new Error(j.error || "Request failed");
+  let r;
+  try { r = await fetch("/api/" + path, opt); } catch { throw new ApiError(NOT_RUNNING, 0); }
+  const j = await r.json().catch(() => undefined);
+  if (j === undefined) throw new ApiError("The viewer sent back something unreadable.", r.status);
+  if (r.status === 403) throw new ApiError(TOKEN ? RESTARTED : NO_KEY, 403);
+  if (!r.ok || (j && j.error && !Array.isArray(j))) throw new ApiError((j && j.error) || "The viewer could not answer.", r.status);
   return j;
 }
 const words = s => s == null ? "" : String(s).replace(/[-_]/g," ").replace(/^./, c => c.toUpperCase());
@@ -3899,13 +3988,17 @@ const words = s => s == null ? "" : String(s).replace(/[-_]/g," ").replace(/^./,
 const ENUM_OF = {sev:"severity", issue:"issue_status", match:"match_type", verif:"verification", review:"review_status",
   scope:"review_scope", step:"step_status", need:"owner_need", gate:"gate_kind", gstat:"gate_status", rel:"relation_type",
   relIn:"relation_type_inverse", check:"check_outcome", kind:"issue_kind", run:"run_status", plan:"plan_status",
-  decision:"decision_status", goal:"goal_status", via:"answered_via"};
+  decision:"decision_status", goal:"goal_status", via:"answered_via", role:"location_role", ownerChange:"owner_change",
+  conf:"confidence", method:"metric_method", verdict:"verdict", tested:"tested", actorKind:"actor_kind",
+  artifact:"artifact_kind", purpose:"test_purpose", event:"event"};
 const FALLBACK = {sev:{H:"High",M:"Medium",L:"Low",T:"Missing test"}, need:{none:""}};
 let L = {};
 const setLabels = enums => { L = Object.fromEntries(Object.entries(ENUM_OF).map(([k, e]) =>
   [k, Object.assign({}, FALLBACK[k] || {}, (enums || {})[e] || {})])); };
 setLabels({});
 const lab = (map, v) => (L[map] && L[map][v] !== undefined) ? L[map][v] : words(v);
+// What a measurement or a reviewer covers: the stored "all" is the whole system.
+const scopeName = sc => !sc || sc === "all" ? "Whole system" : sc;
 const domainName = c => c ? (LABELS.domains[c] || words(c)) : "";
 const themeName = c => c ? (LABELS.themes[c] || words(c)) : "";
 // The colour of a tag, by label map and stored value: the one place a value gets its tone.
@@ -3961,11 +4054,25 @@ function errorBox(e, quiet){
   return h("p", {class:"status err"}, text);
 }
 const fact = (n, label) => h("div", null, h("b", null, n), h("span", null, label));
-// One expandable row: number, title, tags, and the body shown when it is opened.
+// One expandable row: number, title, tags, and the body shown when it is opened. body may be a function (it may
+// be async): it is called the first time the row is opened, so a long list costs only its rows.
 function item(n, title, tags, body){
-  return h("details", {class:"item"},
-    h("summary", null, h("span", {class:"n"}, n), h("span", {class:"t"}, title), h("span", {class:"tags"}, tags)),
-    h("div", {class:"body"}, body));
+  const lazy = typeof body === "function", box = h("div", {class:"body"}, lazy ? null : body);
+  const row = h("details", {class:"item"},
+    h("summary", null, h("span", {class:"n"}, n), h("span", {class:"t"}, title), h("span", {class:"tags"}, tags)), box);
+  if (lazy) {
+    // Built as the row is opened: on the click (or key) that opens it, so a body that needs no request is there
+    // at once, and on toggle for a row opened any other way.
+    const build = async () => {
+      if (row.dataset.built) return;
+      row.dataset.built = "1";
+      try { const made = body(); put(box, made instanceof Promise ? await made : made); }
+      catch (e) { delete row.dataset.built; put(box, errorBox(e)); }
+    };
+    row.firstChild.addEventListener("click", () => { if (!row.open) build(); });
+    row.addEventListener("toggle", () => { if (row.open) build(); });
+  }
+  return row;
 }
 const select = (label, options, attrs) => h("select", {class:"field", "aria-label":label, ...attrs}, options.map(([v, t]) => h("option", {value:v}, t)));
 // A row of filters. onChange(true) runs when a select changes and as a search box is typed in (after `wait` ms of quiet).
@@ -3983,18 +4090,34 @@ function answerText(g, strong){
 }
 // A table. href(row) gives the page a row opens ("#/issue/ISS-0001"), or nothing for a row that opens none: the row's
 // first cell (or the column marked link) is then a real link, and a click anywhere on the row follows it.
-function table(cols, data, href, none="Nothing here yet."){
+// rowAttrs(row): attributes of that row's <tr> (an id to jump to, say).
+function table(cols, data, href, none="Nothing here yet.", rowAttrs){
   if (!data.length) return empty(none);
   const at = Math.max(0, cols.findIndex(c => c.link));
   const row = r => {
     const to = href && href(r);
     const cell = (c, i) => { const v = c.get ? c.get(r) : (r[c.key] ?? ""); return h("td", {class:c.num ? "num" : null}, to && i === at ? h("a", {href:to}, v) : v); };
     const open = e => { if (!e.target.closest("a, button") && !String(getSelection())) go(to); };
-    return h("tr", to ? {class:"link", onclick:open} : null, cols.map(cell));
+    return h("tr", {...(rowAttrs ? rowAttrs(r) : null), ...(to ? {class:"link", onclick:open} : null)}, cols.map(cell));
   };
   return h("div", {class:"scroll"}, h("table", null,
     h("thead", null, h("tr", null, cols.map(c => h("th", {class:c.num ? "num" : null}, c.label)))),
     h("tbody", null, data.map(row))));
+}
+// Under a list that comes a page at a time: which rows are shown, with Previous and Next. turn(offset) loads a page.
+const PAGE_ROWS = 200;
+function pager(d, shown, turn){
+  if (d.total <= shown && !d.offset) return null;
+  const btn = (text, to, on) => on ? h("button", {class:"btn ghost", type:"button", onclick:() => turn(to)}, text) : null;
+  return h("div", {class:"tools pager"},
+    h("span", {class:"note"}, shown ? `Showing ${(d.offset + 1).toLocaleString()}–${(d.offset + shown).toLocaleString()} of ${d.total.toLocaleString()}` : `Nothing past ${d.total.toLocaleString()}`),
+    btn("Previous", Math.max(0, d.offset - d.limit), d.offset > 0), btn("Next", d.offset + d.limit, d.offset + shown < d.total));
+}
+// Bring one part of the drawn page into view and put the keyboard there (a gate opened by its code).
+function jumpTo(el){
+  if (!el) return;
+  el.tabIndex = -1; el.classList.add("target");
+  el.scrollIntoView({block:"center"}); el.focus({preventScroll:true});
 }
 // name: what a screen reader calls the button when the page has several with the same label.
 function copyBtn(text, label="Copy", name){
@@ -4013,7 +4136,19 @@ function setView(...kids){
   if (DRAWN) focusHeading();
   DRAWN = true;
 }
-function failed(err){ setView(h("h1", null, "Could not load this view"), errorBox(err), h("p", {class:"lede"}, STATIC ? "This is a read-only snapshot; reload the page to start again." : "Make sure the viewer is still running in your terminal, then reload the page.")); }
+// What a code in the address names, and the list it would be in.
+const KINDS = {review:["review", "#/reviews", "See every review"], issue:["issue", "#/issues?status=all", "See every issue"], plan:["fix plan", "#/plans", "See every fix plan"]};
+function failed(err, name, parts){
+  const kind = KINDS[name];
+  if (err && err.status === 404 && kind && parts && parts[0]) {
+    const text = `There is no ${kind[0]} ${parts[0]} in this ledger.`;
+    say(text);
+    return setView(h("h1", null, "Not found"), h("p", {class:"lede"}, text), h("p", null, h("a", {href:kind[1]}, kind[2])));
+  }
+  setView(h("h1", null, "This page could not be loaded"), errorBox(err),
+    STATIC ? h("p", {class:"lede"}, "This is a read-only copy; reload the page to start again.")
+    : err && err.status >= 500 ? h("p", {class:"lede"}, "Reload the page to try again.") : null);
+}
 
 // ---------- code at a commit
 // point: the id of the point citing these lines (it tells this reference's buttons from another's).
@@ -4030,12 +4165,17 @@ function codeRef(loc, point){
     try {
       const s = await api("source/" + loc.id);
       const hi = [s.line_start, s.line_end || s.line_start];
-      const notes = [];
-      if (s.source === "excerpt") notes.push("The commit could not be read from git here, so this is the copy of the lines saved at review time. " + (s.git_error ? "Git said: " + s.git_error : ""));
-      if (s.source === "none") notes.push("The commit could not be read from git and no copy of the lines was saved. " + (s.git_error || ""));
+      const notes = [], said = s.git_error || "";
+      // git words a missing commit and a missing file the same way, so one sentence covers both
+      const why = /is not in commit|does not exist in|exists on disk, but not in|bad object|unknown revision|bad revision|not a valid object name|invalid object name/i.test(said)
+        ? "This file is not in that commit, or the commit is not in this copy of the repository." : "The code could not be read from git here.";
+      if (STATIC) notes.push(said);
+      else if (s.source === "excerpt") notes.push(why + " These are the lines as they were saved at review time.");
+      else if (s.source === "none") notes.push(why + " No copy of the lines was saved.");
       if (s.excerpt_matches === false) notes.push("The saved copy of these lines differs from the file at this commit; the line numbers may have been recorded wrong.");
       put(box, 
         notes.length ? h("p", {class:"note"}, notes.join(" ")) : null,
+        !STATIC && said && s.source !== "git" ? h("details", {class:"note"}, h("summary", null, "What git said"), h("code", null, said)) : null,
         s.lines && s.lines.length ? h("div", {class:"code"}, h("table", null, h("tbody", null, s.lines.map(l => {
             const cited = hi[0] && l.n >= hi[0] && l.n <= hi[1];
             return h("tr", {class: cited ? "hit" : null}, h("td", {class:"ln"}, l.n, cited ? h("span", {class:"visually-hidden"}, " cited") : null), h("td", null, l.text)); })))) : null,
@@ -4048,53 +4188,82 @@ function codeRef(loc, point){
   label("Show code at this commit");
   return h("div", {class:"ref"},
     h("div", {class:"refline"},
-      tag(words(loc.role)), h("b", null, loc.repo), h("code", null, loc.path), range ? h("span", null, range) : null,
+      tag(lab("role", loc.role)), h("b", null, loc.repo), h("code", null, loc.path), range ? h("span", null, range) : null,
       loc.symbol ? h("code", {class:"muted"}, loc.symbol) : null,
       h("span", {class:"muted"}, "at commit ", h("code", null, short(loc.commit_sha))), btn),
     box);
 }
 
+// f: a whole point (an issue's page has them) or a list row of a review, whose detail and code references are
+// fetched when it is opened.
 function findingItem(f, opts={}){
   const id = opts.showReview ? `${f.review_code} · ${f.point_id}` : f.point_id;
+  const body = f => [ kv([["Area", domainName(f.domain_code)], ["Theme", themeName(f.theme_code)], ["Kind", lab("kind", f.kind)],
+          ["Issue", f.issue_code && !opts.hideIssue ? h("a", {href:"#/issue/" + f.issue_code}, f.issue_code) : null],
+          ["Found during", f.discovered_in_step ? h("a", {href:`#/plan/${f.discovered_in_plan}`}, `Fix work on step ${f.discovered_in_step} of ${f.discovered_in_plan}`) : null],
+          ["How it was matched", f.match_rationale ? f.match_rationale + (f.match_confidence ? ` (${lab("conf", f.match_confidence).toLowerCase()})` : "") : null],
+          ["What it does now", f.before_state], ["Detail", f.detail],
+          ["Recommended fix", f.recommendation], ["Test to add", f.recommended_test], ["Evidence", f.evidence],
+          ["Checked by the manager", f.verification ? lab("verif", f.verification) + (f.verification_note ? " — " + f.verification_note : "") : null],
+          ["Checked by", f.verified_by],
+          ["Goals it touches", (f.goals || []).length ? f.goals.map(g => h("div", null, h("a", {href:"#/goals/" + g.code}, g.code), " ", g.text)) : null],
+          ["Requirements", (f.requirements || []).length ? f.requirements.map(q => h("div", null, `${q.code} (${lab("verdict", q.verdict).toLowerCase()}): ${q.text}`)) : null],
+          ["Reviewer", f.run_label], ["In the report", f.where_report]]),
+      (f.locations || []).map(loc => codeRef(loc, id))];
   return item(id, f.summary,
     [sevTag(f.severity), f.match_type ? labTag("match", f.match_type) : null,
      f.verification === "false" ? tag("False finding") : f.verification === "confirmed" ? tag("Confirmed", tone("verif", "confirmed")) : null],
-    [ kv([["Area", domainName(f.domain_code)], ["Theme", themeName(f.theme_code)], ["Kind", lab("kind", f.kind)],
-          ["Issue", f.issue_code && !opts.hideIssue ? h("a", {href:"#/issue/" + f.issue_code}, f.issue_code) : null],
-          ["How it was matched", f.match_rationale], ["What it does now", f.before_state], ["Detail", f.detail],
-          ["Recommended fix", f.recommendation], ["Test to add", f.recommended_test], ["Evidence", f.evidence],
-          ["Checked by the manager", f.verification ? lab("verif", f.verification) + (f.verification_note ? " — " + f.verification_note : "") : null],
-          ["Reviewer", f.run_label], ["In the report", f.where_report]]),
-      (f.locations || []).map(loc => codeRef(loc, id))]);
+    f.locations ? () => body(f) : async () => body(await api("finding/" + f.id)));
 }
 
 // ---------- views
+// Stored columns no page shows, on purpose; Explore has them all.
+//   ids, foreign keys and change_* columns: the pages show what they point to, and History shows who changed what
+//   fingerprints and sha256 hashes (issues, findings, artifacts, reports): for matching and checking, not for reading
+//   finding_locations.excerpt, excerpt_sha256, blob_sha, source: the code viewer shows the lines themselves
+//   findings.sub, related_point_ids, created_at; issues.sub: matching keys, and the review's date says when
+//   steps.drafter_key, change_commit_sha; plans.superseded_by, updated_at (the page shows "last updated")
+//   reviewer_runs.report_sha256; test_runs.exit_code, output_path, commit_sha; step_commits.repository_id
+//   repositories.path, permalink_template, allow_outside_root, created_at: how the tool reads the code
+//   actors.session_ref outside a reviewer's row; design_goals.source, superseded_by; requirements.source_location
+//   meta, schema_migrations, ledger_checks, the lookup tables and enum_labels: the ledger's own bookkeeping
 const VIEWS = {};
 
+// The home page: its header comes from the overview route() loaded, its lists from one request, and the
+// ledger's own checks, which read every table, fill in after the page is drawn.
 VIEWS.home = async () => {
-  const o = OVERVIEW = await api("overview");
+  const o = {...OVERVIEW, ...await api("home")};
   const sev = Object.fromEntries(o.open_by_severity.map(r => [r.severity, r.n]));
   const openTotal = o.open_by_severity.reduce((a,r) => a + r.n, 0);
-  const failing = o.checks.filter(c => c.n);
+  const waiting = waitingCount();
+  const back = h("b", null, "…"), checks = h("div", {class:"stack"}, h("p", {class:"note"}, "Checking…"));
   setView(
     h("h1", null, o.project),
     h("p", {class:"lede"}, "Every review of this project, every point it raised, how those points carried over between reviews, the fix plans, and anything waiting on you."),
     h("div", {class:"facts"},
-      fact(o.queue, "waiting on you"), fact(openTotal, "open issues"), fact(sev.H || 0, "open and high"), fact(o.recurring, "came back or seen again")),
-    o.queue ? h("p", {class:"status"}, h("a", {href:"#/inbox"}, plural(o.queue, "thing needs", "things need") + " your input or approval →")) : null,
+      fact(waiting, "waiting on you"), fact(openTotal, "open issues"), fact(sev.H || 0, "open and high"), h("div", null, back, h("span", null, "came back or seen again")),
+      o.discoveries ? fact(o.discoveries, "found during fixes") : null),
+    !o.reviews.length ? h("p", {class:"callout"}, "No reviews yet. Ask your agent to run the system review.") : null,
+    waiting ? h("p", {class:"callout you"}, h("a", {href:"#/inbox"}, plural(waiting, "thing needs", "things need") + " your input or approval →")) : null,
+    o.answered_count ? h("p", {class:"note"}, h("a", {href:"#/inbox"}, plural(o.answered_count, "answer")), " of yours waiting for the agent to act on.") : null,
     h("div", {class:"grid2"},
       h("div", {class:"card"}, h("h2", null, "Latest reviews"),
         table([{label:"Review", get:r => r.code}, {label:"Title", key:"title"}, {label:"Status", get:r => lab("review", r.status)},
                {label:"Started", get:r => whenCell(r.started_at, false)}, {label:"High", key:"high", num:1}, {label:"Points", key:"points", num:1}],
-              o.reviews, r => "#/review/" + r.code)),
+              o.reviews, r => "#/review/" + r.code, "No review has been run yet.")),
       h("div", {class:"card"}, h("h2", null, "Fix plans"),
         o.plans.length ? o.plans.map(p => h("div", {class:"card-link"},
           h("a", {href:"#/plan/" + p.code}, `${p.code} · ${p.title}`), h("span", {class:"muted"}, " — " + lab("plan", p.status)),
-          progressBar(p.done || 0, 0, p.waiting || 0, p.steps || 0))) : empty("No fix plan yet."))),
-    h("div", {class:"card"}, h("h2", null, "Ledger checks"),
-      h("p", {class:"note"}, "These should all be zero once a review has been indexed and matched."),
-      table([{label:"Check", key:"label"}, {label:"Count", key:"n", num:1}], o.checks, c => c.n ? "#/explore/" + c.view : null),
-      failing.length ? errorBox(plural(failing.length, "check needs", "checks need") + " attention.", true) : null));
+          progressBar(p.done || 0, p.doing || 0, p.waiting || 0, p.steps || 0))) : empty("No fix plan yet."))),
+    h("div", {class:"card"}, h("h2", null, "Housekeeping for the agent"), checks));
+  try {
+    const c = await api("checks"), failing = c.checks.filter(x => x.n);
+    back.textContent = c.recurring;
+    put(checks, h("p", {class:"note"}, "The ledger's own checks. Nothing here needs you: the agent brings each count back to zero, and a line that is not zero says how."),
+      table([{label:"Check", key:"label", link:true}, {label:"Count", key:"n", num:1}, {label:"What the agent does", get:x => x.n ? [x.action, h("div", {class:"note"}, "Its steps: " + x.recipe)] : ""}],
+        c.checks, x => x.link, "This ledger has no checks."),
+      failing.length ? h("p", {class:"callout"}, plural(failing.length, "check is", "checks are") + " not at zero.") : null);
+  } catch (e) { back.textContent = "—"; put(checks, errorBox(e, true)); }
 };
 
 function progressBar(done, doing, waiting, total){
@@ -4105,47 +4274,101 @@ function progressBar(done, doing, waiting, total){
     h("span", {class:"note"}, `${done} of ${total} done` + (doing ? ` · ${doing} in progress` : "") + (waiting ? ` · ${waiting} waiting on you` : "")));
 }
 
-VIEWS.inbox = async () => {
-  const d = await api("gates?status=pending");
-  const open = d.gates.filter(g => g.status === "open"), answered = d.gates.filter(g => g.status === "answered");
+// Waiting on you. Each gate is a card; answering one moves that card alone under Answered, so what is typed into the
+// others stays. INBOX.sync() adds the cards of gates asked since the page was drawn (the header refresh calls it).
+let INBOX = null;
+const queueWhat = r => (r.kind === "step" ? "Plan step " : r.kind === "goal" ? "Design goal " : "Decision ") + r.ref;
+const decisionCols = [{label:"Decision", key:"code"}, {label:"Question", key:"question"}, {label:"Status", get:d => lab("decision", d.status)},
+  {label:"Answer", key:"answer"}, {label:"Decided", get:d => whenCell(d.decided_at, false)}];
+VIEWS.inbox = async ([code]) => {
+  const [d, dec] = await Promise.all([api("gates?status=pending"), api("decisions")]);
+  const openBox = h("div", {class:"stack loose", id:"gates-open"}), doneBox = h("div", {class:"stack loose", id:"gates-answered"});
+  const doneHead = sect("Answered, waiting for the agent to act"), none = empty("Nothing is waiting on you right now.");
+  const tidy = () => { doneHead.hidden = !doneBox.childElementCount; none.hidden = !!openBox.childElementCount; };
+  const place = g => g.status === "open" ? add(openBox, gateCard(g, null, moved)) : add(doneBox, gateCard(g, "h3"));
+  // The card of an answered gate (answered here, or elsewhere as a 409 says) is redrawn from the ledger under Answered.
+  async function moved(card, g, note){
+    const y = window.scrollY;
+    let now = null;
+    try { now = (await api("gates?status=pending")).gates.find(x => x.code === g.code) || (await api("gates?status=all&at=" + encodeURIComponent(g.code))).gates.find(x => x.code === g.code); } catch {}
+    const fresh = gateCard({...g, ...(now || {}), status: now ? now.status : "answered"}, "h3");
+    if (note) add(fresh, h("p", {class:"status"}, note));
+    card.remove(); add(doneBox, fresh); tidy();
+    const line = fresh.querySelector(".answer") || fresh; line.tabIndex = -1; line.focus({preventScroll:true});
+    window.scrollTo(0, y);
+    refreshHeader(true);
+  }
+  d.gates.forEach(place); tidy();
+  INBOX = {sync: async () => {
+    const now = await api("gates?status=pending");
+    for (const g of now.gates) if (!document.getElementById("gate-" + g.code)) { place(g); say("A new question is waiting on you."); }
+    tidy();
+  }};
   setView(
     h("h1", null, "Waiting on you"),
-    h("p", {class:"lede"}, STATIC ? "Questions and approvals the agent cannot get past without you. Answer here: your answer is saved with this page, and Claude records it the next time it checks."
+    h("p", {class:"lede"}, STATIC ? "Questions and approvals the agent cannot get past without you. Answer here: your answer is saved with this page, and the agent records it the next time it checks."
       : "Questions and approvals the agent cannot get past without you. Answer here or in the chat; the agent picks answers up the next time it checks the ledger."),
-    open.length ? open.map(g => gateCard(g)) : empty("Nothing is waiting on you right now."),
-    answered.length ? [sect("Answered, waiting for the agent to act"), answered.map(g => gateCard(g, "h3"))] : null,
+    openBox, none, doneHead, doneBox,
     d.other.length ? [sect("Also waiting on you (answer in the chat)"),
-      table([{label:"What", get:r => (r.kind === "step" ? "Plan step " : r.kind === "goal" ? "Design goal " : "Decision ") + r.ref}, {label:"Needs", get:r => lab("need", r.need) || "Your input"},
-             {label:"Title", key:"title"}, {label:"Question", key:"question"}], d.other)] : null,
+      table([{label:"What", get:queueWhat}, {label:"Needs", get:r => lab("need", r.need) || "Your input"},
+             {label:"Title", key:"title"}, {label:"Question", key:"question"}, {label:"Good to know", key:"context"}], d.other)] : null,
+    dec.decisions.length ? [sect("Decisions"),
+      table(decisionCols, dec.decisions.slice(0, 5), x => "#/decisions/" + x.code),
+      dec.decisions.length > 5 ? h("p", null, h("a", {href:"#/decisions"}, `See all ${dec.decisions.length} decisions`)) : null] : null,
     h("p", null, h("a", {href:"#/history"}, "See every question and answer so far")));
+  if (code) jumpTo(document.getElementById("gate-" + code)?.closest(".card"));
 };
 
-VIEWS.history = async () => {
-  const d = await api("gates?status=all");
-  setView(h("h1", null, "Questions and answers"),
-    table([{label:"Asked", get:g => whenCell(g.created_at)}, {label:"About", get:g => lab("gate", g.kind)}, {label:"Title", key:"title"},
-           {label:"Status", get:g => lab("gstat", g.status)}, {label:"Answer", get:g => [g.answer_value ? optLabel(g) : "", g.answer_text ? " " + g.answer_text : ""]},
-           {label:"What the agent did", key:"applied_note"}], d.gates));
+// Every decision of the owner, the ones still open first. #/decisions/D-0001 opens at that decision.
+VIEWS.decisions = async ([code]) => {
+  const d = await api("decisions");
+  setView(h("h1", null, "Decisions"),
+    h("p", {class:"lede"}, "What you have decided about this project, with the reason, so a later review does not ask again."),
+    table([...decisionCols, {label:"Why", key:"rationale"}, {label:"Look again when", key:"revisit_when"}, {label:"Issues", key:"issues"}, {label:"Asked in", key:"review"}],
+      d.decisions, null, "No decision has been recorded yet.", x => ({id:"decision-" + x.code})));
+  if (code) jumpTo(document.getElementById("decision-" + code));
 };
-const optLabel = g => ((g.options || []).find(o => o.value === g.answer_value) || {}).label || words(g.answer_value);
 
-// level: "h3" for a gate listed under a section heading.
-function gateCard(g, level){
+// Every gate, newest first, a page at a time. #/history/GATE-0001 opens the page that gate is on, at its row.
+VIEWS.history = async ([code], params) => {
+  const box = h("div", {class:"stack"});
+  const load = async (query, turned) => {
+    try {
+      const d = await api("gates?status=all&" + query);
+      put(box, table([{label:"Asked", get:g => whenCell(g.created_at)}, {label:"About", get:g => lab("gate", g.kind)}, {label:"Title", key:"title"},
+          {label:"Status", get:g => lab("gstat", g.status)}, {label:"Answer", get:g => answerText(g)}, {label:"What the agent did", key:"applied_note"}],
+          d.gates, null, "No question has been asked yet.", g => ({id:"gate-row-" + g.code})),
+        pager(d, d.gates.length, off => { setPath("#/history" + (off ? "?offset=" + off : "")); load(`limit=${d.limit}&offset=${off}`, true); }));
+      if (turned) { window.scrollTo(0, 0); focusHeading(); say(`Showing from ${d.offset + 1} of ${d.total}`); }
+    } catch (e) { put(box, errorBox(e)); }
+  };
+  setView(h("h1", null, "Questions and answers"), h("p", {class:"lede"}, "Every question the agent has asked you and what you answered, newest first."), box);
+  await load(code ? "at=" + encodeURIComponent(code) : "offset=" + (Number(params.get("offset")) || 0));
+  if (code) jumpTo(document.getElementById("gate-row-" + code));
+};
+const optLabel = g => g.answer_label || ((g.options || []).find(o => o.value === g.answer_value) || {}).label || words(g.answer_value);
+
+// level: "h3" for a gate listed under a section heading. moved(card, gate, note): called once the gate is answered.
+const FINAL = "You can't change an answer once it is sent.";
+const IN_CHAT = "Answer this one in the chat with the agent.";
+function gateCard(g, level, moved){
   const hid = "gate-" + g.code;   // the title's id: it names this gate's choices, text box and button
   const refs = [g.review_code && h("a", {href:"#/review/" + g.review_code}, "Review " + g.review_code),
                 g.plan_code && h("a", {href:"#/plan/" + g.plan_code}, "Plan " + g.plan_code + (g.step_number ? " step " + g.step_number : "")),
-                g.issue_code && h("a", {href:"#/issue/" + g.issue_code}, "Issue " + g.issue_code)].filter(Boolean);
+                g.issue_code && h("a", {href:"#/issue/" + g.issue_code}, "Issue " + g.issue_code),
+                g.decision_code && h("a", {href:"#/decisions/" + g.decision_code}, "Decision " + g.decision_code)].filter(Boolean);
   const card = h("div", {class:"card gate"},
     h("div", null, tag(lab("gate", g.kind), tone("gate", g.kind) || tone("gstat", g.status) || "info"),
       g.blocking && g.status === "open" ? tag("Work is paused until you answer", "warn") : null,
       h("span", {class:"note"}, " Asked " + when(g.created_at))),
-    h(level || "h2", {id:hid, class: level ? "title" : null}, g.title), h("div", {class:"q"}, g.question),
+    h(level || "h2", {id:hid, class: level ? "title" : null}, g.title), g.question ? h("div", {class:"q"}, g.question) : null,
     g.context ? h("div", {class:"ctx"}, g.context) : null,
     refs.length ? h("div", {class:"refline"}, refs) : null);
-  if (g.status === "answered") {
-    add(card, h("p", {class:"status"}, "You answered: ", answerText(g, true), ` (${when(g.answered_at)})`));
+  if (g.status !== "open") {
+    add(card, h("p", {class:"callout answer"}, g.answer_value || g.answer_text ? ["You answered: ", answerText(g, true), g.answered_at ? ` (${when(g.answered_at)})` : ""] : lab("gstat", g.status)));
     return card;
   }
+  if (!(g.options || []).length && !g.allow_text) { add(card, h("p", {class:"note"}, IN_CHAT)); return card; }
   if (STATIC) return hubGateBody(card, g, hid);
   const name = "opt-" + g.code;
   const opts = (g.options || []).length ? h("div", {class:"opts", role:"radiogroup", "aria-labelledby":hid},
@@ -4157,12 +4380,16 @@ function gateCard(g, level){
     send.disabled = true;
     try {
       await api(`gates/${encodeURIComponent(g.code)}/answer`, {answer_value: picked ? picked.value : null, answer_text: ta ? ta.value : null});
-      put(msg, h("p", {class:"status"}, "Answer saved. The agent will act on it the next time it checks."));
       say("Answer saved.");
-      setTimeout(() => route(), 1200);
-    } catch (e) { put(msg, errorBox(e)); send.disabled = false; }
+      if (moved) await moved(card, g, "Answer saved. The agent will act on it the next time it checks."); else put(msg, h("p", {class:"status"}, "Answer saved."));
+    } catch (e) {
+      // 409: answered meanwhile, in another tab or in the chat. Anything else (a busy ledger, a refused answer):
+      // the choice and the text stay as typed and Send works again.
+      if (e.status === 409 && moved) { say(e.message); await moved(card, g, "Already answered in another tab or in the chat; this is the answer on record."); return; }
+      put(msg, errorBox(e)); send.disabled = false;
+    }
   }}, "Send answer");
-  add(card, opts, ta, h("div", null, send), msg);
+  add(card, opts, ta, h("div", {class:"tools"}, send, h("span", {class:"note"}, FINAL)), msg);
   return card;
 }
 
@@ -4171,70 +4398,150 @@ VIEWS.reviews = async () => {
   setView(h("h1", null, "Reviews"), h("p", {class:"lede"}, "Every review run on this project, newest first."),
     table([{label:"Review", key:"code"}, {label:"Title", key:"title"}, {label:"Kind", get:r => lab("scope", r.scope)},
            {label:"Status", get:r => lab("review", r.status)}, {label:"Started", get:r => whenCell(r.started_at)}, {label:"Code reviewed", get:r => h("span", {class:"mono"}, r.commits || "")},
-           {label:"High", key:"high", num:1}, {label:"Medium", key:"medium", num:1}, {label:"Low", key:"low", num:1}, {label:"New", key:"new_issues", num:1}, {label:"Came back", key:"came_back", num:1}],
+           {label:"High", key:"high", num:1}, {label:"Medium", key:"medium", num:1}, {label:"Low", key:"low", num:1}, {label:"Missing tests", key:"tests", num:1},
+           {label:"New", key:"new_issues", num:1}, {label:"Came back", key:"came_back", num:1}],
           list, r => "#/review/" + r.code));
 };
 
-const REQ_VERDICT = {matches:"matches", differs:"differs", partly:"partly matches", missing:"missing", untested:"not tested"};
-VIEWS.review = async ([code]) => {
+VIEWS.review = async ([code], params) => {
   const d = await api("review/" + encodeURIComponent(code)); const r = d.review;
   const fs = d.findings;
   const sel = (id, label, all, values, fmt) => select(label, [["", all], ...[...new Set(values)].filter(v => v != null).map(v => [v, fmt(v)])], {id});
   const q = h("input", {class:"field", type:"search", placeholder:"Search points, ids, files", "aria-label":"Search points"});
   const fd = sel("fd", "Area", "All areas", fs.map(f => f.domain_code), domainName), fsv = sel("fs", "Severity", "All severities", ["H","M","L","T"].filter(s => fs.some(f => f.severity === s)), v => lab("sev", v));
-  const fm = sel("fm", "Match", "Any match", fs.map(f => f.match_type), v => lab("match", v)), fv = sel("fv", "Check", "Any check", fs.map(f => f.verification), v => lab("verif", v));
-  const listBox = h("div", {class:"stack"});
-  let shown = 100;
+  const fm = sel("fm", "Match", "Any match", fs.map(f => f.match_type || "none"), v => v === "none" ? "Not matched yet" : lab("match", v)), fv = sel("fv", "Check", "Any check", fs.map(f => f.verification), v => lab("verif", v));
+  // The points. A row is built the first time it is shown and kept, so an open point stays open while the filters
+  // and the search change. The search box looks through ids and summaries here at
+  // once, and asks the server for points whose detail or cited files contain the text.
+  const listBox = h("div", {class:"stack points"}), countNote = h("p", {class:"note"}), moreBox = h("div");
+  const FIRST = 100, MORE = 200, built = [];
+  let shown = FIRST, deep = null, asked = 0;   // deep: ids the server search matched for the text in the box
+  const card = i => built[i] || (built[i] = findingItem(fs[i]));
   const draw = () => {
     const t = q.value.trim().toLowerCase();
-    const hit = fs.filter(f => (!fd.value || f.domain_code === fd.value) && (!fsv.value || f.severity === fsv.value) && (!fm.value || f.match_type === fm.value) && (!fv.value || f.verification === fv.value)
-      && (!t || [f.point_id, f.summary, f.detail, f.issue_code, ...(f.locations||[]).map(l => l.path)].join(" ").toLowerCase().includes(t)));
+    const hit = [];
+    fs.forEach((f, i) => { if ((!fd.value || f.domain_code === fd.value) && (!fsv.value || f.severity === fsv.value) && (!fm.value || (f.match_type || "none") === fm.value) && (!fv.value || f.verification === fv.value)
+      && (!t || `${f.point_id} ${f.summary} ${f.issue_code || ""}`.toLowerCase().includes(t) || (deep && deep.has(f.id)))) hit.push(i); });
+    // The rows to show, each built once. When the list only grows (Show more) the new rows are appended; otherwise
+    // the same row elements are put back in the new order, open ones still open.
+    const want = hit.slice(0, shown).map(card), cur = listBox.children;
+    let grows = cur.length <= want.length;
+    for (let i = 0; grows && i < cur.length; i++) grows = cur[i] === want[i];
+    if (grows) listBox.append(...want.slice(cur.length)); else listBox.replaceChildren(...want);
     const count = `${hit.length} of ${fs.length} points`;
-    const more = () => { const first = shown; shown += 200; draw(); listBox.querySelectorAll("details.item > summary")[first].focus(); };
-    put(listBox, h("p", {class:"note"}, count), hit.slice(0, shown).map(f => findingItem(f)),
-      hit.length > shown ? h("button", {class:"btn ghost", type:"button", onclick:more}, `Show more (${hit.length - shown} left)`) : null);
+    countNote.textContent = count;
+    const more = () => { const first = hit[shown]; shown += MORE; draw(); built[first].firstChild.focus(); };
+    put(moreBox, hit.length > shown ? h("button", {class:"btn ghost", type:"button", onclick:more}, `Show more (${hit.length - shown} left)`) : null);
     return count;
   };
-  const filters = filterBar([q, fd, fsv, fm, fv], () => { shown = 100; say(draw()); });
+  const search = async () => {
+    const t = q.value.trim(), mine = ++asked;
+    deep = null; shown = FIRST; say(draw());
+    if (!t) return;
+    try {
+      const found = await api(`review/${encodeURIComponent(code)}?q=${encodeURIComponent(t)}`);
+      if (mine !== asked) return;
+      deep = new Set(found.match); say(draw());
+    } catch (e) { if (mine === asked) put(moreBox, errorBox(e)); }
+  };
+  let text = "";
+  if (params.get("match") && [...fm.options].some(o => o.value === params.get("match"))) fm.value = params.get("match");
+  const filters = filterBar([q, fd, fsv, fm, fv], () => {
+    if (q.value.trim() !== text) { text = q.value.trim(); return search(); }
+    shown = FIRST; say(draw());
+  }, 150);
   const sumBy = k => fs.filter(f => f.severity === k).length;
+  const about = kv([["Verdict", r.verdict], ["Summary", r.summary], ["What was asked", r.request_text], ["Run by", r.manager ? `${r.manager}${r.manager_model ? " (" + r.manager_model + ")" : ""}` : null],
+      ["Domains approved by", r.approved_by ? `${r.approved_by}, ${when(r.approved_at)}` : null], ["Follows", r.previous_code ? h("a", {href:"#/review/" + r.previous_code}, r.previous_code) : null],
+      ["Write-up", r.summary_doc_url ? extLink(r.summary_doc_url, "Open the review document") : null],
+      ["Skill version", r.skill_version], ["Working folder", r.review_folder ? h("code", null, r.review_folder) : null]]);
   setView(
     h("h1", null, `${r.code} · ${r.title}`),
     h("p", {class:"lede"}, `${lab("scope", r.scope)} · ${lab("review", r.status)} · started ${when(r.started_at)}` + (r.completed_at ? ` · finished ${when(r.completed_at)}` : "")),
     h("div", {class:"facts"}, fact(fs.length, "points"), ["H","M","L","T"].map(s => fact(sumBy(s), lab("sev", s))),
       fact(fs.filter(f => ["new","continuation"].includes(f.match_type)).length, "new issues"),
       fact(fs.filter(f => ["recurrence","regression"].includes(f.match_type)).length, "came back")),
-    d.gates.length ? h("div", {class:"card"}, h("h2", null, "Questions asked during this review"), table([{label:"About", get:g => lab("gate", g.kind)}, {label:"Title", key:"title"}, {label:"Status", get:g => lab("gstat", g.status)}, {label:"Answer", get:g => [g.answer_value || "", " ", g.answer_text || ""]}], d.gates, () => "#/inbox")) : null,
-    h("div", {class:"card"}, kv([["Verdict", r.verdict], ["Summary", r.summary], ["What was asked", r.request_text], ["Run by", r.manager ? `${r.manager}${r.manager_model ? " (" + r.manager_model + ")" : ""}` : null],
-      ["Domains approved by", r.approved_by ? `${r.approved_by}, ${when(r.approved_at)}` : null], ["Follows", r.previous_code ? h("a", {href:"#/review/" + r.previous_code}, r.previous_code) : null],
-      ["Write-up", r.summary_doc_url ? extLink(r.summary_doc_url, "Open the review document") : null]])),
-    r.report_md ? h("div", {class:"card"}, h("h2", null, "The review document"), (STATIC ? md(r.report_md) : h("div", {class:"mdtext"}, r.report_md))) : null,
+    d.gates.length ? h("div", {class:"card"}, h("h2", null, "Questions asked during this review"), table([{label:"About", get:g => lab("gate", g.kind)}, {label:"Title", key:"title", link:true}, {label:"Status", get:g => lab("gstat", g.status)}, {label:"Answer", get:g => answerText(g)}],
+        d.gates, g => `#/${g.status === "open" ? "inbox" : "history"}/${g.code}`)) : null,
+    about.childElementCount ? h("div", {class:"card"}, about) : null,
+    r.report_md ? h("div", {class:"card"}, h("h2", null, "The review document"), md(r.report_md)) : null,
     sect("Code reviewed"),
-    table([{label:"Repository", key:"name"}, {label:"Branch", key:"branch"}, {label:"Commit", get:x => [h("code", null, short(x.commit_sha)), " ", copyBtn(x.commit_sha, "Copy", "Copy commit " + short(x.commit_sha))]},
+    table([{label:"Repository", get:x => [x.name, x.notes ? h("div", {class:"note"}, x.notes) : null]}, {label:"Branch", get:x => x.branch || x.default_branch || ""},
+           {label:"Commit", get:x => [h("code", null, short(x.commit_sha)), " ", copyBtn(x.commit_sha, "Copy", "Copy commit " + short(x.commit_sha))]},
            {label:"Commit message", key:"commit_subject"}, {label:"Kept by tag", get:x => x.tag_name ? x.tag_name + (x.tag_pushed ? "" : " (not pushed)") : "Not tagged"},
-           {label:"Uncommitted changes", get:x => x.is_dirty ? (x.dirty_note || "Yes") : "None"}], d.repos),
-    d.goals.length ? [sect("Design goals used"), h("ul", null, d.goals.map(g => h("li", null, g.text)))] : null,
+           {label:"Uncommitted changes", get:x => x.is_dirty ? (x.dirty_note || "Yes") : "None"},
+           {label:"Hosted at", get:x => x.remote_url ? (safeHref(x.remote_url) ? extLink(x.remote_url, "Open") : x.remote_url) : ""}], d.repos, null, "No repository was recorded for this review."),
+    d.goals.length ? [sect("Design goals used"), h("ul", null, d.goals.map(g => h("li", null, h("a", {href:"#/goals/" + g.code}, g.code), " ", g.text)))] : null,
     (d.interview || []).length ? interviewSection(d.interview) : null,
     (d.review_goals || []).length ? [sect("Design goals from this interview"), goalsTable(d.review_goals)] : null,
     sect("Areas reviewed and skipped"),
     table([{label:"Area", get:x => x.name}, {label:"Reviewed?", get:x => tag(x.decision === "included" ? "Reviewed" : "Skipped", tone("area", x.decision))},
-           {label:"Why", key:"reason"}, {label:"Your change", get:x => x.owner_change === "none" ? "" : words(x.owner_change)}, {label:"Reviewers", key:"reviewers_planned", num:1}], d.domains),
+           {label:"Why", key:"reason"}, {label:"Your change", get:x => x.owner_change === "none" ? "" : lab("ownerChange", x.owner_change)}, {label:"Reviewers", key:"reviewers_planned", num:1}], d.domains),
     sect("Reviewers"),
-    table([{label:"Reviewer", key:"label"}, {label:"Area", get:x => domainName(x.domain_code)}, {label:"Agent", get:x => x.model ? `${x.actor} (${x.model})` : x.actor},
-           {label:"Status", get:x => lab("run", x.status)}, {label:"Items", key:"items_reviewed", num:1}, {label:"High", key:"high_count", num:1}, {label:"Medium", key:"medium_count", num:1}, {label:"Low", key:"low_count", num:1}], d.runs),
+    d.runs.length ? h("div", {class:"stack"}, d.runs.map(reviewerRow)) : empty("No reviewer has run yet."),
+    d.test_runs.length ? [sect("Test runs"),
+      table([{label:"Command", get:t => h("code", null, t.command)}, {label:"Why", get:t => lab("purpose", t.purpose)}, {label:"Passed", key:"passed", num:1}, {label:"Failed", key:"failed", num:1},
+             {label:"Skipped", key:"skipped", num:1}, {label:"Errors", key:"errored", num:1}, {label:"Took", get:t => t.duration_ms == null ? "" : (t.duration_ms / 1000).toFixed(1) + " s", num:1},
+             {label:"When", get:t => whenCell(t.started_at)}, {label:"Note", key:"notes"}], d.test_runs)] : null,
+    d.artifacts.length ? [sect("Files and documents"), filesTable(d.artifacts)] : null,
+    d.relations.length ? [sect("Links between issues made in this review"),
+      table([{label:"Issue", key:"from_issue", link:true}, {label:"Link", get:x => lab("rel", x.relation)}, {label:"To", get:x => h("a", {href:"#/issue/" + x.to_issue}, x.to_issue)}, {label:"Title", key:"to_title"},
+             {label:"How sure", get:x => lab("conf", x.confidence)}, {label:"Why", key:"rationale"}], d.relations, x => "#/issue/" + x.from_issue)] : null,
     d.agents.length ? [sect("Agents"),
-      table([{label:"Agent", key:"name"}, {label:"Did", key:"role"}, {label:"Kind", get:x => words(x.kind)}, {label:"Model", key:"model"}, {label:"Run in", key:"harness"}, {label:"Started by", key:"parent"}], d.agents)] : null,
+      table([{label:"Agent", key:"name"}, {label:"Did", key:"role"}, {label:"Kind", get:x => lab("actorKind", x.kind)}, {label:"Model", key:"model"}, {label:"Run in", key:"harness"}, {label:"Started by", key:"parent"}], d.agents)] : null,
     d.requirements.length ? [sect("Requirements"),
-      h("p", {class:"note"}, [...new Map(d.requirements.map(x => [x.verdict, x.verdict_count]))].map(([v, n]) => `${n} ${REQ_VERDICT[v] || words(v)}`).join(" · ")),
-      table([{label:"Requirement", key:"requirement"}, {label:"Says", key:"text"}, {label:"Found", get:x => REQ_VERDICT[x.verdict] || words(x.verdict)}, {label:"Where", key:"where_implemented"},
-             {label:"Tested", get:x => words(x.tested)}, {label:"Point", key:"point_id"}, {label:"Evidence", key:"evidence"}], d.requirements)] : null,
-    d.checks.length ? [sect("Earlier issues this review looked for"),
-      table([{label:"Issue", key:"issue_code"}, {label:"Title", key:"title"}, {label:"Found", get:x => lab("check", x.outcome)}, {label:"Evidence", key:"evidence"}, {label:"Now", get:x => issueTag(x.status)}],
-            d.checks, x => "#/issue/" + x.issue_code)] : null,
-    d.metrics.length ? [sect("Measurements"), table([{label:"Measure", get:m => m.label || words(m.name)}, {label:"Of", key:"scope"}, {label:"Value", get:m => `${m.value}${m.unit ? " " + m.unit : ""}`, num:1}, {label:"How", get:m => words(m.method)}, {label:"Note", key:"note"}], d.metrics)] : null,
+      h("p", {class:"note"}, [...new Map(d.requirements.map(x => [x.verdict, x.verdict_count]))].map(([v, n]) => `${n} ${lab("verdict", v).toLowerCase()}`).join(" · ")),
+      table([{label:"Requirement", key:"requirement"}, {label:"Says", key:"text"}, {label:"Found", get:x => lab("verdict", x.verdict)}, {label:"Where", key:"where_implemented"},
+             {label:"Tested", get:x => x.tested ? lab("tested", x.tested) : ""}, {label:"Point", key:"point_id"}, {label:"Evidence", key:"evidence"}], d.requirements)] : null,
+    d.checks.length ? [sect("Earlier issues this review looked for"), earlierIssues(code, d)] : null,
+    d.metrics.length ? [sect("Measurements"), table([{label:"Measure", get:m => m.label || words(m.name)}, {label:"Of", get:m => scopeName(m.scope)}, {label:"Value", get:m => `${m.value}${m.unit ? " " + m.unit : ""}`, num:1}, {label:"How", get:m => lab("method", m.method)}, {label:"Note", key:"note"}], d.metrics)] : null,
     sect("Points raised"),
-    filters, listBox);
-  draw();
+    fs.length ? [filters, h("div", {class:"stack"}, countNote, listBox, moreBox)] : empty("This review has raised no points yet."),
+    d.events.length ? [sect("History"), eventList(d.events, "review")] : null);
+  if (fs.length) draw();
 };
+
+// The recorded history of a review or a plan: each event in words, oldest first. statusMap: the label map of its
+// status values.
+function eventList(events, statusMap){
+  return h("div", {class:"timeline"}, events.map(e => h("div", null, h("b", null, whenCell(e.at)), " — ",
+    e.event === "status-changed" ? `${lab(statusMap, e.from_value)} → ${lab(statusMap, e.to_value)}` : lab("event", e.event),
+    e.actor ? ` · ${e.actor}` : "", e.note ? h("div", {class:"note"}, e.note) : null)));
+}
+
+// One reviewer of a review. What it was asked and what it answered are long, so they are fetched when the row is opened.
+function reviewerRow(x){
+  const counts = [["High", x.high_count], ["Medium", x.medium_count], ["Low", x.low_count], ["Missing tests", x.test_count]].filter(c => c[1]).map(c => `${c[1]} ${c[0].toLowerCase()}`).join(" · ");
+  return Object.assign(item(x.label, [domainName(x.domain_code), x.scope && x.scope !== "all" ? ` · ${x.scope}` : "", counts ? ` · ${counts}` : ""],
+    [tag(lab("run", x.status), x.status === "failed" ? "crit" : x.status === "finished" ? "ok" : "info")],
+    async () => { const t = await api("run/" + x.id);
+      return [kv([["Agent", x.model ? `${x.actor} (${x.model})` : x.actor], ["Run in", x.harness], ["Session", x.session], ["Started", whenCell(x.started_at)], ["Finished", whenCell(x.finished_at)],
+          ["Items reviewed", x.items_reviewed], ["Report", x.report_path ? h("code", null, x.report_path) : null]]),
+        t.prompt ? h("details", null, h("summary", null, "What it was asked"), h("div", {class:"mdtext"}, t.prompt)) : null,
+        t.final_message ? h("details", null, h("summary", null, "What it answered"), h("div", {class:"mdtext"}, t.final_message)) : null]; }), {className:"run"});
+}
+// The files and links a review or plan produced. A file is on the machine that ran the review: its path is shown to
+// copy, and a link only when the record has a web address.
+function filesTable(files){
+  return table([{label:"What", get:a => lab("artifact", a.kind)}, {label:"For", key:"run"},
+    {label:"Where", get:a => [a.url ? extLink(a.url, a.kind === "report" ? "Open report" : "Open") : null, a.url && a.path ? " " : null, a.path ? h("code", null, a.path) : null]},
+    {label:"Recorded", get:a => whenCell(a.created_at)}], files);
+}
+// The earlier issues a review looked for: how many it found in each state, the first rows, and the rest on request.
+function earlierIssues(code, d){
+  const total = d.check_counts.reduce((a, c) => a + c.n, 0), have = d.checks.slice(), box = h("div", {class:"stack"});
+  const draw = () => put(box,
+    h("p", {class:"note"}, d.check_counts.map(c => `${c.n.toLocaleString()} ${lab("check", c.outcome).toLowerCase()}`).join(" · ")),
+    table([{label:"Issue", key:"issue_code"}, {label:"Title", key:"title"}, {label:"Found", get:x => lab("check", x.outcome)}, {label:"Evidence", key:"evidence"}, {label:"Now", get:x => issueTag(x.status)}],
+          have, x => "#/issue/" + x.issue_code),
+    have.length < total ? h("button", {class:"btn ghost", type:"button", onclick:async e => {
+      e.target.disabled = true;
+      try { const more = await api(`review/${encodeURIComponent(code)}/checks?limit=500&offset=${have.length}`); have.push(...more.rows); draw(); box.querySelector("button, a").focus(); }
+      catch (err) { add(box, errorBox(err)); e.target.disabled = false; }
+    }}, `Show more (${(total - have.length).toLocaleString()} left)`) : null);
+  draw();
+  return box;
+}
 
 // ---------- the owner interview and design goals (schema 9)
 function byDomain(list){
@@ -4257,34 +4564,54 @@ function goalsTable(goals){
   return table([{label:"Goal", key:"code"}, {label:"Area", get:g => areaName(g.domain)}, {label:"Statement", key:"text"},
     {label:"Status", get:g => labTag("goal", g.status)},
     {label:"From your answers to", get:g => g.sources.map(q => q.code + ": " + q.question).join("; ")},
-    {label:"Note", get:g => g.note || (g.status === "approved" && g.approved_at ? "Approved " + when(g.approved_at) : "")}], goals);
+    {label:"Note", get:g => g.note || (g.status === "approved" && g.approved_at ? "Approved " + when(g.approved_at) : "")},
+    {label:"Written down", get:g => whenCell(g.adopted_at, false)}, {label:"Retired", get:g => whenCell(g.retired_at, false)},
+    {label:"Used by", key:"used_by"}], goals, null, "No design goals yet.", g => ({id:"goal-" + g.code}));
 }
-VIEWS.goals = async () => {
+VIEWS.goals = async ([code]) => {
   const d = await api("goals");
   setView(h("h1", null, "Design goals"),
     h("p", {class:"lede"}, "What you want the code to be, by area, written from your interview answers. Reviewers, fix plans and every agent work to the approved ones."),
     d.goals.length ? byDomain(d.goals).map(([dom, list]) => [sect(areaName(dom)), goalsTable(list)])
       : empty("No design goals yet."),
-    d.goals.some(g => g.status === "proposed") ? h("p", {class:"status"}, h("a", {href:"#/inbox"}, "Goals are waiting for your approval →")) : null);
+    d.goals.some(g => g.status === "proposed") ? h("p", {class:"callout you"}, h("a", {href:"#/inbox"}, "Goals are waiting for your approval →")) : null);
+  if (code) jumpTo(document.getElementById("goal-" + code));
 };
 
+// The filters live in the address (#/issues?status=all&severity=H&domain_code=spec&q=text&offset=200), so a reload, a
+// link and the back button all give the same list. No status in the address means the issues still to fix.
 VIEWS.issues = async (_, params) => {
-  const o = OVERVIEW || await api("overview");
+  const o = OVERVIEW;
   const q = h("input", {class:"field", type:"search", placeholder:"Search titles, ids, point ids", "aria-label":"Search issues", value:params.get("q") || ""});
   const st = select("Status", [["active","Still to fix"],["","Any status"], ...Object.entries(L.issue)]);
   const sv = select("Severity", [["","Any severity"], ...Object.entries(L.sev)]);
   const dm = select("Area", [["","All areas"], ...Object.entries(o.labels.domains)]);
-  st.value = params.has("status") ? params.get("status") : "active"; sv.value = params.get("severity") || ""; dm.value = params.get("domain") || "";
-  const box = h("div");
-  const load = async announce => {
-    const p = new URLSearchParams(); if (st.value) p.set("status", st.value); if (sv.value) p.set("severity", sv.value); if (dm.value) p.set("domain_code", dm.value); if (q.value.trim()) p.set("q", q.value.trim());
+  const has = (sel, v) => [...sel.options].some(x => x.value === v);
+  const status = params.get("status"), area = params.get("domain_code") || params.get("domain") || "";
+  st.value = status == null ? "active" : has(st, status) ? status : "";
+  sv.value = has(sv, params.get("severity") || "") ? params.get("severity") || "" : "";
+  dm.value = has(dm, area) ? area : "";
+  const box = h("div", {class:"stack"});
+  let asked = 0, offset = Math.max(0, Number(params.get("offset")) || 0);
+  const load = async (changed, turned) => {
+    if (changed && !turned) offset = 0;
+    const p = new URLSearchParams(), text = q.value.trim();
+    if (st.value) p.set("status", st.value); if (sv.value) p.set("severity", sv.value); if (dm.value) p.set("domain_code", dm.value); if (text) p.set("q", text);
+    const shown = new URLSearchParams(p); if (!st.value) shown.set("status", "all"); else if (st.value === "active") shown.delete("status");
+    if (offset) shown.set("offset", offset);
+    if (changed) setPath("#/issues" + (String(shown) ? "?" + shown : ""));
+    p.set("limit", PAGE_ROWS); p.set("offset", offset);
+    const mine = ++asked;   // an answer that arrives after a newer question was asked is dropped
     try {
-      const list = await api("issues?" + p);
-      if (announce) say(`${list.length} issues`);
-      put(box, h("p", {class:"note"}, `${list.length} issues`), table([{label:"Issue", key:"code"}, {label:"Title", key:"title"}, {label:"Severity", get:i => sevTag(i.severity)},
+      const d = await api("issues?" + p);
+      if (mine !== asked) return;
+      const count = plural(d.total, "issue");
+      if (changed) say(count);
+      put(box, h("p", {class:"note"}, count), table([{label:"Issue", key:"code"}, {label:"Title", key:"title"}, {label:"Severity", get:i => sevTag(i.severity)},
         {label:"Status", get:i => issueTag(i.status)}, {label:"Area", get:i => domainName(i.domain_code)}, {label:"First seen", key:"first_seen"}, {label:"Last seen", key:"last_seen"}, {label:"Reviews", key:"times_seen", num:1}],
-        list, i => "#/issue/" + i.code));
-    } catch (e) { put(box, errorBox(e)); }
+        d.rows, i => "#/issue/" + i.code, d.total ? "No more issues." : "No issue matches these filters."),
+        pager(d, d.rows.length, off => { offset = off; load(true, true).then(() => { window.scrollTo(0, 0); focusHeading(); }); }));
+    } catch (e) { if (mine === asked) put(box, errorBox(e)); }
   };
   setView(h("h1", null, "Issues"), h("p", {class:"lede"}, "An issue is one underlying problem, followed across every review that raised it or looked for it."), filterBar([q, st, sv, dm], load, 250), box);
   load();
@@ -4301,9 +4628,10 @@ VIEWS.issue = async ([code]) => {
       ["Last raised", i.last_seen ? h("a", {href:"#/review/" + i.last_seen}, i.last_seen) : null], ["Last looked for", i.last_checked ? h("a", {href:"#/review/" + i.last_checked}, i.last_checked) : null],
       ["Raised in", plural(i.times_seen, "review")],
       ["Before", i.before_state], ["Now", i.current_state], ["After the fix", i.after_state], ["Agreed fix", i.recommendation], ["Resolution", i.resolution],
-      ["Fixed", whenCell(i.resolved_at)], ["Fix confirmed", whenCell(i.verified_at)]])),
+      ["Fixed", whenCell(i.resolved_at)], ["Fix confirmed", whenCell(i.verified_at)],
+      ["Guard test", d.unguarded.length ? (d.unguarded[0].problem === "no guard test" ? "None: no test guards this fix yet." : "Removed: the test that guarded this fix is gone.") : null]])),
     d.relations.length ? [sect("Related issues"), table([{label:"Link", get:x => x.dir === "out" ? lab("rel", x.relation) : lab("relIn", x.relation)},
-      {label:"Issue", key:"other", link:true}, {label:"Title", key:"other_title"}, {label:"Status", get:x => issueTag(x.other_status)}, {label:"How sure", get:x => words(x.confidence)}, {label:"Why", key:"rationale"}, {label:"Linked in", key:"review"}],
+      {label:"Issue", key:"other", link:true}, {label:"Title", key:"other_title"}, {label:"Status", get:x => issueTag(x.other_status)}, {label:"How sure", get:x => lab("conf", x.confidence)}, {label:"Why", key:"rationale"}, {label:"Linked in", key:"review"}],
       d.relations, x => "#/issue/" + x.other)] : null,
     d.decisions.length ? [sect("Your decisions about it"), table([{label:"Decision", key:"code"}, {label:"Question", key:"question"}, {label:"Answer", key:"answer"}, {label:"Why", key:"rationale"}, {label:"When", get:x => whenCell(x.decided_at)}], d.decisions)] : null,
     d.steps.length ? [sect("Fix plan steps"), table([{label:"Plan", key:"plan"}, {label:"Step", key:"number", num:1}, {label:"Title", key:"title"}, {label:"Status", get:x => lab("step", x.status)},
@@ -4317,7 +4645,8 @@ VIEWS.issue = async ([code]) => {
     sect("History"),
     d.timeline.length ? h("div", {class:"timeline"}, d.timeline.map(e => h("div", null, h("b", null, whenCell(e.at)), " — ",
       e.event === "status-changed" ? `${lab("issue", e.from_value)} → ${lab("issue", e.to_value)}` : e.event === "severity-changed" ? `Severity ${lab("sev", e.from_value)} → ${lab("sev", e.to_value)}`
-      : e.event === "seen" ? (e.to_value === "new" ? "Raised as a new issue" : e.to_value === "continuation" ? continues : `Raised again (${lab("match", e.to_value)})`) : e.event === "opened" ? "Opened" : words(e.event),
+      : e.event === "seen" ? (e.to_value === "new" ? "Raised as a new issue" : e.to_value === "continuation" ? continues : `Raised again (${lab("match", e.to_value)})`)
+      : e.event === "checked" ? `${lab("event", e.event)}: ${lab("check", e.to_value).toLowerCase()}` : lab("event", e.event),
       e.review ? ` · ${e.review}` : "", e.step ? ` · step ${e.step}` : "", e.commit_sha ? [" · ", h("code", null, short(e.commit_sha))] : "", e.actor ? ` · ${e.actor}` : "",
       e.note ? h("div", {class:"note"}, e.note) : null))) : empty("No history recorded."));
 };
@@ -4329,8 +4658,10 @@ VIEWS.plans = async () => {
            {label:"Progress", get:p => progressBar(p.done || 0, p.doing || 0, p.waiting || 0, p.steps || 0)}], list, p => "#/plan/" + p.code));
 };
 
+// The plan arrives with every step's row and search text, and with the text and notes of one phase's steps. A step
+// is fetched in full, with the points it closes, when it is opened (the shared copy holds all of it already).
 VIEWS.plan = async ([code, , phaseArg]) => {
-  const d = await api("plan/" + encodeURIComponent(code));
+  const d = await api("plan/" + encodeURIComponent(code) + (Number(phaseArg) ? "?phase=" + Number(phaseArg) : ""));
   const steps = d.steps, phases = d.phase_rows, prog = Object.fromEntries(d.phases.map(p => [p.phase, p]));
   let phase = Number(phaseArg) || (phases[0] && phases[0].number) || 1;
   const count = s => steps.filter(x => x.status === s).length;
@@ -4344,20 +4675,29 @@ VIEWS.plan = async ([code, , phaseArg]) => {
     if (v === "any" && s.owner_need === "none") return false;
     if (["decision","confirm","review","production"].includes(v) && s.owner_need !== v) return false;
     if (v === "behavior" && !s.behavior_change) return false;
-    return !t || [s.number, s.title, s.change, s.proof, ...s.closes.map(c => c.point_id + " " + (c.issue || ""))].join(" ").toLowerCase().includes(t);
+    return !t || s.search.includes(t);
   };
+  const stepBody = (s, closes) => [ kv([["Change", s.change], ["Proof", s.proof], ["Depends on", s.depends.length ? (s.depends.length === 1 ? "Step " : "Steps ") + s.depends.join(", ") : null], ["Behaviour change", s.behavior_note],
+      ["Needs from you", s.owner_question], ["Progress", s.progress_note], ["Started", whenCell(s.started_at)], ["Done", whenCell(s.done_at)],
+      ["Closes no point because", s.no_findings_reason],
+      ["Commits", (s.commits || []).length ? s.commits.map(c => h("div", null, h("code", null, short(c.commit_sha)), c.branch ? ` on ${c.branch}` : "", c.summary ? " " + c.summary : "", c.pr_url ? [" ", extLink(c.pr_url, "pull request")] : "")) : null]]),
+      closes.length ? h("div", {class:"ref"}, h("span", {class:"note"}, "Closes " + plural(closes.length, "point")),
+        closes.map(c => h("div", {class:"refline"}, h("code", null, `${c.review} · ${c.point_id}`), sevTag(c.severity), c.issue ? h("a", {href:"#/issue/" + c.issue}, c.issue) : null, h("span", null, c.summary)))) : null];
   const stepItem = s => item(s.number, s.title,
     [s.status !== "not-started" ? labTag("step", s.status) : null,
      s.owner_need !== "none" ? tag(lab("need", s.owner_need), tone("need", s.owner_need) || "info") : null,
      s.behavior_change ? tag("Changes behaviour") : null],
-    [ kv([["Change", s.change], ["Proof", s.proof], ["Depends on", s.depends.length ? (s.depends.length === 1 ? "Step " : "Steps ") + s.depends.join(", ") : null], ["Behaviour change", s.behavior_note],
-      ["Needs from you", s.owner_question], ["Progress", s.progress_note], ["Commits", s.commits.length ? s.commits.map(c => h("div", null, h("code", null, short(c.commit_sha)), c.summary ? " " + c.summary : "", c.pr_url ? [" ", extLink(c.pr_url, "pull request")] : "")) : null]]),
-      s.closes.length ? h("div", {class:"ref"}, h("span", {class:"note"}, "Closes " + plural(s.closes.length, "point")),
-        s.closes.map(c => h("div", {class:"refline"}, h("code", null, `${c.review} · ${c.point_id}`), sevTag(c.severity), c.issue ? h("a", {href:"#/issue/" + c.issue}, c.issue) : null, h("span", null, c.summary)))) : null]);
+    async () => {
+      if (d.findings) return stepBody(s, s.closes.map(id => d.findings[id]).filter(Boolean));
+      if (s.change !== undefined && !s.closes.length) return stepBody(s, []);
+      const full = await api(`step/${encodeURIComponent(code)}/${s.number}`);
+      return stepBody({...s, ...full, closes:s.closes}, full.closes);
+    });
   // The phase buttons are built once and marked in place, so the one just pressed keeps the keyboard focus.
   const rail = phases.map(p => { const pr = prog[p.number] || {}; return h("button", {type:"button",
     onclick:() => { phase = p.number; q.value = ""; f.value = ""; shown = PAGE_OF; setPath(`#/plan/${code}/phase/${phase}`); draw(); }},
-    h("span", {class:"i"}, p.number), h("span", null, p.title), h("span", {class:"c"}, `${pr.done || 0}/${pr.steps || 0}`)); });
+    h("span", {class:"i"}, p.number), h("span", null, p.title, p.first_step ? h("small", null, p.first_step === p.last_step ? `step ${p.first_step}` : `steps ${p.first_step}–${p.last_step}`) : null),
+    h("span", {class:"c"}, `${pr.done || 0}/${pr.steps || 0}`)); });
   add(nav, rail);
   const PAGE_OF = 300;   // matching steps drawn at a time
   let shown = PAGE_OF;
@@ -4379,16 +4719,27 @@ VIEWS.plan = async ([code, , phaseArg]) => {
         sections.map(sec => [sec ? h("h3", null, sec) : null, ps.filter(s => (s.section || "") === sec).map(stepItem)]));
     }
   };
-  const filters = filterBar([q, f], () => { shown = PAGE_OF; say(draw()); });
+  const filters = filterBar([q, f], () => { shown = PAGE_OF; say(draw()); }, 150);
   const pl = d.plan;
   const head = [h("h1", null, `${pl.code} · ${pl.title}`),
-    h("p", {class:"lede"}, lab("plan", pl.status) + (pl.approved_at ? ` · approved ${when(pl.approved_at)}` : "")),
+    h("p", {class:"lede"}, lab("plan", pl.status) + (pl.approved_at ? ` · approved ${when(pl.approved_at)}` : "") + (d.last_updated ? ` · last updated ${when(d.last_updated)}` : "")),
+    kv([["From", d.reviews.length ? d.reviews.map((r, i) => [i ? ", " : "", h("a", {href:"#/review/" + r.code}, r.code)]) : null],
+        ["Plan document", pl.doc_url ? extLink(pl.doc_url, "Open the plan document") : null], ["Shared page", pl.page_url ? extLink(pl.page_url, "Open the shared page") : null]]),
     h("div", {class:"facts"}, fact(steps.length, "steps"), fact(phases.length, "phases"),
-      fact(new Set(steps.flatMap(s => s.closes.map(c => c.review + c.point_id))).size, "points closed")),
+      fact(new Set(steps.flatMap(s => s.closes)).size, "points closed")),
     progressBar(count("done"), count("doing"), count("waiting-owner"), steps.length),
-    pl.narrative_md ? h("div", {class:"card"}, h("h2", null, "About this plan"), (STATIC ? md(pl.narrative_md) : h("div", {class:"mdtext"}, pl.narrative_md))) : null];
-  if (!phases.length) return setView(head, empty("This plan has no phases yet."), add(main, steps.map(stepItem)));
-  setView(head, filters, h("div", {class:"cols"}, nav, main));
+    pl.narrative_md ? h("div", {class:"card"}, h("h2", null, "About this plan"), md(pl.narrative_md)) : null,
+    d.gates.length ? h("div", {class:"card"}, h("h2", null, "Questions about this plan"),
+      table([{label:"Question", key:"title", link:true}, {label:"Step", key:"step", num:1}, {label:"Status", get:g => lab("gstat", g.status)}], d.gates, g => "#/inbox/" + g.code)) : null,
+    d.discoveries.length ? h("details", {class:"card"}, h("summary", null, plural(d.discoveries.length, "defect") + " found during fixes"),
+      table([{label:"Point", get:x => `${x.review} · ${x.point_id}`}, {label:"Severity", get:x => sevTag(x.severity)}, {label:"What", key:"summary"}, {label:"Found in step", key:"found_in_step", num:1},
+             {label:"Issue", get:x => x.issue ? h("a", {href:"#/issue/" + x.issue}, x.issue) : "Not matched yet"}, {label:"Closed by step", get:x => x.closing_step ?? "Not planned yet", num:1}], d.discoveries)) : null,
+    d.artifacts.length ? h("details", {class:"card"}, h("summary", null, "Files and documents"), filesTable(d.artifacts)) : null];
+  if (d.unguarded.length) head.push(h("details", {class:"card"}, h("summary", null, plural(d.unguarded.length, "fixed issue has", "fixed issues have") + " no test guarding the fix"),
+    table([{label:"Issue", key:"code"}, {label:"Title", key:"title"}, {label:"Step", key:"step", num:1}, {label:"Guard test", get:u => u.problem === "no guard test" ? "None" : "Removed"}], d.unguarded, u => "#/issue/" + u.code)));
+  const past = d.events.length ? [sect("History"), eventList(d.events, "plan")] : null;
+  if (!phases.length) return setView(head, empty("This plan has no phases yet."), add(main, steps.map(stepItem)), past);
+  setView(head, filters, h("div", {class:"cols"}, nav, main), past);
   draw();
 };
 
@@ -4421,7 +4772,8 @@ function lineChart(points, unit){
   const box = h("div", {class:"chart"}, svg, h("table", {class:"visually-hidden"},
     h("thead", null, h("tr", null, h("th", null, "Review"), h("th", null, "Value"))),
     h("tbody", null, points.map(p => h("tr", null, h("td", null, p.review), h("td", null, value(p)))))));
-  new ResizeObserver(() => { const w = Math.max(200, Math.round(box.clientWidth)); if (box.clientWidth && w !== width) draw(w); }).observe(box);
+  // Rounded down: a drawing a fraction wider than its box would be scaled down, its labels with it.
+  new ResizeObserver(() => { const w = Math.max(200, Math.floor(box.getBoundingClientRect().width)); if (box.clientWidth && w !== width) draw(w); }).observe(box);
   return box;
 }
 
@@ -4432,40 +4784,55 @@ VIEWS.trends = async () => {
   setView(h("h1", null, "Over time"), h("p", {class:"lede"}, "How the project has moved between reviews."),
     sect("Points per review"),
     table([{label:"Review", key:"review"}, {label:"Started", get:r => whenCell(r.started_at, false)}, {label:"Points", key:"points", num:1}, {label:"High", key:"high", num:1}, {label:"Medium", key:"medium", num:1}, {label:"Low", key:"low", num:1},
+           {label:"Missing tests", key:"tests", num:1}, {label:"Confirmed", key:"confirmed", num:1},
            {label:"New", key:"new_issues", num:1}, {label:"Carried over", key:"carried_over", num:1}, {label:"Came back", key:"came_back", num:1}, {label:"False", key:"false_findings", num:1}], d.reviews, r => "#/review/" + r.review),
+    d.reviews.length > 1 ? h("div", {class:"grid2"}, [["Points", "points"], ["Missing tests", "tests"], ["Confirmed by the manager", "confirmed"]].map(([title, k]) =>
+      h("div", {class:"card"}, h("b", null, title), h("div", {class:"note"}, "per review"), lineChart(d.reviews.map(r => ({review:r.review, value:r[k]})), "")))) : null,
     sect("Measurements"),
     Object.keys(groups).length ? h("div", {class:"grid2"}, Object.entries(groups).map(([k, pts]) => { const [n, sc, repo] = k.split("|");
       const better = {higher:"higher is better", lower:"lower is better"}[pts[0].better];
-      return h("div", {class:"card"}, h("b", null, pts[0].label || words(n)), h("div", {class:"note"}, [[sc !== "all" ? sc : "", repo !== "all" ? repo : ""].filter(Boolean).join(" · ") || "Whole system", better].filter(Boolean).join(" · ")), lineChart(pts, pts[0].unit)); }))
+      return h("div", {class:"card"}, h("b", null, pts[0].label || words(n)), h("div", {class:"note"}, [[sc !== "all" ? sc : "", repo !== "all" ? repo : ""].filter(Boolean).join(" · ") || scopeName("all"), better].filter(Boolean).join(" · ")), lineChart(pts, pts[0].unit)); }))
       : empty("No measurements recorded yet."),
     sect("Issues that keep coming back"),
     table([{label:"Issue", key:"code"}, {label:"Title", key:"title"}, {label:"Severity", get:i => sevTag(i.severity)}, {label:"Status", get:i => issueTag(i.status)}, {label:"Reviews", key:"times_seen", num:1}, {label:"Came back after a fix", key:"regressions", num:1}, {label:"Raised in", key:"reviews"}],
           d.recurring, i => "#/issue/" + i.code),
     sect("Files that keep producing issues"),
     table([{label:"File", get:r => h("code", null, r.path)}, {label:"Issues", key:"issues", num:1}, {label:"Reviews", key:"reviews", num:1}, {label:"High points", key:"high_points", num:1}], d.hotspots,
-          r => "#/issues?q=" + encodeURIComponent(r.path)));
+          r => "#/issues?status=all&q=" + encodeURIComponent(r.path)));
 };
 
 const cellText = v => v && typeof v === "object" && "blob_bytes" in v ? `<${v.blob_bytes} bytes>` : String(v);
-VIEWS.explore = async ([name]) => {
+// #/explore/<table or view>?offset=N. Tables show their row count; a view is counted only when asked, since counting
+// one runs its whole query.
+VIEWS.explore = async ([name], params) => {
   const tables = await api("tables");
   const list = h("div", {class:"tlist"}), right = h("div", {class:"stack loose"});
   const grid = (cols, data) => data.length ? h("div", {class:"scroll card grid"}, h("table", null, h("thead", null, h("tr", null, cols.map(c => h("th", null, c)))),
     h("tbody", null, data.map(r => h("tr", null, r.map(v => h("td", {class: typeof v === "number" ? "num mono" : null, title: v == null ? null : cellText(v).slice(0, 2000)}, v == null ? h("span", {class:"muted"}, "—") : cellText(v)))))))) : empty("No rows.");
   const showTable = async (t, offset=0, paged=false) => {
+    const info = tables.find(x => x.name === t) || {label:t, description:""};
     list.querySelectorAll("button").forEach(b => b.setAttribute("aria-current", String(b.dataset.n === t)));
-    setPath("#/explore/" + t);
+    setPath("#/explore/" + t + (offset ? "?offset=" + offset : ""));
     try {
-      const d = await api(`table/${t}?limit=100&offset=${offset}`);
-      put(right, h("h2", null, t), h("p", {class:"note"}, `${d.count} rows` + (d.count > d.limit ? ` · showing ${offset + 1}–${Math.min(d.count, offset + d.limit)}` : "")),
+      const d = await api(`table/${encodeURIComponent(t)}?limit=100&offset=${offset}`);
+      const range = d.rows.length ? `rows ${offset + 1}–${offset + d.rows.length}` : "no rows here";
+      const counted = h("span", null, d.count != null ? `${plural(d.count, "row")}` + (d.count > d.rows.length ? ` · ${range}` : "") : range);
+      const count = d.count == null && !STATIC ? h("button", {class:"btn ghost", type:"button", onclick:async e => {
+        try { const c = await api(`table/${encodeURIComponent(t)}?limit=1&count=1`); counted.textContent = `${plural(c.count, "row")} · ${range}`; e.target.remove(); say(counted.textContent); }
+        catch (err) { put(counted, errorBox(err)); } }}, "Count the rows") : null;
+      put(right, h("h2", null, info.label), info.description ? h("p", {class:"lede"}, info.description) : null,
+        h("p", {class:"note"}, "Stored as ", h("code", null, t), info.for_agent ? ". The agent reads this view; no page of this site shows it." : "",
+          STATIC && d.total > d.count ? ` · this copy holds the first ${d.count} of ${d.total} rows` : ""),
+        h("p", {class:"note"}, counted, d.truncated ? " · some rows are too large to show here" : ""),
         h("div", {class:"tools"}, offset > 0 ? h("button", {class:"btn ghost", type:"button", onclick:() => showTable(t, Math.max(0, offset - 100), true)}, "Previous") : null,
-          offset + d.limit < d.count ? h("button", {class:"btn ghost", type:"button", onclick:() => showTable(t, offset + 100, true)}, "Next") : null,
-          h("button", {class:"btn ghost", type:"button", onclick:() => { sql.value = `SELECT * FROM ${t} LIMIT 50`; sql.focus(); }}, "Query this")),
+          d.more ? h("button", {class:"btn ghost", type:"button", onclick:() => showTable(t, offset + 100, true)}, "Next") : null, count,
+          STATIC ? null : h("button", {class:"btn ghost", type:"button", onclick:() => { sql.value = `SELECT * FROM ${t} LIMIT 50`; sql.focus(); }}, "Query this")),
         grid(d.columns, d.rows));
-      if (paged) right.querySelector("button").focus();   // the pressed button was redrawn: Previous, or Next on the first page
+      if (paged) (right.querySelector("button") || right).focus();   // the pressed button was redrawn: Previous, or Next on the first page
     } catch (e) { put(right, errorBox(e)); }
   };
-  const sec = (title, type) => [sect(title), tables.filter(t => t.type === type).map(t => h("button", {type:"button", "data-n":t.name, onclick:() => showTable(t.name)}, h("span", null, t.name), h("span", {class:"muted"}, t.count)))];
+  const sec = (title, type) => [sect(title), tables.filter(t => t.type === type).map(t => h("button", {type:"button", "data-n":t.name, title:t.description || null, onclick:() => showTable(t.name)},
+    h("span", null, t.label, h("small", null, t.name)), t.count != null ? h("span", {class:"muted"}, t.count) : null))];
   add(list, sec("Saved views", "view"), sec("Tables", "table"));
   const sql = h("textarea", {class:"field mono", "aria-label":"SQL query", placeholder:"SELECT code, title, status FROM issues WHERE severity = 'H'"});
   const out = h("div");
@@ -4475,19 +4842,19 @@ VIEWS.explore = async ([name]) => {
   };
   sql.addEventListener("keydown", e => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") run(); });
   setView(h("h1", null, "Explore the ledger"),
-    h("p", {class:"lede"}, STATIC ? "Browse every table and saved view as they were when this snapshot was taken."
+    h("p", {class:"lede"}, STATIC ? "Browse every table and saved view as they were when this copy was made."
       : "Browse every table and saved view, or run your own read-only query. Nothing here can change the ledger."),
+    h("p", {class:"note"}, "Names and values on this page are shown as they are stored in the database."),
     STATIC ? h("p", {class:"note"}, "The query box needs the local viewer (python3 ledger.py serve). Here each table and view shows up to 500 rows, and long values are shortened.")
     : h("div", {class:"card stack"}, h("b", null, "Query"), sql, h("div", {class:"tools"}, h("button", {class:"btn", type:"button", onclick:run}, "Run query"), h("span", {class:"note"}, "Ctrl or ⌘ + Enter runs it")), out),
     h("div", {class:"split"}, list, right));
-  if (name && tables.some(t => t.name === name)) showTable(name); else add(right, empty("Choose a table or view on the left."));
+  if (name && tables.some(t => t.name === name)) showTable(name, Math.max(0, Number(params.get("offset")) || 0)); else add(right, empty("Choose a table or view on the left."));
 };
 
-// ---------- How it works (the shared copy)
-if (STATIC) VIEWS.guide = async () => {
-  const o = OVERVIEW || await api("overview");
-  const plans = await api("plans"), revs = await api("reviews");
-  const r = revs[0], p = plans[0], waiting = Math.max(0, o.queue - (STATIC ? hubAnsweredOpen() : 0));
+// ---------- How it works
+VIEWS.guide = async () => {
+  const [plans, revs, text] = await Promise.all([api("plans"), api("reviews"), api("guide")]);
+  const r = revs[0], p = plans[0], waiting = waitingCount();
   setView(
     h("h1", null, "How it works"),
     h("p", {class:"lede"}, "What this site is, how a review runs, what the words mean, and where things stand right now."),
@@ -4495,21 +4862,42 @@ if (STATIC) VIEWS.guide = async () => {
       kv([["Latest review", r ? h("a", {href:"#/review/" + r.code}, `${r.code} · ${lab("review", r.status)} · ${r.points} points`) : "None yet"],
           ["Fix plan", p ? h("a", {href:"#/plan/" + p.code}, `${p.code} · ${lab("plan", p.status)} · ${p.done || 0} of ${p.steps || 0} steps done`) : "None yet"],
           ["Waiting on you", waiting ? h("a", {href:"#/inbox"}, plural(waiting, "question")) : "Nothing right now"],
-          ["Updated", whenCell(STATIC ? STATIC.taken : null)]])),
-    md(STATIC ? STATIC.guide : ""));
+          ["This copy was made", STATIC ? whenCell(STATIC.taken) : null]])),
+    md(text.guide));
 };
 
 // ---------- routing
-const GUIDE_TAB = ["guide","#/guide","How it works"];
-const TABS = [["home","#/","Overview"], ...(STATIC ? [GUIDE_TAB] : []),["inbox","#/inbox","Waiting on you"],["reviews","#/reviews","Reviews"],["goals","#/goals","Design goals"],["issues","#/issues","Issues"],["plans","#/plans","Fix plans"],["trends","#/trends","Over time"],["explore","#/explore","Explore"]];
+const TABS = [["home","#/","Overview"],["guide","#/guide","How it works"],["inbox","#/inbox","Waiting on you"],["reviews","#/reviews","Reviews"],["goals","#/goals","Design goals"],["issues","#/issues","Issues"],["plans","#/plans","Fix plans"],["trends","#/trends","Over time"],["explore","#/explore","Explore"]];
+// What the badge counts: everything in the owner's queue still to act on. In the shared copy, less the open gates
+// answered there since the copy was made.
+const waitingCount = () => Math.max(0, (OVERVIEW ? OVERVIEW.queue_count : 0) - (STATIC ? hubAnsweredOpen() : 0));
+let TAB = "home";
 function drawTabs(active){
-  const n = Math.max(0, (OVERVIEW ? OVERVIEW.queue : 0) - (STATIC ? hubAnsweredOpen() : 0));
+  TAB = active;
+  const n = waitingCount();
   put(document.getElementById("tabs"), ...TABS.map(([k, href, t]) => {
-    const badge = k === "inbox" && n;
+    const badge = k === "inbox" && n > 0;
     return h("a", {href, "data-k": k, "aria-current": active === k ? "page" : null, "aria-label": badge ? `${t}, ${n} waiting` : null}, t, badge ? h("span", {class:"badge"}, n) : null); }));
   // Where the tabs scroll sideways, bring the current one into view (not scrollIntoView: Chrome then starts Tab from it).
   const tabs = document.getElementById("tabs"), cur = tabs.querySelector('a[aria-current="page"]');
   if (cur && tabs.scrollWidth > tabs.clientWidth) tabs.scrollLeft = cur.offsetLeft - tabs.offsetLeft - (tabs.clientWidth - cur.offsetWidth) / 2;
+}
+function takeOverview(o){
+  OVERVIEW = o; LABELS = o.labels; setLabels(LABELS.enums);
+  put(document.getElementById("brand"), o.project, h("small", null, STATIC ? "review ledger · updated " + when(STATIC.taken) : "review ledger"));
+  document.title = o.project + " · review ledger";
+}
+// Keeps the badge current without a navigation: when the window is looked at again, every 30 s while it is
+// visible, and after an answer (now). A changed count also brings new questions into an open inbox.
+let REFRESHED = 0;
+async function refreshHeader(now){
+  if (STATIC || document.hidden || (now !== true && Date.now() - REFRESHED < 2000)) return;
+  REFRESHED = Date.now();
+  try {
+    const was = OVERVIEW, o = await api("overview");
+    takeOverview(o); drawTabs(TAB);
+    if (INBOX && was && (was.queue_count !== o.queue_count || was.answered_count !== o.answered_count)) await INBOX.sync();
+  } catch {}   // the next navigation says what is wrong
 }
 async function route(){
   takeToken();
@@ -4518,14 +4906,17 @@ async function route(){
   const parts = pathPart.split("/").filter(Boolean).map(decodeURIComponent);
   const name = parts[0] || "home";
   const view = VIEWS[name] || VIEWS.home;
-  const tab = {review:"reviews", issue:"issues", plan:"plans", history:"inbox"}[name] || (VIEWS[name] ? name : "home");
+  const tab = {review:"reviews", issue:"issues", plan:"plans", history:"inbox", decisions:"inbox"}[name] || (VIEWS[name] ? name : "home");
+  INBOX = null;
   try {
-    if (!OVERVIEW || name === "home" || name === "inbox") { OVERVIEW = await api("overview"); LABELS = OVERVIEW.labels; setLabels(LABELS.enums);
-      put(document.getElementById("brand"), OVERVIEW.project, h("small", null, STATIC ? "review ledger · updated " + when(STATIC.taken) : "review ledger")); document.title = OVERVIEW.project + " · review ledger"; }
+    takeOverview(await api("overview")); REFRESHED = Date.now();   // the one overview request of a navigation
     drawTabs(tab);
     await view(parts.slice(1), new URLSearchParams(query || ""));
-  } catch (e) { drawTabs(tab); failed(e); }
+  } catch (e) { drawTabs(tab); failed(e, name, parts.slice(1)); }
 }
+window.addEventListener("focus", () => refreshHeader());
+document.addEventListener("visibilitychange", () => refreshHeader());
+setInterval(() => refreshHeader(), 30000);
 window.addEventListener("hashchange", route);
 document.getElementById("skip").addEventListener("click", e => { e.preventDefault(); focusHeading(); });
 // --top: the sticky header's height, which scrolling to a focused control and the plan's phase list stay clear of.
@@ -6141,6 +6532,50 @@ INSERT INTO enum_labels(enum, value, label, position) VALUES
 -- views; no table and no row changes.
 
 SELECT 1;
+-- migration: 0011-viewer-wave.sql
+-- gate answer rules in the trigger, owner queue context, event labels, the artifact check
+-- Plan P-0001, the viewer wave. tr_gate_answer_rules refuses a note on a gate without free text and a note over
+-- 10,000 characters, as answer_gate() does; v_owner_queue gains a context column; the new warning check
+-- v_artifacts_outside_ledger lists review files recorded outside the ledger's folder. migrate re-creates the shipped
+-- views and triggers; the rows below are what it does not. ix_findings_review_counts lets the per-review counts be
+-- read from the index alone. enum 'event' gives the event names the triggers write a label.
+
+CREATE INDEX ix_findings_review_counts ON findings(review_id, verification, severity, match_type);
+
+INSERT INTO enum_labels(enum, value, label, position) VALUES
+ ('event','opened','Opened',1),
+ ('event','seen','Raised by a review',2),
+ ('event','recurred','Raised again after it was closed',3),
+ ('event','checked','Looked for by a review',4),
+ ('event','unlinked','A point was moved to another issue',5),
+ ('event','status-changed','Status changed',6),
+ ('event','severity-changed','Severity changed',7),
+ ('event','title-changed','Title changed',8),
+ ('event','before-state-changed','What it did before: text changed',9),
+ ('event','current-state-changed','What it does now: text changed',10),
+ ('event','after-state-changed','What it does after the fix: text changed',11),
+ ('event','recommendation-changed','Agreed fix changed',12),
+ ('event','resolution-changed','Resolution changed',13),
+ ('event','created','Created',14),
+ ('event','proof-changed','Proof changed',15),
+ ('event','change-text-changed','Change text changed',16),
+ ('event','answer-changed','Answer changed',17),
+ ('event','answer-cleared','Answer cleared',18),
+ ('event','verification-changed','Check by the manager changed',19),
+ ('event','text-changed','Text changed',20),
+ ('event','asked','Asked',21),
+ ('event','linked','Linked',22),
+ ('event','step-linked','Linked to a plan step',23),
+ ('event','source-linked','Linked to the interview answers it comes from',24),
+ ('event','dependency-added','A step it depends on was added',25),
+ ('event','proposed','Proposed',26),
+ ('event','reviewer-run-created','A reviewer was started',27),
+ ('event','metric-recorded','A measurement was recorded',28),
+ ('event','tag-pushed','The tag of the reviewed commit was pushed',29),
+ ('event','redacted','A secret was removed from the text',30);
+
+INSERT INTO ledger_checks(view, label, tier, position) VALUES
+ ('v_artifacts_outside_ledger','Review files recorded outside the ledger''s folder','warning',110);
 """
 
 
@@ -7064,9 +7499,13 @@ def check(con, quiet=False, full=False):
     full PRAGMA integrity_check (`check --full`); the line printed names the one that ran."""
     bad = 0
     pragma = "integrity_check" if full else "quick_check"
-    ic = con.execute(f"PRAGMA {pragma}").fetchone()[0]
+    try:
+        found = [r[0] for r in con.execute(f"PRAGMA {pragma}").fetchmany(20)]
+    except sqlite3.DatabaseError as e:
+        found = [f"the file could not be read ({_one_line(e)})"]
+    ic = found[0] if found else "ok"
     if ic != "ok":
-        print(f"{pragma}:", ic); bad += 1
+        print(f"{pragma}:", "\n  ".join(found)); bad += 1
     elif not quiet:
         print(f"{pragma}: ok" + ("" if full else " (check --full runs the full integrity_check)"))
     fk = con.execute("PRAGMA foreign_key_check").fetchall()
@@ -7093,8 +7532,30 @@ def check(con, quiet=False, full=False):
                 print("       ", json.dumps(r, ensure_ascii=False)[:200])
         elif not quiet:
             print(f"    0  {label}")
+    for path in missing_artifacts(con):
+        print(f"  warning  a recorded review file is not on disk: {path}")
     optimize(con)
     return bad
+
+
+def missing_artifacts(con, limit=20):
+    """Paths of recorded briefs, reports and indexes that are missing from disk (the first `limit`). A path is taken
+    from the project root: the folder above the ledger's own. Nothing is said for a ledger held in memory."""
+    try:
+        db = next((r[2] for r in con.execute("PRAGMA database_list") if r[1] == "main"), "")
+        if not db:
+            return []
+        root, out = Path(db).resolve().parent.parent, []
+        for (path,) in con.execute("""SELECT path FROM artifacts WHERE path IS NOT NULL
+                                      AND kind IN ('brief','report','index') ORDER BY id"""):
+            p = Path(path)
+            if not (p if p.is_absolute() else root / p).exists():
+                out.append(path)
+                if len(out) >= limit:
+                    break
+        return out
+    except (sqlite3.Error, OSError):
+        return []
 
 
 def optimize_db(db):
@@ -7754,6 +8215,8 @@ def enum_labels(con):
 
 
 ROUTE_SECONDS = 3  # a viewer page read that runs longer is stopped (the SQL box has its own SQL_SECONDS)
+CHECKS_SECONDS = 15  # the ledger's own checks read every table: they get longer
+TRENDS_SECONDS = 10  # so does the page of numbers over time (its answer is then kept until the ledger changes)
 ANSWER_BUSY_MS = 3000  # how long a gate answer waits for another writer before it reports the ledger busy
 TOO_LONG = "The query took too long (over {} s); add a LIMIT or a WHERE."
 
@@ -7808,6 +8271,15 @@ def whole_number(text, what):
     return int(text)
 
 
+_serving = threading.local()  # .on is true while api() answers a request on this thread
+
+
+def int_arg(qs, name, default, lo, hi=None):
+    """A whole-number query parameter, brought into lo..hi (hi None: no upper bound); 400 when it is not a number."""
+    n = whole_number(qs.get(name, [str(default)])[0], name)
+    return max(lo, n if hi is None else min(hi, n))
+
+
 def api(root, db, path, qs, body):
     """One viewer API request. Each request opens its own connection and closes it when the answer is built:
     sqlite3 connections are not shared between the server's threads, and a fresh one always sees the agent's latest
@@ -7817,14 +8289,17 @@ def api(root, db, path, qs, body):
     if not Path(db).exists():
         return error(503, "ledger not found")
     con = connect(db, readonly=True)
-    timed_out = with_deadline(con, ROUTE_SECONDS)
+    seconds = route_seconds(path)
+    timed_out = with_deadline(con, seconds)
+    _serving.on = True  # a request of the running viewer: a slow route may answer from CACHE
     try:
         return route(root, db, con, path, qs, body)
     except sqlite3.OperationalError as e:
         if "interrupted" in str(e) and timed_out():
-            return error(400, TOO_LONG.format(ROUTE_SECONDS))
+            return error(400, TOO_LONG.format(seconds))
         raise
     finally:
+        _serving.on = False
         con.close()
 
 
@@ -7860,65 +8335,196 @@ def quote_name(name):
     return '"' + str(name).replace('"', '""') + '"'
 
 
+PAGE_ROWS = 200  # rows of the issues list and the gate history sent at a time
+PAGE_MAX = 500
+
+
 class Request:
     """What a route handler is given: the project root, the ledger's path, this request's read-only connection, the
     path's '*' segments in order (args), the query string and, for a POST, the JSON body."""
 
-    def __init__(self, root, db, con, args, qs, body):
+    def __init__(self, root, db, con, args, qs, body, whole=False):
         self.root, self.db, self.con, self.args, self.qs, self.body = root, db, con, args, qs, body
+        self.whole = whole  # the hub's snapshot asks for every row of a list, not a page of it
+        self.cached = getattr(_serving, "on", False)  # the running viewer may answer a slow route from CACHE
 
     def arg(self, name, default=None):
         return self.qs.get(name, [default])[0]
+
+    def page(self):
+        """(limit, offset) of a paged list: ?limit= (1 to PAGE_MAX, default PAGE_ROWS) and ?offset=."""
+        if self.whole:
+            return -1, 0
+        return int_arg(self.qs, "limit", PAGE_ROWS, 1, PAGE_MAX), int_arg(self.qs, "offset", 0, 0)
 
 
 class Route:
     """One row of ROUTES: an HTTP method, a path under /api/ ('*' is one segment of any text, handed to the handler
     in Request.args) and its handler. hub, for a GET: the paths of this route the published hub embeds for this
-    ledger (hub(con) -> ["review/R-0001", ...]); the hub is read-only, so a POST has none."""
+    ledger (hub(con) -> ["review/R-0001", ...]); the hub is read-only, so a POST has none. seconds: how long the
+    viewer lets this route read before it stops it (ROUTE_SECONDS unless given)."""
 
-    def __init__(self, method, path, handler, hub=None):
+    def __init__(self, method, path, handler, hub=None, seconds=None):
         self.method, self.pattern, self.handler, self.hub = method, tuple(path.split("/")), handler, hub
+        self.seconds = seconds
+
+
+def queue_counts(con):
+    """What the Waiting on you badge counts: queue_count, everything in the owner's queue still to act on (open
+    gates, waiting steps, open decisions, proposed goals) and answered_count, answers the agent has not acted on."""
+    r = one(con, """SELECT COALESCE(sum(NOT (kind = 'gate' AND status = 'answered')), 0) queue_count,
+                           COALESCE(sum(kind = 'gate' AND status = 'answered'), 0) answered_count,
+                           COALESCE(sum(kind = 'gate' AND status = 'open'), 0) gates_open FROM v_owner_queue""")
+    return dict(r)
 
 
 def get_overview(rq):
+    """What every page needs: the project, the labels of the ledger's words and the counts behind the Waiting on
+    you badge. Kept to a few small reads, because the page asks for it on every navigation and every 30 s."""
     con = rq.con
     meta = {r["key"]: r["value"] for r in rows(con, "SELECT key, value FROM meta")}
     return {
         "project": meta.get("project_name", rq.root.name),
         "schema_version": meta.get("schema_version"),
-        "open_by_severity": rows(con, f"SELECT severity, count(*) n FROM issues WHERE status IN {ACTIVE} GROUP BY severity"),
-        "issues_by_status": rows(con, "SELECT status, count(*) n FROM issues GROUP BY status"),
-        "gates_open": one(con, "SELECT count(*) n FROM v_pending_gates WHERE status = 'open'")["n"],
-        "queue": one(con, "SELECT count(*) n FROM v_owner_queue")["n"],
-        "reviews": rows(con, """SELECT r.code, r.title, r.scope, r.status, r.started_at, r.completed_at, r.verdict,
-            t.points, t.high FROM v_review_totals t JOIN reviews r ON r.code = t.review
-            WHERE t.review IN (SELECT code FROM reviews ORDER BY started_at DESC LIMIT 5)
-            ORDER BY r.started_at DESC"""),
-        "plans": rows(con, """SELECT plan code, title, status, steps, done, waiting_owner waiting
-            FROM v_plan_totals ORDER BY created_at DESC"""),
-        "recurring": one(con, "SELECT count(*) n FROM v_recurring_issues")["n"],
-        "checks": [{"label": label, "view": v, "tier": tier, "n": count_view(con, v)}
-                   for v, label, tier in (ledger_checks(con) or [])],
+        **queue_counts(con),
         "labels": {**{t: {r["code"]: r["name"] for r in rows(con, f"SELECT code, name FROM {t}")} for t in LABEL_TABLES},
                    "enums": enum_labels(con)},
     }
 
 
-def get_gates(rq):
-    """?status=pending (the default: v_pending_gates), all, or one gate status."""
-    con, st = rq.con, rq.arg("status", "pending")
-    where = {"pending": "g.id IN (SELECT id FROM v_pending_gates)", "all": "1"}.get(st, "g.status = ?")
-    args = () if st in ("pending", "all") else (st,)
-    gates = rows(con, f"""SELECT g.*, r.code review_code, pl.code plan_code, s.number step_number,
-            i.code issue_code, d.code decision_code FROM gates g
-            LEFT JOIN reviews r ON r.id=g.review_id LEFT JOIN plans pl ON pl.id=g.plan_id
+def get_home(rq):
+    """What the home page lists: issues by severity and status, the latest reviews and every plan with its step
+    counts (v_plan_totals, so the bar matches the plans page)."""
+    con = rq.con
+    return {
+        "open_by_severity": rows(con, f"SELECT severity, count(*) n FROM issues WHERE status IN {ACTIVE} GROUP BY severity"),
+        "issues_by_status": rows(con, "SELECT status, count(*) n FROM issues GROUP BY status"),
+        "reviews": rows(con, """SELECT r.code, r.title, r.scope, r.status, r.started_at, r.completed_at, r.verdict,
+            t.points, t.high FROM reviews r JOIN v_review_totals t ON t.review = r.code
+            WHERE r.id IN (SELECT id FROM reviews ORDER BY started_at DESC LIMIT 5)
+            ORDER BY r.started_at DESC"""),
+        "plans": rows(con, """SELECT plan code, title, status, steps, done, doing, waiting_owner waiting
+            FROM v_plan_totals ORDER BY created_at DESC"""),
+        "discoveries": one(con, """SELECT count(*) n FROM findings WHERE discovered_in_step_id IS NOT NULL
+                                   AND verification <> 'false'""")["n"],
+    }
+
+
+# What the agent does about a non-empty check, in one sentence the owner can read, by check view. The steps are in
+# references/recipes.md under "A failing check", one heading per view (a test keeps the two lists equal).
+CHECK_ACTIONS = {
+    "v_unmatched_findings": "The agent matches each of these points to an issue.",
+    "v_unchecked_known_issues": "The agent records, for each known issue, whether a reviewer looked for it.",
+    "v_untraceable_refs": "The agent tags the reviewed commit and saves the cited lines.",
+    "v_uncovered_findings": "The agent adds each point to a step of its fix plan.",
+    "v_coverage_problems": "The agent gives a reason for a step that closes nothing, or for a point closed twice.",
+    "v_unplanned_discoveries": "The agent puts each defect found during fixes into a plan step, or asks you.",
+    "v_history_gaps": "Something wrote to the ledger outside the tool; the agent tells you what it found.",
+    "v_match_problems": "The agent matches the point again: its match disagrees with its issue.",
+    "v_off_plan_coverage": "The agent adds the point's review to the plan, or moves the point to a plan that covers it.",
+    "v_done_steps_open_issues": "The agent marks the issues of a finished step fixed, or notes why one stays open.",
+    "v_closed_without_reason": "The agent records why the issue was accepted or declined.",
+    "v_relation_problems": "The agent records the link between the two issues once, in one direction.",
+    "v_check_finding_owner": "The agent records the check again in the review its point belongs to.",
+    "v_unguarded_fixes": "The agent records a test that guards each fix listed.",
+    "v_artifacts_outside_ledger": "The agent copies the file into the ledger's folder and records it there.",
+}
+RECIPES_FILE = "references/recipes.md"
+
+
+def check_help(view):
+    """(what the agent does about this check, where its recipe is) for the viewer's checks panel."""
+    return (CHECK_ACTIONS.get(view, "The agent reads the rows and corrects what they list."),
+            f'{RECIPES_FILE}, under "A failing check": {view}')
+
+
+def check_link(con, view):
+    """The page that shows a check's rows, as a viewer address: the review whose points are not matched, the plan
+    whose points no step closes, else the view in Explore."""
+    try:
+        if view == "v_unmatched_findings":
+            r = con.execute("SELECT review FROM v_unmatched_findings LIMIT 1").fetchone()
+            if r:
+                return f"#/review/{r[0]}?match=none"
+        if view == "v_uncovered_findings":
+            r = con.execute("SELECT plan FROM v_uncovered_findings WHERE plan IS NOT NULL LIMIT 1").fetchone()
+            if r:
+                return f"#/plan/{r[0]}"
+    except sqlite3.Error:
+        pass
+    return f"#/explore/{view}"
+
+
+def get_checks(rq):
+    """The ledger's own checks (each ledger_checks view with its row count) and the count of issues that came back.
+    These scan the whole ledger, so the home page asks for them after it has drawn and they get CHECKS_SECONDS."""
+    con = rq.con
+    checks = []
+    for v, label, tier in ledger_checks(con) or []:
+        n = count_view(con, v)
+        action, recipe = check_help(v)
+        checks.append({"label": label, "view": v, "tier": tier, "n": n, "action": action, "recipe": recipe,
+                       "link": check_link(con, v) if n else None})
+    return {"checks": checks, "recurring": one(con, "SELECT count(*) n FROM v_recurring_issues")["n"]}
+
+
+GATE_LINKS = """LEFT JOIN reviews r ON r.id=g.review_id LEFT JOIN plans pl ON pl.id=g.plan_id
             LEFT JOIN steps s ON s.id=g.step_id LEFT JOIN issues i ON i.id=g.issue_id
-            LEFT JOIN decisions d ON d.id=g.decision_id
-            WHERE {where} ORDER BY g.status='answered', g.blocking DESC, g.created_at""", args)
+            LEFT JOIN decisions d ON d.id=g.decision_id"""
+
+
+def answer_label(options, value):
+    """The label of the option a gate was answered with (the stored value when its options do not have it)."""
+    if value is None:
+        return None
+    try:
+        opts = json.loads(options) if isinstance(options, str) else (options or [])
+    except ValueError:
+        opts = []
+    return next((o.get("label") for o in opts if isinstance(o, dict) and o.get("value") == value), None) or value
+
+
+def get_gates(rq):
+    """?status=pending (the default: v_pending_gates, whole gates in inbox order with the rest of the owner's
+    queue), or the history: all or one gate status, newest first, a page at a time (?limit=, ?offset=, or ?at=
+    a gate's code for the page it is on) with the total. A history row is the short form of a gate: no context or question, and answer_label for its options."""
+    con, st = rq.con, rq.arg("status", "pending")
+    if st == "pending":
+        gates = rows(con, f"""SELECT g.*, r.code review_code, pl.code plan_code, s.number step_number,
+                i.code issue_code, d.code decision_code FROM gates g {GATE_LINKS}
+                WHERE g.id IN (SELECT id FROM v_pending_gates)
+                ORDER BY g.status='answered', g.blocking DESC, g.created_at""")
+        for g in gates:
+            g["options"] = json.loads(g["options"]) if g["options"] else []
+        return {"gates": gates, "other": rows(con, "SELECT * FROM v_owner_queue WHERE kind <> 'gate'")}
+    where, args = ("1", ()) if st == "all" else ("g.status = ?", (st,))
+    limit, offset = rq.page()
+    at = rq.arg("at")  # a gate's code: the page that gate is on
+    if at and limit > 0:
+        newer = one(con, f"""SELECT count(*) n FROM gates g, gates t WHERE t.code = ? AND {where}
+                             AND (g.created_at > t.created_at OR (g.created_at = t.created_at AND g.id > t.id))""",
+                    (at, *args))["n"]
+        offset = newer - newer % limit
+    gates = rows(con, f"""SELECT g.code, g.kind, g.title, g.status, g.blocking, g.created_at, g.answered_at,
+            g.answered_via, g.answer_value, g.answer_text, g.applied_at, g.applied_note, g.options,
+            r.code review_code, pl.code plan_code, s.number step_number, i.code issue_code, d.code decision_code
+            FROM gates g {GATE_LINKS} WHERE {where} ORDER BY g.created_at DESC, g.id DESC LIMIT ? OFFSET ?""",
+                 (*args, limit, offset))
     for g in gates:
-        g["options"] = json.loads(g["options"]) if g["options"] else []
-    other = rows(con, "SELECT * FROM v_owner_queue WHERE kind <> 'gate'")
-    return {"gates": gates, "other": other}
+        g["answer_label"] = answer_label(g.pop("options"), g["answer_value"])
+    total = one(con, f"SELECT count(*) n FROM gates g WHERE {where}", args)["n"]
+    return {"gates": gates, "total": total, "limit": len(gates) if rq.whole else limit, "offset": offset}
+
+
+def get_decisions(rq):
+    """Every decision of the owner: those still open or to look at again first, then the decided ones newest first,
+    each with the issues it settles."""
+    return {"decisions": rows(rq.con, """SELECT d.code, d.question, d.answer, d.rationale, d.status, d.revisit_when,
+            d.asked_at, d.decided_at, r.code review,
+            (SELECT group_concat(i.code, ', ') FROM decision_issues di JOIN issues i ON i.id = di.issue_id
+              WHERE di.decision_id = d.id) issues
+            FROM decisions d LEFT JOIN reviews r ON r.id = d.review_id
+            ORDER BY d.status = 'decided', COALESCE(d.decided_at, d.asked_at) DESC, d.id DESC""")}
 
 
 def post_gate_answer(rq):
@@ -7929,11 +8535,65 @@ def get_reviews(rq):
     return rows(rq.con, """SELECT r.code, r.title, r.scope, r.status, r.started_at, r.completed_at, r.verdict,
         (SELECT group_concat(rp.name || ' ' || substr(rr.commit_sha,1,10) || COALESCE(' on ' || rr.branch, ''), ' · ')
            FROM review_repositories rr JOIN repositories rp ON rp.id=rr.repository_id WHERE rr.review_id=r.id) commits,
-        t.points, t.high, t.medium, t.low, t.new_issues, t.came_back
+        t.points, t.high, t.medium, t.low, t.tests, t.new_issues, t.came_back
         FROM v_review_totals t JOIN reviews r ON r.code = t.review ORDER BY r.started_at DESC""")
 
 
+def came_back_rule():
+    """The condition on an issue event e that means the issue came back, taken from the shipped v_review_summary
+    so the view stays its one definition."""
+    m = re.search(r"CREATE VIEW v_review_summary AS.*?AND (\(\(e\.event = 'status-changed'.*?OR e\.event = 'recurred'\))",
+                  SCHEMA, re.S)
+    if not m:
+        raise LedgerError("v_review_summary does not spell out when an issue came back; review_summary() reads it")
+    return m.group(1)
+
+
+def review_summary(con, review_id=None):
+    """The rows of v_review_summary (points per review and domain), for one review or all, without the view's
+    per-row subquery: one pass over the findings and one over the issue events that mean an issue came back. The
+    view stays the definition; a test keeps the two equal."""
+    one_review = "" if review_id is None else "AND r.id = ?"
+    args = () if review_id is None else (review_id,)
+    out = rows(con, f"""SELECT r.code AS review, r.started_at, f.domain_code, r.id AS review_id,
+        sum(f.verification <> 'false') AS points,
+        sum(f.verification <> 'false' AND f.severity = 'H') AS high,
+        sum(f.verification <> 'false' AND f.severity = 'M') AS medium,
+        sum(f.verification <> 'false' AND f.severity = 'L') AS low,
+        sum(f.verification <> 'false' AND f.severity = 'T') AS tests,
+        sum(f.verification = 'confirmed') AS confirmed,
+        sum(f.verification = 'false') AS false_findings,
+        sum(f.verification <> 'false' AND f.match_type IN ('new','continuation')) AS new_issues,
+        sum(f.verification <> 'false' AND f.match_type IN ('still-present','changed')) AS carried_over
+        FROM findings f JOIN reviews r ON r.id = f.review_id WHERE 1 {one_review}
+        GROUP BY r.id, r.code, f.domain_code ORDER BY r.started_at, f.domain_code""", args)
+    # CROSS JOIN fixes the order (each event, then that issue's findings): the planner, on a ledger without
+    # statistics, may otherwise walk every finding for every event.
+    back = {(r[0], r[1]): r[2] for r in con.execute(f"""SELECT e.review_id, f2.domain_code, count(DISTINCT e.entity_id)
+        FROM events e CROSS JOIN findings f2 ON f2.issue_id = e.entity_id AND f2.review_id = e.review_id
+             AND f2.verification <> 'false'
+        WHERE e.entity_type = 'issue' AND e.review_id IS NOT NULL AND {came_back_rule()}
+              {one_review.replace('r.id', 'e.review_id')}
+        GROUP BY e.review_id, f2.domain_code""", args)}
+    for r in out:
+        r["came_back"] = back.get((r.pop("review_id"), r["domain_code"]), 0)
+    return out
+
+
+def like_arg(text):
+    """text as a LIKE pattern that matches it anywhere, with % and _ taken as themselves (use with LIKE_ESCAPED)."""
+    return "%" + re.sub(r"([\\%_])", r"\\\1", text) + "%"
+
+
+LIKE_ESCAPED = "LIKE ? ESCAPE '\\'"
+REVIEW_CHECKS = 50  # earlier issues listed with a review; the rest come from review/<code>/checks
+
+
 def get_review(rq):
+    """A review's page: the review, what it covered, who ran, and its points as list rows (enough for the row, the
+    filters and the search of ids and summaries; a point's detail and code references are /api/finding/<id>).
+    The earlier issues it looked for come as counts by outcome and the first REVIEW_CHECKS rows. With ?q=text the
+    answer is only {"match": [finding ids]}: the points whose text or cited paths contain it."""
     con, code = rq.con, rq.args[0]
     r = one(con, """SELECT r.*, m.name manager, m.model manager_model, a.name approved_by,
                     pr.code previous_code FROM reviews r
@@ -7942,48 +8602,126 @@ def get_review(rq):
     if not r:
         return error(404, "no such review")
     rid = r["id"]
-    findings = rows(con, """SELECT f.*, i.code issue_code, i.status issue_status, rr.label run_label
-        FROM findings f LEFT JOIN issues i ON i.id=f.issue_id LEFT JOIN reviewer_runs rr ON rr.id=f.reviewer_run_id
-        WHERE f.review_id=? ORDER BY CASE f.severity WHEN 'H' THEN 0 WHEN 'M' THEN 1 WHEN 'L' THEN 2 ELSE 3 END, length(f.point_id), f.point_id""", (rid,))
-    locs = rows(con, """SELECT fl.id, fl.finding_id, fl.path, fl.line_start, fl.line_end, fl.symbol, fl.role,
-        fl.commit_sha, fl.permalink, rp.name repo FROM finding_locations fl
-        JOIN findings f ON f.id=fl.finding_id JOIN repositories rp ON rp.id=fl.repository_id WHERE f.review_id=?""", (rid,))
-    by = {}
-    for l in locs:
-        by.setdefault(l["finding_id"], []).append(l)
-    for f in findings:
-        f["locations"] = by.get(f["id"], [])
+    q = (rq.arg("q") or "").strip()
+    if q:
+        like = LIKE_ESCAPED
+        return {"match": [x[0] for x in con.execute(f"""SELECT f.id FROM findings f LEFT JOIN issues i ON i.id=f.issue_id
+            WHERE f.review_id=? AND (f.point_id {like} OR f.summary {like} OR f.detail {like} OR f.before_state {like}
+              OR f.recommendation {like} OR f.recommended_test {like} OR f.evidence {like} OR i.code {like}
+              OR EXISTS (SELECT 1 FROM finding_locations fl WHERE fl.finding_id=f.id
+                         AND (fl.path {like} OR fl.symbol {like})))""", (rid, *[like_arg(q)] * 10))]}
+    findings = rows(con, """SELECT f.id, f.point_id, f.severity, f.kind, f.domain_code, f.theme_code, f.summary,
+        f.match_type, f.verification, i.code issue_code
+        FROM findings f LEFT JOIN issues i ON i.id=f.issue_id WHERE f.review_id=?
+        ORDER BY CASE f.severity WHEN 'H' THEN 0 WHEN 'M' THEN 1 WHEN 'L' THEN 2 ELSE 3 END, length(f.point_id), f.point_id""", (rid,))
     return {
         "review": r,
-        "repos": rows(con, """SELECT rp.name, rr.* FROM review_repositories rr JOIN repositories rp
+        "repos": rows(con, """SELECT rp.name, rp.remote_url, rp.default_branch, rp.notes, rr.*
+                              FROM review_repositories rr JOIN repositories rp
                               ON rp.id=rr.repository_id WHERE rr.review_id=?""", (rid,)),
         "goals": rows(con, """SELECT g.code, g.text FROM review_goals rg JOIN design_goals g ON g.id=rg.goal_id
                               WHERE rg.review_id=? ORDER BY g.code""", (rid,)),
+        "test_runs": rows(con, """SELECT t.command, t.purpose, t.passed, t.failed, t.skipped, t.errored, t.exit_code,
+                              t.duration_ms, t.output_path, t.notes, t.started_at, t.commit_sha, rp.name repo
+                              FROM test_runs t LEFT JOIN repositories rp ON rp.id=t.repository_id
+                              WHERE t.review_id=? ORDER BY t.started_at, t.id""", (rid,)),
+        "relations": rows(con, """SELECT a.code from_issue, x.relation, b.code to_issue, b.title to_title,
+                              x.confidence, x.rationale FROM issue_relations x JOIN issues a ON a.id=x.from_issue_id
+                              JOIN issues b ON b.id=x.to_issue_id WHERE x.established_in_review_id=?
+                              ORDER BY a.code, b.code""", (rid,)),
+        "events": entity_events(con, "review", rid),
         "domains": rows(con, """SELECT rd.*, d.name, d.category FROM review_domains rd JOIN domains d ON d.code=rd.domain_code
                                 WHERE rd.review_id=? ORDER BY rd.decision, d.category, d.name""", (rid,)),
-        "runs": rows(con, """SELECT rr.*, a.name actor, a.model FROM reviewer_runs rr JOIN actors a ON a.id=rr.actor_id
+        # a run's prompt and final message are long: /api/run/<id> sends them when its row is opened
+        "runs": rows(con, """SELECT rr.id, rr.domain_code, rr.label, rr.scope, rr.report_path, rr.status,
+                             rr.items_reviewed, rr.high_count, rr.medium_count, rr.low_count, rr.test_count,
+                             rr.started_at, rr.finished_at, a.name actor, a.model, a.harness, a.session_ref session
+                             FROM reviewer_runs rr JOIN actors a ON a.id=rr.actor_id
                              WHERE rr.review_id=? ORDER BY rr.domain_code, rr.label""", (rid,)),
-        "checks": rows(con, """SELECT c.outcome, c.evidence, i.code issue_code, i.title, i.status
-                               FROM review_issue_checks c JOIN issues i ON i.id=c.issue_id WHERE c.review_id=?
-                               ORDER BY c.outcome, i.code""", (rid,)),
-        "summary": rows(con, "SELECT * FROM v_review_summary WHERE review=?", (code,)),
+        "checks": review_checks(con, rid, REVIEW_CHECKS, 0),
+        "check_counts": rows(con, """SELECT outcome, count(*) n FROM review_issue_checks WHERE review_id=?
+                                     GROUP BY outcome ORDER BY outcome""", (rid,)),
+        "summary": review_summary(con, rid),
         "agents": rows(con, "SELECT * FROM v_review_agents WHERE review=?", (code,)),
         "requirements": rows(con, "SELECT * FROM v_requirement_trace WHERE review=?", (code,)),
         "metrics": rows(con, """SELECT m.name, m.scope, m.value, COALESCE(m.unit, md.unit) unit, m.method, m.note,
             COALESCE(md.label, upper(substr(m.name, 1, 1)) || replace(substr(m.name, 2), '_', ' ')) label,
             COALESCE(md.better, 'none') better
             FROM metrics m LEFT JOIN metric_defs md ON md.name=m.name WHERE m.review_id=? ORDER BY m.name, m.scope""", (rid,)),
-        "artifacts": rows(con, "SELECT kind, path, url FROM artifacts WHERE review_id=? ORDER BY kind", (rid,)),
-        "gates": rows(con, "SELECT code, kind, title, status, answer_value, answer_text FROM gates WHERE review_id=? ORDER BY created_at", (rid,)),
+        "artifacts": rows(con, """SELECT a.kind, a.path, a.url, a.created_at, rr.label run FROM artifacts a
+                                  LEFT JOIN reviewer_runs rr ON rr.id=a.reviewer_run_id
+                                  WHERE a.review_id=? ORDER BY a.kind, a.id""", (rid,)),
+        "gates": [{**g, "answer_label": answer_label(g.pop("options"), g["answer_value"])} for g in rows(
+            con, """SELECT code, kind, title, status, answer_value, answer_text, options FROM gates
+                    WHERE review_id=? ORDER BY created_at""", (rid,))],
         "interview": interview_list(con, code) if has_table(con, "interview_questions") else [],
         "review_goals": goals_list(con, include_all=True, review=code) if has_table(con, "goal_statuses") else [],
         "findings": findings,
     }
 
 
+def entity_events(con, entity_type, entity_id, limit=200):
+    """The history of one review or plan: its events, oldest first (the latest `limit` of them)."""
+    got = rows(con, """SELECT e.at, e.event, e.from_value, e.to_value, e.note, a.name actor FROM events e
+                       LEFT JOIN actors a ON a.id=e.actor_id WHERE e.entity_type=? AND e.entity_id=?
+                       ORDER BY e.at DESC, e.id DESC LIMIT ?""", (entity_type, entity_id, limit))
+    return got[::-1]
+
+
+def get_run(rq):
+    """What a reviewer was asked and what it answered: the two long texts of one reviewer run."""
+    r = one(rq.con, "SELECT id, label, prompt, final_message FROM reviewer_runs WHERE id=?",
+            (whole_number(rq.args[0], "The run id"),))
+    return r or error(404, "no such reviewer run")
+
+
+def review_checks(con, review_id, limit, offset):
+    return rows(con, """SELECT c.outcome, c.evidence, i.code issue_code, i.title, i.status
+                        FROM review_issue_checks c JOIN issues i ON i.id=c.issue_id WHERE c.review_id=?
+                        ORDER BY c.outcome, i.code LIMIT ? OFFSET ?""", (review_id, limit, offset))
+
+
+def get_review_checks(rq):
+    """Every earlier issue a review looked for, a page at a time (?limit=, ?offset=) with the total."""
+    r = one(rq.con, "SELECT id FROM reviews WHERE code=?", (rq.args[0],))
+    if not r:
+        return error(404, "no such review")
+    limit, offset = rq.page()
+    found = review_checks(rq.con, r["id"], limit, offset)
+    total = one(rq.con, "SELECT count(*) n FROM review_issue_checks WHERE review_id=?", (r["id"],))["n"]
+    return {"rows": found, "total": total, "limit": len(found) if rq.whole else limit, "offset": offset}
+
+
+# With a point: who checked it, and the plan step it was found in during fix work (None for a reviewer's point).
+FINDING_EXTRAS = "va.name verified_by, ds.number discovered_in_step, dp.code discovered_in_plan"
+FINDING_EXTRA_JOINS = """LEFT JOIN actors va ON va.id=f.verified_by_actor_id
+        LEFT JOIN steps ds ON ds.id=f.discovered_in_step_id LEFT JOIN plans dp ON dp.id=ds.plan_id"""
+LOCATION_COLUMNS = """fl.id, fl.finding_id, fl.path, fl.line_start, fl.line_end, fl.symbol, fl.role, fl.commit_sha,
+    fl.permalink, rp.name repo"""
+
+
+def get_finding(rq):
+    """One point in full: every column, its issue, its reviewer and the code it cites."""
+    f = one(rq.con, f"""SELECT f.*, r.code review_code, i.code issue_code, i.status issue_status, rr.label run_label,
+        {FINDING_EXTRAS}
+        FROM findings f JOIN reviews r ON r.id=f.review_id LEFT JOIN issues i ON i.id=f.issue_id
+        LEFT JOIN reviewer_runs rr ON rr.id=f.reviewer_run_id {FINDING_EXTRA_JOINS} WHERE f.id=?""",
+            (whole_number(rq.args[0], "The point id"),))
+    if not f:
+        return error(404, "no such point")
+    f["goals"] = rows(rq.con, """SELECT g.code, g.text FROM finding_goals fg JOIN design_goals g ON g.id=fg.goal_id
+                                 WHERE fg.finding_id=? ORDER BY g.code""", (f["id"],))
+    f["requirements"] = rows(rq.con, """SELECT q.code, q.text, fr.verdict FROM finding_requirements fr
+        JOIN requirements q ON q.id=fr.requirement_id WHERE fr.finding_id=? ORDER BY q.code""", (f["id"],))
+    f["locations"] = rows(rq.con, f"""SELECT {LOCATION_COLUMNS} FROM finding_locations fl
+        JOIN repositories rp ON rp.id=fl.repository_id WHERE fl.finding_id=? ORDER BY fl.id""", (f["id"],))
+    return f
+
+
 def get_issues(rq):
     """?status= (active: the statuses still to fix; else one status), severity=, domain_code= (exact) and q= (text in
-    the code, title, sub, a finding's point id or summary, or a location's path), all ANDed."""
+    the code, title, sub, a finding's point id or summary, or a location's path), all ANDed; a page at a time
+    (?limit=, ?offset=) with the total the filters match."""
     where, args = ["1"], []
     for k in ("status", "severity", "domain_code"):
         v = rq.arg(k)
@@ -7993,13 +8731,20 @@ def get_issues(rq):
             where.append(f"i.{k} = ?"); args.append(v)
     q = rq.arg("q")
     if q:
-        where.append("(i.code LIKE ? OR i.title LIKE ? OR i.sub LIKE ? OR EXISTS (SELECT 1 FROM findings f LEFT JOIN finding_locations fl ON fl.finding_id=f.id WHERE f.issue_id=i.id AND (f.point_id LIKE ? OR f.summary LIKE ? OR fl.path LIKE ?)))")
-        args += [f"%{q}%"] * 6
-    return rows(rq.con, f"""SELECT i.code, i.title, i.severity, i.status, i.domain_code, i.theme_code, i.times_seen,
+        like = LIKE_ESCAPED  # % and _ in the search text are matched as themselves
+        where.append(f"""(i.code {like} OR i.title {like} OR i.sub {like} OR EXISTS (
+            SELECT 1 FROM findings f LEFT JOIN finding_locations fl ON fl.finding_id=f.id
+            WHERE f.issue_id=i.id AND (f.point_id {like} OR f.summary {like} OR fl.path {like})))""")
+        args += [like_arg(q)] * 6
+    limit, offset = rq.page()
+    found = rows(rq.con, f"""SELECT i.code, i.title, i.severity, i.status, i.domain_code, i.theme_code, i.times_seen,
         i.opened_at, i.updated_at, fr.code first_seen, lr.code last_seen
         FROM issues i JOIN reviews fr ON fr.id=i.first_seen_review_id LEFT JOIN reviews lr ON lr.id=i.last_seen_review_id
         WHERE {' AND '.join(where)}
-        ORDER BY CASE i.severity WHEN 'H' THEN 0 WHEN 'M' THEN 1 WHEN 'L' THEN 2 ELSE 3 END, i.id LIMIT 2000""", args)
+        ORDER BY CASE i.severity WHEN 'H' THEN 0 WHEN 'M' THEN 1 WHEN 'L' THEN 2 ELSE 3 END, i.id
+        LIMIT ? OFFSET ?""", (*args, limit, offset))
+    total = one(rq.con, f"SELECT count(*) n FROM issues i WHERE {' AND '.join(where)}", args)["n"]
+    return {"rows": found, "total": total, "limit": len(found) if rq.whole else limit, "offset": offset}
 
 
 def get_issue(rq):
@@ -8010,21 +8755,24 @@ def get_issue(rq):
     if not i:
         return error(404, "no such issue")
     iid = i["id"]
-    findings = rows(con, """SELECT f.*, r.code review_code, r.started_at review_at FROM findings f
-                            JOIN reviews r ON r.id=f.review_id WHERE f.issue_id=? ORDER BY r.started_at""", (iid,))
+    findings = rows(con, f"""SELECT f.*, r.code review_code, r.started_at review_at, {FINDING_EXTRAS}
+                             FROM findings f JOIN reviews r ON r.id=f.review_id {FINDING_EXTRA_JOINS}
+                             WHERE f.issue_id=? ORDER BY r.started_at""", (iid,))
+    by = {}
+    for loc in rows(con, f"""SELECT {LOCATION_COLUMNS} FROM finding_locations fl JOIN findings f ON f.id=fl.finding_id
+                             JOIN repositories rp ON rp.id=fl.repository_id WHERE f.issue_id=? ORDER BY fl.id""", (iid,)):
+        by.setdefault(loc.pop("finding_id"), []).append(loc)
     for f in findings:
-        f["locations"] = rows(con, """SELECT fl.id, fl.path, fl.line_start, fl.line_end, fl.symbol, fl.role, fl.commit_sha,
-            fl.permalink, rp.name repo FROM finding_locations fl JOIN repositories rp ON rp.id=fl.repository_id
-            WHERE fl.finding_id=?""", (f["id"],))
+        f["locations"] = by.get(f["id"], [])
     return {
         "issue": i,
         "findings": findings,
-        "relations": rows(con, """SELECT 'out' dir, r.relation, b.code other, b.title other_title, b.status other_status,
-                r.confidence, r.rationale, rv.code review FROM issue_relations r JOIN issues b ON b.id=r.to_issue_id
-                LEFT JOIN reviews rv ON rv.id=r.established_in_review_id WHERE r.from_issue_id=?
-            UNION ALL SELECT 'in', r.relation, a.code, a.title, a.status, r.confidence, r.rationale, rv.code
-                FROM issue_relations r JOIN issues a ON a.id=r.from_issue_id
-                LEFT JOIN reviews rv ON rv.id=r.established_in_review_id WHERE r.to_issue_id=?""", (iid, iid)),
+        "relations": rows(con, """SELECT 'out' dir, g.relation, b.code other, b.title other_title, b.status other_status,
+                g.confidence, g.rationale, g.established_in review FROM v_issue_graph g JOIN issues b ON b.code=g.to_issue
+                WHERE g.from_issue=?
+            UNION ALL SELECT 'in', g.relation, a.code, a.title, a.status, g.confidence, g.rationale, g.established_in
+                FROM v_issue_graph g JOIN issues a ON a.code=g.from_issue WHERE g.to_issue=?""", (code, code)),
+        "unguarded": rows(con, "SELECT problem FROM v_unguarded_fixes WHERE code=?", (code,)),
         "checks": rows(con, """SELECT r.code review, r.started_at, c.outcome, c.evidence FROM review_issue_checks c
                                JOIN reviews r ON r.id=c.review_id WHERE c.issue_id=? ORDER BY r.started_at""", (iid,)),
         "timeline": rows(con, "SELECT * FROM v_issue_timeline WHERE code=?", (code,)),
@@ -8043,33 +8791,120 @@ def get_plans(rq):
         waiting_owner waiting, reviews FROM v_plan_totals ORDER BY created_at DESC""")
 
 
+STEP_SEARCH = 2000  # characters of a step's search text sent with a plan
+# What a step's row in a plan's list carries, and what is added when the step is shown in full.
+STEP_ROW = "s.id, s.number, s.section, s.title, s.status, s.owner_need, s.behavior_change, ph.number phase"
+STEP_FULL = ("s.change, s.proof, s.owner_question, s.behavior_note, s.progress_note, s.no_findings_reason, "
+             "s.started_at, s.done_at, s.updated_at")
+
+
+def _plan_closes(con, where, args):
+    """{step id: [the points it closes]} for the steps a WHERE on steps s picks."""
+    out = {}
+    for c in rows(con, f"""SELECT sf.step_id, f.id, f.point_id, f.severity, f.summary, r.code review, i.code issue
+                           FROM step_findings sf JOIN steps s ON s.id=sf.step_id JOIN findings f ON f.id=sf.finding_id
+                           JOIN reviews r ON r.id=f.review_id LEFT JOIN issues i ON i.id=f.issue_id
+                           WHERE {where} ORDER BY sf.step_id, f.id""", args):
+        out.setdefault(c.pop("step_id"), []).append(c)
+    return out
+
+
+def _step_commits(con, where, args):
+    out = {}
+    for c in rows(con, f"""SELECT sc.step_id, sc.commit_sha, sc.branch, sc.pr_url, sc.summary, sc.committed_at
+                           FROM step_commits sc
+                           JOIN steps s ON s.id=sc.step_id WHERE {where} ORDER BY sc.id""", args):
+        out.setdefault(c.pop("step_id"), []).append(c)
+    return out
+
+
 def get_plan(rq):
+    """A plan's page. Every step comes as a list row (STEP_ROW) with the numbers of the steps it depends on, the
+    ids of the points it closes and search: lower-case text of its number, title, point ids, issue codes, proof
+    and change, cut to STEP_SEARCH, so the page's search covers every phase. The steps of one phase (?phase=N,
+    default the first) also carry their text and notes (STEP_FULL) and commits; any step in full, with the points
+    it closes, is /api/step/<plan>/<number>. The hub's copy carries every step in full and those points as
+    findings {id: row}."""
     con, code = rq.con, rq.args[0]
     pl = one(con, "SELECT * FROM plans WHERE code=?", (code,))
     if not pl:
         return error(404, "no such plan")
     pid = pl["id"]
-    steps = rows(con, """SELECT s.*, ph.number phase FROM steps s JOIN phases ph ON ph.id=s.phase_id
-                         WHERE s.plan_id=? ORDER BY s.number""", (pid,))
-    deps, closes, commits = {}, {}, {}
+    steps = rows(con, f"""SELECT {STEP_ROW}, {STEP_FULL} FROM steps s JOIN phases ph ON ph.id=s.phase_id
+                          WHERE s.plan_id=? ORDER BY s.number""", (pid,))
+    phase = int_arg(rq.qs, "phase", min([s["phase"] for s in steps] or [1]), 0)
+    deps, ids, words = {}, {}, {}
     for d in rows(con, """SELECT sd.step_id, s.number FROM step_dependencies sd JOIN steps s ON s.id=sd.depends_on_step_id
                           WHERE s.plan_id=?""", (pid,)):
         deps.setdefault(d["step_id"], []).append(d["number"])
-    for c in rows(con, """SELECT sf.step_id, f.point_id, f.severity, f.summary, r.code review, i.code issue
-                          FROM step_findings sf JOIN steps s ON s.id=sf.step_id JOIN findings f ON f.id=sf.finding_id
-                          JOIN reviews r ON r.id=f.review_id LEFT JOIN issues i ON i.id=f.issue_id WHERE s.plan_id=?""", (pid,)):
-        closes.setdefault(c["step_id"], []).append(c)
-    for c in rows(con, """SELECT sc.step_id, sc.commit_sha, sc.branch, sc.pr_url, sc.summary FROM step_commits sc
-                          JOIN steps s ON s.id=sc.step_id WHERE s.plan_id=?""", (pid,)):
-        commits.setdefault(c["step_id"], []).append(c)
+    for sid, fid, point, issue in con.execute("""SELECT sf.step_id, f.id, f.point_id, i.code FROM step_findings sf
+            JOIN steps s ON s.id=sf.step_id JOIN findings f ON f.id=sf.finding_id LEFT JOIN issues i ON i.id=f.issue_id
+            WHERE s.plan_id=? ORDER BY sf.step_id, f.id""", (pid,)):
+        ids.setdefault(sid, []).append(fid)
+        words.setdefault(sid, []).append(f"{point} {issue or ''}".strip())
+    commits = _step_commits(con, "s.plan_id=?" + ("" if rq.whole else " AND s.phase_id IN (SELECT id FROM phases "
+                            "WHERE plan_id=s.plan_id AND number=?)"), (pid,) if rq.whole else (pid, phase))
+    full = STEP_FULL.replace("s.", "").split(", ")
     for s in steps:
         s["depends"] = sorted(deps.get(s["id"], []))
-        s["closes"] = closes.get(s["id"], [])
-        s["commits"] = commits.get(s["id"], [])
-    return {"plan": pl,
-            "phases": rows(con, "SELECT * FROM v_plan_progress WHERE plan=?", (code,)),
-            "phase_rows": rows(con, "SELECT number, title, goal, why FROM phases WHERE plan_id=? ORDER BY number", (pid,)),
-            "steps": steps}
+        s["closes"] = ids.get(s["id"], [])
+        s["search"] = " ".join([str(s["number"]), s["title"] or ""] + words.get(s["id"], [])
+                               + [s["proof"] or "", s["change"] or ""]).lower()[:STEP_SEARCH]
+        if rq.whole or s["phase"] == phase:
+            s["commits"] = commits.get(s["id"], [])
+        else:
+            for k in full:
+                del s[k]
+    out = {"plan": pl,
+           "reviews": rows(con, """SELECT r.code, r.title FROM plan_reviews pr JOIN reviews r ON r.id=pr.review_id
+                                   WHERE pr.plan_id=? ORDER BY r.started_at, r.id""", (pid,)),
+           "artifacts": rows(con, "SELECT kind, path, url, created_at FROM artifacts WHERE plan_id=? ORDER BY kind, id",
+                             (pid,)),
+           "last_updated": one(con, """SELECT max(t) t FROM (SELECT max(updated_at) t FROM steps WHERE plan_id=?
+                                       UNION ALL SELECT updated_at FROM plans WHERE id=?)""", (pid, pid))["t"],
+           "gates": rows(con, """SELECT g.code, g.title, g.status, s.number step FROM gates g
+                                 LEFT JOIN steps s ON s.id=g.step_id
+                                 WHERE g.status IN ('open','answered') AND (g.plan_id=? OR s.plan_id=?)
+                                 ORDER BY g.status='answered', g.created_at""", (pid, pid)),
+           # defects found during fix work on this plan, with the step that now closes each (None: not planned yet)
+           "discoveries": rows(con, """SELECT f.id, f.point_id, f.summary, f.severity, r.code review, i.code issue,
+                    ds.number found_in_step,
+                    (SELECT min(cs.number) FROM step_findings sf JOIN steps cs ON cs.id=sf.step_id
+                      WHERE sf.finding_id=f.id AND cs.status <> 'dropped') closing_step
+                FROM findings f JOIN steps ds ON ds.id=f.discovered_in_step_id JOIN reviews r ON r.id=f.review_id
+                LEFT JOIN issues i ON i.id=f.issue_id
+                WHERE ds.plan_id=? AND f.verification <> 'false' ORDER BY ds.number, f.id""", (pid,)),
+           "events": entity_events(con, "plan", pid),
+           # each fixed issue without a guard test (the view), with the first step of this plan that closes it
+           "unguarded": rows(con, """SELECT * FROM (SELECT u.code, u.title, u.problem,
+                    (SELECT min(s.number) FROM issues i JOIN findings f ON f.issue_id = i.id
+                       JOIN step_findings sf ON sf.finding_id = f.id JOIN steps s ON s.id = sf.step_id
+                      WHERE i.code = u.code AND s.plan_id = ?) step
+                FROM v_unguarded_fixes u) WHERE step IS NOT NULL ORDER BY code""", (pid,)),
+           "phases": rows(con, "SELECT * FROM v_plan_progress WHERE plan=?", (code,)),
+           "phase_rows": rows(con, """SELECT ph.number, ph.title, ph.goal, ph.why, min(s.number) first_step,
+                                         max(s.number) last_step FROM phases ph LEFT JOIN steps s ON s.phase_id=ph.id
+                                         WHERE ph.plan_id=? GROUP BY ph.id ORDER BY ph.number""", (pid,)),
+           "steps": steps}
+    if rq.whole:
+        out["findings"] = {c["id"]: c for group in _plan_closes(con, "s.plan_id=?", (pid,)).values() for c in group}
+    return out
+
+
+def get_step(rq):
+    """One step of a plan in full: its text and notes (STEP_FULL), its commits and the points it closes."""
+    s = one(rq.con, f"""SELECT s.id, s.number, {STEP_FULL} FROM steps s JOIN plans p ON p.id=s.plan_id
+                        WHERE p.code=? AND s.number=?""", (rq.args[0], whole_number(rq.args[1], "The step number")))
+    if not s:
+        return error(404, "no such step")
+    sid = s.pop("id")
+    return {**s, "commits": _step_commits(rq.con, "s.id=?", (sid,)).get(sid, []),
+            "closes": _plan_closes(rq.con, "s.id=?", (sid,)).get(sid, [])}
+
+
+def get_guide(rq):
+    """The How it works page's text (Markdown the page draws itself)."""
+    return {"guide": HUB_GUIDE_MD}
 
 
 def get_goals(rq):
@@ -8080,14 +8915,68 @@ def get_goals(rq):
 
 
 def get_trends(rq):
-    con = rq.con
-    return {"metrics": rows(con, "SELECT * FROM v_metric_trends"),
-            "reviews": rows(con, """SELECT review, min(started_at) started_at, sum(points) points, sum(high) high,
-                sum(medium) medium, sum(low) low, sum(new_issues) new_issues, sum(carried_over) carried_over,
-                sum(came_back) came_back, sum(false_findings) false_findings
-                FROM v_review_summary GROUP BY review ORDER BY started_at"""),
-            "recurring": rows(con, "SELECT * FROM v_recurring_issues LIMIT 50"),
-            "hotspots": rows(con, "SELECT * FROM v_file_hotspots LIMIT 30")}
+    """How the numbers moved between reviews: each review's points (review_summary summed over its domains, with
+    tests and confirmed), every measurement, the issues that keep coming back and the files that keep producing
+    issues. It reads most of the ledger, so the viewer keeps the answer until the ledger changes (LedgerCache)."""
+    def build():
+        con, per = rq.con, {}
+        keys = ("points", "high", "medium", "low", "tests", "confirmed", "new_issues", "carried_over", "came_back",
+                "false_findings")
+        for r in review_summary(con):
+            t = per.setdefault(r["review"], {"review": r["review"], "started_at": r["started_at"], **dict.fromkeys(keys, 0)})
+            for k in keys:
+                t[k] += r[k] or 0
+        return {"metrics": rows(con, "SELECT * FROM v_metric_trends"),
+                "reviews": sorted(per.values(), key=lambda t: t["started_at"]),
+                "recurring": rows(con, "SELECT * FROM v_recurring_issues LIMIT 50"),
+                "hotspots": rows(con, "SELECT * FROM v_file_hotspots LIMIT 30")}
+    return CACHE.get(rq.db, "trends", build) if rq.cached else build()
+
+
+class LedgerCache:
+    """Answers that cost a read of the whole ledger, kept until the ledger changes. For each ledger file one
+    connection stays open only to ask PRAGMA data_version, which moves when any other connection commits; an
+    answer is kept with the version it was built at. A file put in the ledger's place (restore) starts again."""
+
+    def __init__(self):
+        self.lock, self.held = threading.Lock(), {}
+
+    def version(self, db):
+        """(the file's identity, its data version), or None when it cannot be asked."""
+        key = str(db)
+        try:
+            st = os.stat(key)
+            con, ident = self.held.get(key, (None, None))
+            if con is None or ident != (st.st_dev, st.st_ino):
+                if con is not None:
+                    con.close()
+                con = connect(db, readonly=True)  # used only under self.lock, from whichever request thread asks
+                self.held[key] = (con, (st.st_dev, st.st_ino))
+            return (st.st_dev, st.st_ino), con.execute("PRAGMA data_version").fetchone()[0]
+        except (OSError, sqlite3.Error):
+            return None
+
+    def get(self, db, name, build):
+        with self.lock:
+            now = self.version(db)
+            kept = self.held.get((str(db), name))
+            if now is not None and kept and kept[0] == now:
+                return kept[1]
+        answer = build()  # outside the lock: a slow build does not hold up other requests
+        with self.lock:
+            if now is not None and self.version(db) == now:
+                self.held[(str(db), name)] = (now, answer)
+        return answer
+
+    def close(self):
+        with self.lock:
+            for v in self.held.values():
+                if isinstance(v[0], sqlite3.Connection):
+                    v[0].close()
+            self.held = {}
+
+
+CACHE = LedgerCache()
 
 
 def tables_and_views(con):
@@ -8096,25 +8985,64 @@ def tables_and_views(con):
                         AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY type, name""")
 
 
+def _schema_notes():
+    """{table or view: the first comment line above its CREATE in the shipped schema}: one plain sentence each."""
+    notes, lines = {}, SCHEMA.split("\n")
+    for n, line in enumerate(lines):
+        m = re.match(r"CREATE (?:TABLE|VIEW) (\w+)", line)
+        if m:
+            k = n
+            while k > 0 and lines[k - 1].startswith("--"):
+                k -= 1
+            if k < n:
+                notes[m.group(1)] = lines[k][2:].strip()
+    return notes
+
+
+SCHEMA_NOTES = _schema_notes()
+AGENT_VIEWS = ("v_open_issues", "v_known_issues_for_brief", "v_code_refs")  # read by the agent, shown in Explore only
+
+
+def plain_name(name):
+    """A table's or view's stored name as words: v_owner_queue -> Owner queue."""
+    words = re.sub(r"^v_", "", name).replace("_", " ")
+    return words[:1].upper() + words[1:]
+
+
 def get_tables(rq):
+    """Every table and saved view with its name in words and the one-line description from the schema. Tables
+    carry their row count; a view does not (counting one runs its whole query: /api/table/<view>?count=1)."""
     con, out = rq.con, []
     for t in tables_and_views(con):
-        cols = [c["name"] for c in rows(con, "SELECT name FROM pragma_table_info(?)", (t["name"],))]
-        n = con.execute(f"SELECT count(*) FROM {quote_name(t['name'])}").fetchone()[0]
-        out.append({**t, "columns": cols, "count": n})
+        row = {**t, "label": plain_name(t["name"]), "description": SCHEMA_NOTES.get(t["name"], ""),
+               "for_agent": t["name"] in AGENT_VIEWS}
+        if t["type"] == "table":
+            row["count"] = con.execute(f"SELECT count(*) FROM {quote_name(t['name'])}").fetchone()[0]
+        out.append(row)
     return out
 
 
 def get_table(rq):
-    """?limit= (1 to 500, default 100) and offset= rows of one table or view."""
+    """?limit= (1 to 500, default 100) and offset= rows of one table or view, under the SQL box's limits (long text
+    cut, a BLOB as its size, about SQL_MAX_RESPONSE bytes in all: truncated). more says whether rows follow. count
+    is the row count of a table; a view is counted only when asked (?count=1), since that runs its whole query."""
     con, name = rq.con, rq.args[0]
-    if not NAME.match(name) or not one(con, "SELECT 1 x FROM sqlite_master WHERE name=? AND type IN ('table','view')", (name,)):
+    kind = one(con, "SELECT type FROM sqlite_master WHERE name=? AND type IN ('table','view')", (name,)) \
+        if NAME.match(name) else None
+    if not kind:
         return error(404, "no such table")
-    limit = max(1, min(500, whole_number(rq.arg("limit", "100"), "limit")))
-    offset = max(0, whole_number(rq.arg("offset", "0"), "offset"))
-    cur = con.execute(f'SELECT * FROM "{name}" LIMIT ? OFFSET ?', (limit, offset))
-    return {"columns": [d[0] for d in cur.description], "rows": [list(r) for r in cur.fetchall()],
-            "count": con.execute(f'SELECT count(*) FROM "{name}"').fetchone()[0], "offset": offset, "limit": limit}
+    limit, offset = int_arg(rq.qs, "limit", 100, 1, 500), int_arg(rq.qs, "offset", 0, 0)
+    if rq.whole:
+        limit = HUB_MAX_ROWS
+    cur = con.execute(f'SELECT * FROM "{name}" LIMIT ? OFFSET ?', (limit + 1, offset))
+    cols = [d[0] for d in cur.description]
+    out, truncated = _bounded_rows(cur, limit + 1)
+    more = len(out) > limit or truncated
+    count = None
+    if kind["type"] == "table" or rq.arg("count") == "1" or rq.whole:
+        count = con.execute(f'SELECT count(*) FROM "{name}"').fetchone()[0]
+    return {"columns": cols, "rows": out[:limit], "count": count, "more": more, "truncated": truncated,
+            "offset": offset, "limit": limit}
 
 
 def post_sql(rq):
@@ -8143,16 +9071,25 @@ def _hub_each(prefix, sql):
 # with Allow. The published hub embeds the answers of every GET row (hub_snapshot).
 ROUTES = (
     Route("GET", "overview", get_overview, _hub("overview")),
+    Route("GET", "home", get_home, _hub("home")),
+    Route("GET", "checks", get_checks, _hub("checks"), seconds=CHECKS_SECONDS),
+    Route("GET", "decisions", get_decisions, _hub("decisions")),
     Route("GET", "gates", get_gates, _hub("gates?status=pending", "gates?status=all")),
     Route("POST", "gates/*/answer", post_gate_answer),
     Route("GET", "reviews", get_reviews, _hub("reviews")),
     Route("GET", "review/*", get_review, _hub_each("review", "SELECT code FROM reviews ORDER BY code")),
+    Route("GET", "review/*/checks", get_review_checks,
+          lambda con: [f"review/{r[0]}/checks" for r in con.execute("SELECT code FROM reviews ORDER BY code")]),
+    Route("GET", "finding/*", get_finding, _hub_each("finding", "SELECT id FROM findings ORDER BY id")),
     Route("GET", "issues", get_issues, _hub("issues")),
     Route("GET", "issue/*", get_issue, _hub_each("issue", "SELECT code FROM issues ORDER BY code")),
     Route("GET", "plans", get_plans, _hub("plans")),
     Route("GET", "plan/*", get_plan, _hub_each("plan", "SELECT code FROM plans ORDER BY code")),
+    Route("GET", "step/*/*", get_step, lambda con: []),  # none in the hub: its plans carry every step in full
     Route("GET", "goals", get_goals, _hub("goals")),
-    Route("GET", "trends", get_trends, _hub("trends")),
+    Route("GET", "guide", get_guide, _hub("guide")),
+    Route("GET", "run/*", get_run, _hub_each("run", "SELECT id FROM reviewer_runs ORDER BY id")),
+    Route("GET", "trends", get_trends, _hub("trends"), seconds=TRENDS_SECONDS),
     Route("GET", "tables", get_tables, _hub("tables")),
     Route("GET", "table/*", get_table,
           lambda con: [f"table/{t['name']}?limit={HUB_MAX_ROWS}&offset=0" for t in tables_and_views(con)
@@ -8163,8 +9100,9 @@ ROUTES = (
 
 
 def api_segments(path):
-    """The segments after /api of a URL path, or None for a path that is not under /api."""
-    parts = [x for x in path.split("/") if x]
+    """The segments after /api of a URL path, each URL-decoded after the split (the page encodes every code it
+    puts in a path, so GATE%2D0001 is GATE-0001), or None for a path that is not under /api."""
+    parts = [unquote(x) for x in path.split("/") if x]
     return parts[1:] if parts and parts[0] == "api" else None
 
 
@@ -8180,13 +9118,20 @@ def allowed_methods(path):
     return [] if parts is None else [r.method for r in ROUTES if _matches(r, parts)]
 
 
+def route_seconds(path):
+    """How long the viewer lets a GET of this path read: its route's seconds, ROUTE_SECONDS for anything else."""
+    parts = api_segments(path)
+    return next((r.seconds for r in ROUTES if parts is not None and r.method == "GET" and _matches(r, parts)),
+                None) or ROUTE_SECONDS
+
+
 def wrong_method(method, allowed):
     return error(405, f"This address takes {' or '.join(allowed)}, not {method}.", {"Allow": ", ".join(allowed)})
 
 
-def route(root, db, con, path, qs, body):
+def route(root, db, con, path, qs, body, whole=False):
     """Answer one API request from ROUTES: the handler's result (a dict or list: 200) or error(...). body is None
-    for a GET and the JSON object for a POST."""
+    for a GET and the JSON object for a POST. whole: a paged list is answered in full (the hub's snapshot)."""
     method = "GET" if body is None else "POST"
     parts = api_segments(path)
     allowed = [] if parts is None else allowed_methods(path)
@@ -8196,7 +9141,7 @@ def route(root, db, con, path, qs, body):
         return wrong_method(method, allowed)
     r = next(r for r in ROUTES if r.method == method and _matches(r, parts))
     try:
-        return r.handler(Request(root, db, con, [b for a, b in zip(r.pattern, parts) if a == "*"], qs, body))
+        return r.handler(Request(root, db, con, [b for a, b in zip(r.pattern, parts) if a == "*"], qs, body, whole))
     except ApiError as e:
         return error(e.status, e.message, e.headers)
 
@@ -8208,12 +9153,33 @@ SQL_MAX_RESPONSE = 5_000_000  # rows stop being added once the JSON passes about
 SQL_MAX_ROWS = 1000
 
 
+def _json_cell(v):
+    """json.dumps default for a viewer answer: a BLOB as {"blob_bytes": N} (as the SQL box sends it), else text."""
+    return {"blob_bytes": len(v)} if isinstance(v, (bytes, bytearray, memoryview)) else str(v)
+
+
 def _sql_cell(v):
     if isinstance(v, bytes):
         return {"blob_bytes": len(v)}
     if isinstance(v, str) and len(v) > SQL_MAX_CELL:
         return v[:SQL_MAX_CELL] + f" … [cut: {len(v):,} characters in all]"
     return v
+
+
+def _bounded_rows(cur, max_rows):
+    """Rows of a cursor as lists, under the limits every table of raw rows is sent with: at most max_rows rows, each
+    cell through _sql_cell, stopping at about SQL_MAX_RESPONSE bytes of JSON. Returns (rows, whether any were
+    left out)."""
+    out, size = [], 2
+    for r in cur:
+        if len(out) >= max_rows:
+            return out, True
+        row = [_sql_cell(v) for v in r]
+        size += len(json.dumps(row, ensure_ascii=False, default=str).encode()) + 1
+        if size > SQL_MAX_RESPONSE:
+            return out, True
+        out.append(row)
+    return out, False
 
 
 def run_readonly(db, sql):
@@ -8234,17 +9200,7 @@ def run_readonly(db, sql):
     try:
         cur = con.execute(sql)
         cols = [d[0] for d in cur.description or []]
-        out, size, truncated = [], 2, False
-        for r in cur:
-            if len(out) >= SQL_MAX_ROWS:
-                truncated = True
-                break
-            row = [_sql_cell(v) for v in r]
-            size += len(json.dumps(row, ensure_ascii=False, default=str).encode()) + 1
-            if size > SQL_MAX_RESPONSE:
-                truncated = True
-                break
-            out.append(row)
+        out, truncated = _bounded_rows(cur, SQL_MAX_ROWS)
         return {"columns": cols, "rows": out, "truncated": truncated}
     except (sqlite3.Error, sqlite3.Warning) as e:  # before Python 3.11, several statements raise sqlite3.Warning
         if isinstance(e, sqlite3.OperationalError) and "interrupted" in str(e) and timed_out():
@@ -8258,6 +9214,19 @@ def run_readonly(db, sql):
 
 REQUEST_TIMEOUT = 10  # seconds a viewer connection may sit idle or half-sent before it is dropped
 MAX_BODY = 200_000  # bytes of POST body accepted
+GZIP_FROM = 8_000  # bytes: a larger answer is sent gzipped to a browser that accepts it
+
+# What a browser shows when the viewer is opened under a name it does not answer to (a forwarded port, another
+# machine's address). It holds no token and runs no script; %s is the list of addresses the viewer listens on.
+WRONG_HOST_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Review ledger</title></head>
+<body style="font:16px/1.5 system-ui,sans-serif;max-width:60ch;margin:48px auto;padding:0 16px">
+<h1>This address does not reach the viewer</h1>
+<p>The viewer only answers at %s, on the computer where <code>ledger.py serve</code> is running.</p>
+<p>Open the link that <code>ledger.py serve</code> printed in its terminal. To view from another computer, forward
+the same port number to that address and open the printed link there.</p>
+</body></html>
+"""
 
 
 def page_csp(page):
@@ -8271,28 +9240,70 @@ def page_csp(page):
             "connect-src 'self'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
 
 
-def make_server(root, db, port=0):
+def log_line(text):
+    """One line of the viewer's log: to stderr, the terminal `ledger.py serve` runs in. The log holds each request
+    (time, method, path with the names of its query parameters, status, how long it took), each gate answer's
+    outcome and each failure's traceback (api_failure). It never holds the token, a query value, or what the owner
+    answered."""
+    sys.stderr.write(text + "\n")
+    sys.stderr.flush()
+
+
+def logged_path(raw):
+    """A request's path as the log shows it: the path, then the names of its query parameters without their values
+    (a search text or a code stays out of the terminal's scrollback)."""
+    u = urlparse(raw)
+    names = sorted(parse_qs(u.query, keep_blank_values=True))
+    return u.path[:200] + ("?" + "&".join(names) if names else "")
+
+
+def make_server(root, db, port=0, ipv6=False):
     """Build the viewer's handler and bind it to 127.0.0.1:port (0 = any free port); returns (server, token).
     The caller runs server.serve_forever(). The Host allow-list uses the port actually bound. The page itself holds
     no secret: the token reaches the browser only in the launch URL's #k= fragment (see serve), and every /api/
-    request must send it back as X-Ledger-Token."""
+    request must send it back as X-Ledger-Token. ipv6: also bind [::1] on the same port where the machine has
+    IPv6 and the port is free there; that second server is server.also[0] (the caller runs and closes it too).
+    Nothing but the two loopback addresses is ever bound."""
     token = secrets.token_urlsafe(32)
     token_bytes = token.encode()
     page = PAGE.encode("utf-8")
     csp = page_csp(PAGE)
-    hosts = set()
+    hosts, addresses = set(), []
 
     class H(BaseHTTPRequestHandler):
         timeout = REQUEST_TIMEOUT
 
+        # The handler. parse_request() stamps the start; send() is the one way an answer leaves, so every answer
+        # has the security headers and one log line (log_request). do_GET and do_POST check the Host, then the
+        # token, then hand /api/ paths to handle_api(); any other method goes to refuse_method().
+        def parse_request(self):
+            from time import monotonic
+            self.started = monotonic()
+            return super().parse_request()
+
+        def log_request(self, code="-", size="-"):
+            from time import monotonic
+            ms = int((monotonic() - getattr(self, "started", monotonic())) * 1000)
+            status = getattr(code, "value", code)
+            # a request the library refused before reading it whole has no method or path yet
+            log_line(f"{now()[:19]}Z {getattr(self, 'command', None) or '-'} "
+                     f"{logged_path(getattr(self, 'path', '') or '') or '-'} {status} {ms} ms")
+
         def log_message(self, *a):
-            pass
+            pass  # the library's own messages (a malformed request line) are answered by send_error, logged there
 
         def send(self, code, body, ctype="application/json; charset=utf-8", headers=None):
-            data = body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=False, default=str).encode()
+            data = body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=False, default=_json_cell).encode()
             self.send_response(code)
             for k, v in (headers or {}).items():
                 self.send_header(k, v)
+            if len(data) > GZIP_FROM:
+                self.send_header("Vary", "Accept-Encoding")
+                if re.search(r"(?i)(^|,)\s*gzip\s*(,|$|;(?!\s*q=0(\.0*)?\s*(,|$)))",
+                             self.headers.get("Accept-Encoding", "")):
+                    import gzip
+                    data = gzip.compress(data, 6, mtime=0)
+                    self.send_header("Content-Encoding", "gzip")
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Cache-Control", "no-store")
@@ -8326,9 +9337,16 @@ def make_server(root, db, port=0):
         do_HEAD = do_PUT = do_DELETE = do_OPTIONS = do_PATCH = refuse_method
 
         def host_ok(self):
-            if self.headers.get("Host") not in hosts:
-                self.send(403, {"error": "wrong host"}); return False
-            return True
+            """Only requests addressed to the viewer's own loopback addresses are answered. A browser asking for
+            the page under another name gets a page that says where the viewer is; anything else gets JSON."""
+            if self.headers.get("Host") in hosts:
+                return True
+            if self.command == "GET" and urlparse(self.path).path == "/":
+                self.send(403, (WRONG_HOST_PAGE % " or ".join(f"http://{a}/" for a in addresses)).encode("utf-8"),
+                          "text/html; charset=utf-8")
+            else:
+                self.send(403, {"error": "wrong host"})
+            return False
 
         def token_ok(self):
             try:  # headers are decoded as latin-1, so this gives back the bytes that were sent
@@ -8347,6 +9365,11 @@ def make_server(root, db, port=0):
             except Exception as e:
                 res = api_failure(e, f"{self.command} {u.path}")
             res = res if isinstance(res, tuple) else (res, 200)
+            parts = api_segments(u.path) or []
+            if body is not None and len(parts) == 3 and parts[0] == "gates" and parts[2] == "answer":
+                code = re.sub(r"[^A-Za-z0-9-]", "?", parts[1])[:40]  # what was answered is never logged
+                log_line(f"answer {code}: " + ("saved" if res[1] == 200 else
+                                               f"not saved ({res[1]}: {res[0].get('error')})"))
             self.send(res[1], res[0], headers=res[2] if len(res) > 2 else None)
 
         def do_GET(self):
@@ -8375,7 +9398,7 @@ def make_server(root, db, port=0):
             if allowed and "POST" not in allowed:  # before the body is read
                 res = wrong_method("POST", allowed)
                 return self.send(res[1], res[0], headers=res[2])
-            if self.headers.get("Content-Type", "").split(";")[0] != "application/json":
+            if self.headers.get("Content-Type", "").split(";")[0].strip().lower() != "application/json":
                 return self.send(415, {"error": "JSON only"})
             raw_n = self.headers.get("Content-Length")
             if raw_n is None:
@@ -8402,27 +9425,92 @@ def make_server(root, db, port=0):
             self.handle_api(u, body)
 
     srv = ThreadingHTTPServer(("127.0.0.1", port), H)
+    srv.handle_error = _quiet_disconnects(srv.handle_error)
     bound = srv.server_address[1]
     hosts.update({f"127.0.0.1:{bound}", f"localhost:{bound}"})
+    addresses.append(f"127.0.0.1:{bound}")
+    srv.also = []
+    if ipv6:
+        six = _ipv6_loopback_server(bound, H)
+        if six is not None:
+            six.handle_error = _quiet_disconnects(six.handle_error)
+            srv.also.append(six)
+            hosts.add(f"[::1]:{bound}")
+            addresses.append(f"[::1]:{bound}")
+    srv.addresses = addresses
     return srv, token
 
 
+def _quiet_disconnects(handle_error):
+    """A server's handle_error that says nothing when the browser went away (a closed tab, a reload in
+    mid-answer) and leaves every other failure to the library, which prints it."""
+    def quiet(request, client_address):
+        if isinstance(sys.exc_info()[1], (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)):
+            return
+        handle_error(request, client_address)
+    return quiet
+
+
+def _ipv6_loopback_server(port, handler):
+    """A second viewer server on [::1]:port, or None where IPv6 is missing or that port is taken there."""
+    import socket
+    if not socket.has_ipv6:
+        return None
+
+    class Six(ThreadingHTTPServer):
+        address_family = socket.AF_INET6
+
+        def server_bind(self):
+            if hasattr(socket, "IPV6_V6ONLY"):
+                self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            super().server_bind()
+
+    try:
+        return Six(("::1", port), handler)
+    except OSError:
+        return None
+
+
 def serve(root, db, port, open_browser):
-    """Run the viewer until Ctrl+C. The launch URL carries the token in its #k= fragment (never sent to the server,
+    """Run the viewer until Ctrl+C, on 127.0.0.1 and, where the machine has it, on [::1]. The launch URL carries the token in its #k= fragment (never sent to the server,
     read by the page into sessionStorage and removed from the address bar). The umask is set to 077 first, so any
     file the viewer's connections create beside the ledger (-journal, -wal, -shm) is owner-only."""
     import os
     if hasattr(os, "umask"):
         os.umask(0o077)
-    srv, token = make_server(root, db, port)
+    try:
+        srv, token = make_server(root, db, port, ipv6=True)
+    except OSError as e:
+        import errno
+        if e.errno in (errno.EADDRINUSE, getattr(errno, "WSAEADDRINUSE", -1)):
+            print(f"serve: port {port} is in use; try --port {port + 1}", file=sys.stderr)
+        else:
+            print(f"serve: cannot listen on 127.0.0.1:{port}: {e.strerror or e}", file=sys.stderr)
+        sys.exit(2)
     url = f"http://127.0.0.1:{srv.server_address[1]}/#k={token}"
-    print(f"Ledger viewer for {db} at {url}  (Ctrl+C to stop)", flush=True)
+    more = "".join(f"  also at http://{a}/#k={token}" for a in srv.addresses[1:])
+    print(f"Ledger viewer for {db} at {url}{more}  (Ctrl+C to stop)", flush=True)
+    def open_it():
+        try:
+            opened = webbrowser.open(url)
+        except Exception:  # a machine with no browser at all
+            opened = False
+        if not opened:
+            print("No browser could be opened from here; open the address above in your browser.", flush=True)
+
     if open_browser:
-        threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+        threading.Timer(0.5, open_it).start()
+    for other in srv.also:
+        threading.Thread(target=other.serve_forever, daemon=True).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        for other in srv.also:
+            other.shutdown()
+            other.server_close()
+        CACHE.close()
 
 
 # ---------------------------------------------------------------- owner queue, query, progress, hub, answers
@@ -8445,8 +9533,8 @@ def print_gates(con):
         if o["kind"] == "step":
             print(f"step {o['ref']} [{o['need']}] {o['title']}: {o['question']}")
         else:
-            print(f"decision {o['ref']} [{o['status']}] {o['title']}"
-                  + (f" (revisit when: {o['question']})" if o["question"] else ""))
+            print(f"decision {o['ref']} [{o['status']}] {o['question']}"
+                  + (f" (revisit when: {o['context']})" if o["context"] else ""))
     try:
         stale = rows(con, "SELECT * FROM v_stale_steps ORDER BY plan, step")
     except sqlite3.Error:
@@ -8544,19 +9632,19 @@ def progress_md(con, plan_code):
 # Nothing in the page makes an outside request; publishing it is the agent's job, outside this tool.
 HUB_GUIDE_MD = """## What this site is
 
-This is the review ledger for this project, shown as a website. Every review, every point it raised, the issues those points describe, the fix plan, and every question waiting on you live here. Claude updates the site after each step of a review and after each batch of fixes; the date at the top says when.
+This is the review ledger for this project, shown as a website. Every review, every point it raised, the issues those points describe, the fix plan, and every question waiting on you live here. It always shows the ledger as it is now; a shared copy of it shows the date it was made at the top.
 
-You can answer every question here, under **Waiting on you**. Your answer is saved with this page; Claude records it the next time it checks, or right away if you tell it in the chat.
+You can answer every question here, under **Waiting on you**. The agent picks your answer up the next time it checks, or right away if you tell it in the chat.
 
 ## How a review runs
 
-1. **Goals and areas.** Claude reads the project, proposes the design goals the code is judged against and the areas to review (security, tests, the viewer, and so on), and asks you to approve them. Nothing runs before you do.
+1. **Goals and areas.** The agent reads the project, proposes the design goals the code is judged against and the areas to review (security, tests, the viewer, and so on), and asks you to approve them. Nothing runs before you do.
 2. **Reviewers.** One reviewer per approved area reads its part of the code, read-only, and writes a report.
-3. **Checking.** Claude checks every serious point against the code itself and records which were confirmed and which were wrong.
+3. **Checking.** The agent checks every serious point against the code itself and records which were confirmed and which were wrong.
 4. **Points into issues.** Every point of every report is recorded here, pinned to the exact lines at the reviewed commit, and grouped into issues: one issue per underlying problem, however many reviewers described it. Issues found by earlier reviews are matched, so a problem that comes back is marked as having come back.
 5. **Report.** The review's report (on the review's page) gives the verdict, the root causes, what to fix first, and how each of your requirements is met.
 6. **Fix plan.** Every point is placed in a step; steps are grouped into phases that build on each other. You approve the plan and any choices it needs.
-7. **Fixing.** Claude works through the steps in order. Each fix comes with a test that fails before it and passes after; each step's note says in plain words what changed.
+7. **Fixing.** The agent works through the steps in order. Each fix comes with a test that fails before it and passes after; each step's note says in plain words what changed.
 8. **Second review.** The skill runs again on the fixed code and confirms each fix; only then is an issue marked fixed and confirmed.
 
 ## Words used here
@@ -8566,14 +9654,14 @@ You can answer every question here, under **Waiting on you**. Your answer is sav
 | Point | One thing one reviewer raised in one review |
 | Issue | The underlying problem, followed across reviews; several points can describe one issue |
 | Severity | High, Medium, Low, or Missing test |
-| Question (gate) | Something Claude cannot get past without you; it waits until you answer |
+| Question (gate) | Something the agent cannot get past without you; it waits until you answer |
 | Decision | Your answer, kept so later reviews don't ask again |
 | Plan, phase, step | The fix plan; its stages, in order; one change with its proof |
 | Commit | The exact version of the code a review looked at |
 
 ## Where to look
 
-**Overview** shows the totals and the ledger's own checks. **Reviews** lists every review; open one for its report, the areas reviewed and skipped, the reviewers, and every point with the code it cites. **Issues** lets you search and filter every issue and see its full history. **Fix plans** shows every step by phase, with what it changes, how it is proven, and which points it closes. **Over time** shows how the numbers move between reviews. **Explore** shows the raw tables behind everything.
+**Overview** shows the totals and the ledger's own checks. **Reviews** lists every review; open one for its report, the areas reviewed and skipped, the reviewers, and every point with the code it cites. **Design goals** lists what you want the code to be. **Issues** lets you search and filter every issue and see its full history. **Fix plans** shows every step by phase, with what it changes, how it is proven, and which points it closes. **Over time** shows how the numbers move between reviews. **Explore** shows the raw tables behind everything.
 """
 
 # The one change progress-page makes to page.html: the data script (%s is the JSON), put in front of the page's own
@@ -8594,15 +9682,15 @@ def hub_snapshot(root, db, con, start=None):
     ledger (the hub cannot read git); each issue of the list gains the text its search box matches."""
     def call(path):
         p, _, q = path.partition("?")
-        res = route(root, db, con, "/api/" + p, parse_qs(q), None)
+        res = route(root, db, con, "/api/" + p, parse_qs(q), None, whole=True)
         if isinstance(res, tuple):
             raise LedgerError(f"progress-page: /api/{path} failed: {res[0].get('error')}")
         return res
 
     def table(path):
         d = call(path)
-        cut = [[(v[:HUB_MAX_CELL] + "…") if isinstance(v, str) and len(v) > HUB_MAX_CELL else
-                ({"blob_bytes": len(v)} if isinstance(v, bytes) else v) for v in r] for r in d["rows"]]
+        cut = [[(v[:HUB_MAX_CELL] + "…") if isinstance(v, str) and len(v) > HUB_MAX_CELL else v for v in r]
+               for r in d["rows"]]
         return {"columns": d["columns"], "rows": cut, "count": len(cut), "total": d["count"]}
 
     cmds = {r[0]: r[1] for r in con.execute("SELECT location_id, git_command FROM v_code_refs")}
@@ -8634,7 +9722,7 @@ def hub_snapshot(root, db, con, start=None):
                                             JOIN findings f ON f.issue_id=i.id
                                             LEFT JOIN finding_locations fl ON fl.finding_id=f.id"""):
         search.setdefault(code, set()).update([point, path])
-    for i in R["issues"]:
+    for i in R["issues"]["rows"]:
         i["search"] = " ".join([i["code"], i["title"] or "", i.get("sub") or ""] + sorted(search.get(i["code"], ())))
     try:
         active = [r[0] for r in con.execute("SELECT value FROM issue_statuses WHERE active = 1 ORDER BY position")]
@@ -8657,7 +9745,7 @@ def hub_page(root, db, start=None, page=None):
         con.close()
     # In JSON, '<' only appears inside strings, where \u003c means the same: no '</script>' or '<!--' can end or
     # bend the data script.
-    data = json.dumps(snap, ensure_ascii=False, default=str, separators=(",", ":")).replace("<", "\\u003c")
+    data = json.dumps(snap, ensure_ascii=False, default=_json_cell, separators=(",", ":")).replace("<", "\\u003c")
     data = data.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
     page = page.replace(marker, script % data, 1)
     name = snap["responses"]["overview"].get("project") or root.name
@@ -9944,13 +11032,22 @@ def cmd_open_gate(ctx):
     return [code]
 
 
+ANSWER_MAX_TEXT = 10_000  # characters of a gate answer's free text (tr_gate_answer_rules has the same number)
+# Why a gate that is not open takes no answer, by its status.
+GATE_CLOSED = {"answered": "This question was already answered.",
+               "applied": "This question was already answered and the agent has acted on the answer.",
+               "withdrawn": "This question was withdrawn; it needs no answer."}
+
+
 def answer_gate(con, code, value=None, text=None, via="chat", actor_id=None):
     """Record the owner's answer to an open gate: the one set of answer rules for the viewer (via 'viewer') and
     `ledger.py answer-gate` (via 'chat' or 'other'). On the caller's open transaction, or else in a BEGIN IMMEDIATE
     of its own (committed here): the gate is read and updated in that one transaction and the UPDATE must change
     exactly one open row, so two answers cannot both be saved. actor_id is who answered (default: the project's
-    owner actor, made on first use). Raises GateRefused(status, message) for 404 no such gate, 409 answered
-    already, 400 an answer the gate does not take; returns {"ok": True}."""
+    owner actor, made on first use). Raises GateRefused(status, message) for 404 no such gate, 409 a gate that is
+    not open (the sentence says whether it was answered, applied or withdrawn), 400 an answer the gate does not
+    take (a value that is not an option, nothing at all, a note on a gate without free text, a note over
+    ANSWER_MAX_TEXT); returns {"ok": True}. tr_gate_answer_rules holds the same rules for answers written as SQL."""
     if not isinstance(con, sqlite3.Connection):  # answer_gate(db, code, body): the viewer's request form
         return gate_answer_request(con, code, value if isinstance(value, dict) else {})
     if (value is not None and not isinstance(value, str)) or (text is not None and not isinstance(text, str)):
@@ -9963,7 +11060,7 @@ def answer_gate(con, code, value=None, text=None, via="chat", actor_id=None):
         if not g:
             raise GateRefused(404, "no such gate")
         if g["status"] != "open":
-            raise GateRefused(409, "This question was already answered.")
+            raise GateRefused(409, GATE_CLOSED.get(g["status"], GATE_CLOSED["answered"]))
         val = (value or "").strip() or None
         txt = (text or "").strip() or None
         opts = [o.get("value") for o in json.loads(g["options"] or "[]")]
@@ -9971,8 +11068,11 @@ def answer_gate(con, code, value=None, text=None, via="chat", actor_id=None):
             raise GateRefused(400, "That choice is not one of the options.")
         if val is None and not txt:
             raise GateRefused(400, "Choose an option or write an answer.")
-        if txt and not g["allow_text"] and val is None:
-            raise GateRefused(400, "Choose one of the options.")
+        if txt and not g["allow_text"]:
+            raise GateRefused(400, "This question takes one of its options and no note." if val is not None
+                              else "Choose one of the options.")
+        if txt and len(txt) > ANSWER_MAX_TEXT:
+            raise GateRefused(400, f"The answer is too long (over {ANSWER_MAX_TEXT:,} characters).")
         if via not in ("chat", "viewer", "other"):
             raise GateRefused(400, "answered via must be chat, viewer or other")
         who = actor_id if actor_id is not None else owner_actor(con)
@@ -9981,7 +11081,7 @@ def answer_gate(con, code, value=None, text=None, via="chat", actor_id=None):
                                           WHERE id=?), answered_via=?, answered_by_actor_id=?
                              WHERE id=? AND status='open'""", (val, txt, who, via, who, g["id"]))
         if cur.rowcount != 1:
-            raise GateRefused(409, "This question was already answered.")
+            raise GateRefused(409, GATE_CLOSED["answered"])
         if own:
             con.execute("COMMIT")
         return {"ok": True}
@@ -10296,7 +11396,10 @@ def goals_list(con, domain=None, include_all=False, review=None):
     if review:
         where.append("r.code = ?"); args.append(review)
     goals = rows(con, f"""SELECT g.id, g.code, g.domain_code domain, g.text, g.status, gs.label status_label,
-        g.approved_by_actor_id approved_by, g.approved_at, r.code review, g.note, g.source, gt.code gate
+        g.approved_by_actor_id approved_by, g.approved_at, r.code review, g.note, g.source, gt.code gate,
+        g.adopted_at, g.retired_at,
+        (SELECT group_concat(code, ', ') FROM (SELECT ur.code FROM review_goals rg JOIN reviews ur ON ur.id=rg.review_id
+           WHERE rg.goal_id=g.id ORDER BY ur.started_at, ur.id)) used_by
         FROM design_goals g JOIN goal_statuses gs ON gs.value=g.status LEFT JOIN reviews r ON r.id=g.review_id
         LEFT JOIN gates gt ON gt.id=g.gate_id
         WHERE {' AND '.join(where) or '1'} ORDER BY g.domain_code IS NOT NULL, g.domain_code, g.id""", args)
@@ -11822,6 +12925,20 @@ def main():
         if isinstance(e.code, str):
             raise SystemExit(terminal_safe(e.code)) from None
         raise
+    # What the commands do not answer themselves (a write command prints its own refusal and exits 1): one line
+    # and exit 2, never a traceback.
+    except subprocess.TimeoutExpired as e:
+        cmd = e.cmd if isinstance(e.cmd, str) else " ".join(map(str, e.cmd))
+        print(f"ledger.py: `{cmd}` did not finish in {e.timeout:g} s; nothing more was done", file=err)
+        raise SystemExit(2) from None
+    except sqlite3.DatabaseError as e:
+        print(f"ledger.py: the ledger could not be read ({_one_line(e)}). If the file is damaged, rebuild it from "
+              f"its dump: python3 ledger.py restore .code-review/ledger.sql --to NEW.sqlite", file=err)
+        raise SystemExit(2) from None
+    except OSError as e:
+        what = f"{e.strerror or e}" + (f": {e.filename}" if e.filename else "")
+        print(f"ledger.py: {what}", file=err)
+        raise SystemExit(2) from None
     finally:
         sys.stdout, sys.stderr = out, err
         while _MAIN_CONNECTIONS:
@@ -11908,8 +13025,12 @@ def _main():
         if was and was[0] != str(db.parent):
             print(f"warning: this ledger was set up at {was[0]} and is now used from {db.parent} (fine after a move; "
                   f"init records the new place)", file=sys.stderr)
-        bad = check(con, quiet=a.quiet, full=a.full)
-        bad += check_git_refs(root, con, quiet=a.quiet)
+        try:
+            bad = check(con, quiet=a.quiet, full=a.full)
+            bad += check_git_refs(root, con, quiet=a.quiet)
+        except sqlite3.DatabaseError as e:  # a damaged file stops a later read: what was found is printed already
+            print(f"check: stopped, the ledger file is damaged ({_one_line(e)})")
+            sys.exit(1)
         if old_sqlite_note():
             print(old_sqlite_note(), file=sys.stderr)
         sys.exit(1 if bad else 0)

@@ -46,8 +46,8 @@ DEFAULT_CHROME = "/usr/bin/google-chrome"
 DESKTOP = {"width": 1280, "height": 900}
 PHONE = {"width": 390, "height": 844}
 
-# Injected before the page's own script: counts fetches in flight (until the body is read) and the time of the last
-# DOM change, so settle() can wait until the view has finished drawing.
+# Injected before the page's own script: counts fetches in flight (until the body is read), short timers still to
+# fire and the time of the last DOM change, so settle() can wait until the view has finished drawing.
 _INIT_SCRIPT = r"""
 (() => {
   window.__pending = 0; window.__fetches = 0; window.__lastMutation = performance.now();
@@ -57,13 +57,22 @@ _INIT_SCRIPT = r"""
     try { const r = await orig(...a); try { await r.clone().arrayBuffer(); } catch (e) {} return r; }
     finally { window.__pending--; window.__lastMutation = performance.now(); }
   };
+  // Short timers (a search box waits a moment after the last key): settle() waits for them too.
+  window.__timers = new Set();
+  const st = window.setTimeout.bind(window), ct = window.clearTimeout.bind(window);
+  window.setTimeout = (f, ms, ...a) => {
+    if (typeof f !== "function" || !(ms > 0 && ms <= 1000)) return st(f, ms, ...a);
+    const id = st(() => { window.__timers.delete(id); f(...a); }, ms); window.__timers.add(id); return id;
+  };
+  window.clearTimeout = id => { window.__timers.delete(id); ct(id); };
   const start = () => new MutationObserver(() => { window.__lastMutation = performance.now(); })
     .observe(document, {subtree:true, childList:true, attributes:true, characterData:true});
   if (document.documentElement) start(); else document.addEventListener("DOMContentLoaded", start);
 })();
 """
 
-_SETTLED = "q => window.__pending === 0 && performance.now() - window.__lastMutation > q"
+_SETTLED = ("q => window.__pending === 0 && window.__timers.size === 0 && "
+            "performance.now() - window.__lastMutation > q")
 
 _state = {"pw": None, "browser": None, "reason": None, "tried": False}
 

@@ -35,6 +35,16 @@ after `init`):
 
     python3 <skill folder>/scripts/ledger.py --root . serve
 
+It listens on 127.0.0.1 only and prints the link to open (the link carries the viewer's key). `--port 8766` picks
+another port when 8765 is in use; `--no-open` leaves the browser alone. Each request is logged to that terminal as
+one line (time, method, path, status, milliseconds), never the key or what was typed. To view it from another
+machine, forward the port and open the printed link there:
+
+    ssh -L 8765:127.0.0.1:8765 host
+
+Use the same port number on both ends: the viewer only answers the address it was started on. The hub file needs
+no server and can be read anywhere.
+
 ## Where the ledger lives
 
 In `<project root>/.code-review/` (owner-only: the folder 0700, the files 0600): the ledger, the copy of the tool, the

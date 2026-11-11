@@ -24,7 +24,7 @@ class NaturalOrder(unittest.TestCase):
                 L.issue(first_seen_review_id=rid, severity="M")
             L.commit()
             with fixtures.ServerThread(L) as srv:
-                codes = [i["code"] for i in srv.get("/api/issues").json()]
+                codes = [i["code"] for i in srv.get("/api/issues").json()["rows"]]
         self.assertEqual(codes, ["ISS-0001", "ISS-0002", "ISS-0003"])
 
 

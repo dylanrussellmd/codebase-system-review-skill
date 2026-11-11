@@ -47,12 +47,11 @@ class IssuesPlansExplore(browser.ViewerTestCase):
                 self.assertEqual(self._codes(page), want)
         page.hash("#/issues?q=notice")
         self.assertEqual(page.js("document.querySelector('#app input[type=search]').value"), "notice")
-        # characterization: ISS-0249 hand-written plurals: one issue is shown as "1 issues"
-        self.assertEqual(page.text("#app p.note"), "1 issues")
-        # characterization: ISS-0234 the page reads ?domain=, so a link with the API's own name domain_code is ignored
+        self.assertEqual(page.text("#app p.note"), "1 issue")  # ISS-0249 fixed
+        # ISS-0234 fixed: the API's own name, domain_code, filters by area
         page.hash("#/issues?domain_code=security")
-        self.assertEqual(page.js("document.querySelector('select[aria-label=Area]').value"), "")
-        self.assertEqual(self._codes(page), ["ISS-0002", "ISS-0003", "ISS-0004"])
+        self.assertEqual(page.js("document.querySelector('select[aria-label=Area]').value"), "security")
+        self.assertEqual(self._codes(page), ["ISS-0004"])
         page.after(lambda: page.page.locator("tbody tr", has_text="ISS-0004").click())
         self.assertEqual(page.location_hash(), "#/issue/ISS-0004")
 
@@ -66,7 +65,7 @@ class IssuesPlansExplore(browser.ViewerTestCase):
                                     "e.name.includes('/api/issues?')).length > n", arg=1, timeout=2000)
         page.settle()
         self.assertEqual(len(calls()), 2)                    # one request 250 ms after the last key
-        self.assertTrue(calls()[-1].endswith("status=active&q=sign"), calls()[-1])
+        self.assertIn("status=active&q=sign&", calls()[-1])
         self.assertEqual(self._codes(page), ["ISS-0004"])
         # A select change loads at once.
         page.after(lambda: page.page.select_option("select[aria-label=Status]", ""))
@@ -84,8 +83,10 @@ class IssuesPlansExplore(browser.ViewerTestCase):
         page = self.open("#/issue/ISS-0001")
         self.assertEqual([t.split(" — ", 1)[1].split(" · ")[0] for t in page.texts(".timeline > div")],
                          # schema 3 logs text edits and every review check too
-                         ["Opened", "Current state changed", "Raised as a new issue", "After state changed",
-                          "Open → Fixed", "Fixed → Fixed and confirmed", "Checked"])
+                         # step 184: event names come from the ledger's labels; a review's check says what it found
+                         ["Opened", "What it does now: text changed", "Raised as a new issue",
+                          "What it does after the fix: text changed", "Open → Fixed", "Fixed → Fixed and confirmed",
+                          "Looked for by a review: fixed"])
         self.assertIn(" · step 2 · ", page.texts(".timeline > div")[4])
         self.assertEqual([r.split("\t")[:2] for r in page.texts("h2:text('Related issues') + div tbody tr")],
                          [["Related to", "ISS-0004"]])   # the incoming side of related-to
@@ -126,7 +127,7 @@ class IssuesPlansExplore(browser.ViewerTestCase):
 
     def test_page_plan_phase_routing(self):
         page = self.open("#/plan/P-0001")
-        self.assertEqual(self._rail(page), [["1Safety net0/1", "true"], ["2Fix first1/2", "false"]])
+        self.assertEqual(self._rail(page), [["1Safety netstep 10/1", "true"], ["2Fix firststeps 2–31/2", "false"]])   # step 191: the steps of each phase
         self.assertEqual(page.text("#app .steps h2"), "Phase 1 · Safety net")
         self.assertEqual(page.contents("#app .steps h3"), ["CI"])     # steps grouped by section
         self.assertEqual(page.texts(".steps details.item > summary .n"), ["1"])
@@ -180,6 +181,7 @@ class IssuesPlansExplore(browser.ViewerTestCase):
         page.settle()
         item = page.page.locator(".steps details.item").first
         item.locator("summary").click()
+        page.settle()   # the points a step closes arrive when it is opened (step 162)
         self.assertEqual(item.locator(".ref .note").inner_text(), "Closes 1 point")
         self.assertEqual(item.locator(".ref .refline").first.locator(":scope > *").all_text_contents(),
                          ["R-0001 · SEC-H1", "High", "ISS-0001", "Sign-in codes come from a predictable random "
@@ -238,7 +240,13 @@ class IssuesPlansExplore(browser.ViewerTestCase):
 
     def test_page_trends_grouping(self):
         page = self.open("#/trends")
-        cards = page.page.locator("#app .grid2 .card")
+        # step 168: points, missing tests and confirmed points are charted per review, above the measurements
+        per = page.page.locator("h2:text('Points per review') ~ .grid2").first.locator(".card")
+        self.assertEqual(per.evaluate_all("cs => cs.map(c => [c.querySelector('b').textContent, "
+                                          "c.querySelectorAll('circle').length])"),
+                         [["Points", 2], ["Missing tests", 2], ["Confirmed by the manager", 2]])
+        self.assertEqual(page.contents("h2:text('Points per review') + div thead th")[6:8], ["Missing tests", "Confirmed"])
+        cards = page.page.locator("h2:text('Measurements') + .grid2 .card")
         got = cards.evaluate_all("cs => cs.map(c => [c.querySelector('b').textContent, "
                                  "c.querySelector('.note').textContent, c.querySelectorAll('circle').length])")
         # plan step 94: the title is the metric_defs label and the note says which way is better
@@ -250,10 +258,10 @@ class IssuesPlansExplore(browser.ViewerTestCase):
                          ["ISS-0002"])
         hot = page.page.locator("h2:text('Files that keep producing issues') + div tbody tr", has_text="src/auth.py")
         page.after(hot.click)
-        self.assertEqual(page.location_hash(), "#/issues?q=src%2Fauth.py")
+        self.assertEqual(page.location_hash(), "#/issues?status=all&q=src%2Fauth.py")  # ISS-0235 fixed
         self.assertEqual(page.js("document.querySelector('#app input[type=search]').value"), "src/auth.py")
-        # characterization: ISS-0258 the hotspot link keeps the default Still to fix filter, hiding the fixed ISS-0001
-        self.assertEqual(self._codes(page), ["ISS-0004"])
+        # ISS-0258 fixed: the hotspot link asks for every status, so the fixed ISS-0001 is listed
+        self.assertEqual(self._codes(page), ["ISS-0001", "ISS-0004"])
 
     # ------------------------------------------------------------------ explore
 
@@ -265,17 +273,27 @@ class IssuesPlansExplore(browser.ViewerTestCase):
         self.assertEqual(page.location_hash(), "#/explore/design_goals")
         self.assertEqual(page.js("document.querySelector('.tlist button[aria-current=true]').dataset.n"),
                          "design_goals")
-        note = "#app .split > div:last-child > p.note"
-        self.assertEqual(page.text(note), "152 rows · showing 1–100")
+        note = "#app .split > div:last-child > p.note:nth-of-type(3)"
+        # step 189: the name in words, what it holds, and the stored name
+        self.assertEqual(page.text("#app .split h2:not(.sec)"), "Design goals")
+        self.assertEqual(page.text("#app .split > div:last-child > p.lede"),
+                         self.ledger.module.SCHEMA_NOTES["design_goals"])
+        self.assertEqual(page.text("#app .split > div:last-child > p.note"), "Stored as design_goals")
+        self.assertEqual(page.text(note), "152 rows · rows 1–100")
         self.assertEqual(page.count("#app .split .grid tbody tr"), 100)
         tools = "#app .split > div:last-child .tools button"
         self.assertEqual(page.texts(tools), ["Next", "Query this"])
         page.after(lambda: page.page.locator(tools, has_text="Next").click())
-        self.assertEqual(page.text(note), "152 rows · showing 101–152")
+        self.assertEqual(page.text(note), "152 rows · rows 101–152")
+        self.assertEqual(page.location_hash(), "#/explore/design_goals?offset=100")
+        page.page.reload()                       # the position survives a reload (step 189)
+        page.settle()
+        self.assertEqual(page.text(note), "152 rows · rows 101–152")
         self.assertEqual(page.count("#app .split .grid tbody tr"), 52)
         self.assertEqual(page.texts(tools), ["Previous", "Query this"])
         page.after(lambda: page.page.locator(tools, has_text="Previous").click())
-        self.assertEqual(page.text(note), "152 rows · showing 1–100")
+        self.assertEqual(page.text(note), "152 rows · rows 1–100")
+        self.assertEqual(page.location_hash(), "#/explore/design_goals")
         page.page.locator(tools, has_text="Query this").click()
         self.assertEqual(page.js("[document.activeElement.getAttribute('aria-label'), document.activeElement.value]"),
                          ["SQL query", "SELECT * FROM design_goals LIMIT 50"])
@@ -283,6 +301,19 @@ class IssuesPlansExplore(browser.ViewerTestCase):
         page.hash("#/explore/plans")
         self.assertEqual(page.text(note), "2 rows")
         self.assertEqual(page.texts(tools), ["Query this"])
+        # a view is not counted until asked (step 165), and says what it is (step 189)
+        page.hash("#/explore/v_owner_queue")
+        self.assertEqual(page.text("#app .split > div:last-child > p.lede"), "Everything waiting on the owner.")
+        self.assertRegex(page.text(note), r"^rows 1–\d+$")
+        self.assertEqual(page.texts(tools), ["Count the rows", "Query this"])
+        page.after(lambda: page.page.locator(tools, has_text="Count the rows").click())
+        self.assertRegex(page.text(note), r"^\d+ rows? · rows 1–\d+$")
+        self.assertEqual(page.texts(tools), ["Query this"])
+        self.assertEqual(page.js("document.querySelector('.tlist button[data-n=v_owner_queue]').textContent"),
+                         "Owner queuev_owner_queue")
+        self.assertEqual(page.js("document.querySelector('.tlist button[data-n=plans]').textContent"), "Plansplans2")
+        page.hash("#/explore/v_code_refs")
+        self.assertIn("The agent reads this view", page.text("#app .split > div:last-child > p.note"))
         page.hash("#/explore/no_such_table")
         self.assertEqual(page.texts("#app .split > div:last-child p.empty"), ["Choose a table or view on the left."])
 

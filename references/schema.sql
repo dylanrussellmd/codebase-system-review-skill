@@ -1,5 +1,5 @@
 -- =====================================================================
--- Code review ledger — schema version 10
+-- Code review ledger — schema version 11
 -- One SQLite file per project: <project root>/.code-review/ledger.sqlite
 -- Every connection must run:  PRAGMA foreign_keys = ON;
 -- Times are UTC ISO-8601 text with milliseconds (strftime('%Y-%m-%dT%H:%M:%fZ','now')); the tr_time_*
@@ -951,6 +951,8 @@ CREATE TABLE events (
 -- ---------- Indexes -----------------------------------------------------
 
 CREATE INDEX ix_findings_review      ON findings(review_id);
+-- The columns the per-review counts read (v_review_totals), so a list of reviews never reads the findings themselves.
+CREATE INDEX ix_findings_review_counts ON findings(review_id, verification, severity, match_type);
 CREATE INDEX ix_findings_issue       ON findings(issue_id);
 CREATE INDEX ix_findings_fingerprint ON findings(fingerprint);
 CREATE INDEX ix_findings_slug        ON findings(domain_code, theme_code, sub);
@@ -2093,8 +2095,9 @@ WHEN NEW.options IS NOT NULL AND json_valid(NEW.options) AND json_type(NEW.optio
   SELECT RAISE(ABORT, 'gate options must be objects with a text value and label (and an optional description)');
 END;
 
--- The same answer rules as the viewer, for answers written as SQL: answer_value is one of the option values,
--- and a gate without free text needs an option chosen.
+-- The answer rules of answer_gate() (the viewer, answer-gate, import-answers), for answers written as SQL:
+-- answer_value is one of the option values; a gate without free text needs an option chosen and takes no note;
+-- a note is at most 10,000 characters.
 CREATE TRIGGER tr_gate_answer_rules BEFORE UPDATE OF status, answer_value, answer_text ON gates
 WHEN NEW.status = 'answered' AND (OLD.status IS NOT 'answered' OR OLD.answer_value IS NOT NEW.answer_value
                                   OR OLD.answer_text IS NOT NEW.answer_text) BEGIN
@@ -2104,6 +2107,10 @@ WHEN NEW.status = 'answered' AND (OLD.status IS NOT 'answered' OR OLD.answer_val
                     WHERE json_extract(j.value, '$.value') = NEW.answer_value);
   SELECT RAISE(ABORT, 'this gate takes no free text: choose one of the options')
   WHERE NEW.allow_text = 0 AND NEW.answer_value IS NULL;
+  SELECT RAISE(ABORT, 'this gate takes no free text: answer with the option alone')
+  WHERE NEW.allow_text = 0 AND NEW.answer_text IS NOT NULL;
+  SELECT RAISE(ABORT, 'answer_text is too long (over 10,000 characters)')
+  WHERE length(NEW.answer_text) > 10000;
 END;
 
 -- A gate moves open -> answered -> applied (or withdrawn); it cannot be applied before it is answered. Any
@@ -2968,26 +2975,29 @@ ORDER BY g.status = 'answered', g.blocking DESC, g.created_at;
 -- (steps, decisions, and design goals proposed for a review and not on an open approval gate). Each thing once: a
 -- step or decision with an open or answered gate (on it, or for a decision on its step) is listed as that gate. A
 -- step's question falls back to its progress note, then to its change text, so it is never blank; it is blocking
--- when an unfinished step depends on it.
+-- when an unfinished step depends on it. question is what the owner is asked; context is what helps answer it
+-- (a gate's context, what reopens a decision).
 CREATE VIEW v_owner_queue AS
 SELECT 'gate' AS kind, g.code AS ref, g.kind AS need, g.title, g.question,
-       g.status, g.blocking, g.created_at
+       g.status, g.blocking, g.created_at, g.context
 FROM gates g WHERE g.status IN ('open','answered')
 UNION ALL
 SELECT 'step', p.code || ' #' || s.number, s.owner_need, s.title,
        COALESCE(NULLIF(trim(s.owner_question), ''), NULLIF(trim(s.progress_note), ''), s.change), 'open',
        EXISTS (SELECT 1 FROM step_dependencies sd JOIN steps ds ON ds.id = sd.step_id
-               WHERE sd.depends_on_step_id = s.id AND ds.status NOT IN ('done','dropped')), s.updated_at
+               WHERE sd.depends_on_step_id = s.id AND ds.status NOT IN ('done','dropped')), s.updated_at, NULL
 FROM steps s JOIN plans p ON p.id = s.plan_id
 WHERE s.status = 'waiting-owner'
   AND NOT EXISTS (SELECT 1 FROM gates g WHERE g.step_id = s.id AND g.status IN ('open','answered'))
 UNION ALL
-SELECT 'decision', d.code, 'decision', d.question, d.revisit_when, d.status, 0, d.asked_at
+SELECT 'decision', d.code, 'decision',
+       CASE d.status WHEN 'revisit' THEN 'A decision to look at again' ELSE 'A decision to make' END,
+       d.question, d.status, 0, d.asked_at, d.revisit_when
 FROM decisions d WHERE d.status IN ('open','revisit')
   AND NOT EXISTS (SELECT 1 FROM gates g WHERE g.decision_id = d.id AND g.status IN ('open','answered'))
   AND NOT EXISTS (SELECT 1 FROM gates g WHERE g.step_id = d.step_id AND g.status IN ('open','answered'))
 UNION ALL
-SELECT 'goal', g.code, 'confirm', 'Approve a design goal', g.text, g.status, 1, g.adopted_at
+SELECT 'goal', g.code, 'confirm', 'Approve a design goal', g.text, g.status, 1, g.adopted_at, NULL
 FROM design_goals g WHERE g.status = 'proposed' AND g.review_id IS NOT NULL
   AND NOT EXISTS (SELECT 1 FROM gates x WHERE x.id = g.gate_id AND x.status IN ('open','answered'));
 
@@ -3073,6 +3083,18 @@ WHERE f.verification <> 'false'
   AND NOT EXISTS (SELECT 1 FROM findings f2 JOIN step_findings sf ON sf.finding_id = f2.id
                   JOIN steps cs ON cs.id = sf.step_id
                   WHERE f.issue_id IS NOT NULL AND f2.issue_id = f.issue_id AND cs.status <> 'dropped');
+
+-- Review files recorded outside the ledger's folder.
+-- A brief, report or index whose path is not under .code-review/ (or under the folder meta.ledger_location names,
+-- for a ledger kept elsewhere): it was left in a scratch folder and will not travel with the ledger. A warning;
+-- check also says when a recorded file is missing from disk.
+CREATE VIEW v_artifacts_outside_ledger AS
+SELECT r.code AS review, a.kind, a.path
+FROM artifacts a LEFT JOIN reviews r ON r.id = a.review_id
+WHERE a.path IS NOT NULL AND a.kind IN ('brief','report','index')
+  AND replace(a.path, char(92), '/') NOT LIKE '.code-review/%'
+  AND replace(a.path, char(92), '/') NOT LIKE
+      replace(COALESCE((SELECT value FROM meta WHERE key = 'ledger_location'), '.code-review'), char(92), '/') || '/%';
 
 -- Fixed issues with no test guarding the fix, or whose guard test is gone.
 -- Issues of kind docs or design need no guard test.
@@ -3566,7 +3588,42 @@ INSERT INTO ledger_checks(view, label, tier, position) VALUES
  ('v_closed_without_reason','Issues accepted or declined with no reason recorded','error',78),
  ('v_relation_problems','Related-to pairs stored in both directions','error',80),
  ('v_check_finding_owner','Review checks citing a finding of another issue','error',82);
-INSERT INTO meta(key, value) VALUES ('schema_version','10');
+-- The names the triggers give to events (events.event is free text: a name without a label is shown in words).
+INSERT INTO enum_labels(enum, value, label, position) VALUES
+ ('event','opened','Opened',1),
+ ('event','seen','Raised by a review',2),
+ ('event','recurred','Raised again after it was closed',3),
+ ('event','checked','Looked for by a review',4),
+ ('event','unlinked','A point was moved to another issue',5),
+ ('event','status-changed','Status changed',6),
+ ('event','severity-changed','Severity changed',7),
+ ('event','title-changed','Title changed',8),
+ ('event','before-state-changed','What it did before: text changed',9),
+ ('event','current-state-changed','What it does now: text changed',10),
+ ('event','after-state-changed','What it does after the fix: text changed',11),
+ ('event','recommendation-changed','Agreed fix changed',12),
+ ('event','resolution-changed','Resolution changed',13),
+ ('event','created','Created',14),
+ ('event','proof-changed','Proof changed',15),
+ ('event','change-text-changed','Change text changed',16),
+ ('event','answer-changed','Answer changed',17),
+ ('event','answer-cleared','Answer cleared',18),
+ ('event','verification-changed','Check by the manager changed',19),
+ ('event','text-changed','Text changed',20),
+ ('event','asked','Asked',21),
+ ('event','linked','Linked',22),
+ ('event','step-linked','Linked to a plan step',23),
+ ('event','source-linked','Linked to the interview answers it comes from',24),
+ ('event','dependency-added','A step it depends on was added',25),
+ ('event','proposed','Proposed',26),
+ ('event','reviewer-run-created','A reviewer was started',27),
+ ('event','metric-recorded','A measurement was recorded',28),
+ ('event','tag-pushed','The tag of the reviewed commit was pushed',29),
+ ('event','redacted','A secret was removed from the text',30);
+
+INSERT INTO ledger_checks(view, label, tier, position) VALUES
+ ('v_artifacts_outside_ledger','Review files recorded outside the ledger''s folder','warning',110);
+INSERT INTO meta(key, value) VALUES ('schema_version','11');
 INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger schema'),
   (2, 'url, path, hash and code checks; repositories.allow_outside_root; finding_locations.excerpt_redacted'),
   (3, 'integrity rules: codes, hashes, checks, append-only history, owner actor on gate answers'),
@@ -3576,4 +3633,5 @@ INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger s
   (7, 'must-be-empty checks for history gaps, matches, off-plan and done-step coverage, closings, relations and checks; steps.no_findings_reason'),
   (8, 'finding_locations.source (the reviewed text of a dirty working tree); v_next_codes for the write commands'),
   (9, 'owner interview (interview_questions, interview_answers) and per-domain design goals the owner approves'),
-  (10, 'v_plan_totals, v_review_totals and v_pending_gates: the counts the viewer''s lists show');
+  (10, 'v_plan_totals, v_review_totals and v_pending_gates: the counts the viewer''s lists show'),
+  (11, 'gate answer rules in the trigger, owner queue context, event labels, the artifact check');

@@ -106,7 +106,7 @@ class OpenIssues(unittest.TestCase):
 
 class IssuesRoute(unittest.TestCase):
     def codes(self, L=None, **qs):
-        return [r["code"] for r in api(L or demo()[0], "/api/issues", **qs)]
+        return [r["code"] for r in api(L or demo()[0], "/api/issues", **qs)["rows"]]
 
     def test_issues_active_filter(self):
         L, _ = extra()
@@ -114,7 +114,7 @@ class IssuesRoute(unittest.TestCase):
         self.assertEqual(sorted(self.codes(L, status="active")),
                          sorted(r["code"] for r in rows if r["status"] in ACTIVE))
         self.assertEqual(self.codes(L, status="active"),
-                         [r["code"] for r in api(L, "/api/issues") if r["status"] in ACTIVE])
+                         [r["code"] for r in api(L, "/api/issues")["rows"] if r["status"] in ACTIVE])
         for status in ACTIVE + ("fixed", "obsolete"):
             self.assertEqual(sorted(self.codes(L, status=status)),
                              sorted(r["code"] for r in rows if r["status"] == status), status)
@@ -140,7 +140,7 @@ class IssuesRoute(unittest.TestCase):
         self.assertEqual(self.codes(q="auth.py", domain_code="spec"), [])
         # order: H, M, L, T, then the order the issues were opened
         self.assertEqual(self.codes(), ["ISS-0001", "ISS-0002", "ISS-0004", "ISS-0003"])
-        sev = [SEVERITY[r["severity"]] for r in api(L, "/api/issues")]
+        sev = [SEVERITY[r["severity"]] for r in api(L, "/api/issues")["rows"]]
         self.assertEqual(sev, sorted(sev))
 
 
@@ -201,7 +201,7 @@ class Totals(unittest.TestCase):
 
     def test_overview_counts_equal_views(self):
         for L in (demo()[0], extra()[0]):
-            o = api(L, "/api/overview")
+            o = {**api(L, "/api/overview"), **api(L, "/api/home")}
             totals = {r["review"]: r for r in L.all("SELECT * FROM v_review_totals")}
             self.assertEqual([r["code"] for r in o["reviews"]],
                              [r["code"] for r in L.all("SELECT code FROM reviews ORDER BY started_at DESC LIMIT 5")])
@@ -223,11 +223,11 @@ class Totals(unittest.TestCase):
             self.assertEqual(o["gates_open"], L.count("v_pending_gates", "status = 'open'"))
             self.assertEqual([g["code"] for g in api(L, "/api/gates")["gates"]],
                              [r["code"] for r in L.all("SELECT code FROM v_pending_gates")])
-            self.assertEqual(o["queue"], L.count("v_owner_queue"))
+            self.assertEqual(o["queue_count"] + o["answered_count"], L.count("v_owner_queue"))
             self.assertEqual(sum(r["n"] for r in o["open_by_severity"]), L.count("v_open_issues"))
             for r in o["open_by_severity"]:
                 self.assertEqual(r["n"], L.count("v_open_issues", "severity = ?", (r["severity"],)))
-            self.assertEqual(sorted(r["code"] for r in api(L, "/api/issues", status="active")),
+            self.assertEqual(sorted(r["code"] for r in api(L, "/api/issues", status="active")["rows"]),
                              sorted(r["code"] for r in L.all("SELECT code FROM v_open_issues")))
 
     def test_core_names_the_active_statuses_once(self):

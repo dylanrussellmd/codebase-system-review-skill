@@ -35,9 +35,12 @@ class Viewer(ServerThread):
 
 def example_path(pattern, L):
     """A real path for a ROUTES pattern on the demo ledger ('*' segments filled from the ledger)."""
-    fill = {"review": "R-0001", "issue": "ISS-0002", "plan": "P-0001", "table": "issues", "gates": "GATE-0001",
-            "source": str(L.scalar("SELECT min(id) FROM finding_locations"))}
-    return "/api/" + "/".join(fill[pattern[0]] if seg == "*" else seg for seg in pattern)
+    fill = {"review": ["R-0001"], "issue": ["ISS-0002"], "plan": ["P-0001"], "table": ["issues"], "gates": ["GATE-0001"],
+            "source": [str(L.scalar("SELECT min(id) FROM finding_locations"))],
+            "finding": [str(L.scalar("SELECT min(id) FROM findings"))], "step": ["P-0001", "2"],
+            "run": [str(L.scalar("SELECT min(id) FROM reviewer_runs"))]}
+    stars = iter(fill.get(pattern[0], []))
+    return "/api/" + "/".join(next(stars) if seg == "*" else seg for seg in pattern)
 
 
 class MethodRouting(unittest.TestCase):
@@ -81,9 +84,11 @@ class MethodRouting(unittest.TestCase):
         self.assertEqual(len({(r.method, r.pattern) for r in routes}), len(routes), "one handler per method and path")
         documented = {}
         for name, (method, path, body, status, shape, keys) in CONTRACT.items():
-            if status == 200:
+            if status == 200 and "?" not in path:
                 documented[(method, tuple("*" if "{" in s else s for s in path.split("/")[2:]))] = (path, body, shape, keys)
         loc = self.L.scalar("SELECT min(id) FROM finding_locations")
+        finding = self.L.scalar("SELECT min(id) FROM findings")
+        run = self.L.scalar("SELECT min(id) FROM reviewer_runs")
         for r in routes:
             with self.subTest(route=f"{r.method} {'/'.join(r.pattern)}"):
                 self.assertIn(r.method, ("GET", "POST"))
@@ -97,10 +102,11 @@ class MethodRouting(unittest.TestCase):
                 self.assertEqual(len(match), 1, f"no CONTRACT example for {r.method} {path}")
                 doc_path, body, shape, keys = match[0]
                 if r.pattern != ("gates", "*", "answer"):  # the one write is exercised by test_routes.Contract
-                    res, status = self.call(doc_path.format(loc=loc), body)[:2]
+                    res, status = self.call(doc_path.format(loc=loc, finding=finding, run=run), body)[:2]
                     self.assertEqual(status, 200, res)
                     self.assertIsInstance(res, shape)
-                    self.assertEqual(set(res[0]) if shape is list else set(res), keys)
+                    if keys is not None:   # (a point in full has every column of findings: test_routes checks it)
+                        self.assertEqual(set(res[0]) if shape is list else set(res), keys)
                 # the other method on the same path is refused, naming the method that works
                 wrong = self.call(path, {} if r.method == "GET" else None)
                 self.assertEqual(wrong[1], 405, wrong)
@@ -176,12 +182,17 @@ class MethodRouting(unittest.TestCase):
                 self.assertIsNone(r.hub, "the hub is read-only")
                 continue
             self.assertTrue(callable(r.hub), f"GET {'/'.join(r.pattern)} has no list of hub paths")
+            if r.pattern == ("step", "*", "*"):   # the hub's plans carry every step in full, so it asks for none
+                self.assertEqual(r.hub(con := self.mod.connect(self.L.db, readonly=True)), [])
+                con.close()
+                self.assertTrue(all("change" in s for s in R["plan/P-0001"]["steps"]))
+                continue
             head = r.pattern[0]
             held = [k for k in R if k.split("?")[0].split("/")[0] == head
                     and len(k.split("?")[0].split("/")) == len(r.pattern)]
             self.assertTrue(held, f"the hub holds no answer for GET /api/{'/'.join(r.pattern)}")
         n = lambda table: self.L.count(table)
-        count = lambda head: sum(1 for k in R if k.startswith(head + "/"))
+        count = lambda head: sum(1 for k in R if k.startswith(head + "/") and k.count("/") == 1)
         self.assertEqual((count("review"), count("issue"), count("plan"), count("source")),
                          (n("reviews"), n("issues"), n("plans"), n("finding_locations")))
         self.assertEqual(count("table"), len(R["tables"]))

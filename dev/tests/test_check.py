@@ -256,7 +256,8 @@ class CheckFunction(unittest.TestCase):
             views = {r["name"] for r in L.all("SELECT name FROM sqlite_schema WHERE type='view'")}
         self.assertLessEqual({"v_unmatched_findings", "v_unchecked_known_issues", "v_untraceable_refs",
                               "v_uncovered_findings", "v_coverage_problems"}, set(self.views))
-        self.assertEqual([(v, t) for v, _, t in self.checks if t == "warning"], [("v_unguarded_fixes", "warning")])
+        self.assertEqual([(v, t) for v, _, t in self.checks if t == "warning"],
+                         [("v_unguarded_fixes", "warning"), ("v_artifacts_outside_ledger", "warning")])
         for v in self.views:
             self.assertIn(v, views)
 

@@ -384,7 +384,10 @@ class GateAnswers(IntegrityCase):
         nid = self.gate(allow_text=0)
         self.raises("UPDATE gates SET status='answered', answer_text='my own words' WHERE id=?", (nid,),
                     "no free text")
-        self.x("UPDATE gates SET status='answered', answer_value='change', answer_text='and why' WHERE id=?", (nid,))
+        # step 158: a gate without free text takes its option alone
+        self.raises("UPDATE gates SET status='answered', answer_value='change', answer_text='and why' WHERE id=?",
+                    (nid,), "no free text")
+        self.x("UPDATE gates SET status='answered', answer_value='change' WHERE id=?", (nid,))
 
     def test_gate_options_shape_checked(self):
         with self.assertRaises(sqlite3.IntegrityError):

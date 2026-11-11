@@ -158,15 +158,15 @@ class Helpers(browser.ViewerTestCase):
         facts = dict(zip(page.texts(".facts span"), page.texts(".facts b")))
         self.assertEqual(facts, {"waiting on you": "2", "open issues": "3", "open and high": "0",
                                  "came back or seen again": "1"})
-        link = page.page.locator("p.status a")
+        link = page.page.locator("p.callout a")   # step 188: a standing fact is a callout, never a status line
         self.assertEqual(link.inner_text(), "2 things need your input or approval →")
         self.assertEqual(link.get_attribute("href"), "#/inbox")
-        self.assertEqual(page.texts(".card h2"), ["Latest reviews", "Fix plans", "Ledger checks"])
+        self.assertEqual(page.texts(".card h2"), ["Latest reviews", "Fix plans", "Housekeeping for the agent"])
         self.assertEqual(page.texts(".card:has(h2:text('Latest reviews')) tbody td:first-child"), ["R-0002", "R-0001"])
         self.assertEqual(page.text(".card:has(h2:text('Fix plans')) a"), "P-0001 · Fix plan for R-0001")
         self.assertEqual(page.count(".status.err"), 0)          # every check is 0: no failing-checks line
         # A check row with n = 0 does not navigate.
-        page.after(page.page.locator(".card:has(h2:text('Ledger checks')) tbody tr").first.click, timeout=300)
+        page.after(page.page.locator(".card:has(h2:text('Housekeeping for the agent')) tbody tr").first.click, timeout=300)
         self.assertEqual(page.location_hash(), "#/")
         # A review row does.
         page.after(page.page.locator(".card:has(h2:text('Latest reviews')) tbody tr").first.click)
@@ -174,19 +174,33 @@ class Helpers(browser.ViewerTestCase):
         self.assertEqual(page.text("#app h1"), "R-0002 · Comprehensive review R-0002")
 
     def test_page_home_failing_checks_link(self):
-        # One unmatched finding makes a check fail: the line appears and that row links to Explore.
+        # One unmatched finding makes a check fail: the line appears and that row opens the page that shows the
+        # rows (step 188, K36: the review's points that are not matched yet), and says what the agent does (196).
         rid = self.ids["reviews"]["R-0002"]
         fid = self.ledger.finding(rid, "SPEC-L9", severity="L", summary="Unmatched probe.")
         self.ledger.commit()
         try:
             page = self.open("#/")
             # two: the finding is unmatched, and (step 76, schema 7) a finding with no location is untraceable
-            self.assertEqual(page.texts(".status.err"), ["2 checks need attention."])
-            row = page.page.locator(".card:has(h2:text('Ledger checks')) tbody tr", has_text="not matched")
+            self.assertEqual(page.count(".status"), 0)
+            self.assertEqual(page.texts(".card p.callout"), ["2 checks are not at zero."])
+            row = page.page.locator(".card:has(h2:text('Housekeeping for the agent')) tbody tr", has_text="not matched")
             self.assertEqual(row.locator("td").nth(1).inner_text(), "1")
+            self.assertEqual(row.locator("td").nth(2).inner_text().split("\n")[0],
+                             "The agent matches each of these points to an issue.")
+            self.assertIn('references/recipes.md, under "A failing check": v_unmatched_findings',
+                          row.locator("td").nth(2).inner_text())
             page.after(row.click)
-            self.assertEqual(page.location_hash(), "#/explore/v_unmatched_findings")
-            self.assertEqual(page.text("#app h2:not(.sec)"), "v_unmatched_findings")
+            self.assertEqual(page.location_hash(), "#/review/R-0002?match=none")
+            self.assertEqual(page.js("document.querySelector('#fm').selectedOptions[0].textContent"), "Not matched yet")
+            self.assertEqual(page.texts("details.item > summary .n"), ["SPEC-L9"])
+            # a check with no page of its own opens in Explore, under its name in words (step 189)
+            page.hash("#/")
+            other = page.page.locator(".card:has(h2:text('Housekeeping for the agent')) tbody tr", has_text="traced")
+            page.after(other.click)
+            self.assertEqual(page.location_hash(), "#/explore/v_untraceable_refs")
+            self.assertEqual(page.text("#app h2:not(.sec)"), "Untraceable refs")
+            self.assertIn("v_untraceable_refs", page.text("#app .split p.note"))
         finally:
             # findings are append-only (schema 3): lift the guard for this cleanup only, then put it back as it was
             con = self.ledger.con
@@ -198,7 +212,7 @@ class Helpers(browser.ViewerTestCase):
 
     def test_page_router_tabs_and_unknown(self):
         page = self.open("#/")
-        self.assertEqual(page.texts(".tabs a"), ["Overview", "Waiting on you2", "Reviews", "Design goals", "Issues", "Fix plans",
+        self.assertEqual(page.texts(".tabs a"), ["Overview", "How it works", "Waiting on you2", "Reviews", "Design goals", "Issues", "Fix plans",
                                                  "Over time", "Explore"])
         cases = [("#/inbox", "Waiting on you", "Waiting on you"), ("#/history", "Waiting on you", "Questions and answers"),
                  ("#/reviews", "Reviews", "Reviews"), ("#/review/R-0001", "Reviews", "R-0001 · Comprehensive review R-0001"),
@@ -222,27 +236,27 @@ class Helpers(browser.ViewerTestCase):
         self.assertEqual(page.js("document.getElementById('brand').firstChild.textContent"), "proj")
 
     def test_page_router_badge_refresh(self):
-        # The tab badge counts the owner queue; the router reloads the overview on home and inbox only.
+        # The tab badge counts the owner queue; the router reloads the overview on every navigation.
         page = self.open("#/reviews")
         self.assertEqual(page.text(".tabs .badge"), "2")
         gate = self.ids["gates"]["GATE-0002"]
         self.write("UPDATE gates SET status='withdrawn' WHERE id=?", (gate,))
         try:
             page.hash("#/issues")
-            # characterization: ISS-0259 the badge is stale outside home and inbox (still 2 after a gate went away)
-            self.assertEqual(page.text(".tabs .badge"), "2")
+            self.assertEqual(page.text(".tabs .badge"), "1")  # ISS-0259 fixed (step 177): current on every page
             page.hash("#/inbox")
             self.assertEqual(page.text(".tabs .badge"), "1")
         finally:
             self.write("UPDATE gates SET status='open' WHERE id=?", (gate,))
 
-    def test_page_badge_counts_answered_gates(self):
+    def test_page_badge_leaves_out_answered_gates(self):
         gate = self.ids["gates"]["GATE-0002"]
         self.write("UPDATE gates SET status='answered', answer_value='approve' WHERE id=?", (gate,))
         try:
             page = self.open("#/inbox")
-            # characterization: ISS-0107 an answered gate (no longer waiting on the owner) still counts in the badge
-            self.assertEqual(page.text(".tabs .badge"), "2")
+            # ISS-0107 fixed (step 177; was test_page_badge_counts_answered_gates): an answered gate is no longer
+            # waiting on the owner, so the badge leaves it out
+            self.assertEqual(page.text(".tabs .badge"), "1")
             self.assertEqual(page.count(".card.gate"), 2)
         finally:
             self.write("UPDATE gates SET status='open', answer_value=NULL, answered_at=NULL WHERE id=?", (gate,))
@@ -257,13 +271,12 @@ class HomeWithStepInProgress(browser.ViewerTestCase):
         ledger.update("steps", ids["steps"][1], status="doing")
         return ids
 
-    def test_page_home_bar_ignores_in_progress(self):
+    def test_overview_bar_matches_plans_bar(self):
         page = self.open("#/")
         bar = page.page.locator(".card:has(h2:text('Fix plans'))")
-        # characterization: ISS-0237 the overview always passes doing=0, so the in-progress step is not shown
-        self.assertEqual(bar.locator(".note").inner_text(), "1 of 3 done · 1 waiting on you")
-        self.assertEqual(bar.locator(".bar i.g").get_attribute("style"), "width:0.00%")
-        # The plans list does show it.
+        # ISS-0237 fixed (step 188; was test_page_home_bar_ignores_in_progress): the step in progress shows
+        self.assertEqual(bar.locator(".note").inner_text(), "1 of 3 done · 1 in progress · 1 waiting on you")
+        self.assertEqual(bar.locator(".bar i.g").get_attribute("style"), "width:33.33%")
         page.hash("#/plans")
         self.assertEqual(page.text("#app td .note"), "1 of 3 done · 1 in progress · 1 waiting on you")
 
@@ -280,16 +293,20 @@ class EmptyLedger(browser.ViewerTestCase):
         facts = dict(zip(page.texts(".facts span"), page.texts(".facts b")))
         self.assertEqual(facts, {"waiting on you": "0", "open issues": "0", "open and high": "0",
                                  "came back or seen again": "0"})
-        self.assertEqual(page.count("p.status"), 0)               # no queue link when the queue is 0
+        self.assertEqual(page.count("p.callout.you"), 0)          # no queue link when the queue is 0
         self.assertEqual(page.count(".tabs .badge"), 0)
-        self.assertEqual(page.texts("p.empty"), ["Nothing here yet.", "No fix plan yet."])
+        # step 188 (test_empty_ledger_has_guidance): what to do next, and each empty list says what is missing
+        self.assertEqual(page.texts("p.callout"), ["No reviews yet. Ask your agent to run the system review."])
+        self.assertEqual(page.texts("p.empty"), ["No review has been run yet.", "No fix plan yet."])
+
+    test_empty_ledger_has_guidance = test_page_home_empty
 
     def test_page_empty_views(self):
         page = self.open("#/inbox")
         self.assertEqual(page.texts("p.empty"), ["Nothing is waiting on you right now."])
-        self.assertEqual(page.count("#app h2.sec"), 0)                 # no answered or other section
+        self.assertEqual(page.count("#app h2.sec:not([hidden])"), 0)   # no answered or other section
         for hash_, want in (("#/reviews", ["Nothing here yet."]), ("#/plans", ["Nothing here yet."]),
-                            ("#/history", ["Nothing here yet."])):
+                            ("#/history", ["No question has been asked yet."])):
             with self.subTest(hash_):
                 page.hash(hash_)
                 self.assertEqual(page.texts("p.empty"), want)

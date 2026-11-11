@@ -115,19 +115,20 @@ class RouteCase(unittest.TestCase):
 
 class Overview(RouteCase):
     def test_overview_counts(self):
-        d = self.ok("/api/overview")
+        # step 161: the header is /api/overview, the home page's lists /api/home, the ledger's checks /api/checks
+        d = {**self.ok("/api/overview"), **self.ok("/api/home"), **self.ok("/api/checks")}
         self.assertEqual(d["project"], self.L.root.name)
         self.assertEqual(d["schema_version"], str(fixtures.load_ledger_module().SCHEMA_VERSION))
         self.assertEqual({r["severity"]: r["n"] for r in d["open_by_severity"]}, {"M": 2, "L": 1})
         self.assertEqual({r["status"]: r["n"] for r in d["issues_by_status"]}, {"open": 3, "verified": 1})
         self.assertEqual(d["gates_open"], 2)
-        self.assertEqual(d["queue"], 2)
+        self.assertEqual((d["queue_count"], d["answered_count"]), (2, 0))
         self.assertEqual(d["recurring"], 1)
         self.assertEqual([r["code"] for r in d["reviews"]], ["R-0002", "R-0001"])
         self.assertEqual([(r["points"], r["high"]) for r in d["reviews"]], [(2, 0), (3, 1)])
-        # characterization: ISS-0237 overview plans carry done and waiting counts but no doing count
+        # ISS-0237 fixed (step 188): the home page's plans carry the doing count too
         self.assertEqual(d["plans"], [{"code": "P-0001", "title": "Fix plan for R-0001", "status": "in-progress",
-                                       "steps": 3, "done": 1, "waiting": 1}])
+                                       "steps": 3, "done": 1, "doing": 0, "waiting": 1}])
         # plan step 69: the checks come from the ledger's ledger_checks table, with their tier
         got = [(c["view"], c["tier"]) for c in d["checks"]]
         self.assertEqual(got, [(r["view"], r["tier"]) for r in self.L.all(
@@ -145,7 +146,7 @@ class Overview(RouteCase):
 
     def test_overview_counts_active_statuses_only(self):
         L, _, _ = extra()
-        d = self.ok("/api/overview", L=L)
+        d = {**self.ok("/api/overview", L=L), **self.ok("/api/home", L=L)}
         want = {}
         for r in L.all("SELECT severity, status FROM issues"):
             if r["status"] in ACTIVE:
@@ -153,19 +154,20 @@ class Overview(RouteCase):
         self.assertEqual({r["severity"]: r["n"] for r in d["open_by_severity"]}, want)
         self.assertEqual(want, {"H": 2, "M": 2, "L": 1, "T": 2})
         self.assertEqual(d["gates_open"], 3)  # GATE-0001, -0002, -0004
-        self.assertEqual(d["queue"], L.count("v_owner_queue"))
-        # characterization: ISS-0107 the queue counts answered gates too (3 open + 2 answered + step + decision)
-        self.assertEqual(d["queue"], 7)
+        # ISS-0107 fixed (step 177): answered gates are counted apart (3 open + step + decision; 2 answered)
+        self.assertEqual((d["queue_count"], d["answered_count"]), (5, 2))
+        self.assertEqual(d["queue_count"] + d["answered_count"], L.count("v_owner_queue"))
         self.assertEqual([r["code"] for r in d["reviews"]], ["R-0006", "R-0005", "R-0004", "R-0003", "R-0002"])
         self.assertEqual([p["code"] for p in d["plans"]], ["P-0002", "P-0001"])
         # v_plan_totals: a plan with no steps counts 0, not NULL
         self.assertEqual(d["plans"][0], {"code": "P-0002", "title": "Empty plan", "status": "drafting",
-                                         "steps": 0, "done": 0, "waiting": 0})
+                                         "steps": 0, "done": 0, "doing": 0, "waiting": 0})
 
     def test_overview_empty_ledger(self):
-        d = self.ok("/api/overview", L=empty())
+        d = {**self.ok("/api/overview", L=empty()), **self.ok("/api/home", L=empty()),
+             **self.ok("/api/checks", L=empty())}
         self.assertEqual((d["open_by_severity"], d["issues_by_status"], d["reviews"], d["plans"]), ([], [], [], []))
-        self.assertEqual((d["gates_open"], d["queue"], d["recurring"]), (0, 0, 0))
+        self.assertEqual((d["gates_open"], d["queue_count"], d["answered_count"], d["recurring"]), (0, 0, 0, 0))
         self.assertEqual([c["n"] for c in d["checks"]], [0] * empty().count("ledger_checks"))
         self.assertGreater(len(d["labels"]["domains"]), 10)
 
@@ -183,8 +185,8 @@ class Gates(RouteCase):
         self.assertEqual(sorted(pending), ["GATE-0001", "GATE-0002", "GATE-0003", "GATE-0004", "GATE-0007"])
         self.assertEqual(self.codes(status="pending"), pending)
         self.assertEqual(sorted(self.codes(status="all")), [f"GATE-000{n}" for n in range(1, 8)])
-        self.assertEqual(self.codes(status="open"), ["GATE-0001", "GATE-0002", "GATE-0004"])
-        self.assertEqual(self.codes(status="answered"), ["GATE-0003", "GATE-0007"])
+        self.assertEqual(sorted(self.codes(status="open")), ["GATE-0001", "GATE-0002", "GATE-0004"])
+        self.assertEqual(sorted(self.codes(status="answered")), ["GATE-0003", "GATE-0007"])
         self.assertEqual(self.codes(status="applied"), ["GATE-0005"])
         self.assertEqual(self.codes(status="withdrawn"), ["GATE-0006"])
         self.assertEqual(self.codes(status="bogus"), [])
@@ -193,11 +195,13 @@ class Gates(RouteCase):
     def test_gates_order(self):
         # open before answered; within each, blocking first; then oldest first
         self.assertEqual(self.codes(), ["GATE-0001", "GATE-0002", "GATE-0004", "GATE-0003", "GATE-0007"])
-        self.assertEqual(self.codes(status="all"),
-                         ["GATE-0001", "GATE-0002", "GATE-0005", "GATE-0006", "GATE-0004", "GATE-0003", "GATE-0007"])
+        # the history (step 186): newest first, whatever the status
+        want = [r["code"] for r in self.L.all("SELECT code FROM gates ORDER BY created_at DESC, id DESC")]
+        self.assertEqual(self.codes(status="all"), want)
+        self.assertEqual(want[-2:], ["GATE-0002", "GATE-0001"])
 
     def test_gates_options_parsed(self):
-        g = {x["code"]: x for x in self.ok("/api/gates", status="all")["gates"]}
+        g = {x["code"]: x for x in self.ok("/api/gates")["gates"]}
         self.assertEqual(g["GATE-0001"]["options"][0],
                          {"value": "keep-14", "label": "Keep 14 days", "description": "Current behaviour stays the default."})
         self.assertEqual([o["value"] for o in g["GATE-0002"]["options"]], ["approve", "add"])
@@ -206,6 +210,13 @@ class Gates(RouteCase):
         self.assertEqual((one["review_code"], one["plan_code"], one["step_number"], one["issue_code"],
                           one["decision_code"]), ("R-0001", "P-0001", 3, "ISS-0002", "D-0001"))
         self.assertEqual((g["GATE-0004"]["review_code"], g["GATE-0004"]["plan_code"]), (None, None))
+        # a history row is the short form: the chosen option's label, no options, context or question (step 160)
+        hist = {x["code"]: x for x in self.ok("/api/gates", status="all")["gates"]}
+        self.assertEqual((hist["GATE-0003"]["answer_value"], hist["GATE-0003"]["answer_label"]), ("a", "A"))
+        self.assertEqual(hist["GATE-0005"]["answer_label"], "x")  # a value its options no longer have: as stored
+        self.assertIsNone(hist["GATE-0001"]["answer_label"])
+        self.assertFalse({"options", "context", "question"} & set(hist["GATE-0001"]))
+        self.assertEqual(hist["GATE-0001"]["review_code"], "R-0001")
 
     def test_gates_other_queue(self):
         L, _, _ = extra()
@@ -216,7 +227,7 @@ class Gates(RouteCase):
         self.assertTrue(all(o["kind"] != "gate" for o in other))
         # the demo's waiting step 3 and D-0001 are covered by GATE-0001, so they are not listed again
         self.assertEqual(self.ok("/api/gates", L=demo()[0])["other"], [])
-        self.assertEqual(self.ok("/api/gates", status="open")["other"], other)  # other ignores the filter
+        self.assertNotIn("other", self.ok("/api/gates", status="open"))  # the history has gates only
 
 
 # ---------------------------------------------------------------- step 19: reviews
@@ -248,9 +259,9 @@ class Reviews(RouteCase):
 
     def test_review_detail_shape(self):
         d = self.ok("/api/review/R-0002")
-        self.assertEqual(set(d), {"review", "repos", "goals", "domains", "runs", "checks", "summary", "metrics",
-                                  "artifacts", "gates", "findings", "agents", "requirements",
-                                  "interview", "review_goals"})  # schema 9 (step 129)
+        self.assertEqual(set(d), {"review", "repos", "goals", "domains", "runs", "checks", "check_counts", "summary",
+                                  "metrics", "artifacts", "gates", "findings", "agents", "requirements",
+                                  "interview", "review_goals", "test_runs", "relations", "events"})
         r = d["review"]
         self.assertEqual((r["code"], r["previous_code"], r["manager"], r["approved_by"]),
                          ("R-0002", "R-0001", "Review manager", fixtures.DEMO_OWNER))
@@ -265,9 +276,11 @@ class Reviews(RouteCase):
         self.assertEqual(d["artifacts"], [])
         self.assertEqual([g["code"] for g in d["gates"]], ["GATE-0002"])
         self.assertEqual([r["name"] for r in d["repos"]], ["demo"])
+        # step 148: a point's list row here, the point in full on its own route
         f = {x["point_id"]: x for x in d["findings"]}
-        self.assertEqual((f["SPEC-M1"]["issue_code"], f["SPEC-M1"]["issue_status"], f["SPEC-M1"]["run_label"]),
-                         ("ISS-0002", "open", "spec"))
+        self.assertEqual(f["SPEC-M1"]["issue_code"], "ISS-0002")
+        whole = self.ok(f"/api/finding/{f['SPEC-M1']['id']}")
+        self.assertEqual((whole["issue_code"], whole["issue_status"], whole["run_label"]), ("ISS-0002", "open", "spec"))
 
     def test_review_with_no_findings(self):
         L, _, _ = extra()
@@ -285,25 +298,25 @@ class Reviews(RouteCase):
         L, _, made = extra()
         d = self.ok("/api/review/R-0001", L=L)
         self.assertEqual([x["point_id"] for x in d["findings"]], ["SEC-H1", "ZZZ-H2", "SPEC-M1", "SPEC-L1", "AAA-T1"])
-        for x in d["findings"]:
+        whole = [self.ok(f"/api/finding/{x['id']}", L=L) for x in d["findings"]]   # step 148: locations come here
+        for x in whole:
             for loc in x["locations"]:
                 self.assertEqual(loc["finding_id"], x["id"])
-        locs = {x["point_id"]: [(l["path"], l["line_start"], l["line_end"]) for l in x["locations"]]
-                for x in d["findings"]}
+        locs = {x["point_id"]: [(l["path"], l["line_start"], l["line_end"]) for l in x["locations"]] for x in whole}
         self.assertEqual(locs, {"SEC-H1": [("src/auth.py", 1, 3)], "ZZZ-H2": [("src/auth.py", 2, 2)],
                                 "SPEC-M1": [("src/timeoff.py", 2, 4)], "SPEC-L1": [("src/timeoff.py", 5, 6)],
                                 "AAA-T1": []})
-        self.assertEqual(d["findings"][0]["locations"][0]["repo"], "demo")
+        self.assertEqual(whole[0]["locations"][0]["repo"], "demo")
 
 
 # ---------------------------------------------------------------- step 19: issues
 
 class Issues(RouteCase):
     def codes(self, L=None, **qs):
-        return [r["code"] for r in self.ok("/api/issues", L=L, **qs)]
+        return [r["code"] for r in self.ok("/api/issues", L=L, **qs)["rows"]]
 
     def test_issues_list_order_and_fields(self):
-        rows = self.ok("/api/issues")
+        rows = self.ok("/api/issues")["rows"]
         self.assertEqual([r["code"] for r in rows], ["ISS-0001", "ISS-0002", "ISS-0004", "ISS-0003"])
         self.assertEqual(set(rows[0]), {"code", "title", "severity", "status", "domain_code", "theme_code",
                                         "times_seen", "opened_at", "updated_at", "first_seen", "last_seen"})
@@ -333,11 +346,9 @@ class Issues(RouteCase):
         self.assertEqual(self.codes(q="timeoff.py"), ["ISS-0002", "ISS-0003"])   # location path
         self.assertEqual(self.codes(q="PREDICTABLE"), ["ISS-0001"])              # LIKE is case-insensitive
         self.assertEqual(self.codes(q="no such words"), [])
-        # characterization: ISS-0226 % and _ are LIKE wildcards today (unescaped), so they match every issue
-        self.assertEqual(self.codes(q="%"), ["ISS-0001", "ISS-0002", "ISS-0004", "ISS-0003"])
-        self.assertEqual(self.codes(q="_"), ["ISS-0001", "ISS-0002", "ISS-0004", "ISS-0003"])
-
-    test_issues_search_wildcards_current = test_issues_search_fields
+        # ISS-0226 fixed (step 159): % and _ are matched as themselves (test_issues_search_wildcards_literal)
+        self.assertEqual(self.codes(q="%"), [])
+        self.assertEqual(self.codes(q="_"), [])
 
     def test_issues_combined(self):
         self.assertEqual(self.codes(status="open", domain_code="security"), ["ISS-0004"])
@@ -347,17 +358,19 @@ class Issues(RouteCase):
         self.assertEqual(self.codes(q="auth.py", severity="M"), ["ISS-0004"])
         self.assertEqual(self.codes(q="auth.py", domain_code="spec"), [])
 
-    def test_issues_list_capped_at_2000(self):
+    def test_issues_route_reports_total(self):
+        # ISS-0128 fixed (step 160; was test_issues_list_capped_at_2000): a page of rows and the total, never a
+        # silent cut
         L = bulk()
-        rows = self.ok("/api/issues", L=L)
-        # characterization: ISS-0128 the list silently stops at 2000 with no notice
-        self.assertEqual(len(rows), 2000)
+        d = self.ok("/api/issues", L=L)
+        self.assertEqual((len(d["rows"]), d["limit"], d["offset"]), (200, 200, 0))
+        self.assertEqual(self.ok("/api/issues", L=L, status="")["total"], L.count("issues"))
         self.assertEqual(L.count("issues"), 2105)
 
     def test_issue_detail_shape(self):
         d = self.ok("/api/issue/ISS-0002")
         self.assertEqual(set(d), {"issue", "findings", "relations", "checks", "timeline", "guard_tests",
-                                  "decisions", "steps"})
+                                  "decisions", "steps", "unguarded"})
         i = d["issue"]
         self.assertEqual((i["code"], i["first_seen"], i["last_seen"], i["last_checked"]),
                          ("ISS-0002", "R-0001", "R-0002", "R-0002"))
@@ -421,17 +434,21 @@ class Plans(RouteCase):
 
     def test_plan_detail_shape(self):
         d = self.ok("/api/plan/P-0001")
-        self.assertEqual(set(d), {"plan", "phases", "phase_rows", "steps"})
+        self.assertEqual(set(d), {"plan", "reviews", "artifacts", "last_updated", "gates", "discoveries", "events", "phases", "phase_rows", "steps", "unguarded"})
         self.assertEqual(d["plan"]["code"], "P-0001")
         self.assertEqual([s["number"] for s in d["steps"]], [1, 2, 3])
         self.assertEqual([s["phase"] for s in d["steps"]], [1, 2, 2])
         self.assertEqual([s["depends"] for s in d["steps"]], [[], [1], [1]])
-        self.assertEqual([[c["point_id"] for c in s["closes"]] for s in d["steps"]],
-                         [["SPEC-L1"], ["SEC-H1"], ["SPEC-M1"]])
-        c = d["steps"][1]["closes"][0]
+        # step 162: a step lists the ids of the points it closes; the points and the step in full are /api/step
+        f = demo()[1]["findings"]
+        self.assertEqual([s["closes"] for s in d["steps"]],
+                         [[f["R-0001/SPEC-L1"]], [f["R-0001/SEC-H1"]], [f["R-0001/SPEC-M1"]]])
+        full = [self.ok(f"/api/step/P-0001/{n}") for n in (1, 2, 3)]
+        self.assertEqual([[c["point_id"] for c in s["closes"]] for s in full], [["SPEC-L1"], ["SEC-H1"], ["SPEC-M1"]])
+        c = full[1]["closes"][0]
         self.assertEqual((c["review"], c["issue"], c["severity"]), ("R-0001", "ISS-0001", "H"))
         c2 = self.L.repo.commits[1]
-        self.assertEqual([[x["commit_sha"] for x in s["commits"]] for s in d["steps"]], [[], [c2], []])
+        self.assertEqual([[x["commit_sha"] for x in s["commits"]] for s in full], [[], [c2], []])
         self.assertEqual([(p["phase"], p["steps"], p["done"], p["waiting_owner"], p["not_started"])
                           for p in d["phases"]], [(1, 1, 0, 0, 1), (2, 2, 1, 1, 0)])
         self.assertEqual([p["number"] for p in d["phase_rows"]], [1, 2])
@@ -502,11 +519,12 @@ class Tables(RouteCase):
                           "AND name NOT LIKE 'sqlite%' ORDER BY type, name")
         self.assertEqual([(r["name"], r["type"]) for r in rows], [(w["name"], w["type"]) for w in want])
         self.assertFalse([r["name"] for r in rows if r["name"].startswith("sqlite_")])
-        self.assertEqual(set(rows[0]), {"name", "type", "columns", "count"})
+        # steps 165 and 189: no column list (the page never read it), a label and description, and no count for a view
+        self.assertEqual(set(rows[0]), {"name", "type", "label", "description", "for_agent", "count"})
         by = {r["name"]: r for r in rows}
-        for name in ("issues", "gates", "v_owner_queue", "events"):
+        for name in ("issues", "gates", "events"):
             self.assertEqual(by[name]["count"], self.L.count(name), name)
-            self.assertEqual(by[name]["columns"], [c[1] for c in self.L.x(f'PRAGMA table_info("{name}")')], name)
+        self.assertNotIn("count", by["v_owner_queue"])
         self.assertEqual(by["issues"]["count"], 4)
         n_tables = sum(1 for r in rows if r["type"] == "table")
         n_views = sum(1 for r in rows if r["type"] == "view")
@@ -514,9 +532,10 @@ class Tables(RouteCase):
 
     def test_table_view(self):
         d = self.ok("/api/table/v_open_issues")
-        self.assertEqual(set(d), {"columns", "rows", "count", "offset", "limit"})
-        self.assertEqual(d["count"], self.L.count("v_open_issues"))
-        self.assertEqual(len(d["rows"]), d["count"])
+        self.assertEqual(set(d), {"columns", "rows", "count", "more", "truncated", "offset", "limit"})
+        self.assertIsNone(d["count"])   # step 165: a view is counted only when asked
+        self.assertEqual(self.ok("/api/table/v_open_issues", count=1)["count"], self.L.count("v_open_issues"))
+        self.assertEqual(len(d["rows"]), self.L.count("v_open_issues"))
         self.assertEqual(len(d["columns"]), len(d["rows"][0]))
         d = self.ok("/api/table/issues", limit=2, offset=1)
         self.assertEqual((d["limit"], d["offset"], d["count"], len(d["rows"])), (2, 1, 4, 2))
@@ -536,7 +555,7 @@ class Tables(RouteCase):
                          (400, {"error": "offset must be a whole number."}))
 
     def test_table_name_validation(self):
-        for name in ('issues"--', "sqlite_master", "sqlite_schema", "nope", "issues;", "1issues", "%69ssues"):
+        for name in ('issues"--', "sqlite_master", "sqlite_schema", "nope", "issues;", "1issues", "%2569ssues"):
             self.assertEqual(self.call(f"/api/table/{name}"), (404, {"error": "no such table"}), name)
         # ../x and deeper paths never reach the table lookup
         self.assertEqual(self.call("/api/table/../x"), (404, {"error": "not found"}))
@@ -573,28 +592,42 @@ class OtherRoutes(RouteCase):
 # Exact top-level keys of each route on the demo ledger. For list routes: the keys of one row.
 CONTRACT = {
     "overview": ("GET", "/api/overview", None, 200, dict,
-                 {"project", "schema_version", "open_by_severity", "issues_by_status", "gates_open", "queue",
-                  "reviews", "plans", "recurring", "checks", "labels"}),
+                 {"project", "schema_version", "gates_open", "queue_count", "answered_count", "labels"}),
+    "home": ("GET", "/api/home", None, 200, dict,
+             {"open_by_severity", "issues_by_status", "reviews", "plans", "discoveries"}),
+    "guide": ("GET", "/api/guide", None, 200, dict, {"guide"}),
+    "run": ("GET", "/api/run/{run}", None, 200, dict, {"id", "label", "prompt", "final_message"}),
+    "checks": ("GET", "/api/checks", None, 200, dict, {"checks", "recurring"}),
+    "decisions": ("GET", "/api/decisions", None, 200, dict, {"decisions"}),
     "gates": ("GET", "/api/gates", None, 200, dict, {"gates", "other"}),
+    "gates-all": ("GET", "/api/gates?status=all", None, 200, dict, {"gates", "total", "limit", "offset"}),
     "reviews": ("GET", "/api/reviews", None, 200, list,
                 {"code", "title", "scope", "status", "started_at", "completed_at", "verdict", "commits", "points",
-                 "high", "medium", "low", "new_issues", "came_back"}),
+                 "high", "medium", "low", "tests", "new_issues", "came_back"}),
     "review": ("GET", "/api/review/R-0001", None, 200, dict,
-               {"review", "repos", "goals", "domains", "runs", "checks", "summary", "metrics", "artifacts", "gates",
-                "findings", "agents", "requirements", "interview", "review_goals"}),
-    "issues": ("GET", "/api/issues", None, 200, list,
-               {"code", "title", "severity", "status", "domain_code", "theme_code", "times_seen", "opened_at",
-                "updated_at", "first_seen", "last_seen"}),
+               {"review", "repos", "goals", "domains", "runs", "checks", "check_counts", "summary", "metrics",
+                "artifacts", "gates", "findings", "agents", "requirements", "interview", "review_goals",
+                "test_runs", "relations", "events"}),
+    "review-checks": ("GET", "/api/review/R-0001/checks", None, 200, dict, {"rows", "total", "limit", "offset"}),
+    "review-search": ("GET", "/api/review/R-0001?q=auth", None, 200, dict, {"match"}),
+    "finding": ("GET", "/api/finding/{finding}", None, 200, dict, None),
+    "step": ("GET", "/api/step/P-0001/2", None, 200, dict,
+             {"number", "change", "proof", "owner_question", "behavior_note", "progress_note", "no_findings_reason",
+              "started_at", "done_at", "updated_at", "commits", "closes"}),
+    "issues": ("GET", "/api/issues", None, 200, dict, {"rows", "total", "limit", "offset"}),
     "issue": ("GET", "/api/issue/ISS-0002", None, 200, dict,
-              {"issue", "findings", "relations", "checks", "timeline", "guard_tests", "decisions", "steps"}),
+              {"issue", "findings", "relations", "checks", "timeline", "guard_tests", "decisions", "steps",
+               "unguarded"}),
     "plans": ("GET", "/api/plans", None, 200, list,
               {"code", "title", "status", "created_at", "approved_at", "steps", "done", "doing", "waiting",
                "reviews"}),
-    "plan": ("GET", "/api/plan/P-0001", None, 200, dict, {"plan", "phases", "phase_rows", "steps"}),
+    "plan": ("GET", "/api/plan/P-0001", None, 200, dict,
+             {"plan", "reviews", "artifacts", "last_updated", "gates", "discoveries", "events", "phases", "phase_rows", "steps", "unguarded"}),
     "trends": ("GET", "/api/trends", None, 200, dict, {"metrics", "reviews", "recurring", "hotspots"}),
     "goals": ("GET", "/api/goals", None, 200, dict, {"goals"}),  # schema 9 (step 129)
-    "tables": ("GET", "/api/tables", None, 200, list, {"name", "type", "columns", "count"}),
-    "table": ("GET", "/api/table/issues", None, 200, dict, {"columns", "rows", "count", "offset", "limit"}),
+    "tables": ("GET", "/api/tables", None, 200, list, {"name", "type", "label", "description", "for_agent", "count"}),
+    "table": ("GET", "/api/table/issues", None, 200, dict,
+              {"columns", "rows", "count", "more", "truncated", "offset", "limit"}),
     "sql": ("POST", "/api/sql", {"sql": "SELECT 1 AS one"}, 200, dict, {"columns", "rows", "truncated"}),
     "source": ("GET", "/api/source/{loc}", None, 200, dict,
                {"repo_name", "path", "commit_sha", "line_start", "line_end", "symbol", "permalink", "blob_sha",
@@ -615,7 +648,9 @@ CONTRACT = {
 
 # Keys a route returns only in some cases (source: excerpt_matches when an excerpt is saved and git was read;
 # git_error when git could not be read). The page may read them; the contract on the demo does not see them.
-OPTIONAL_KEYS = {"source": {"git_error", "excerpt_matches"}}
+# table: total is the hub's own (rows the ledger has, when its copy holds fewer).
+# plan: findings is the hub's own (every closed point's row; the viewer asks /api/step when a step is opened).
+OPTIONAL_KEYS = {"source": {"git_error", "excerpt_matches"}, "table": {"total"}, "plan": {"findings"}}
 
 
 class Contract(RouteCase):
@@ -632,20 +667,28 @@ class Contract(RouteCase):
 
     def test_every_route_contract(self):
         loc = self.L.scalar("SELECT min(id) FROM finding_locations")
+        finding = self.L.scalar("SELECT min(id) FROM findings")
+        run = self.L.scalar("SELECT min(id) FROM reviewer_runs")
         for name, (method, path, body, status, shape, keys) in CONTRACT.items():
             with self.subTest(route=name):
-                got_status, res = self.call(path.format(loc=loc), body)
+                p, _, q = path.format(loc=loc, finding=finding, run=run).partition("?")
+                got_status, res = self.call(p, body, **dict(x.split("=") for x in q.split("&") if x))
                 self.assertEqual(got_status, status, f"{name}: {res}")
                 self.assertIsInstance(res, shape)
                 got = set(res[0]) if shape is list else set(res)
+                if keys is None:   # a point in full: every column of findings, and what the route adds
+                    keys = set(self.L.columns("findings")) | {
+                        "review_code", "issue_code", "issue_status", "run_label", "locations", "verified_by",
+                        "discovered_in_step", "discovered_in_plan", "goals", "requirements"}
                 self.assertEqual(got, keys, name)
 
     def test_page_reads_only_returned_fields(self):
         """Every d.<prop> (or o.<prop>, OVERVIEW.<prop>) the page reads from a dict route is one of its keys."""
         route_keys = {}
         for name, (method, path, body, status, shape, keys) in CONTRACT.items():
-            if status == 200 and shape is dict:
-                route_keys.setdefault(path.split("/")[2], keys | OPTIONAL_KEYS.get(name, set()))
+            if status == 200 and shape is dict and keys is not None:
+                route_keys.setdefault(path.split("/")[2].split("?")[0], set()).update(
+                    keys | OPTIONAL_KEYS.get(name, set()))
         decl = re.compile(r"const (\w+) = (?:OVERVIEW = |OVERVIEW \|\| )?await api\([\"`]([a-z]+)")
         checked = 0
         problems = []

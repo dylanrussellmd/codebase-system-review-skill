@@ -79,8 +79,8 @@ class Discoveries(unittest.TestCase):
         with self.assertRaises(sqlite3.IntegrityError):
             L.finding(self.r1, point_id="FOUND-2", discovered_in_step_id=9999)
         L.commit()
-        self.assertEqual([f["discovered_in_step_id"] for f in route(L, "/api/review/R-0001")["findings"]
-                          if f["point_id"] == "FOUND-1"], [self.s1])
+        # step 148: the point in full is /api/finding/<id>
+        self.assertEqual(route(L, f"/api/finding/{fid}")["discovered_in_step_id"], self.s1)
 
     def test_v_unplanned_discoveries_flags_unplanned_and_clears_when_a_step_closes_it(self):
         L = self.L

@@ -2,6 +2,14 @@
 
 The tool version is `version:` in SKILL.md's frontmatter; `ledger.py --version` prints it with the schema version.
 
+## 1.8.0 (schema 11)
+
+- Viewer: input checked with clear 400s; answers keep drafts and show 409 and 503 in place; paged issue and gate
+  lists; slimmer review and plan payloads with server search; gzip; a request log; `/api/home`, `/api/checks`,
+  `/api/decisions`, `/api/guide` and per-item routes; decisions, recorded data and goal lifecycle pages.
+- Commands that fail print one line and exit 2. Schema 11 (migration 0011): answer rules, queue context, a check for
+  artifacts outside the ledger folder, event labels.
+
 ## 1.7.0 (schema 10)
 
 - Viewer: one JSON error shape with accurate statuses; a route table with method routing; totals views (migration

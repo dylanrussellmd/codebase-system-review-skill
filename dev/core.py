@@ -22,7 +22,7 @@ import webbrowser
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 
 TOOL_VERSION = "@@TOOL_VERSION@@"  # stamped by dev/build.py from `version:` in SKILL.md's frontmatter
 TOOL_HASH = "@@TOOL_HASH@@"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
@@ -951,9 +951,13 @@ def check(con, quiet=False, full=False):
     full PRAGMA integrity_check (`check --full`); the line printed names the one that ran."""
     bad = 0
     pragma = "integrity_check" if full else "quick_check"
-    ic = con.execute(f"PRAGMA {pragma}").fetchone()[0]
+    try:
+        found = [r[0] for r in con.execute(f"PRAGMA {pragma}").fetchmany(20)]
+    except sqlite3.DatabaseError as e:
+        found = [f"the file could not be read ({_one_line(e)})"]
+    ic = found[0] if found else "ok"
     if ic != "ok":
-        print(f"{pragma}:", ic); bad += 1
+        print(f"{pragma}:", "\n  ".join(found)); bad += 1
     elif not quiet:
         print(f"{pragma}: ok" + ("" if full else " (check --full runs the full integrity_check)"))
     fk = con.execute("PRAGMA foreign_key_check").fetchall()
@@ -980,8 +984,30 @@ def check(con, quiet=False, full=False):
                 print("       ", json.dumps(r, ensure_ascii=False)[:200])
         elif not quiet:
             print(f"    0  {label}")
+    for path in missing_artifacts(con):
+        print(f"  warning  a recorded review file is not on disk: {path}")
     optimize(con)
     return bad
+
+
+def missing_artifacts(con, limit=20):
+    """Paths of recorded briefs, reports and indexes that are missing from disk (the first `limit`). A path is taken
+    from the project root: the folder above the ledger's own. Nothing is said for a ledger held in memory."""
+    try:
+        db = next((r[2] for r in con.execute("PRAGMA database_list") if r[1] == "main"), "")
+        if not db:
+            return []
+        root, out = Path(db).resolve().parent.parent, []
+        for (path,) in con.execute("""SELECT path FROM artifacts WHERE path IS NOT NULL
+                                      AND kind IN ('brief','report','index') ORDER BY id"""):
+            p = Path(path)
+            if not (p if p.is_absolute() else root / p).exists():
+                out.append(path)
+                if len(out) >= limit:
+                    break
+        return out
+    except (sqlite3.Error, OSError):
+        return []
 
 
 def optimize_db(db):
@@ -1641,6 +1667,8 @@ def enum_labels(con):
 
 
 ROUTE_SECONDS = 3  # a viewer page read that runs longer is stopped (the SQL box has its own SQL_SECONDS)
+CHECKS_SECONDS = 15  # the ledger's own checks read every table: they get longer
+TRENDS_SECONDS = 10  # so does the page of numbers over time (its answer is then kept until the ledger changes)
 ANSWER_BUSY_MS = 3000  # how long a gate answer waits for another writer before it reports the ledger busy
 TOO_LONG = "The query took too long (over {} s); add a LIMIT or a WHERE."
 
@@ -1695,6 +1723,15 @@ def whole_number(text, what):
     return int(text)
 
 
+_serving = threading.local()  # .on is true while api() answers a request on this thread
+
+
+def int_arg(qs, name, default, lo, hi=None):
+    """A whole-number query parameter, brought into lo..hi (hi None: no upper bound); 400 when it is not a number."""
+    n = whole_number(qs.get(name, [str(default)])[0], name)
+    return max(lo, n if hi is None else min(hi, n))
+
+
 def api(root, db, path, qs, body):
     """One viewer API request. Each request opens its own connection and closes it when the answer is built:
     sqlite3 connections are not shared between the server's threads, and a fresh one always sees the agent's latest
@@ -1704,14 +1741,17 @@ def api(root, db, path, qs, body):
     if not Path(db).exists():
         return error(503, "ledger not found")
     con = connect(db, readonly=True)
-    timed_out = with_deadline(con, ROUTE_SECONDS)
+    seconds = route_seconds(path)
+    timed_out = with_deadline(con, seconds)
+    _serving.on = True  # a request of the running viewer: a slow route may answer from CACHE
     try:
         return route(root, db, con, path, qs, body)
     except sqlite3.OperationalError as e:
         if "interrupted" in str(e) and timed_out():
-            return error(400, TOO_LONG.format(ROUTE_SECONDS))
+            return error(400, TOO_LONG.format(seconds))
         raise
     finally:
+        _serving.on = False
         con.close()
 
 
@@ -1747,65 +1787,196 @@ def quote_name(name):
     return '"' + str(name).replace('"', '""') + '"'
 
 
+PAGE_ROWS = 200  # rows of the issues list and the gate history sent at a time
+PAGE_MAX = 500
+
+
 class Request:
     """What a route handler is given: the project root, the ledger's path, this request's read-only connection, the
     path's '*' segments in order (args), the query string and, for a POST, the JSON body."""
 
-    def __init__(self, root, db, con, args, qs, body):
+    def __init__(self, root, db, con, args, qs, body, whole=False):
         self.root, self.db, self.con, self.args, self.qs, self.body = root, db, con, args, qs, body
+        self.whole = whole  # the hub's snapshot asks for every row of a list, not a page of it
+        self.cached = getattr(_serving, "on", False)  # the running viewer may answer a slow route from CACHE
 
     def arg(self, name, default=None):
         return self.qs.get(name, [default])[0]
+
+    def page(self):
+        """(limit, offset) of a paged list: ?limit= (1 to PAGE_MAX, default PAGE_ROWS) and ?offset=."""
+        if self.whole:
+            return -1, 0
+        return int_arg(self.qs, "limit", PAGE_ROWS, 1, PAGE_MAX), int_arg(self.qs, "offset", 0, 0)
 
 
 class Route:
     """One row of ROUTES: an HTTP method, a path under /api/ ('*' is one segment of any text, handed to the handler
     in Request.args) and its handler. hub, for a GET: the paths of this route the published hub embeds for this
-    ledger (hub(con) -> ["review/R-0001", ...]); the hub is read-only, so a POST has none."""
+    ledger (hub(con) -> ["review/R-0001", ...]); the hub is read-only, so a POST has none. seconds: how long the
+    viewer lets this route read before it stops it (ROUTE_SECONDS unless given)."""
 
-    def __init__(self, method, path, handler, hub=None):
+    def __init__(self, method, path, handler, hub=None, seconds=None):
         self.method, self.pattern, self.handler, self.hub = method, tuple(path.split("/")), handler, hub
+        self.seconds = seconds
+
+
+def queue_counts(con):
+    """What the Waiting on you badge counts: queue_count, everything in the owner's queue still to act on (open
+    gates, waiting steps, open decisions, proposed goals) and answered_count, answers the agent has not acted on."""
+    r = one(con, """SELECT COALESCE(sum(NOT (kind = 'gate' AND status = 'answered')), 0) queue_count,
+                           COALESCE(sum(kind = 'gate' AND status = 'answered'), 0) answered_count,
+                           COALESCE(sum(kind = 'gate' AND status = 'open'), 0) gates_open FROM v_owner_queue""")
+    return dict(r)
 
 
 def get_overview(rq):
+    """What every page needs: the project, the labels of the ledger's words and the counts behind the Waiting on
+    you badge. Kept to a few small reads, because the page asks for it on every navigation and every 30 s."""
     con = rq.con
     meta = {r["key"]: r["value"] for r in rows(con, "SELECT key, value FROM meta")}
     return {
         "project": meta.get("project_name", rq.root.name),
         "schema_version": meta.get("schema_version"),
-        "open_by_severity": rows(con, f"SELECT severity, count(*) n FROM issues WHERE status IN {ACTIVE} GROUP BY severity"),
-        "issues_by_status": rows(con, "SELECT status, count(*) n FROM issues GROUP BY status"),
-        "gates_open": one(con, "SELECT count(*) n FROM v_pending_gates WHERE status = 'open'")["n"],
-        "queue": one(con, "SELECT count(*) n FROM v_owner_queue")["n"],
-        "reviews": rows(con, """SELECT r.code, r.title, r.scope, r.status, r.started_at, r.completed_at, r.verdict,
-            t.points, t.high FROM v_review_totals t JOIN reviews r ON r.code = t.review
-            WHERE t.review IN (SELECT code FROM reviews ORDER BY started_at DESC LIMIT 5)
-            ORDER BY r.started_at DESC"""),
-        "plans": rows(con, """SELECT plan code, title, status, steps, done, waiting_owner waiting
-            FROM v_plan_totals ORDER BY created_at DESC"""),
-        "recurring": one(con, "SELECT count(*) n FROM v_recurring_issues")["n"],
-        "checks": [{"label": label, "view": v, "tier": tier, "n": count_view(con, v)}
-                   for v, label, tier in (ledger_checks(con) or [])],
+        **queue_counts(con),
         "labels": {**{t: {r["code"]: r["name"] for r in rows(con, f"SELECT code, name FROM {t}")} for t in LABEL_TABLES},
                    "enums": enum_labels(con)},
     }
 
 
-def get_gates(rq):
-    """?status=pending (the default: v_pending_gates), all, or one gate status."""
-    con, st = rq.con, rq.arg("status", "pending")
-    where = {"pending": "g.id IN (SELECT id FROM v_pending_gates)", "all": "1"}.get(st, "g.status = ?")
-    args = () if st in ("pending", "all") else (st,)
-    gates = rows(con, f"""SELECT g.*, r.code review_code, pl.code plan_code, s.number step_number,
-            i.code issue_code, d.code decision_code FROM gates g
-            LEFT JOIN reviews r ON r.id=g.review_id LEFT JOIN plans pl ON pl.id=g.plan_id
+def get_home(rq):
+    """What the home page lists: issues by severity and status, the latest reviews and every plan with its step
+    counts (v_plan_totals, so the bar matches the plans page)."""
+    con = rq.con
+    return {
+        "open_by_severity": rows(con, f"SELECT severity, count(*) n FROM issues WHERE status IN {ACTIVE} GROUP BY severity"),
+        "issues_by_status": rows(con, "SELECT status, count(*) n FROM issues GROUP BY status"),
+        "reviews": rows(con, """SELECT r.code, r.title, r.scope, r.status, r.started_at, r.completed_at, r.verdict,
+            t.points, t.high FROM reviews r JOIN v_review_totals t ON t.review = r.code
+            WHERE r.id IN (SELECT id FROM reviews ORDER BY started_at DESC LIMIT 5)
+            ORDER BY r.started_at DESC"""),
+        "plans": rows(con, """SELECT plan code, title, status, steps, done, doing, waiting_owner waiting
+            FROM v_plan_totals ORDER BY created_at DESC"""),
+        "discoveries": one(con, """SELECT count(*) n FROM findings WHERE discovered_in_step_id IS NOT NULL
+                                   AND verification <> 'false'""")["n"],
+    }
+
+
+# What the agent does about a non-empty check, in one sentence the owner can read, by check view. The steps are in
+# references/recipes.md under "A failing check", one heading per view (a test keeps the two lists equal).
+CHECK_ACTIONS = {
+    "v_unmatched_findings": "The agent matches each of these points to an issue.",
+    "v_unchecked_known_issues": "The agent records, for each known issue, whether a reviewer looked for it.",
+    "v_untraceable_refs": "The agent tags the reviewed commit and saves the cited lines.",
+    "v_uncovered_findings": "The agent adds each point to a step of its fix plan.",
+    "v_coverage_problems": "The agent gives a reason for a step that closes nothing, or for a point closed twice.",
+    "v_unplanned_discoveries": "The agent puts each defect found during fixes into a plan step, or asks you.",
+    "v_history_gaps": "Something wrote to the ledger outside the tool; the agent tells you what it found.",
+    "v_match_problems": "The agent matches the point again: its match disagrees with its issue.",
+    "v_off_plan_coverage": "The agent adds the point's review to the plan, or moves the point to a plan that covers it.",
+    "v_done_steps_open_issues": "The agent marks the issues of a finished step fixed, or notes why one stays open.",
+    "v_closed_without_reason": "The agent records why the issue was accepted or declined.",
+    "v_relation_problems": "The agent records the link between the two issues once, in one direction.",
+    "v_check_finding_owner": "The agent records the check again in the review its point belongs to.",
+    "v_unguarded_fixes": "The agent records a test that guards each fix listed.",
+    "v_artifacts_outside_ledger": "The agent copies the file into the ledger's folder and records it there.",
+}
+RECIPES_FILE = "references/recipes.md"
+
+
+def check_help(view):
+    """(what the agent does about this check, where its recipe is) for the viewer's checks panel."""
+    return (CHECK_ACTIONS.get(view, "The agent reads the rows and corrects what they list."),
+            f'{RECIPES_FILE}, under "A failing check": {view}')
+
+
+def check_link(con, view):
+    """The page that shows a check's rows, as a viewer address: the review whose points are not matched, the plan
+    whose points no step closes, else the view in Explore."""
+    try:
+        if view == "v_unmatched_findings":
+            r = con.execute("SELECT review FROM v_unmatched_findings LIMIT 1").fetchone()
+            if r:
+                return f"#/review/{r[0]}?match=none"
+        if view == "v_uncovered_findings":
+            r = con.execute("SELECT plan FROM v_uncovered_findings WHERE plan IS NOT NULL LIMIT 1").fetchone()
+            if r:
+                return f"#/plan/{r[0]}"
+    except sqlite3.Error:
+        pass
+    return f"#/explore/{view}"
+
+
+def get_checks(rq):
+    """The ledger's own checks (each ledger_checks view with its row count) and the count of issues that came back.
+    These scan the whole ledger, so the home page asks for them after it has drawn and they get CHECKS_SECONDS."""
+    con = rq.con
+    checks = []
+    for v, label, tier in ledger_checks(con) or []:
+        n = count_view(con, v)
+        action, recipe = check_help(v)
+        checks.append({"label": label, "view": v, "tier": tier, "n": n, "action": action, "recipe": recipe,
+                       "link": check_link(con, v) if n else None})
+    return {"checks": checks, "recurring": one(con, "SELECT count(*) n FROM v_recurring_issues")["n"]}
+
+
+GATE_LINKS = """LEFT JOIN reviews r ON r.id=g.review_id LEFT JOIN plans pl ON pl.id=g.plan_id
             LEFT JOIN steps s ON s.id=g.step_id LEFT JOIN issues i ON i.id=g.issue_id
-            LEFT JOIN decisions d ON d.id=g.decision_id
-            WHERE {where} ORDER BY g.status='answered', g.blocking DESC, g.created_at""", args)
+            LEFT JOIN decisions d ON d.id=g.decision_id"""
+
+
+def answer_label(options, value):
+    """The label of the option a gate was answered with (the stored value when its options do not have it)."""
+    if value is None:
+        return None
+    try:
+        opts = json.loads(options) if isinstance(options, str) else (options or [])
+    except ValueError:
+        opts = []
+    return next((o.get("label") for o in opts if isinstance(o, dict) and o.get("value") == value), None) or value
+
+
+def get_gates(rq):
+    """?status=pending (the default: v_pending_gates, whole gates in inbox order with the rest of the owner's
+    queue), or the history: all or one gate status, newest first, a page at a time (?limit=, ?offset=, or ?at=
+    a gate's code for the page it is on) with the total. A history row is the short form of a gate: no context or question, and answer_label for its options."""
+    con, st = rq.con, rq.arg("status", "pending")
+    if st == "pending":
+        gates = rows(con, f"""SELECT g.*, r.code review_code, pl.code plan_code, s.number step_number,
+                i.code issue_code, d.code decision_code FROM gates g {GATE_LINKS}
+                WHERE g.id IN (SELECT id FROM v_pending_gates)
+                ORDER BY g.status='answered', g.blocking DESC, g.created_at""")
+        for g in gates:
+            g["options"] = json.loads(g["options"]) if g["options"] else []
+        return {"gates": gates, "other": rows(con, "SELECT * FROM v_owner_queue WHERE kind <> 'gate'")}
+    where, args = ("1", ()) if st == "all" else ("g.status = ?", (st,))
+    limit, offset = rq.page()
+    at = rq.arg("at")  # a gate's code: the page that gate is on
+    if at and limit > 0:
+        newer = one(con, f"""SELECT count(*) n FROM gates g, gates t WHERE t.code = ? AND {where}
+                             AND (g.created_at > t.created_at OR (g.created_at = t.created_at AND g.id > t.id))""",
+                    (at, *args))["n"]
+        offset = newer - newer % limit
+    gates = rows(con, f"""SELECT g.code, g.kind, g.title, g.status, g.blocking, g.created_at, g.answered_at,
+            g.answered_via, g.answer_value, g.answer_text, g.applied_at, g.applied_note, g.options,
+            r.code review_code, pl.code plan_code, s.number step_number, i.code issue_code, d.code decision_code
+            FROM gates g {GATE_LINKS} WHERE {where} ORDER BY g.created_at DESC, g.id DESC LIMIT ? OFFSET ?""",
+                 (*args, limit, offset))
     for g in gates:
-        g["options"] = json.loads(g["options"]) if g["options"] else []
-    other = rows(con, "SELECT * FROM v_owner_queue WHERE kind <> 'gate'")
-    return {"gates": gates, "other": other}
+        g["answer_label"] = answer_label(g.pop("options"), g["answer_value"])
+    total = one(con, f"SELECT count(*) n FROM gates g WHERE {where}", args)["n"]
+    return {"gates": gates, "total": total, "limit": len(gates) if rq.whole else limit, "offset": offset}
+
+
+def get_decisions(rq):
+    """Every decision of the owner: those still open or to look at again first, then the decided ones newest first,
+    each with the issues it settles."""
+    return {"decisions": rows(rq.con, """SELECT d.code, d.question, d.answer, d.rationale, d.status, d.revisit_when,
+            d.asked_at, d.decided_at, r.code review,
+            (SELECT group_concat(i.code, ', ') FROM decision_issues di JOIN issues i ON i.id = di.issue_id
+              WHERE di.decision_id = d.id) issues
+            FROM decisions d LEFT JOIN reviews r ON r.id = d.review_id
+            ORDER BY d.status = 'decided', COALESCE(d.decided_at, d.asked_at) DESC, d.id DESC""")}
 
 
 def post_gate_answer(rq):
@@ -1816,11 +1987,65 @@ def get_reviews(rq):
     return rows(rq.con, """SELECT r.code, r.title, r.scope, r.status, r.started_at, r.completed_at, r.verdict,
         (SELECT group_concat(rp.name || ' ' || substr(rr.commit_sha,1,10) || COALESCE(' on ' || rr.branch, ''), ' · ')
            FROM review_repositories rr JOIN repositories rp ON rp.id=rr.repository_id WHERE rr.review_id=r.id) commits,
-        t.points, t.high, t.medium, t.low, t.new_issues, t.came_back
+        t.points, t.high, t.medium, t.low, t.tests, t.new_issues, t.came_back
         FROM v_review_totals t JOIN reviews r ON r.code = t.review ORDER BY r.started_at DESC""")
 
 
+def came_back_rule():
+    """The condition on an issue event e that means the issue came back, taken from the shipped v_review_summary
+    so the view stays its one definition."""
+    m = re.search(r"CREATE VIEW v_review_summary AS.*?AND (\(\(e\.event = 'status-changed'.*?OR e\.event = 'recurred'\))",
+                  SCHEMA, re.S)
+    if not m:
+        raise LedgerError("v_review_summary does not spell out when an issue came back; review_summary() reads it")
+    return m.group(1)
+
+
+def review_summary(con, review_id=None):
+    """The rows of v_review_summary (points per review and domain), for one review or all, without the view's
+    per-row subquery: one pass over the findings and one over the issue events that mean an issue came back. The
+    view stays the definition; a test keeps the two equal."""
+    one_review = "" if review_id is None else "AND r.id = ?"
+    args = () if review_id is None else (review_id,)
+    out = rows(con, f"""SELECT r.code AS review, r.started_at, f.domain_code, r.id AS review_id,
+        sum(f.verification <> 'false') AS points,
+        sum(f.verification <> 'false' AND f.severity = 'H') AS high,
+        sum(f.verification <> 'false' AND f.severity = 'M') AS medium,
+        sum(f.verification <> 'false' AND f.severity = 'L') AS low,
+        sum(f.verification <> 'false' AND f.severity = 'T') AS tests,
+        sum(f.verification = 'confirmed') AS confirmed,
+        sum(f.verification = 'false') AS false_findings,
+        sum(f.verification <> 'false' AND f.match_type IN ('new','continuation')) AS new_issues,
+        sum(f.verification <> 'false' AND f.match_type IN ('still-present','changed')) AS carried_over
+        FROM findings f JOIN reviews r ON r.id = f.review_id WHERE 1 {one_review}
+        GROUP BY r.id, r.code, f.domain_code ORDER BY r.started_at, f.domain_code""", args)
+    # CROSS JOIN fixes the order (each event, then that issue's findings): the planner, on a ledger without
+    # statistics, may otherwise walk every finding for every event.
+    back = {(r[0], r[1]): r[2] for r in con.execute(f"""SELECT e.review_id, f2.domain_code, count(DISTINCT e.entity_id)
+        FROM events e CROSS JOIN findings f2 ON f2.issue_id = e.entity_id AND f2.review_id = e.review_id
+             AND f2.verification <> 'false'
+        WHERE e.entity_type = 'issue' AND e.review_id IS NOT NULL AND {came_back_rule()}
+              {one_review.replace('r.id', 'e.review_id')}
+        GROUP BY e.review_id, f2.domain_code""", args)}
+    for r in out:
+        r["came_back"] = back.get((r.pop("review_id"), r["domain_code"]), 0)
+    return out
+
+
+def like_arg(text):
+    """text as a LIKE pattern that matches it anywhere, with % and _ taken as themselves (use with LIKE_ESCAPED)."""
+    return "%" + re.sub(r"([\\%_])", r"\\\1", text) + "%"
+
+
+LIKE_ESCAPED = "LIKE ? ESCAPE '\\'"
+REVIEW_CHECKS = 50  # earlier issues listed with a review; the rest come from review/<code>/checks
+
+
 def get_review(rq):
+    """A review's page: the review, what it covered, who ran, and its points as list rows (enough for the row, the
+    filters and the search of ids and summaries; a point's detail and code references are /api/finding/<id>).
+    The earlier issues it looked for come as counts by outcome and the first REVIEW_CHECKS rows. With ?q=text the
+    answer is only {"match": [finding ids]}: the points whose text or cited paths contain it."""
     con, code = rq.con, rq.args[0]
     r = one(con, """SELECT r.*, m.name manager, m.model manager_model, a.name approved_by,
                     pr.code previous_code FROM reviews r
@@ -1829,48 +2054,126 @@ def get_review(rq):
     if not r:
         return error(404, "no such review")
     rid = r["id"]
-    findings = rows(con, """SELECT f.*, i.code issue_code, i.status issue_status, rr.label run_label
-        FROM findings f LEFT JOIN issues i ON i.id=f.issue_id LEFT JOIN reviewer_runs rr ON rr.id=f.reviewer_run_id
-        WHERE f.review_id=? ORDER BY CASE f.severity WHEN 'H' THEN 0 WHEN 'M' THEN 1 WHEN 'L' THEN 2 ELSE 3 END, length(f.point_id), f.point_id""", (rid,))
-    locs = rows(con, """SELECT fl.id, fl.finding_id, fl.path, fl.line_start, fl.line_end, fl.symbol, fl.role,
-        fl.commit_sha, fl.permalink, rp.name repo FROM finding_locations fl
-        JOIN findings f ON f.id=fl.finding_id JOIN repositories rp ON rp.id=fl.repository_id WHERE f.review_id=?""", (rid,))
-    by = {}
-    for l in locs:
-        by.setdefault(l["finding_id"], []).append(l)
-    for f in findings:
-        f["locations"] = by.get(f["id"], [])
+    q = (rq.arg("q") or "").strip()
+    if q:
+        like = LIKE_ESCAPED
+        return {"match": [x[0] for x in con.execute(f"""SELECT f.id FROM findings f LEFT JOIN issues i ON i.id=f.issue_id
+            WHERE f.review_id=? AND (f.point_id {like} OR f.summary {like} OR f.detail {like} OR f.before_state {like}
+              OR f.recommendation {like} OR f.recommended_test {like} OR f.evidence {like} OR i.code {like}
+              OR EXISTS (SELECT 1 FROM finding_locations fl WHERE fl.finding_id=f.id
+                         AND (fl.path {like} OR fl.symbol {like})))""", (rid, *[like_arg(q)] * 10))]}
+    findings = rows(con, """SELECT f.id, f.point_id, f.severity, f.kind, f.domain_code, f.theme_code, f.summary,
+        f.match_type, f.verification, i.code issue_code
+        FROM findings f LEFT JOIN issues i ON i.id=f.issue_id WHERE f.review_id=?
+        ORDER BY CASE f.severity WHEN 'H' THEN 0 WHEN 'M' THEN 1 WHEN 'L' THEN 2 ELSE 3 END, length(f.point_id), f.point_id""", (rid,))
     return {
         "review": r,
-        "repos": rows(con, """SELECT rp.name, rr.* FROM review_repositories rr JOIN repositories rp
+        "repos": rows(con, """SELECT rp.name, rp.remote_url, rp.default_branch, rp.notes, rr.*
+                              FROM review_repositories rr JOIN repositories rp
                               ON rp.id=rr.repository_id WHERE rr.review_id=?""", (rid,)),
         "goals": rows(con, """SELECT g.code, g.text FROM review_goals rg JOIN design_goals g ON g.id=rg.goal_id
                               WHERE rg.review_id=? ORDER BY g.code""", (rid,)),
+        "test_runs": rows(con, """SELECT t.command, t.purpose, t.passed, t.failed, t.skipped, t.errored, t.exit_code,
+                              t.duration_ms, t.output_path, t.notes, t.started_at, t.commit_sha, rp.name repo
+                              FROM test_runs t LEFT JOIN repositories rp ON rp.id=t.repository_id
+                              WHERE t.review_id=? ORDER BY t.started_at, t.id""", (rid,)),
+        "relations": rows(con, """SELECT a.code from_issue, x.relation, b.code to_issue, b.title to_title,
+                              x.confidence, x.rationale FROM issue_relations x JOIN issues a ON a.id=x.from_issue_id
+                              JOIN issues b ON b.id=x.to_issue_id WHERE x.established_in_review_id=?
+                              ORDER BY a.code, b.code""", (rid,)),
+        "events": entity_events(con, "review", rid),
         "domains": rows(con, """SELECT rd.*, d.name, d.category FROM review_domains rd JOIN domains d ON d.code=rd.domain_code
                                 WHERE rd.review_id=? ORDER BY rd.decision, d.category, d.name""", (rid,)),
-        "runs": rows(con, """SELECT rr.*, a.name actor, a.model FROM reviewer_runs rr JOIN actors a ON a.id=rr.actor_id
+        # a run's prompt and final message are long: /api/run/<id> sends them when its row is opened
+        "runs": rows(con, """SELECT rr.id, rr.domain_code, rr.label, rr.scope, rr.report_path, rr.status,
+                             rr.items_reviewed, rr.high_count, rr.medium_count, rr.low_count, rr.test_count,
+                             rr.started_at, rr.finished_at, a.name actor, a.model, a.harness, a.session_ref session
+                             FROM reviewer_runs rr JOIN actors a ON a.id=rr.actor_id
                              WHERE rr.review_id=? ORDER BY rr.domain_code, rr.label""", (rid,)),
-        "checks": rows(con, """SELECT c.outcome, c.evidence, i.code issue_code, i.title, i.status
-                               FROM review_issue_checks c JOIN issues i ON i.id=c.issue_id WHERE c.review_id=?
-                               ORDER BY c.outcome, i.code""", (rid,)),
-        "summary": rows(con, "SELECT * FROM v_review_summary WHERE review=?", (code,)),
+        "checks": review_checks(con, rid, REVIEW_CHECKS, 0),
+        "check_counts": rows(con, """SELECT outcome, count(*) n FROM review_issue_checks WHERE review_id=?
+                                     GROUP BY outcome ORDER BY outcome""", (rid,)),
+        "summary": review_summary(con, rid),
         "agents": rows(con, "SELECT * FROM v_review_agents WHERE review=?", (code,)),
         "requirements": rows(con, "SELECT * FROM v_requirement_trace WHERE review=?", (code,)),
         "metrics": rows(con, """SELECT m.name, m.scope, m.value, COALESCE(m.unit, md.unit) unit, m.method, m.note,
             COALESCE(md.label, upper(substr(m.name, 1, 1)) || replace(substr(m.name, 2), '_', ' ')) label,
             COALESCE(md.better, 'none') better
             FROM metrics m LEFT JOIN metric_defs md ON md.name=m.name WHERE m.review_id=? ORDER BY m.name, m.scope""", (rid,)),
-        "artifacts": rows(con, "SELECT kind, path, url FROM artifacts WHERE review_id=? ORDER BY kind", (rid,)),
-        "gates": rows(con, "SELECT code, kind, title, status, answer_value, answer_text FROM gates WHERE review_id=? ORDER BY created_at", (rid,)),
+        "artifacts": rows(con, """SELECT a.kind, a.path, a.url, a.created_at, rr.label run FROM artifacts a
+                                  LEFT JOIN reviewer_runs rr ON rr.id=a.reviewer_run_id
+                                  WHERE a.review_id=? ORDER BY a.kind, a.id""", (rid,)),
+        "gates": [{**g, "answer_label": answer_label(g.pop("options"), g["answer_value"])} for g in rows(
+            con, """SELECT code, kind, title, status, answer_value, answer_text, options FROM gates
+                    WHERE review_id=? ORDER BY created_at""", (rid,))],
         "interview": interview_list(con, code) if has_table(con, "interview_questions") else [],
         "review_goals": goals_list(con, include_all=True, review=code) if has_table(con, "goal_statuses") else [],
         "findings": findings,
     }
 
 
+def entity_events(con, entity_type, entity_id, limit=200):
+    """The history of one review or plan: its events, oldest first (the latest `limit` of them)."""
+    got = rows(con, """SELECT e.at, e.event, e.from_value, e.to_value, e.note, a.name actor FROM events e
+                       LEFT JOIN actors a ON a.id=e.actor_id WHERE e.entity_type=? AND e.entity_id=?
+                       ORDER BY e.at DESC, e.id DESC LIMIT ?""", (entity_type, entity_id, limit))
+    return got[::-1]
+
+
+def get_run(rq):
+    """What a reviewer was asked and what it answered: the two long texts of one reviewer run."""
+    r = one(rq.con, "SELECT id, label, prompt, final_message FROM reviewer_runs WHERE id=?",
+            (whole_number(rq.args[0], "The run id"),))
+    return r or error(404, "no such reviewer run")
+
+
+def review_checks(con, review_id, limit, offset):
+    return rows(con, """SELECT c.outcome, c.evidence, i.code issue_code, i.title, i.status
+                        FROM review_issue_checks c JOIN issues i ON i.id=c.issue_id WHERE c.review_id=?
+                        ORDER BY c.outcome, i.code LIMIT ? OFFSET ?""", (review_id, limit, offset))
+
+
+def get_review_checks(rq):
+    """Every earlier issue a review looked for, a page at a time (?limit=, ?offset=) with the total."""
+    r = one(rq.con, "SELECT id FROM reviews WHERE code=?", (rq.args[0],))
+    if not r:
+        return error(404, "no such review")
+    limit, offset = rq.page()
+    found = review_checks(rq.con, r["id"], limit, offset)
+    total = one(rq.con, "SELECT count(*) n FROM review_issue_checks WHERE review_id=?", (r["id"],))["n"]
+    return {"rows": found, "total": total, "limit": len(found) if rq.whole else limit, "offset": offset}
+
+
+# With a point: who checked it, and the plan step it was found in during fix work (None for a reviewer's point).
+FINDING_EXTRAS = "va.name verified_by, ds.number discovered_in_step, dp.code discovered_in_plan"
+FINDING_EXTRA_JOINS = """LEFT JOIN actors va ON va.id=f.verified_by_actor_id
+        LEFT JOIN steps ds ON ds.id=f.discovered_in_step_id LEFT JOIN plans dp ON dp.id=ds.plan_id"""
+LOCATION_COLUMNS = """fl.id, fl.finding_id, fl.path, fl.line_start, fl.line_end, fl.symbol, fl.role, fl.commit_sha,
+    fl.permalink, rp.name repo"""
+
+
+def get_finding(rq):
+    """One point in full: every column, its issue, its reviewer and the code it cites."""
+    f = one(rq.con, f"""SELECT f.*, r.code review_code, i.code issue_code, i.status issue_status, rr.label run_label,
+        {FINDING_EXTRAS}
+        FROM findings f JOIN reviews r ON r.id=f.review_id LEFT JOIN issues i ON i.id=f.issue_id
+        LEFT JOIN reviewer_runs rr ON rr.id=f.reviewer_run_id {FINDING_EXTRA_JOINS} WHERE f.id=?""",
+            (whole_number(rq.args[0], "The point id"),))
+    if not f:
+        return error(404, "no such point")
+    f["goals"] = rows(rq.con, """SELECT g.code, g.text FROM finding_goals fg JOIN design_goals g ON g.id=fg.goal_id
+                                 WHERE fg.finding_id=? ORDER BY g.code""", (f["id"],))
+    f["requirements"] = rows(rq.con, """SELECT q.code, q.text, fr.verdict FROM finding_requirements fr
+        JOIN requirements q ON q.id=fr.requirement_id WHERE fr.finding_id=? ORDER BY q.code""", (f["id"],))
+    f["locations"] = rows(rq.con, f"""SELECT {LOCATION_COLUMNS} FROM finding_locations fl
+        JOIN repositories rp ON rp.id=fl.repository_id WHERE fl.finding_id=? ORDER BY fl.id""", (f["id"],))
+    return f
+
+
 def get_issues(rq):
     """?status= (active: the statuses still to fix; else one status), severity=, domain_code= (exact) and q= (text in
-    the code, title, sub, a finding's point id or summary, or a location's path), all ANDed."""
+    the code, title, sub, a finding's point id or summary, or a location's path), all ANDed; a page at a time
+    (?limit=, ?offset=) with the total the filters match."""
     where, args = ["1"], []
     for k in ("status", "severity", "domain_code"):
         v = rq.arg(k)
@@ -1880,13 +2183,20 @@ def get_issues(rq):
             where.append(f"i.{k} = ?"); args.append(v)
     q = rq.arg("q")
     if q:
-        where.append("(i.code LIKE ? OR i.title LIKE ? OR i.sub LIKE ? OR EXISTS (SELECT 1 FROM findings f LEFT JOIN finding_locations fl ON fl.finding_id=f.id WHERE f.issue_id=i.id AND (f.point_id LIKE ? OR f.summary LIKE ? OR fl.path LIKE ?)))")
-        args += [f"%{q}%"] * 6
-    return rows(rq.con, f"""SELECT i.code, i.title, i.severity, i.status, i.domain_code, i.theme_code, i.times_seen,
+        like = LIKE_ESCAPED  # % and _ in the search text are matched as themselves
+        where.append(f"""(i.code {like} OR i.title {like} OR i.sub {like} OR EXISTS (
+            SELECT 1 FROM findings f LEFT JOIN finding_locations fl ON fl.finding_id=f.id
+            WHERE f.issue_id=i.id AND (f.point_id {like} OR f.summary {like} OR fl.path {like})))""")
+        args += [like_arg(q)] * 6
+    limit, offset = rq.page()
+    found = rows(rq.con, f"""SELECT i.code, i.title, i.severity, i.status, i.domain_code, i.theme_code, i.times_seen,
         i.opened_at, i.updated_at, fr.code first_seen, lr.code last_seen
         FROM issues i JOIN reviews fr ON fr.id=i.first_seen_review_id LEFT JOIN reviews lr ON lr.id=i.last_seen_review_id
         WHERE {' AND '.join(where)}
-        ORDER BY CASE i.severity WHEN 'H' THEN 0 WHEN 'M' THEN 1 WHEN 'L' THEN 2 ELSE 3 END, i.id LIMIT 2000""", args)
+        ORDER BY CASE i.severity WHEN 'H' THEN 0 WHEN 'M' THEN 1 WHEN 'L' THEN 2 ELSE 3 END, i.id
+        LIMIT ? OFFSET ?""", (*args, limit, offset))
+    total = one(rq.con, f"SELECT count(*) n FROM issues i WHERE {' AND '.join(where)}", args)["n"]
+    return {"rows": found, "total": total, "limit": len(found) if rq.whole else limit, "offset": offset}
 
 
 def get_issue(rq):
@@ -1897,21 +2207,24 @@ def get_issue(rq):
     if not i:
         return error(404, "no such issue")
     iid = i["id"]
-    findings = rows(con, """SELECT f.*, r.code review_code, r.started_at review_at FROM findings f
-                            JOIN reviews r ON r.id=f.review_id WHERE f.issue_id=? ORDER BY r.started_at""", (iid,))
+    findings = rows(con, f"""SELECT f.*, r.code review_code, r.started_at review_at, {FINDING_EXTRAS}
+                             FROM findings f JOIN reviews r ON r.id=f.review_id {FINDING_EXTRA_JOINS}
+                             WHERE f.issue_id=? ORDER BY r.started_at""", (iid,))
+    by = {}
+    for loc in rows(con, f"""SELECT {LOCATION_COLUMNS} FROM finding_locations fl JOIN findings f ON f.id=fl.finding_id
+                             JOIN repositories rp ON rp.id=fl.repository_id WHERE f.issue_id=? ORDER BY fl.id""", (iid,)):
+        by.setdefault(loc.pop("finding_id"), []).append(loc)
     for f in findings:
-        f["locations"] = rows(con, """SELECT fl.id, fl.path, fl.line_start, fl.line_end, fl.symbol, fl.role, fl.commit_sha,
-            fl.permalink, rp.name repo FROM finding_locations fl JOIN repositories rp ON rp.id=fl.repository_id
-            WHERE fl.finding_id=?""", (f["id"],))
+        f["locations"] = by.get(f["id"], [])
     return {
         "issue": i,
         "findings": findings,
-        "relations": rows(con, """SELECT 'out' dir, r.relation, b.code other, b.title other_title, b.status other_status,
-                r.confidence, r.rationale, rv.code review FROM issue_relations r JOIN issues b ON b.id=r.to_issue_id
-                LEFT JOIN reviews rv ON rv.id=r.established_in_review_id WHERE r.from_issue_id=?
-            UNION ALL SELECT 'in', r.relation, a.code, a.title, a.status, r.confidence, r.rationale, rv.code
-                FROM issue_relations r JOIN issues a ON a.id=r.from_issue_id
-                LEFT JOIN reviews rv ON rv.id=r.established_in_review_id WHERE r.to_issue_id=?""", (iid, iid)),
+        "relations": rows(con, """SELECT 'out' dir, g.relation, b.code other, b.title other_title, b.status other_status,
+                g.confidence, g.rationale, g.established_in review FROM v_issue_graph g JOIN issues b ON b.code=g.to_issue
+                WHERE g.from_issue=?
+            UNION ALL SELECT 'in', g.relation, a.code, a.title, a.status, g.confidence, g.rationale, g.established_in
+                FROM v_issue_graph g JOIN issues a ON a.code=g.from_issue WHERE g.to_issue=?""", (code, code)),
+        "unguarded": rows(con, "SELECT problem FROM v_unguarded_fixes WHERE code=?", (code,)),
         "checks": rows(con, """SELECT r.code review, r.started_at, c.outcome, c.evidence FROM review_issue_checks c
                                JOIN reviews r ON r.id=c.review_id WHERE c.issue_id=? ORDER BY r.started_at""", (iid,)),
         "timeline": rows(con, "SELECT * FROM v_issue_timeline WHERE code=?", (code,)),
@@ -1930,33 +2243,120 @@ def get_plans(rq):
         waiting_owner waiting, reviews FROM v_plan_totals ORDER BY created_at DESC""")
 
 
+STEP_SEARCH = 2000  # characters of a step's search text sent with a plan
+# What a step's row in a plan's list carries, and what is added when the step is shown in full.
+STEP_ROW = "s.id, s.number, s.section, s.title, s.status, s.owner_need, s.behavior_change, ph.number phase"
+STEP_FULL = ("s.change, s.proof, s.owner_question, s.behavior_note, s.progress_note, s.no_findings_reason, "
+             "s.started_at, s.done_at, s.updated_at")
+
+
+def _plan_closes(con, where, args):
+    """{step id: [the points it closes]} for the steps a WHERE on steps s picks."""
+    out = {}
+    for c in rows(con, f"""SELECT sf.step_id, f.id, f.point_id, f.severity, f.summary, r.code review, i.code issue
+                           FROM step_findings sf JOIN steps s ON s.id=sf.step_id JOIN findings f ON f.id=sf.finding_id
+                           JOIN reviews r ON r.id=f.review_id LEFT JOIN issues i ON i.id=f.issue_id
+                           WHERE {where} ORDER BY sf.step_id, f.id""", args):
+        out.setdefault(c.pop("step_id"), []).append(c)
+    return out
+
+
+def _step_commits(con, where, args):
+    out = {}
+    for c in rows(con, f"""SELECT sc.step_id, sc.commit_sha, sc.branch, sc.pr_url, sc.summary, sc.committed_at
+                           FROM step_commits sc
+                           JOIN steps s ON s.id=sc.step_id WHERE {where} ORDER BY sc.id""", args):
+        out.setdefault(c.pop("step_id"), []).append(c)
+    return out
+
+
 def get_plan(rq):
+    """A plan's page. Every step comes as a list row (STEP_ROW) with the numbers of the steps it depends on, the
+    ids of the points it closes and search: lower-case text of its number, title, point ids, issue codes, proof
+    and change, cut to STEP_SEARCH, so the page's search covers every phase. The steps of one phase (?phase=N,
+    default the first) also carry their text and notes (STEP_FULL) and commits; any step in full, with the points
+    it closes, is /api/step/<plan>/<number>. The hub's copy carries every step in full and those points as
+    findings {id: row}."""
     con, code = rq.con, rq.args[0]
     pl = one(con, "SELECT * FROM plans WHERE code=?", (code,))
     if not pl:
         return error(404, "no such plan")
     pid = pl["id"]
-    steps = rows(con, """SELECT s.*, ph.number phase FROM steps s JOIN phases ph ON ph.id=s.phase_id
-                         WHERE s.plan_id=? ORDER BY s.number""", (pid,))
-    deps, closes, commits = {}, {}, {}
+    steps = rows(con, f"""SELECT {STEP_ROW}, {STEP_FULL} FROM steps s JOIN phases ph ON ph.id=s.phase_id
+                          WHERE s.plan_id=? ORDER BY s.number""", (pid,))
+    phase = int_arg(rq.qs, "phase", min([s["phase"] for s in steps] or [1]), 0)
+    deps, ids, words = {}, {}, {}
     for d in rows(con, """SELECT sd.step_id, s.number FROM step_dependencies sd JOIN steps s ON s.id=sd.depends_on_step_id
                           WHERE s.plan_id=?""", (pid,)):
         deps.setdefault(d["step_id"], []).append(d["number"])
-    for c in rows(con, """SELECT sf.step_id, f.point_id, f.severity, f.summary, r.code review, i.code issue
-                          FROM step_findings sf JOIN steps s ON s.id=sf.step_id JOIN findings f ON f.id=sf.finding_id
-                          JOIN reviews r ON r.id=f.review_id LEFT JOIN issues i ON i.id=f.issue_id WHERE s.plan_id=?""", (pid,)):
-        closes.setdefault(c["step_id"], []).append(c)
-    for c in rows(con, """SELECT sc.step_id, sc.commit_sha, sc.branch, sc.pr_url, sc.summary FROM step_commits sc
-                          JOIN steps s ON s.id=sc.step_id WHERE s.plan_id=?""", (pid,)):
-        commits.setdefault(c["step_id"], []).append(c)
+    for sid, fid, point, issue in con.execute("""SELECT sf.step_id, f.id, f.point_id, i.code FROM step_findings sf
+            JOIN steps s ON s.id=sf.step_id JOIN findings f ON f.id=sf.finding_id LEFT JOIN issues i ON i.id=f.issue_id
+            WHERE s.plan_id=? ORDER BY sf.step_id, f.id""", (pid,)):
+        ids.setdefault(sid, []).append(fid)
+        words.setdefault(sid, []).append(f"{point} {issue or ''}".strip())
+    commits = _step_commits(con, "s.plan_id=?" + ("" if rq.whole else " AND s.phase_id IN (SELECT id FROM phases "
+                            "WHERE plan_id=s.plan_id AND number=?)"), (pid,) if rq.whole else (pid, phase))
+    full = STEP_FULL.replace("s.", "").split(", ")
     for s in steps:
         s["depends"] = sorted(deps.get(s["id"], []))
-        s["closes"] = closes.get(s["id"], [])
-        s["commits"] = commits.get(s["id"], [])
-    return {"plan": pl,
-            "phases": rows(con, "SELECT * FROM v_plan_progress WHERE plan=?", (code,)),
-            "phase_rows": rows(con, "SELECT number, title, goal, why FROM phases WHERE plan_id=? ORDER BY number", (pid,)),
-            "steps": steps}
+        s["closes"] = ids.get(s["id"], [])
+        s["search"] = " ".join([str(s["number"]), s["title"] or ""] + words.get(s["id"], [])
+                               + [s["proof"] or "", s["change"] or ""]).lower()[:STEP_SEARCH]
+        if rq.whole or s["phase"] == phase:
+            s["commits"] = commits.get(s["id"], [])
+        else:
+            for k in full:
+                del s[k]
+    out = {"plan": pl,
+           "reviews": rows(con, """SELECT r.code, r.title FROM plan_reviews pr JOIN reviews r ON r.id=pr.review_id
+                                   WHERE pr.plan_id=? ORDER BY r.started_at, r.id""", (pid,)),
+           "artifacts": rows(con, "SELECT kind, path, url, created_at FROM artifacts WHERE plan_id=? ORDER BY kind, id",
+                             (pid,)),
+           "last_updated": one(con, """SELECT max(t) t FROM (SELECT max(updated_at) t FROM steps WHERE plan_id=?
+                                       UNION ALL SELECT updated_at FROM plans WHERE id=?)""", (pid, pid))["t"],
+           "gates": rows(con, """SELECT g.code, g.title, g.status, s.number step FROM gates g
+                                 LEFT JOIN steps s ON s.id=g.step_id
+                                 WHERE g.status IN ('open','answered') AND (g.plan_id=? OR s.plan_id=?)
+                                 ORDER BY g.status='answered', g.created_at""", (pid, pid)),
+           # defects found during fix work on this plan, with the step that now closes each (None: not planned yet)
+           "discoveries": rows(con, """SELECT f.id, f.point_id, f.summary, f.severity, r.code review, i.code issue,
+                    ds.number found_in_step,
+                    (SELECT min(cs.number) FROM step_findings sf JOIN steps cs ON cs.id=sf.step_id
+                      WHERE sf.finding_id=f.id AND cs.status <> 'dropped') closing_step
+                FROM findings f JOIN steps ds ON ds.id=f.discovered_in_step_id JOIN reviews r ON r.id=f.review_id
+                LEFT JOIN issues i ON i.id=f.issue_id
+                WHERE ds.plan_id=? AND f.verification <> 'false' ORDER BY ds.number, f.id""", (pid,)),
+           "events": entity_events(con, "plan", pid),
+           # each fixed issue without a guard test (the view), with the first step of this plan that closes it
+           "unguarded": rows(con, """SELECT * FROM (SELECT u.code, u.title, u.problem,
+                    (SELECT min(s.number) FROM issues i JOIN findings f ON f.issue_id = i.id
+                       JOIN step_findings sf ON sf.finding_id = f.id JOIN steps s ON s.id = sf.step_id
+                      WHERE i.code = u.code AND s.plan_id = ?) step
+                FROM v_unguarded_fixes u) WHERE step IS NOT NULL ORDER BY code""", (pid,)),
+           "phases": rows(con, "SELECT * FROM v_plan_progress WHERE plan=?", (code,)),
+           "phase_rows": rows(con, """SELECT ph.number, ph.title, ph.goal, ph.why, min(s.number) first_step,
+                                         max(s.number) last_step FROM phases ph LEFT JOIN steps s ON s.phase_id=ph.id
+                                         WHERE ph.plan_id=? GROUP BY ph.id ORDER BY ph.number""", (pid,)),
+           "steps": steps}
+    if rq.whole:
+        out["findings"] = {c["id"]: c for group in _plan_closes(con, "s.plan_id=?", (pid,)).values() for c in group}
+    return out
+
+
+def get_step(rq):
+    """One step of a plan in full: its text and notes (STEP_FULL), its commits and the points it closes."""
+    s = one(rq.con, f"""SELECT s.id, s.number, {STEP_FULL} FROM steps s JOIN plans p ON p.id=s.plan_id
+                        WHERE p.code=? AND s.number=?""", (rq.args[0], whole_number(rq.args[1], "The step number")))
+    if not s:
+        return error(404, "no such step")
+    sid = s.pop("id")
+    return {**s, "commits": _step_commits(rq.con, "s.id=?", (sid,)).get(sid, []),
+            "closes": _plan_closes(rq.con, "s.id=?", (sid,)).get(sid, [])}
+
+
+def get_guide(rq):
+    """The How it works page's text (Markdown the page draws itself)."""
+    return {"guide": HUB_GUIDE_MD}
 
 
 def get_goals(rq):
@@ -1967,14 +2367,68 @@ def get_goals(rq):
 
 
 def get_trends(rq):
-    con = rq.con
-    return {"metrics": rows(con, "SELECT * FROM v_metric_trends"),
-            "reviews": rows(con, """SELECT review, min(started_at) started_at, sum(points) points, sum(high) high,
-                sum(medium) medium, sum(low) low, sum(new_issues) new_issues, sum(carried_over) carried_over,
-                sum(came_back) came_back, sum(false_findings) false_findings
-                FROM v_review_summary GROUP BY review ORDER BY started_at"""),
-            "recurring": rows(con, "SELECT * FROM v_recurring_issues LIMIT 50"),
-            "hotspots": rows(con, "SELECT * FROM v_file_hotspots LIMIT 30")}
+    """How the numbers moved between reviews: each review's points (review_summary summed over its domains, with
+    tests and confirmed), every measurement, the issues that keep coming back and the files that keep producing
+    issues. It reads most of the ledger, so the viewer keeps the answer until the ledger changes (LedgerCache)."""
+    def build():
+        con, per = rq.con, {}
+        keys = ("points", "high", "medium", "low", "tests", "confirmed", "new_issues", "carried_over", "came_back",
+                "false_findings")
+        for r in review_summary(con):
+            t = per.setdefault(r["review"], {"review": r["review"], "started_at": r["started_at"], **dict.fromkeys(keys, 0)})
+            for k in keys:
+                t[k] += r[k] or 0
+        return {"metrics": rows(con, "SELECT * FROM v_metric_trends"),
+                "reviews": sorted(per.values(), key=lambda t: t["started_at"]),
+                "recurring": rows(con, "SELECT * FROM v_recurring_issues LIMIT 50"),
+                "hotspots": rows(con, "SELECT * FROM v_file_hotspots LIMIT 30")}
+    return CACHE.get(rq.db, "trends", build) if rq.cached else build()
+
+
+class LedgerCache:
+    """Answers that cost a read of the whole ledger, kept until the ledger changes. For each ledger file one
+    connection stays open only to ask PRAGMA data_version, which moves when any other connection commits; an
+    answer is kept with the version it was built at. A file put in the ledger's place (restore) starts again."""
+
+    def __init__(self):
+        self.lock, self.held = threading.Lock(), {}
+
+    def version(self, db):
+        """(the file's identity, its data version), or None when it cannot be asked."""
+        key = str(db)
+        try:
+            st = os.stat(key)
+            con, ident = self.held.get(key, (None, None))
+            if con is None or ident != (st.st_dev, st.st_ino):
+                if con is not None:
+                    con.close()
+                con = connect(db, readonly=True)  # used only under self.lock, from whichever request thread asks
+                self.held[key] = (con, (st.st_dev, st.st_ino))
+            return (st.st_dev, st.st_ino), con.execute("PRAGMA data_version").fetchone()[0]
+        except (OSError, sqlite3.Error):
+            return None
+
+    def get(self, db, name, build):
+        with self.lock:
+            now = self.version(db)
+            kept = self.held.get((str(db), name))
+            if now is not None and kept and kept[0] == now:
+                return kept[1]
+        answer = build()  # outside the lock: a slow build does not hold up other requests
+        with self.lock:
+            if now is not None and self.version(db) == now:
+                self.held[(str(db), name)] = (now, answer)
+        return answer
+
+    def close(self):
+        with self.lock:
+            for v in self.held.values():
+                if isinstance(v[0], sqlite3.Connection):
+                    v[0].close()
+            self.held = {}
+
+
+CACHE = LedgerCache()
 
 
 def tables_and_views(con):
@@ -1983,25 +2437,64 @@ def tables_and_views(con):
                         AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY type, name""")
 
 
+def _schema_notes():
+    """{table or view: the first comment line above its CREATE in the shipped schema}: one plain sentence each."""
+    notes, lines = {}, SCHEMA.split("\n")
+    for n, line in enumerate(lines):
+        m = re.match(r"CREATE (?:TABLE|VIEW) (\w+)", line)
+        if m:
+            k = n
+            while k > 0 and lines[k - 1].startswith("--"):
+                k -= 1
+            if k < n:
+                notes[m.group(1)] = lines[k][2:].strip()
+    return notes
+
+
+SCHEMA_NOTES = _schema_notes()
+AGENT_VIEWS = ("v_open_issues", "v_known_issues_for_brief", "v_code_refs")  # read by the agent, shown in Explore only
+
+
+def plain_name(name):
+    """A table's or view's stored name as words: v_owner_queue -> Owner queue."""
+    words = re.sub(r"^v_", "", name).replace("_", " ")
+    return words[:1].upper() + words[1:]
+
+
 def get_tables(rq):
+    """Every table and saved view with its name in words and the one-line description from the schema. Tables
+    carry their row count; a view does not (counting one runs its whole query: /api/table/<view>?count=1)."""
     con, out = rq.con, []
     for t in tables_and_views(con):
-        cols = [c["name"] for c in rows(con, "SELECT name FROM pragma_table_info(?)", (t["name"],))]
-        n = con.execute(f"SELECT count(*) FROM {quote_name(t['name'])}").fetchone()[0]
-        out.append({**t, "columns": cols, "count": n})
+        row = {**t, "label": plain_name(t["name"]), "description": SCHEMA_NOTES.get(t["name"], ""),
+               "for_agent": t["name"] in AGENT_VIEWS}
+        if t["type"] == "table":
+            row["count"] = con.execute(f"SELECT count(*) FROM {quote_name(t['name'])}").fetchone()[0]
+        out.append(row)
     return out
 
 
 def get_table(rq):
-    """?limit= (1 to 500, default 100) and offset= rows of one table or view."""
+    """?limit= (1 to 500, default 100) and offset= rows of one table or view, under the SQL box's limits (long text
+    cut, a BLOB as its size, about SQL_MAX_RESPONSE bytes in all: truncated). more says whether rows follow. count
+    is the row count of a table; a view is counted only when asked (?count=1), since that runs its whole query."""
     con, name = rq.con, rq.args[0]
-    if not NAME.match(name) or not one(con, "SELECT 1 x FROM sqlite_master WHERE name=? AND type IN ('table','view')", (name,)):
+    kind = one(con, "SELECT type FROM sqlite_master WHERE name=? AND type IN ('table','view')", (name,)) \
+        if NAME.match(name) else None
+    if not kind:
         return error(404, "no such table")
-    limit = max(1, min(500, whole_number(rq.arg("limit", "100"), "limit")))
-    offset = max(0, whole_number(rq.arg("offset", "0"), "offset"))
-    cur = con.execute(f'SELECT * FROM "{name}" LIMIT ? OFFSET ?', (limit, offset))
-    return {"columns": [d[0] for d in cur.description], "rows": [list(r) for r in cur.fetchall()],
-            "count": con.execute(f'SELECT count(*) FROM "{name}"').fetchone()[0], "offset": offset, "limit": limit}
+    limit, offset = int_arg(rq.qs, "limit", 100, 1, 500), int_arg(rq.qs, "offset", 0, 0)
+    if rq.whole:
+        limit = HUB_MAX_ROWS
+    cur = con.execute(f'SELECT * FROM "{name}" LIMIT ? OFFSET ?', (limit + 1, offset))
+    cols = [d[0] for d in cur.description]
+    out, truncated = _bounded_rows(cur, limit + 1)
+    more = len(out) > limit or truncated
+    count = None
+    if kind["type"] == "table" or rq.arg("count") == "1" or rq.whole:
+        count = con.execute(f'SELECT count(*) FROM "{name}"').fetchone()[0]
+    return {"columns": cols, "rows": out[:limit], "count": count, "more": more, "truncated": truncated,
+            "offset": offset, "limit": limit}
 
 
 def post_sql(rq):
@@ -2030,16 +2523,25 @@ def _hub_each(prefix, sql):
 # with Allow. The published hub embeds the answers of every GET row (hub_snapshot).
 ROUTES = (
     Route("GET", "overview", get_overview, _hub("overview")),
+    Route("GET", "home", get_home, _hub("home")),
+    Route("GET", "checks", get_checks, _hub("checks"), seconds=CHECKS_SECONDS),
+    Route("GET", "decisions", get_decisions, _hub("decisions")),
     Route("GET", "gates", get_gates, _hub("gates?status=pending", "gates?status=all")),
     Route("POST", "gates/*/answer", post_gate_answer),
     Route("GET", "reviews", get_reviews, _hub("reviews")),
     Route("GET", "review/*", get_review, _hub_each("review", "SELECT code FROM reviews ORDER BY code")),
+    Route("GET", "review/*/checks", get_review_checks,
+          lambda con: [f"review/{r[0]}/checks" for r in con.execute("SELECT code FROM reviews ORDER BY code")]),
+    Route("GET", "finding/*", get_finding, _hub_each("finding", "SELECT id FROM findings ORDER BY id")),
     Route("GET", "issues", get_issues, _hub("issues")),
     Route("GET", "issue/*", get_issue, _hub_each("issue", "SELECT code FROM issues ORDER BY code")),
     Route("GET", "plans", get_plans, _hub("plans")),
     Route("GET", "plan/*", get_plan, _hub_each("plan", "SELECT code FROM plans ORDER BY code")),
+    Route("GET", "step/*/*", get_step, lambda con: []),  # none in the hub: its plans carry every step in full
     Route("GET", "goals", get_goals, _hub("goals")),
-    Route("GET", "trends", get_trends, _hub("trends")),
+    Route("GET", "guide", get_guide, _hub("guide")),
+    Route("GET", "run/*", get_run, _hub_each("run", "SELECT id FROM reviewer_runs ORDER BY id")),
+    Route("GET", "trends", get_trends, _hub("trends"), seconds=TRENDS_SECONDS),
     Route("GET", "tables", get_tables, _hub("tables")),
     Route("GET", "table/*", get_table,
           lambda con: [f"table/{t['name']}?limit={HUB_MAX_ROWS}&offset=0" for t in tables_and_views(con)
@@ -2050,8 +2552,9 @@ ROUTES = (
 
 
 def api_segments(path):
-    """The segments after /api of a URL path, or None for a path that is not under /api."""
-    parts = [x for x in path.split("/") if x]
+    """The segments after /api of a URL path, each URL-decoded after the split (the page encodes every code it
+    puts in a path, so GATE%2D0001 is GATE-0001), or None for a path that is not under /api."""
+    parts = [unquote(x) for x in path.split("/") if x]
     return parts[1:] if parts and parts[0] == "api" else None
 
 
@@ -2067,13 +2570,20 @@ def allowed_methods(path):
     return [] if parts is None else [r.method for r in ROUTES if _matches(r, parts)]
 
 
+def route_seconds(path):
+    """How long the viewer lets a GET of this path read: its route's seconds, ROUTE_SECONDS for anything else."""
+    parts = api_segments(path)
+    return next((r.seconds for r in ROUTES if parts is not None and r.method == "GET" and _matches(r, parts)),
+                None) or ROUTE_SECONDS
+
+
 def wrong_method(method, allowed):
     return error(405, f"This address takes {' or '.join(allowed)}, not {method}.", {"Allow": ", ".join(allowed)})
 
 
-def route(root, db, con, path, qs, body):
+def route(root, db, con, path, qs, body, whole=False):
     """Answer one API request from ROUTES: the handler's result (a dict or list: 200) or error(...). body is None
-    for a GET and the JSON object for a POST."""
+    for a GET and the JSON object for a POST. whole: a paged list is answered in full (the hub's snapshot)."""
     method = "GET" if body is None else "POST"
     parts = api_segments(path)
     allowed = [] if parts is None else allowed_methods(path)
@@ -2083,7 +2593,7 @@ def route(root, db, con, path, qs, body):
         return wrong_method(method, allowed)
     r = next(r for r in ROUTES if r.method == method and _matches(r, parts))
     try:
-        return r.handler(Request(root, db, con, [b for a, b in zip(r.pattern, parts) if a == "*"], qs, body))
+        return r.handler(Request(root, db, con, [b for a, b in zip(r.pattern, parts) if a == "*"], qs, body, whole))
     except ApiError as e:
         return error(e.status, e.message, e.headers)
 
@@ -2095,12 +2605,33 @@ SQL_MAX_RESPONSE = 5_000_000  # rows stop being added once the JSON passes about
 SQL_MAX_ROWS = 1000
 
 
+def _json_cell(v):
+    """json.dumps default for a viewer answer: a BLOB as {"blob_bytes": N} (as the SQL box sends it), else text."""
+    return {"blob_bytes": len(v)} if isinstance(v, (bytes, bytearray, memoryview)) else str(v)
+
+
 def _sql_cell(v):
     if isinstance(v, bytes):
         return {"blob_bytes": len(v)}
     if isinstance(v, str) and len(v) > SQL_MAX_CELL:
         return v[:SQL_MAX_CELL] + f" … [cut: {len(v):,} characters in all]"
     return v
+
+
+def _bounded_rows(cur, max_rows):
+    """Rows of a cursor as lists, under the limits every table of raw rows is sent with: at most max_rows rows, each
+    cell through _sql_cell, stopping at about SQL_MAX_RESPONSE bytes of JSON. Returns (rows, whether any were
+    left out)."""
+    out, size = [], 2
+    for r in cur:
+        if len(out) >= max_rows:
+            return out, True
+        row = [_sql_cell(v) for v in r]
+        size += len(json.dumps(row, ensure_ascii=False, default=str).encode()) + 1
+        if size > SQL_MAX_RESPONSE:
+            return out, True
+        out.append(row)
+    return out, False
 
 
 def run_readonly(db, sql):
@@ -2121,17 +2652,7 @@ def run_readonly(db, sql):
     try:
         cur = con.execute(sql)
         cols = [d[0] for d in cur.description or []]
-        out, size, truncated = [], 2, False
-        for r in cur:
-            if len(out) >= SQL_MAX_ROWS:
-                truncated = True
-                break
-            row = [_sql_cell(v) for v in r]
-            size += len(json.dumps(row, ensure_ascii=False, default=str).encode()) + 1
-            if size > SQL_MAX_RESPONSE:
-                truncated = True
-                break
-            out.append(row)
+        out, truncated = _bounded_rows(cur, SQL_MAX_ROWS)
         return {"columns": cols, "rows": out, "truncated": truncated}
     except (sqlite3.Error, sqlite3.Warning) as e:  # before Python 3.11, several statements raise sqlite3.Warning
         if isinstance(e, sqlite3.OperationalError) and "interrupted" in str(e) and timed_out():
@@ -2145,6 +2666,19 @@ def run_readonly(db, sql):
 
 REQUEST_TIMEOUT = 10  # seconds a viewer connection may sit idle or half-sent before it is dropped
 MAX_BODY = 200_000  # bytes of POST body accepted
+GZIP_FROM = 8_000  # bytes: a larger answer is sent gzipped to a browser that accepts it
+
+# What a browser shows when the viewer is opened under a name it does not answer to (a forwarded port, another
+# machine's address). It holds no token and runs no script; %s is the list of addresses the viewer listens on.
+WRONG_HOST_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Review ledger</title></head>
+<body style="font:16px/1.5 system-ui,sans-serif;max-width:60ch;margin:48px auto;padding:0 16px">
+<h1>This address does not reach the viewer</h1>
+<p>The viewer only answers at %s, on the computer where <code>ledger.py serve</code> is running.</p>
+<p>Open the link that <code>ledger.py serve</code> printed in its terminal. To view from another computer, forward
+the same port number to that address and open the printed link there.</p>
+</body></html>
+"""
 
 
 def page_csp(page):
@@ -2158,28 +2692,70 @@ def page_csp(page):
             "connect-src 'self'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
 
 
-def make_server(root, db, port=0):
+def log_line(text):
+    """One line of the viewer's log: to stderr, the terminal `ledger.py serve` runs in. The log holds each request
+    (time, method, path with the names of its query parameters, status, how long it took), each gate answer's
+    outcome and each failure's traceback (api_failure). It never holds the token, a query value, or what the owner
+    answered."""
+    sys.stderr.write(text + "\n")
+    sys.stderr.flush()
+
+
+def logged_path(raw):
+    """A request's path as the log shows it: the path, then the names of its query parameters without their values
+    (a search text or a code stays out of the terminal's scrollback)."""
+    u = urlparse(raw)
+    names = sorted(parse_qs(u.query, keep_blank_values=True))
+    return u.path[:200] + ("?" + "&".join(names) if names else "")
+
+
+def make_server(root, db, port=0, ipv6=False):
     """Build the viewer's handler and bind it to 127.0.0.1:port (0 = any free port); returns (server, token).
     The caller runs server.serve_forever(). The Host allow-list uses the port actually bound. The page itself holds
     no secret: the token reaches the browser only in the launch URL's #k= fragment (see serve), and every /api/
-    request must send it back as X-Ledger-Token."""
+    request must send it back as X-Ledger-Token. ipv6: also bind [::1] on the same port where the machine has
+    IPv6 and the port is free there; that second server is server.also[0] (the caller runs and closes it too).
+    Nothing but the two loopback addresses is ever bound."""
     token = secrets.token_urlsafe(32)
     token_bytes = token.encode()
     page = PAGE.encode("utf-8")
     csp = page_csp(PAGE)
-    hosts = set()
+    hosts, addresses = set(), []
 
     class H(BaseHTTPRequestHandler):
         timeout = REQUEST_TIMEOUT
 
+        # The handler. parse_request() stamps the start; send() is the one way an answer leaves, so every answer
+        # has the security headers and one log line (log_request). do_GET and do_POST check the Host, then the
+        # token, then hand /api/ paths to handle_api(); any other method goes to refuse_method().
+        def parse_request(self):
+            from time import monotonic
+            self.started = monotonic()
+            return super().parse_request()
+
+        def log_request(self, code="-", size="-"):
+            from time import monotonic
+            ms = int((monotonic() - getattr(self, "started", monotonic())) * 1000)
+            status = getattr(code, "value", code)
+            # a request the library refused before reading it whole has no method or path yet
+            log_line(f"{now()[:19]}Z {getattr(self, 'command', None) or '-'} "
+                     f"{logged_path(getattr(self, 'path', '') or '') or '-'} {status} {ms} ms")
+
         def log_message(self, *a):
-            pass
+            pass  # the library's own messages (a malformed request line) are answered by send_error, logged there
 
         def send(self, code, body, ctype="application/json; charset=utf-8", headers=None):
-            data = body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=False, default=str).encode()
+            data = body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=False, default=_json_cell).encode()
             self.send_response(code)
             for k, v in (headers or {}).items():
                 self.send_header(k, v)
+            if len(data) > GZIP_FROM:
+                self.send_header("Vary", "Accept-Encoding")
+                if re.search(r"(?i)(^|,)\s*gzip\s*(,|$|;(?!\s*q=0(\.0*)?\s*(,|$)))",
+                             self.headers.get("Accept-Encoding", "")):
+                    import gzip
+                    data = gzip.compress(data, 6, mtime=0)
+                    self.send_header("Content-Encoding", "gzip")
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Cache-Control", "no-store")
@@ -2213,9 +2789,16 @@ def make_server(root, db, port=0):
         do_HEAD = do_PUT = do_DELETE = do_OPTIONS = do_PATCH = refuse_method
 
         def host_ok(self):
-            if self.headers.get("Host") not in hosts:
-                self.send(403, {"error": "wrong host"}); return False
-            return True
+            """Only requests addressed to the viewer's own loopback addresses are answered. A browser asking for
+            the page under another name gets a page that says where the viewer is; anything else gets JSON."""
+            if self.headers.get("Host") in hosts:
+                return True
+            if self.command == "GET" and urlparse(self.path).path == "/":
+                self.send(403, (WRONG_HOST_PAGE % " or ".join(f"http://{a}/" for a in addresses)).encode("utf-8"),
+                          "text/html; charset=utf-8")
+            else:
+                self.send(403, {"error": "wrong host"})
+            return False
 
         def token_ok(self):
             try:  # headers are decoded as latin-1, so this gives back the bytes that were sent
@@ -2234,6 +2817,11 @@ def make_server(root, db, port=0):
             except Exception as e:
                 res = api_failure(e, f"{self.command} {u.path}")
             res = res if isinstance(res, tuple) else (res, 200)
+            parts = api_segments(u.path) or []
+            if body is not None and len(parts) == 3 and parts[0] == "gates" and parts[2] == "answer":
+                code = re.sub(r"[^A-Za-z0-9-]", "?", parts[1])[:40]  # what was answered is never logged
+                log_line(f"answer {code}: " + ("saved" if res[1] == 200 else
+                                               f"not saved ({res[1]}: {res[0].get('error')})"))
             self.send(res[1], res[0], headers=res[2] if len(res) > 2 else None)
 
         def do_GET(self):
@@ -2262,7 +2850,7 @@ def make_server(root, db, port=0):
             if allowed and "POST" not in allowed:  # before the body is read
                 res = wrong_method("POST", allowed)
                 return self.send(res[1], res[0], headers=res[2])
-            if self.headers.get("Content-Type", "").split(";")[0] != "application/json":
+            if self.headers.get("Content-Type", "").split(";")[0].strip().lower() != "application/json":
                 return self.send(415, {"error": "JSON only"})
             raw_n = self.headers.get("Content-Length")
             if raw_n is None:
@@ -2289,27 +2877,92 @@ def make_server(root, db, port=0):
             self.handle_api(u, body)
 
     srv = ThreadingHTTPServer(("127.0.0.1", port), H)
+    srv.handle_error = _quiet_disconnects(srv.handle_error)
     bound = srv.server_address[1]
     hosts.update({f"127.0.0.1:{bound}", f"localhost:{bound}"})
+    addresses.append(f"127.0.0.1:{bound}")
+    srv.also = []
+    if ipv6:
+        six = _ipv6_loopback_server(bound, H)
+        if six is not None:
+            six.handle_error = _quiet_disconnects(six.handle_error)
+            srv.also.append(six)
+            hosts.add(f"[::1]:{bound}")
+            addresses.append(f"[::1]:{bound}")
+    srv.addresses = addresses
     return srv, token
 
 
+def _quiet_disconnects(handle_error):
+    """A server's handle_error that says nothing when the browser went away (a closed tab, a reload in
+    mid-answer) and leaves every other failure to the library, which prints it."""
+    def quiet(request, client_address):
+        if isinstance(sys.exc_info()[1], (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)):
+            return
+        handle_error(request, client_address)
+    return quiet
+
+
+def _ipv6_loopback_server(port, handler):
+    """A second viewer server on [::1]:port, or None where IPv6 is missing or that port is taken there."""
+    import socket
+    if not socket.has_ipv6:
+        return None
+
+    class Six(ThreadingHTTPServer):
+        address_family = socket.AF_INET6
+
+        def server_bind(self):
+            if hasattr(socket, "IPV6_V6ONLY"):
+                self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            super().server_bind()
+
+    try:
+        return Six(("::1", port), handler)
+    except OSError:
+        return None
+
+
 def serve(root, db, port, open_browser):
-    """Run the viewer until Ctrl+C. The launch URL carries the token in its #k= fragment (never sent to the server,
+    """Run the viewer until Ctrl+C, on 127.0.0.1 and, where the machine has it, on [::1]. The launch URL carries the token in its #k= fragment (never sent to the server,
     read by the page into sessionStorage and removed from the address bar). The umask is set to 077 first, so any
     file the viewer's connections create beside the ledger (-journal, -wal, -shm) is owner-only."""
     import os
     if hasattr(os, "umask"):
         os.umask(0o077)
-    srv, token = make_server(root, db, port)
+    try:
+        srv, token = make_server(root, db, port, ipv6=True)
+    except OSError as e:
+        import errno
+        if e.errno in (errno.EADDRINUSE, getattr(errno, "WSAEADDRINUSE", -1)):
+            print(f"serve: port {port} is in use; try --port {port + 1}", file=sys.stderr)
+        else:
+            print(f"serve: cannot listen on 127.0.0.1:{port}: {e.strerror or e}", file=sys.stderr)
+        sys.exit(2)
     url = f"http://127.0.0.1:{srv.server_address[1]}/#k={token}"
-    print(f"Ledger viewer for {db} at {url}  (Ctrl+C to stop)", flush=True)
+    more = "".join(f"  also at http://{a}/#k={token}" for a in srv.addresses[1:])
+    print(f"Ledger viewer for {db} at {url}{more}  (Ctrl+C to stop)", flush=True)
+    def open_it():
+        try:
+            opened = webbrowser.open(url)
+        except Exception:  # a machine with no browser at all
+            opened = False
+        if not opened:
+            print("No browser could be opened from here; open the address above in your browser.", flush=True)
+
     if open_browser:
-        threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+        threading.Timer(0.5, open_it).start()
+    for other in srv.also:
+        threading.Thread(target=other.serve_forever, daemon=True).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        for other in srv.also:
+            other.shutdown()
+            other.server_close()
+        CACHE.close()
 
 
 # ---------------------------------------------------------------- owner queue, query, progress, hub, answers
@@ -2332,8 +2985,8 @@ def print_gates(con):
         if o["kind"] == "step":
             print(f"step {o['ref']} [{o['need']}] {o['title']}: {o['question']}")
         else:
-            print(f"decision {o['ref']} [{o['status']}] {o['title']}"
-                  + (f" (revisit when: {o['question']})" if o["question"] else ""))
+            print(f"decision {o['ref']} [{o['status']}] {o['question']}"
+                  + (f" (revisit when: {o['context']})" if o["context"] else ""))
     try:
         stale = rows(con, "SELECT * FROM v_stale_steps ORDER BY plan, step")
     except sqlite3.Error:
@@ -2431,19 +3084,19 @@ def progress_md(con, plan_code):
 # Nothing in the page makes an outside request; publishing it is the agent's job, outside this tool.
 HUB_GUIDE_MD = """## What this site is
 
-This is the review ledger for this project, shown as a website. Every review, every point it raised, the issues those points describe, the fix plan, and every question waiting on you live here. Claude updates the site after each step of a review and after each batch of fixes; the date at the top says when.
+This is the review ledger for this project, shown as a website. Every review, every point it raised, the issues those points describe, the fix plan, and every question waiting on you live here. It always shows the ledger as it is now; a shared copy of it shows the date it was made at the top.
 
-You can answer every question here, under **Waiting on you**. Your answer is saved with this page; Claude records it the next time it checks, or right away if you tell it in the chat.
+You can answer every question here, under **Waiting on you**. The agent picks your answer up the next time it checks, or right away if you tell it in the chat.
 
 ## How a review runs
 
-1. **Goals and areas.** Claude reads the project, proposes the design goals the code is judged against and the areas to review (security, tests, the viewer, and so on), and asks you to approve them. Nothing runs before you do.
+1. **Goals and areas.** The agent reads the project, proposes the design goals the code is judged against and the areas to review (security, tests, the viewer, and so on), and asks you to approve them. Nothing runs before you do.
 2. **Reviewers.** One reviewer per approved area reads its part of the code, read-only, and writes a report.
-3. **Checking.** Claude checks every serious point against the code itself and records which were confirmed and which were wrong.
+3. **Checking.** The agent checks every serious point against the code itself and records which were confirmed and which were wrong.
 4. **Points into issues.** Every point of every report is recorded here, pinned to the exact lines at the reviewed commit, and grouped into issues: one issue per underlying problem, however many reviewers described it. Issues found by earlier reviews are matched, so a problem that comes back is marked as having come back.
 5. **Report.** The review's report (on the review's page) gives the verdict, the root causes, what to fix first, and how each of your requirements is met.
 6. **Fix plan.** Every point is placed in a step; steps are grouped into phases that build on each other. You approve the plan and any choices it needs.
-7. **Fixing.** Claude works through the steps in order. Each fix comes with a test that fails before it and passes after; each step's note says in plain words what changed.
+7. **Fixing.** The agent works through the steps in order. Each fix comes with a test that fails before it and passes after; each step's note says in plain words what changed.
 8. **Second review.** The skill runs again on the fixed code and confirms each fix; only then is an issue marked fixed and confirmed.
 
 ## Words used here
@@ -2453,14 +3106,14 @@ You can answer every question here, under **Waiting on you**. Your answer is sav
 | Point | One thing one reviewer raised in one review |
 | Issue | The underlying problem, followed across reviews; several points can describe one issue |
 | Severity | High, Medium, Low, or Missing test |
-| Question (gate) | Something Claude cannot get past without you; it waits until you answer |
+| Question (gate) | Something the agent cannot get past without you; it waits until you answer |
 | Decision | Your answer, kept so later reviews don't ask again |
 | Plan, phase, step | The fix plan; its stages, in order; one change with its proof |
 | Commit | The exact version of the code a review looked at |
 
 ## Where to look
 
-**Overview** shows the totals and the ledger's own checks. **Reviews** lists every review; open one for its report, the areas reviewed and skipped, the reviewers, and every point with the code it cites. **Issues** lets you search and filter every issue and see its full history. **Fix plans** shows every step by phase, with what it changes, how it is proven, and which points it closes. **Over time** shows how the numbers move between reviews. **Explore** shows the raw tables behind everything.
+**Overview** shows the totals and the ledger's own checks. **Reviews** lists every review; open one for its report, the areas reviewed and skipped, the reviewers, and every point with the code it cites. **Design goals** lists what you want the code to be. **Issues** lets you search and filter every issue and see its full history. **Fix plans** shows every step by phase, with what it changes, how it is proven, and which points it closes. **Over time** shows how the numbers move between reviews. **Explore** shows the raw tables behind everything.
 """
 
 # The one change progress-page makes to page.html: the data script (%s is the JSON), put in front of the page's own
@@ -2481,15 +3134,15 @@ def hub_snapshot(root, db, con, start=None):
     ledger (the hub cannot read git); each issue of the list gains the text its search box matches."""
     def call(path):
         p, _, q = path.partition("?")
-        res = route(root, db, con, "/api/" + p, parse_qs(q), None)
+        res = route(root, db, con, "/api/" + p, parse_qs(q), None, whole=True)
         if isinstance(res, tuple):
             raise LedgerError(f"progress-page: /api/{path} failed: {res[0].get('error')}")
         return res
 
     def table(path):
         d = call(path)
-        cut = [[(v[:HUB_MAX_CELL] + "…") if isinstance(v, str) and len(v) > HUB_MAX_CELL else
-                ({"blob_bytes": len(v)} if isinstance(v, bytes) else v) for v in r] for r in d["rows"]]
+        cut = [[(v[:HUB_MAX_CELL] + "…") if isinstance(v, str) and len(v) > HUB_MAX_CELL else v for v in r]
+               for r in d["rows"]]
         return {"columns": d["columns"], "rows": cut, "count": len(cut), "total": d["count"]}
 
     cmds = {r[0]: r[1] for r in con.execute("SELECT location_id, git_command FROM v_code_refs")}
@@ -2521,7 +3174,7 @@ def hub_snapshot(root, db, con, start=None):
                                             JOIN findings f ON f.issue_id=i.id
                                             LEFT JOIN finding_locations fl ON fl.finding_id=f.id"""):
         search.setdefault(code, set()).update([point, path])
-    for i in R["issues"]:
+    for i in R["issues"]["rows"]:
         i["search"] = " ".join([i["code"], i["title"] or "", i.get("sub") or ""] + sorted(search.get(i["code"], ())))
     try:
         active = [r[0] for r in con.execute("SELECT value FROM issue_statuses WHERE active = 1 ORDER BY position")]
@@ -2544,7 +3197,7 @@ def hub_page(root, db, start=None, page=None):
         con.close()
     # In JSON, '<' only appears inside strings, where \u003c means the same: no '</script>' or '<!--' can end or
     # bend the data script.
-    data = json.dumps(snap, ensure_ascii=False, default=str, separators=(",", ":")).replace("<", "\\u003c")
+    data = json.dumps(snap, ensure_ascii=False, default=_json_cell, separators=(",", ":")).replace("<", "\\u003c")
     data = data.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
     page = page.replace(marker, script % data, 1)
     name = snap["responses"]["overview"].get("project") or root.name
@@ -3831,13 +4484,22 @@ def cmd_open_gate(ctx):
     return [code]
 
 
+ANSWER_MAX_TEXT = 10_000  # characters of a gate answer's free text (tr_gate_answer_rules has the same number)
+# Why a gate that is not open takes no answer, by its status.
+GATE_CLOSED = {"answered": "This question was already answered.",
+               "applied": "This question was already answered and the agent has acted on the answer.",
+               "withdrawn": "This question was withdrawn; it needs no answer."}
+
+
 def answer_gate(con, code, value=None, text=None, via="chat", actor_id=None):
     """Record the owner's answer to an open gate: the one set of answer rules for the viewer (via 'viewer') and
     `ledger.py answer-gate` (via 'chat' or 'other'). On the caller's open transaction, or else in a BEGIN IMMEDIATE
     of its own (committed here): the gate is read and updated in that one transaction and the UPDATE must change
     exactly one open row, so two answers cannot both be saved. actor_id is who answered (default: the project's
-    owner actor, made on first use). Raises GateRefused(status, message) for 404 no such gate, 409 answered
-    already, 400 an answer the gate does not take; returns {"ok": True}."""
+    owner actor, made on first use). Raises GateRefused(status, message) for 404 no such gate, 409 a gate that is
+    not open (the sentence says whether it was answered, applied or withdrawn), 400 an answer the gate does not
+    take (a value that is not an option, nothing at all, a note on a gate without free text, a note over
+    ANSWER_MAX_TEXT); returns {"ok": True}. tr_gate_answer_rules holds the same rules for answers written as SQL."""
     if not isinstance(con, sqlite3.Connection):  # answer_gate(db, code, body): the viewer's request form
         return gate_answer_request(con, code, value if isinstance(value, dict) else {})
     if (value is not None and not isinstance(value, str)) or (text is not None and not isinstance(text, str)):
@@ -3850,7 +4512,7 @@ def answer_gate(con, code, value=None, text=None, via="chat", actor_id=None):
         if not g:
             raise GateRefused(404, "no such gate")
         if g["status"] != "open":
-            raise GateRefused(409, "This question was already answered.")
+            raise GateRefused(409, GATE_CLOSED.get(g["status"], GATE_CLOSED["answered"]))
         val = (value or "").strip() or None
         txt = (text or "").strip() or None
         opts = [o.get("value") for o in json.loads(g["options"] or "[]")]
@@ -3858,8 +4520,11 @@ def answer_gate(con, code, value=None, text=None, via="chat", actor_id=None):
             raise GateRefused(400, "That choice is not one of the options.")
         if val is None and not txt:
             raise GateRefused(400, "Choose an option or write an answer.")
-        if txt and not g["allow_text"] and val is None:
-            raise GateRefused(400, "Choose one of the options.")
+        if txt and not g["allow_text"]:
+            raise GateRefused(400, "This question takes one of its options and no note." if val is not None
+                              else "Choose one of the options.")
+        if txt and len(txt) > ANSWER_MAX_TEXT:
+            raise GateRefused(400, f"The answer is too long (over {ANSWER_MAX_TEXT:,} characters).")
         if via not in ("chat", "viewer", "other"):
             raise GateRefused(400, "answered via must be chat, viewer or other")
         who = actor_id if actor_id is not None else owner_actor(con)
@@ -3868,7 +4533,7 @@ def answer_gate(con, code, value=None, text=None, via="chat", actor_id=None):
                                           WHERE id=?), answered_via=?, answered_by_actor_id=?
                              WHERE id=? AND status='open'""", (val, txt, who, via, who, g["id"]))
         if cur.rowcount != 1:
-            raise GateRefused(409, "This question was already answered.")
+            raise GateRefused(409, GATE_CLOSED["answered"])
         if own:
             con.execute("COMMIT")
         return {"ok": True}
@@ -4183,7 +4848,10 @@ def goals_list(con, domain=None, include_all=False, review=None):
     if review:
         where.append("r.code = ?"); args.append(review)
     goals = rows(con, f"""SELECT g.id, g.code, g.domain_code domain, g.text, g.status, gs.label status_label,
-        g.approved_by_actor_id approved_by, g.approved_at, r.code review, g.note, g.source, gt.code gate
+        g.approved_by_actor_id approved_by, g.approved_at, r.code review, g.note, g.source, gt.code gate,
+        g.adopted_at, g.retired_at,
+        (SELECT group_concat(code, ', ') FROM (SELECT ur.code FROM review_goals rg JOIN reviews ur ON ur.id=rg.review_id
+           WHERE rg.goal_id=g.id ORDER BY ur.started_at, ur.id)) used_by
         FROM design_goals g JOIN goal_statuses gs ON gs.value=g.status LEFT JOIN reviews r ON r.id=g.review_id
         LEFT JOIN gates gt ON gt.id=g.gate_id
         WHERE {' AND '.join(where) or '1'} ORDER BY g.domain_code IS NOT NULL, g.domain_code, g.id""", args)
@@ -5709,6 +6377,20 @@ def main():
         if isinstance(e.code, str):
             raise SystemExit(terminal_safe(e.code)) from None
         raise
+    # What the commands do not answer themselves (a write command prints its own refusal and exits 1): one line
+    # and exit 2, never a traceback.
+    except subprocess.TimeoutExpired as e:
+        cmd = e.cmd if isinstance(e.cmd, str) else " ".join(map(str, e.cmd))
+        print(f"ledger.py: `{cmd}` did not finish in {e.timeout:g} s; nothing more was done", file=err)
+        raise SystemExit(2) from None
+    except sqlite3.DatabaseError as e:
+        print(f"ledger.py: the ledger could not be read ({_one_line(e)}). If the file is damaged, rebuild it from "
+              f"its dump: python3 ledger.py restore .code-review/ledger.sql --to NEW.sqlite", file=err)
+        raise SystemExit(2) from None
+    except OSError as e:
+        what = f"{e.strerror or e}" + (f": {e.filename}" if e.filename else "")
+        print(f"ledger.py: {what}", file=err)
+        raise SystemExit(2) from None
     finally:
         sys.stdout, sys.stderr = out, err
         while _MAIN_CONNECTIONS:
@@ -5795,8 +6477,12 @@ def _main():
         if was and was[0] != str(db.parent):
             print(f"warning: this ledger was set up at {was[0]} and is now used from {db.parent} (fine after a move; "
                   f"init records the new place)", file=sys.stderr)
-        bad = check(con, quiet=a.quiet, full=a.full)
-        bad += check_git_refs(root, con, quiet=a.quiet)
+        try:
+            bad = check(con, quiet=a.quiet, full=a.full)
+            bad += check_git_refs(root, con, quiet=a.quiet)
+        except sqlite3.DatabaseError as e:  # a damaged file stops a later read: what was found is printed already
+            print(f"check: stopped, the ledger file is damaged ({_one_line(e)})")
+            sys.exit(1)
         if old_sqlite_note():
             print(old_sqlite_note(), file=sys.stderr)
         sys.exit(1 if bad else 0)

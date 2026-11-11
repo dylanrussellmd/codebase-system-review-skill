@@ -125,6 +125,11 @@ def load_ledger_module(path=None, fresh=False):
     mod = importlib.util.module_from_spec(spec)
     sys.modules[name] = mod
     spec.loader.exec_module(mod)
+    if hasattr(mod, "log_line"):
+        # The viewer logs each request to stderr; in tests the lines are kept on the module (mod.logged) so the
+        # suite's own output stays readable. mod.log_to_stderr is the real one.
+        mod.log_to_stderr, mod.logged = mod.log_line, []
+        mod.log_line = mod.logged.append
     if not fresh:
         _module_cache[key] = mod
     return mod
@@ -1033,6 +1038,7 @@ class ServerThread:
 
     def _start_thread(self):
         mod = load_ledger_module(self.ledger_py, fresh=True)
+        self.log = getattr(mod, "logged", [])  # the viewer's request log, a line per entry
         captured, ready = [], threading.Event()
         base = mod.ThreadingHTTPServer
 
@@ -1076,11 +1082,15 @@ class ServerThread:
     def _start_process(self):
         cmd = [sys.executable, str(self.ledger_py), "--root", str(self.root), "--db", str(self.db), "serve",
                "--port", str(self.port), "--no-open"]
-        self._proc = subprocess.Popen(cmd, env=git_env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # stderr goes to a file, not a pipe: the viewer logs a line per request, and nobody reads a pipe here
+        self.stderr_path = temp_dir("serve-") / "stderr.txt"
+        with open(self.stderr_path, "wb") as errlog:
+            self._proc = subprocess.Popen(cmd, env=git_env(), stdout=subprocess.PIPE, stderr=errlog)
         deadline = time.time() + self.start_timeout
         while time.time() < deadline:
             if self._proc.poll() is not None:
-                out, err = self._proc.communicate()
+                out, _ = self._proc.communicate()
+                err = self.stderr_path.read_bytes()
                 code, self._proc = self._proc.returncode, None
                 if b"in use" in err or b"Errno 98" in err:
                     raise OSError(err.decode(errors="replace"))
@@ -1116,6 +1126,7 @@ class ServerThread:
         self.stop()
 
     def _take_launch_url(self, printed):
+        self.printed = printed or ""  # everything serve() printed at start
         m = re.search(r"(http://127\.0\.0\.1:\d+/#k=([A-Za-z0-9_\-]{16,}))", printed or "")
         if not m:
             raise RuntimeError(f"serve() printed no launch URL with a #k= token: {printed!r}")

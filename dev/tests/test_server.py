@@ -250,12 +250,15 @@ class HostCorsHeaders(unittest.TestCase):
                 body = b'{"sql":"SELECT 1"}' if method == "POST" else None
                 r = self.req(method, path, host=host, headers={"Content-Type": "application/json"}, body=body)
                 self.assertEqual(r.status, 403, f"{method} {path} Host {host}")
-                self.assertEqual(r.json(), {"error": "wrong host"})
+                if (method, path) == ("GET", "/"):  # step 175: a browser gets a page that says where the viewer is
+                    self.assertIn("text/html", r.headers["Content-Type"])
+                    self.assertIn(f"http://127.0.0.1:{p}/", r.text)
+                else:
+                    self.assertEqual(r.json(), {"error": "wrong host"})
         # no Host header at all (HTTP/1.1 request without Host)
-        for path in ("/", "/api/overview"):
-            r = self.req("GET", path, host=False)
-            self.assertEqual(r.status, 403, path)
-            self.assertEqual(r.json(), {"error": "wrong host"})
+        self.assertEqual(self.req("GET", "/", host=False).status, 403)
+        r = self.req("GET", "/api/overview", host=False)
+        self.assertEqual((r.status, r.json()), (403, {"error": "wrong host"}))
 
     # The names other reports used for the same property.
     test_host_header_required = test_host_check
@@ -289,7 +292,7 @@ class HostCorsHeaders(unittest.TestCase):
             ("GET", "/api/review/R-9999", True, None, 404, False),
             ("GET", "/nope", True, None, 404, False),
             ("GET", "/api/overview", False, None, 403, False),          # missing token
-            ("GET", "/", "evil.com", None, 403, False),                  # wrong host
+            ("GET", "/", "evil.com", None, 403, True),                   # wrong host: the explanation page
             ("POST", "/api/sql", True, b"not json", 400, False),
         ]
         for method, path, token, body, status, html in cases:

@@ -49,7 +49,7 @@ class Inbox(browser.ViewerTestCase):
         self.assertEqual(page.texts(".card.gate h2, .card.gate h3"), ["Default notice period", "Approve the domains for R-0002",
                                                        "Anything else?", "No way to answer", "Approve the fix plan"])
         self.assertEqual(page.contents("#app h2.sec"), ["Answered, waiting for the agent to act",
-                                                 "Also waiting on you (answer in the chat)"])
+                                                 "Also waiting on you (answer in the chat)", "Decisions"])
         answered = self.card(page, "Approve the fix plan")
         self.assertIn("You answered: Approve the plan — Go ahead.", answered.inner_text())
         self.assertEqual(answered.locator("button").count(), 0)
@@ -57,15 +57,22 @@ class Inbox(browser.ViewerTestCase):
         first = self.card(page, "Default notice period")
         self.assertEqual(first.locator(".tag").all_inner_texts(), ["Decision", "Work is paused until you answer"])
         self.assertEqual(first.locator(".refline a").all_inner_texts(), ["Review R-0001", "Plan P-0001 step 3",
-                                                                         "Issue ISS-0002"])
+                                                                         "Issue ISS-0002", "Decision D-0001"])
+        self.assertEqual(first.locator(".refline a").last.get_attribute("href"), "#/decisions/D-0001")  # step 190
         self.assertEqual(self.card(page, "Anything else?").locator(".tag").all_inner_texts(), ["Question"])
         # Owner-queue items with no gate: answered in the chat, listed in a table.
-        rows = page.js("[...document.querySelectorAll('#app table tbody tr')].map(r => "
+        rows = page.js("[...document.querySelectorAll('#app table')[0].querySelectorAll('tbody tr')].map(r => "
                        "[...r.cells].map(c => c.textContent))")
         # The step has no owner question or progress note: Question falls back to its change text (was blank before
-        # plan step 66, ISS-0305). The decision has no revisit note: its Question is blank.
-        self.assertEqual(rows, [["Plan step P-0001 #1", "Your input", "Run every suite in CI", "Add a CI workflow."],
-                                ["Decision D-0002", "Your decision", "Keep the weekend rule?", ""]])
+        # plan step 66, ISS-0305). Step 190: a decision's question is under Question (it used to hold what reopens
+        # the decision, blank here), and what reopens it is under Good to know.
+        self.assertEqual(rows, [["Plan step P-0001 #1", "Your input", "Run every suite in CI", "Add a CI workflow.", ""],
+                                ["Decision D-0002", "Your decision", "A decision to make", "Keep the weekend rule?", ""]])
+        # the Decisions section: each decision with its status in words (step 190)
+        dec = page.js("[...document.querySelectorAll('#app table')[1].querySelectorAll('tbody tr')].map(r => "
+                      "[...r.cells].slice(0, 3).map(c => c.textContent))")
+        self.assertIn(["D-0002", "Keep the weekend rule?", "Open"], dec)
+        self.assertIn("D-0001", [r[0] for r in dec])
         self.assertEqual(page.page.locator("a", has_text="See every question and answer so far").get_attribute("href"),
                          "#/history")
 
@@ -81,14 +88,16 @@ class Inbox(browser.ViewerTestCase):
         c4 = self.card(page, "Anything else?")
         self.assertEqual(c4.locator("input[type=radio]").count(), 0)
         self.assertEqual(c4.locator("textarea").get_attribute("placeholder"), "Your answer")
-        # characterization: ISS-0042 allow_text=0 with no options: only a Send button, so the gate cannot be answered
+        # ISS-0042 fixed (step 154; test_gate_without_options_or_text_shows_chat_hint): a gate with no options and
+        # no text box says where to answer it and has no form
         c5 = self.card(page, "No way to answer")
-        self.assertEqual((c5.locator("input").count(), c5.locator("textarea").count()), (0, 0))
-        self.assertEqual(c5.locator("button").all_inner_texts(), ["Send answer"])
-        page.allow_console_errors = True
-        c5.locator("button").click()
-        page.page.wait_for_selector(".card.gate .status.err")
-        self.assertEqual(c5.locator(".status.err").inner_text(), EMPTY_ANSWER)
+        self.assertEqual((c5.locator("input").count(), c5.locator("textarea").count(), c5.locator("button").count()),
+                         (0, 0, 0))
+        self.assertEqual(c5.locator("p.note").inner_text(), "Answer this one in the chat with the agent.")
+        # an answer cannot be changed once sent, and the form says so beside Send
+        self.assertEqual(c1.locator(".tools .note").inner_text(), "You can't change an answer once it is sent.")
+
+    test_gate_without_options_or_text_shows_chat_hint = test_page_gate_form_shape
 
     def test_page_gate_form_empty_error(self):
         page = self.open("#/inbox")
@@ -116,7 +125,7 @@ class Inbox(browser.ViewerTestCase):
                                   ("GATE-0004",))
             self.assertEqual(row, {"status": "answered", "answer_value": None,
                                    "answer_text": "Look at the export too.", "answered_via": "viewer"})
-            # After 1.2 s the inbox is drawn again and the gate is listed as answered.
+            # The card moves under Answered with the answer on it (step 176: nothing else is redrawn).
             page.page.wait_for_function("() => [...document.querySelectorAll('.card.gate')].some(c => "
                                         "c.textContent.includes('You answered: Look at the export too.'))",
                                         timeout=5000)
@@ -124,28 +133,43 @@ class Inbox(browser.ViewerTestCase):
         finally:
             _reopen(self, "GATE-0004")
 
-    def test_page_inbox_redraw_erases_other_drafts(self):
-        page = self.open("#/inbox")
+    def test_gate_answer_keeps_other_drafts(self):
+        """ISS-0029 fixed (step 176; was test_page_inbox_redraw_erases_other_drafts): answering one gate leaves what
+        is typed and chosen in the others, the scroll position and the keyboard where they were."""
+        page = self.open("#/inbox", viewport={"width": 1280, "height": 500})
         try:
-            self.card(page, "Approve the domains for R-0002").locator("textarea").fill("Draft I have not sent")
+            other = self.card(page, "Approve the domains for R-0002")
+            other.locator("textarea").fill("Draft I have not sent")
+            other.locator("input[type=radio]").first.check()
             c1 = self.card(page, "Default notice period")
             c1.locator("input[value=use-7]").check()
-            c1.locator("button", has_text="Send answer").click()
+            page.js("window.scrollTo(0, 120)")
+            send = c1.locator("button", has_text="Send answer")
+            send.hover()   # Playwright scrolls a control into reach before it clicks: do that first
+            before = page.js("[window.scrollY, window.__fetches]")
+            self.assertGreater(before[0], 0)
+            send.click()
             page.page.wait_for_selector(f"text={SAVED}")
-            draft = self.card(page, "Approve the domains for R-0002").locator("textarea")
-            self.assertEqual(draft.input_value(), "Draft I have not sent")   # still there until the redraw
-            page.page.wait_for_function("t => !document.getElementById('app').textContent.includes(t)", arg=SAVED,
-                                        timeout=5000)
+            page.page.wait_for_timeout(2000)
             page.settle()
-            # characterization: ISS-0029 the redraw after an answer wipes unsent text typed into another gate
-            self.assertEqual(self.card(page, "Approve the domains for R-0002").locator("textarea").input_value(), "")
+            self.assertEqual(other.locator("textarea").input_value(), "Draft I have not sent")
+            self.assertTrue(other.locator("input[type=radio]").first.is_checked())
+            self.assertEqual(page.js("window.scrollY"), before[0])
+            moved = self.card(page, "Default notice period")
+            self.assertIn("You answered: Change to 7 days", moved.inner_text())
+            self.assertEqual(moved.locator("button").count(), 0)
+            self.assertTrue(page.js("document.activeElement.closest('.card.gate').querySelector('h3').id === "
+                                    "'gate-GATE-0001'"))
+            self.assertTrue(page.js("!!document.querySelector('#gates-answered #gate-GATE-0001')"))
+            self.assertEqual(page.text(".tabs .badge"), "5")   # test_badge_drops_after_answer: one lower than 6
+            self.assertEqual(page.text("#live"), "Answer saved.")
         finally:
             _reopen(self, "GATE-0001")
 
     def test_page_history_uses_option_labels(self):
         page = self.open("#/history")
         row = page.page.locator("tbody tr", has_text="Approve the fix plan")
-        self.assertEqual(row.locator("td").nth(4).inner_text(), "Approve the plan Go ahead.")
+        self.assertEqual(row.locator("td").nth(4).inner_text(), "Approve the plan — Go ahead.")  # ISS-0103 fixed
         self.assertEqual(row.locator("td").nth(3).inner_text(), "Answered, waiting for the agent")
 
 
@@ -201,16 +225,15 @@ class Reviews(browser.ViewerTestCase):
                 self.assertEqual(self._points(page), want)
                 self.assertEqual(page.text(".tools ~ div p.note"), f"{len(want)} of 3 points")
 
-    def test_page_review_gate_answers_raw(self):
+    def test_review_gates_use_option_labels(self):
         self.write("UPDATE gates SET status='answered', answer_value='approve' WHERE code='GATE-0002'")
         try:
             page = self.open("#/review/R-0002")
             row = page.page.locator(".card:has(h2:text('Questions asked during this review')) tbody tr")
-            # characterization: ISS-0103 the review page shows the raw answer value, not the option label
-            self.assertEqual(row.locator("td").nth(3).inner_text(), "approve")
-            page.after(row.click)
-            # characterization: ISS-0256 a gate row on the review page links to the inbox, not to the gate
-            self.assertEqual(page.location_hash(), "#/inbox")
+            # ISS-0103 fixed (was test_page_review_gate_answers_raw): the option's label, not its stored value
+            self.assertEqual(row.locator("td").nth(3).inner_text(), "Approve as listed")
+            # ISS-0256 fixed: the row opens that gate (test_review_gate_row_links_to_gate has the rest)
+            self.assertEqual(row.locator("a").get_attribute("href"), "#/history/GATE-0002")
         finally:
             _reopen(self, "GATE-0002")
 
@@ -218,9 +241,10 @@ class Reviews(browser.ViewerTestCase):
         page = self.open("#/review/R-0001")
         item = page.page.locator("details.item", has_text="SEC-H1")
         item.locator("summary").click()
+        page.settle()   # a point's detail and code references arrive when it is opened (step 148)
         ref = item.locator(".ref")
         self.assertEqual(ref.locator(".refline").first.locator(":scope > *").all_text_contents(),
-                         ["Primary", "demo", "src/auth.py", "lines 1–3", "make_code",
+                         ["Main place", "demo", "src/auth.py", "lines 1–3", "make_code",   # the ledger's label (184)
                           f"at commit {self.ids['commits'][0][:10]}", "Show code at this commit"])
         btn = ref.locator(".refline").first.locator("button")
         self.assertEqual(btn.inner_text(), "Show code at this commit")
@@ -316,15 +340,18 @@ class PointsAndCode(browser.ViewerTestCase):
     def test_page_code_viewer_fallback_notes(self):
         page = self.open("#/review/R-0002")
         exc = self._show(page, "SPEC-L1")
-        note = exc.locator("p.note").inner_text()
-        self.assertTrue(note.startswith("The commit could not be read from git here, so this is the copy of the "
-                                        "lines saved at review time. Git said: "), note)
+        # step 174: a plain sentence, with what git said folded away
+        self.assertEqual(exc.locator("p.note").inner_text(), "This file is not in that commit, or the commit is not in this "
+                         "copy of the repository. These are the lines as they were saved at review time.")
+        self.assertEqual(exc.locator("details summary").inner_text(), "What git said")
+        self.assertFalse(exc.locator("details").evaluate("d => d.open"))
+        self.assertNotIn("fatal", exc.inner_text())
         self.assertEqual(exc.locator(".code td.ln").all_text_contents(), ["5 cited", "6 cited"])
         self.assertEqual(exc.locator(".code tr.hit td:not(.ln)").all_inner_texts(), ["five = 5", "six = 6"])
         self.assertIn("lines 5–6", exc.locator(".refline").first.inner_text())
         none = self._show(page, "SPEC-L2")
-        self.assertTrue(none.locator("p.note").inner_text().startswith(
-            "The commit could not be read from git and no copy of the lines was saved. "))
+        self.assertEqual(none.locator("p.note").inner_text(), "This file is not in that commit, or the commit is not in "
+                         "this copy of the repository. No copy of the lines was saved.")
         self.assertEqual(none.locator(".code").count(), 0)
         self.assertIn("line 3", none.locator(".refline").first.inner_text())
         self.assertEqual(none.locator(".refline code").last.inner_text(),

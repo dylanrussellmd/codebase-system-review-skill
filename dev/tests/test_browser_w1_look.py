@@ -213,7 +213,7 @@ class Stress(browser.ViewerTestCase):
         page.page.keyboard.press("Enter")                            # a phase: the button keeps focus
         page.settle()
         self.assertEqual(page.js("[document.activeElement.textContent, document.activeElement.getAttribute('aria-current')]"),
-                         ["2Fix first1/2", "true"])
+                         ["2Fix firststeps 2–31/2", "true"])
         self.assertEqual(rail.first.get_attribute("aria-current"), "false")
         page.hash("#/review/R-0003")
         item = page.page.locator("details.item").first
@@ -262,7 +262,8 @@ class Stress(browser.ViewerTestCase):
         self.assertEqual(page.text("#live"), "130 of 130 points")
         page.allow_console_errors = True                             # Chrome logs the 404
         page.hash("#/issue/ISS-9999")                                # an error is said too
-        self.assertEqual(page.text("#live"), page.text("#app .status.err"))
+        self.assertEqual(page.text("#live"), "There is no issue ISS-9999 in this ledger.")   # step 174
+        self.assertEqual(page.text("#live"), page.text("#app p.lede"))
 
     # ------------------------------------------------------------------ step 179: structure and names
 
@@ -406,7 +407,7 @@ class Stress(browser.ViewerTestCase):
                     self.assertEqual([h[:2] for h in hrefs if h.startswith("#")][:1], ["#/"], hash_)
         self.assertGreater(rows, 25)
         page.hash("#/")
-        checks = page.page.locator(".card:has(h2:text('Ledger checks')) tbody tr")
+        checks = page.page.locator(".card:has(h2:text('Housekeeping for the agent')) tbody tr")
         got = checks.evaluate_all("rs => rs.map(r => [r.cells[1].textContent, r.className, r.querySelectorAll('a').length])")
         self.assertEqual({(cls, links) for n, cls, links in got if n == "0"}, {("", 0)})      # nothing to open
         self.assertEqual({(cls, links) for n, cls, links in got if n != "0"}, {("link", 1)})
@@ -453,7 +454,7 @@ class Stress(browser.ViewerTestCase):
         page = self.open("#/trends", viewport=browser.PHONE)
         boxes = page.js("[...document.querySelectorAll('#tabs a')].map(a => { const r = a.getBoundingClientRect();"
                         " return [a.textContent, r.left, r.right, r.top, r.bottom]; })")
-        self.assertEqual(len(boxes), 8)
+        self.assertEqual(len(boxes), 9)   # How it works is a tab of the viewer too (step 197)
         for text, left, right, top, bottom in boxes:
             self.assertTrue(0 <= left and right <= 390 and 0 <= top and bottom <= 844, (text, left, right, top, bottom))
         # between phone and desktop width the tabs scroll sideways, and the current one is brought into view
@@ -467,7 +468,7 @@ class Stress(browser.ViewerTestCase):
             cls: c.querySelector("table").className, head: [...c.querySelectorAll("th")].map(t => t.textContent),
             rows: [...c.querySelectorAll("tbody tr")].map(r => [...r.cells].map(td => td.textContent)),
             points: c.querySelectorAll("circle").length}))""")
-        self.assertEqual(len(got), 2)
+        self.assertEqual(len(got), 5)   # two measurements, and three per-review counts (step 168)
         for c in got:
             self.assertEqual(c["cls"], "visually-hidden")
             self.assertEqual(c["head"], ["Review", "Value"])
@@ -485,7 +486,7 @@ class Stress(browser.ViewerTestCase):
                   && a.left < b.right && b.left < a.right));
                 return {px: texts.map(t => parseFloat(getComputedStyle(t).fontSize) * scale), clash,
                         last: texts[texts.length - 1].textContent, out: boxes.some(b => b.left < 0 || b.right > innerWidth)}; })""")
-            self.assertEqual(len(got), 2)
+            self.assertEqual(len(got), 5)   # two measurements, and points, missing tests and confirmed per review
             for c in got:
                 self.assertGreaterEqual(min(c["px"]), 11, viewport)
                 self.assertFalse(c["clash"], viewport)                # labels that would overlap are left out
@@ -528,7 +529,7 @@ class HubLook(unittest.TestCase):
             with self.subTest(slug):
                 self.assertNotEqual(got["h1"], "Could not load this view")
                 self.assertEqual((got["mains"], got["emptyTh"]), (1, 0))
-                self.assertEqual(got["errs"], 1 if slug == "home" else 0)    # home: the line about failing checks
+                self.assertEqual(got["errs"], 0)    # (step 188: the line about checks is a callout, not an error)
                 self.assertEqual(got["levels"][0], 1)
                 for a, b in zip(got["levels"], got["levels"][1:]):
                     self.assertLessEqual(b, a + 1, got["levels"])

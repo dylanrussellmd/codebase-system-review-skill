@@ -94,7 +94,8 @@ class ViewerReadsAreReadonly(unittest.TestCase):
             del modes[:]
             res = mod.api(self.L.root, self.L.db, path, {}, None)
             self.assertNotIsInstance(res, tuple, path)
-            self.assertEqual(modes, [True], path)
+            # one read-only connection; /api/trends also keeps one to ask whether the ledger changed (step 168)
+            self.assertEqual(modes, [True, True] if path == "/api/trends" else [True], path)
         del modes[:]
         mod.api(self.L.root, self.L.db, "/api/sql", {}, {"sql": "SELECT 1"})
         self.assertEqual(set(modes), {True})
@@ -134,7 +135,9 @@ class ViewerReadsAreReadonly(unittest.TestCase):
         mod = load_fresh()
         res = mod.api(self.L.root, self.L.db, "/api/tables", {}, None)
         odd = [t for t in res if t["name"] == 'a"b']
-        self.assertEqual(odd, [{"name": 'a"b', "type": "view", "columns": ['x"y'], "count": 1}])
+        self.assertEqual(odd, [{"name": 'a"b', "type": "view", "label": 'A"b', "description": "", "for_agent": False}])
+        res = mod.api(self.L.root, self.L.db, '/api/table/a"b', {"count": ["1"]}, None)
+        self.assertEqual(res, (mod.error(404, "no such table")))  # a name the viewer does not open
 
     def test_route_deadline(self):
         mod = load_fresh()

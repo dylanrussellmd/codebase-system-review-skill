@@ -136,8 +136,9 @@ class PlanAndQueueViews(SchemaCase):
         self.L.decision("D-0002", "Ungated revisit?", status="revisit", answer="no", revisit_when="next review")
         self.L.decision("D-0003", "Decided?", status="decided", answer="yes")
         self.assertEqual(self.queue(), [
-            ("decision", "D-0001", None, "open", 0),
-            ("decision", "D-0002", "next review", "revisit", 0),
+            # step 190: a decision's question is its question; what reopens it is in context
+            ("decision", "D-0001", "Ungated open?", "open", 0),
+            ("decision", "D-0002", "Ungated revisit?", "revisit", 0),
             ("gate", "GATE-0001", "Open?", "open", 1),
             ("gate", "GATE-0002", "Answered?", "answered", 1),
             ("step", "P-0001 #1", "Which file?", "open", 0),

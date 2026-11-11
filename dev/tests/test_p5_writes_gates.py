@@ -37,8 +37,9 @@ class GateCommandsTest(unittest.TestCase):
         self.assertIn("not one of the options", refused(self, L, "answer-gate", "GATE-0001", "--value", "maybe"))
         self.assertIn("Choose one of the options", refused(self, L, "answer-gate", "GATE-0001", "--text", "hmm"))
         self.assertIn("no such gate", refused(self, L, "answer-gate", "GATE-0009", "--value", "keep"))
-        self.assertEqual(ok(L, "answer-gate", "GATE-0001", "--value", "keep", "--text", "for now"),
-                         ["GATE-0001: answered (keep, for now)"])
+        # step 158: a gate without free text takes its option alone
+        self.assertIn("no note", refused(self, L, "answer-gate", "GATE-0001", "--value", "keep", "--text", "for now"))
+        self.assertEqual(ok(L, "answer-gate", "GATE-0001", "--value", "keep"), ["GATE-0001: answered (keep)"])
         g = L.one("SELECT status, answered_via, answered_by, answered_by_actor_id FROM gates")
         owner = L.scalar("SELECT id FROM actors WHERE kind='owner'")
         self.assertEqual(g, {"status": "answered", "answered_via": "chat", "answered_by": "owner",

@@ -1,7 +1,7 @@
 ---
 name: codebase-system-review
 description: Run a managed, read-only, multi-reviewer audit of any codebase (tests, security, performance, architecture, UI, API, DB, docs, logging), verify findings, record every point in a per-project SQLite ledger tracked across reviews, then turn every point into a tracked fix plan.
-version: 1.7.0
+version: 1.8.0
 ---
 
 # Comprehensive review of a software system
@@ -141,9 +141,9 @@ each commit, the plan with its narrative and progress, How it works, every open 
 separate review or plan documents: the report and the narrative live in the ledger.
 
 - **Publish** after every review step and fix batch: `ledger.py progress-page [P-0001]` writes `.code-review/hub.html`
-  (self-contained); give the owner that file, or the local viewer `ledger.py serve` (127.0.0.1 only, takes answers;
-  `--no-open` without a browser). Publishing it elsewhere is optional: only where the harness offers a page with a
-  database (so it takes answers), to the same address each time (`ledger.py add-artifact progress-page --url`).
+  (self-contained); give the owner that file, or the viewer `ledger.py serve [--no-open] [--port N]` (127.0.0.1 only,
+  takes answers; from another machine `ssh -L 8765:127.0.0.1:8765 host`, same port both ends). Publishing it elsewhere
+  is optional: only as a page with a database, to the same address (`ledger.py add-artifact progress-page --url`).
 - **Ask** with `ledger.py open-gate <kind> --title '...' --question '...' --context @file`, one `--option value=label`
   per choice, linked by `--review`, `--plan`, `--step` or `--issue`; say in chat what you asked (with the harness's
   question tool, when it has one) and that the owner can answer in the hub or in chat.

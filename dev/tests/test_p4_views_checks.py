@@ -87,7 +87,7 @@ class CheckRegistry(unittest.TestCase):
         try:
             con = L.module.connect(L.db)
             try:
-                d = L.module.route(L.root, L.db, con, "/api/overview", {}, None)
+                d = L.module.route(L.root, L.db, con, "/api/checks", {}, None)
             finally:
                 con.close()
             want = L.all("SELECT view, label, tier FROM ledger_checks ORDER BY position")

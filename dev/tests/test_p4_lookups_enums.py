@@ -54,6 +54,8 @@ COLUMN_ENUMS = {
     ("artifacts", "kind"): "artifact_kind",
     ("events", "entity_type"): "entity_type",
 }
+# Enums whose words no CHECK lists: events.event is free text, and its labels cover the names the triggers write.
+FREE_TEXT_ENUMS = {"event"}
 EMPTY_LABEL_OK = {("owner_need", "none")}  # the page shows nothing when a step needs nothing from the owner
 
 ACTIVE_LIST = "('open','needs-decision','planned','in-progress','regressed')"
@@ -106,7 +108,15 @@ class Labels(unittest.TestCase):
                 for key, values in lists.items():
                     allowed.setdefault(COLUMN_ENUMS[key], set()).update(values)
                 for enum, value in L.con.execute("SELECT enum, value FROM enum_labels"):
+                    if enum in FREE_TEXT_ENUMS:
+                        continue
                     self.assertIn(value, allowed.get(enum, set()), f"enum_labels {enum} {value!r} is not used")
+            with self.subTest("every event name a trigger writes has a label"):
+                schema = (fixtures.REPO_ROOT / "references" / "schema.sql").read_text(encoding="utf-8")
+                written = set(re.findall(r"VALUES \('[a-z-]+', NEW\.id, '([a-z-]+)'", schema)) \
+                    | set(re.findall(r"'issue', (?:NEW|OLD)\.issue_id, '([a-z-]+)'", schema))
+                self.assertGreater(len(written), 15)
+                self.assertEqual(written - set(enums["event"]), set())
             for table, enum in LOOKUPS.items():
                 with self.subTest(lookup=table):
                     got = {r[0]: r[1] for r in L.con.execute(f"SELECT value, label FROM {table} ORDER BY position")}
@@ -179,8 +189,8 @@ class Flags(unittest.TestCase):
             L.issue("ISS-0002", first_seen_review_id=r, status="parked", severity="H")
             L.commit()
             self.assertEqual([x["code"] for x in L.all("SELECT code FROM v_open_issues")], ["ISS-0001"])
-            self.assertEqual([x["code"] for x in route(L, "/api/issues", {"status": ["active"]})], ["ISS-0001"])
-            self.assertEqual(route(L, "/api/overview")["open_by_severity"], [{"severity": "H", "n": 1}])
+            self.assertEqual([x["code"] for x in route(L, "/api/issues", {"status": ["active"]})["rows"]], ["ISS-0001"])
+            self.assertEqual(route(L, "/api/home")["open_by_severity"], [{"severity": "H", "n": 1}])
             # tr_issue_status sets resolved_at on entering a status flagged resolved
             L.update("issues", iid, status="parked", change_note="parked for now")
             L.commit()
