@@ -9,6 +9,7 @@ import unittest
 from unittest import mock
 
 from dev.tests import fixtures
+from dev.tests import _migrate_helpers as M
 from dev.tests.fixtures import built_ledger_path, run_ledger, temp_dir
 from dev.tests._core_helpers import project, ref
 
@@ -39,11 +40,11 @@ class Init(unittest.TestCase):
         gi.write_text("ledger.sqlite-journal\nledger.sqlite-wal\nledger.sqlite-shm\nmy-notes.txt")
         p = run_ledger("--root", d, "init")
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertEqual(gi.read_text(), "ledger.sqlite-journal\nledger.sqlite-wal\nledger.sqlite-shm\nmy-notes.txt\n"
-                                         "ledger.sqlite.bak-v*\nledger.py.bak\n")
-        self.assertIn("added ledger.sqlite.bak-v*, ledger.py.bak to", p.stdout)
+        # Step 48: the owner's lines first, then the tool's lines in order (the file is rewritten, not appended to).
+        self.assertEqual(gi.read_text(), "my-notes.txt\n" + fixtures.load_ledger_module().GITIGNORE)
+        self.assertIn(f"repaired {gi}: added ledger.sqlite.tmp, ledger.sqlite.bak-v*, ledger.py.bak", p.stdout)
         p = run_ledger("--root", d, "init")
-        self.assertNotIn("added", p.stdout)
+        self.assertNotIn("repaired", p.stdout)
 
     def test_init_copies_tool_and_gitignore(self):
         mod = fixtures.load_ledger_module()
@@ -55,8 +56,8 @@ class Init(unittest.TestCase):
         self.assertIn(f"created {db}", p.stdout)
         self.assertIn(f"copied ledger.py to {d / '.code-review' / 'ledger.py'}", p.stdout)
         counts = object_counts(db)
-        # The counts at commit ea00196; a schema migration changes them on purpose.
-        self.assertEqual((counts["table"], counts["view"], counts["trigger"]), (35, 18, 16))
+        # The counts at commit ea00196 were 35, 18, 16; schema 2 (migration 0002) added tr_gate_answer_final and tr_gate_answer_cleared.
+        self.assertEqual((counts["table"], counts["view"], counts["trigger"]), (35, 18, 18))
         # Same objects as the source schema.
         mem = sqlite3.connect(":memory:")
         mem.executescript(SCHEMA_SQL.read_text(encoding="utf-8"))
@@ -67,15 +68,15 @@ class Init(unittest.TestCase):
         meta = dict(con.execute("SELECT key, value FROM meta").fetchall())
         con.close()
         self.assertEqual(got, want)
-        self.assertEqual(meta["schema_version"], "1")
+        self.assertEqual(meta["schema_version"], str(mod.SCHEMA_VERSION))
         self.assertEqual(meta["project_name"], "myproj")
         self.assertEqual(meta["created_by_skill"], mod.TOOL_VERSION)
         self.assertRegex(meta["created_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$")
         # ledger.py copied byte-identical; .gitignore written (local backups included).
         self.assertEqual((d / ".code-review" / "ledger.py").read_bytes(), built_ledger_path().read_bytes())
-        self.assertEqual((d / ".code-review" / ".gitignore").read_text(),
-                         "ledger.sqlite-journal\nledger.sqlite-wal\nledger.sqlite-shm\n"
-                         "ledger.sqlite.bak-v*\nledger.py.bak\n")
+        self.assertEqual((d / ".code-review" / ".gitignore").read_text(), mod.GITIGNORE)
+        self.assertIn("ledger.sqlite-wal\nledger.sqlite-shm\n", mod.GITIGNORE)
+        self.assertIn("WAL", mod.GITIGNORE.splitlines()[0])  # test_init_gitignore_lists_wal_files_with_comment
 
         # Second run: reports the existing schema, leaves the data alone, does not copy again.
         con = sqlite3.connect(str(db))
@@ -84,7 +85,7 @@ class Init(unittest.TestCase):
         con.close()
         p = run_ledger("--root", d, "init")
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertIn(f"{db} already exists (schema 1)", p.stdout)
+        self.assertIn(f"{db} already exists (schema {mod.SCHEMA_VERSION})", p.stdout)
         self.assertNotIn("copied", p.stdout)
         con = sqlite3.connect(str(db))
         self.assertEqual(con.execute("SELECT value FROM meta WHERE key='probe'").fetchone()[0], "kept")
@@ -105,7 +106,8 @@ class Init(unittest.TestCase):
         p = run_ledger("--root", d, "init")
         self.assertEqual(p.returncode, 0, p.stderr)
         # Custom lines are kept; the tool's own lines are added after them.
-        self.assertTrue((d / ".code-review" / ".gitignore").read_text().startswith("custom\nledger.sqlite-journal\n"))
+        self.assertEqual((d / ".code-review" / ".gitignore").read_text(),
+                         "custom\n" + fixtures.load_ledger_module().GITIGNORE)
 
     def set_version(self, db, value):
         con = sqlite3.connect(str(db))
@@ -126,17 +128,18 @@ class Init(unittest.TestCase):
         d = fresh_project()
         run_ledger("--root", d, "init")
         db = d / ".code-review" / "ledger.sqlite"
-        self.set_version(db, "2")
+        self.set_version(db, "99")
         before = db.read_bytes()
         p = run_ledger("--root", d, "init")
-        self.assertOneLineRefusal(p, f"{db} is schema 2; this ledger.py only knows 1. Use a newer ledger.py.")
+        self.assertOneLineRefusal(p, f"{db} is schema 99; this ledger.py only knows {M.SHIPPED}. Use a newer "
+                                     f"ledger.py.")
         self.assertEqual(db.read_bytes(), before)
 
     def test_init_refuses_older_schema(self):
         from dev.tests import _migrate_helpers as M
         project, db = M.restore_v1()
         p = run_ledger("--root", project, "init", ledger_py=M.v2_ledger_py())
-        self.assertOneLineRefusal(p, f"{db} is schema 1; this ledger.py is schema 2. Run: python3 ")
+        self.assertOneLineRefusal(p, f"{db} is schema 1; this ledger.py is schema {M.NEXT}. Run: python3 ")
         self.assertIn("ledger.py migrate", p.stderr)
         # Below the oldest schema this tool can migrate (step 32; at ea00196: "run the migrations for 1..1 first",
         # which did not exist).
@@ -243,7 +246,10 @@ class Serve(unittest.TestCase):
         self.assertIn(f"at http://127.0.0.1:{port}/", out)
         self.assertFalse(marker.exists(), "--no-open must not open a browser")
         port, out = run_serve()  # control: without --no-open the shim sees the call
-        self.assertEqual(marker.read_text(), f"http://127.0.0.1:{port}/\n")
+        # step 42: the browser opens the launch URL, whose #k= fragment carries the token; serve printed the same URL
+        opened = marker.read_text()
+        self.assertRegex(opened, r"^http://127\.0\.0\.1:%d/#k=[A-Za-z0-9_\-]{32,}\n$" % port)
+        self.assertIn(opened.strip(), out)
 
 
 class Show(unittest.TestCase):

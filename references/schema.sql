@@ -1,5 +1,5 @@
 -- =====================================================================
--- Code review ledger — schema version 1
+-- Code review ledger — schema version 2
 -- One SQLite file per project: <project root>/.code-review/ledger.sqlite
 -- Every connection must run:  PRAGMA foreign_keys = ON;
 -- Times are UTC ISO-8601 text (strftime('%Y-%m-%dT%H:%M:%fZ','now')).
@@ -32,9 +32,20 @@ CREATE TABLE repositories (
   path           TEXT,                   -- relative to the project root, '.' for the root repo
   remote_url     TEXT,
   default_branch TEXT,
-  permalink_template TEXT,               -- e.g. https://github.com/o/r/blob/{sha}/{path}#L{start}-L{end}
+  permalink_template TEXT CHECK (permalink_template IS NULL OR permalink_template GLOB 'https://*'
+                                 OR permalink_template GLOB 'http://*'),
+                                         -- e.g. https://github.com/o/r/blob/{sha}/{path}#L{start}-L{end}
   notes          TEXT,
-  created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  allow_outside_root INTEGER NOT NULL DEFAULT 0 CHECK (allow_outside_root IN (0,1)),
+                                         -- 1 = the owner listed this repo explicitly as living outside the
+                                         -- project root (a sibling checkout); its path may then be absolute or
+                                         -- start with ../. Otherwise ledger.py refuses to read outside the root.
+  -- path: no leading -, no control characters; and unless allow_outside_root, relative (no leading /, no
+  -- backslash) with no .. segment
+  CHECK (path IS NULL OR (path NOT GLOB '-*' AND (path NOT GLOB '*[' || char(1) || '-' || char(31) || char(127) || ']*')
+         AND (allow_outside_root = 1 OR (path NOT GLOB '/*' AND path NOT GLOB '*\*' AND path <> '..'
+              AND path NOT GLOB '../*' AND path NOT GLOB '*/../*' AND path NOT GLOB '*/..'))))
 );
 
 -- People and agents. One row per agent instance (each subagent run gets
@@ -87,7 +98,8 @@ CREATE TABLE design_goals (
 
 CREATE TABLE reviews (
   id                    INTEGER PRIMARY KEY,
-  code                  TEXT NOT NULL UNIQUE,   -- R-0001
+  code                  TEXT NOT NULL UNIQUE    -- R-0001
+                          CHECK (code GLOB 'R-[0-9][0-9][0-9][0-9]*' AND code NOT GLOB 'R-*[^0-9]*'),
   title                 TEXT NOT NULL,
   scope                 TEXT NOT NULL CHECK (scope IN
                           ('full','partial','targeted','second','fix-verification')),
@@ -102,7 +114,8 @@ CREATE TABLE reviews (
   previous_review_id    INTEGER REFERENCES reviews(id),  -- the review this one follows up
   skill_version         TEXT,
   review_folder         TEXT,                   -- scratch folder used (may not persist)
-  summary_doc_url       TEXT,
+  summary_doc_url       TEXT CHECK (summary_doc_url IS NULL OR summary_doc_url GLOB 'https://*'
+                                    OR summary_doc_url GLOB 'http://*'),
   verdict               TEXT,
   summary               TEXT,
   started_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
@@ -114,7 +127,8 @@ CREATE TABLE reviews (
 CREATE TABLE review_repositories (
   review_id     INTEGER NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
   repository_id INTEGER NOT NULL REFERENCES repositories(id),
-  commit_sha    TEXT NOT NULL CHECK (length(commit_sha) = 40 OR length(commit_sha) = 64),  -- full hash
+  commit_sha    TEXT NOT NULL CHECK ((length(commit_sha) = 40 OR length(commit_sha) = 64)
+                                   AND commit_sha NOT GLOB '*[^0-9a-f]*'),  -- full hash, lowercase hex
   branch        TEXT,
   commit_time   TEXT,
   commit_subject TEXT,
@@ -294,16 +308,24 @@ CREATE TABLE finding_locations (
   repository_id  INTEGER NOT NULL REFERENCES repositories(id),
   commit_sha     TEXT CHECK (commit_sha IS NULL OR (length(commit_sha) >= 7 AND commit_sha NOT GLOB '*[^0-9a-f]*')),
                                             -- filled from review_repositories if left NULL
-  path           TEXT NOT NULL,             -- repo-relative, forward slashes
+  path           TEXT NOT NULL,             -- repo-relative, forward slashes (see the CHECK below)
   line_start     INTEGER CHECK (line_start IS NULL OR line_start >= 1),
   line_end       INTEGER,
   symbol         TEXT,                      -- function, class, route, setting name
   blob_sha       TEXT,                      -- `git rev-parse <commit>:<path>`
   excerpt        TEXT,                      -- the cited lines, verbatim, at that commit
   excerpt_sha256 TEXT,                      -- hash of excerpt, to detect the same code later
-  permalink      TEXT,                      -- e.g. https://github.com/o/r/blob/<sha>/<path>#L10-L20
+  permalink      TEXT CHECK (permalink IS NULL OR permalink GLOB 'https://*' OR permalink GLOB 'http://*'),
+                                            -- e.g. https://github.com/o/r/blob/<sha>/<path>#L10-L20
   role           TEXT NOT NULL DEFAULT 'primary' CHECK (role IN ('primary','also','test','doc','config')),
-  CHECK (line_end IS NULL OR line_start IS NULL OR line_end >= line_start)
+  excerpt_redacted INTEGER NOT NULL DEFAULT 0 CHECK (excerpt_redacted IN (0,1)),
+                                            -- 1 = fill-refs masked secret-looking values in excerpt as [redacted];
+                                            -- excerpt_sha256 is still the hash of the real lines
+  CHECK (line_end IS NULL OR line_start IS NULL OR line_end >= line_start),
+  -- path: relative (no leading / or -), no backslash, no .. segment, no control characters
+  CHECK (length(path) > 0 AND path NOT GLOB '/*' AND path NOT GLOB '-*' AND path NOT GLOB '*\*'
+         AND path <> '..' AND path NOT GLOB '../*' AND path NOT GLOB '*/../*' AND path NOT GLOB '*/..'
+         AND (path NOT GLOB '*[' || char(1) || '-' || char(31) || char(127) || ']*'))
 );
 
 CREATE TABLE finding_goals (
@@ -472,9 +494,10 @@ CREATE TABLE step_commits (
   id            INTEGER PRIMARY KEY,
   step_id       INTEGER NOT NULL REFERENCES steps(id) ON DELETE CASCADE,
   repository_id INTEGER REFERENCES repositories(id),
-  commit_sha    TEXT NOT NULL,
+  commit_sha    TEXT NOT NULL CHECK ((length(commit_sha) = 40 OR length(commit_sha) = 64)
+                                   AND commit_sha NOT GLOB '*[^0-9a-f]*'),  -- full hash, lowercase hex
   branch        TEXT,
-  pr_url        TEXT,
+  pr_url        TEXT CHECK (pr_url IS NULL OR pr_url GLOB 'https://*' OR pr_url GLOB 'http://*'),
   summary       TEXT,
   committed_at  TEXT,
   UNIQUE (step_id, commit_sha)
@@ -739,6 +762,24 @@ WHEN OLD.status IS NOT NEW.status BEGIN
   WHERE id = NEW.id;
 END;
 
+-- An answer is final once the gate is no longer open (answered, applied or withdrawn): a later write, by the
+-- viewer or an agent, cannot silently replace what the owner said. The one way back is to reopen the gate
+-- (status 'open', both answer columns NULL), which tr_gate_answer_cleared records with the answer it removed.
+CREATE TRIGGER tr_gate_answer_final BEFORE UPDATE OF answer_value, answer_text ON gates
+WHEN OLD.status <> 'open'
+ AND (OLD.answer_value IS NOT NEW.answer_value OR OLD.answer_text IS NOT NEW.answer_text)
+ AND NOT (NEW.status = 'open' AND NEW.answer_value IS NULL AND NEW.answer_text IS NULL) BEGIN
+  SELECT RAISE(ABORT, 'the answer of a gate that is no longer open cannot be changed; open a new gate');
+END;
+
+CREATE TRIGGER tr_gate_answer_cleared AFTER UPDATE OF answer_value, answer_text ON gates
+WHEN OLD.status <> 'open' AND NEW.status = 'open'
+ AND (OLD.answer_value IS NOT NULL OR OLD.answer_text IS NOT NULL) BEGIN
+  INSERT INTO events(entity_type, entity_id, event, from_value, to_value, review_id, step_id, note)
+  VALUES ('gate', NEW.id, 'answer-cleared', OLD.answer_value, NULL, NEW.review_id, NEW.step_id,
+          'reopened; the answer was: ' || COALESCE(OLD.answer_value || ': ', '') || COALESCE(OLD.answer_text, ''));
+END;
+
 -- Plan rules enforced by the database.
 CREATE TRIGGER tr_dep_order BEFORE INSERT ON step_dependencies BEGIN
   SELECT RAISE(ABORT, 'a step may only depend on an earlier step of the same plan')
@@ -910,7 +951,10 @@ CREATE VIEW v_code_refs AS
 SELECT r.code AS review, f.point_id, i.code AS issue, fl.id AS location_id, fl.role,
        rp.name AS repository, rp.path AS repo_path, fl.commit_sha, rr.tag_name,
        fl.path, fl.line_start, fl.line_end, fl.symbol, fl.blob_sha, fl.permalink,
-       'git -C ' || COALESCE(rp.path, '.') || ' show ' || fl.commit_sha || ':' || fl.path
+       -- every argument single-quoted for a POSIX shell (an embedded quote is closed, escaped and reopened);
+       -- ledger.py show, /api/source and the viewer's Copy button all use this one command
+       'git -C ''' || replace(COALESCE(NULLIF(rp.path, ''), '.'), '''', '''\''''') || ''' show '''
+         || replace(fl.commit_sha || ':' || fl.path, '''', '''\''''') || ''''
          || CASE WHEN fl.line_start IS NOT NULL
                  THEN ' | sed -n ''' || fl.line_start || ',' || COALESCE(fl.line_end, fl.line_start) || 'p'''
                  ELSE '' END AS git_command,
@@ -1017,5 +1061,6 @@ INSERT INTO themes(code, name) VALUES
  ('docs-repo','Repo developer docs'),('docs-user','End-user docs'),('handover','Handover and ownership'),
  ('localization','Localization'),('verify','Verify'),('other','Other');
 
-INSERT INTO meta(key, value) VALUES ('schema_version','1');
-INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger schema');
+INSERT INTO meta(key, value) VALUES ('schema_version','2');
+INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger schema'),
+  (2, 'url, path, hash and code checks; repositories.allow_outside_root; finding_locations.excerpt_redacted');

@@ -56,12 +56,11 @@ class FileAtGuards(unittest.TestCase):
         # choose to allow it with './' or '--' quoting; then change this test on purpose.
         self.assertEqual(self.err(self.sha, "-x"), "bad path")
 
-    def test_current_parent_path_reaches_git(self):
-        # characterization: '..' segments are not refused by file_at; git itself rejects a path outside the
-        # repository ("outside repository"), so nothing is read. The path CHECKs step should refuse it up front.
-        msg = self.err(self.sha, "../outside.txt")
-        self.assertNotEqual(msg, "bad path")
-        self.assertTrue(msg)
+    def test_parent_path_refused_before_git(self):
+        # Was test_current_parent_path_reaches_git (git itself rejected it). Step 45: file_at refuses any '..'
+        # segment up front with the same fixed message as every other refused path.
+        self.assertEqual(self.err(self.sha, "../outside.txt"), "bad path")
+        self.assertEqual(self.err(self.sha, "a/../../outside.txt"), "bad path")
 
 
 if __name__ == "__main__":

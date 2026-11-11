@@ -38,7 +38,7 @@ class Refusals(unittest.TestCase):
         for args in ALL + (["init"],):
             with self.subTest(args=args):
                 p = run_ledger("--root", L.root, *args, timeout=20)
-                self.assertCleanRefusal(p, "is schema 99; this ledger.py only knows 1. Use a newer ledger.py.")
+                self.assertCleanRefusal(p, f"is schema 99; this ledger.py only knows {M.SHIPPED}. Use a newer ledger.py.")
         self.assertEqual(L.db.read_bytes(), before)
 
     def test_commands_refuse_missing_version_row(self):
@@ -80,7 +80,7 @@ class Refusals(unittest.TestCase):
         for args in WRITES:
             with self.subTest(args=args):
                 p = run_ledger("--root", project, *args, ledger_py=v2, timeout=20)
-                self.assertCleanRefusal(p, "is schema 1; this ledger.py is schema 2. Run: python3 ")
+                self.assertCleanRefusal(p, f"is schema 1; this ledger.py is schema {M.NEXT}. Run: python3 ")
                 self.assertIn("ledger.py migrate", p.stderr)
         for args in (["gates"], ["show", "1"], ["dump"]):
             with self.subTest(args=args):
@@ -91,7 +91,7 @@ class Refusals(unittest.TestCase):
         db.with_suffix(".sql").unlink()
         p = run_ledger("--root", project, "check", ledger_py=v2)
         self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
-        self.assertIn("schema_version: the ledger is schema 1; this ledger.py is schema 2", p.stdout)
+        self.assertIn(f"schema_version: the ledger is schema 1; this ledger.py is schema {M.NEXT}", p.stdout)
         self.assertNotIn("Traceback", p.stderr)
         self.assertEqual(db.read_bytes(), before)
 

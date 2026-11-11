@@ -104,12 +104,12 @@ class ReviewAndIssueTables(SchemaCase):
             lambda n: {"review_id": self.review(), "repository_id": repo, "commit_sha": SHA40},
             good=[("64-char sha", {"commit_sha": SHA64}),
                   ("tag pushed and dirty", {"tag_pushed": 1, "is_dirty": 1, "dirty_note": "x"}),
-                  # characterization: ISS-0153 — only the length is checked, so 40 non-hex characters (and
-                  # upper-case hex) are accepted; the fix makes these bad rows.
-                  ("40 non-hex chars accepted", {"commit_sha": "z" * 40}),
-                  ("upper-case hex accepted", {"commit_sha": "A" * 40})],
-            bad=[("39 chars", {"commit_sha": "a" * 39}, ck("length(commit_sha)")),
-                 ("41 chars", {"commit_sha": "a" * 41}, ck("length(commit_sha)")),
+                  ],
+            # ISS-0153 fixed by step 47 (schema 2): full lowercase hex only.
+            bad=[("39 chars", {"commit_sha": "a" * 39}, ck("(length(commit_sha)")),
+                 ("41 chars", {"commit_sha": "a" * 41}, ck("(length(commit_sha)")),
+                 ("40 non-hex chars", {"commit_sha": "z" * 40}, ck("(length(commit_sha)")),
+                 ("upper-case hex", {"commit_sha": "A" * 40}, ck("(length(commit_sha)")),
                  ("no sha", {"commit_sha": None}, nn("review_repositories.commit_sha")),
                  ("tag_pushed 2", {"tag_pushed": 2}, ck("tag_pushed")),
                  ("is_dirty 2", {"is_dirty": 2}, ck("is_dirty")),
@@ -360,10 +360,11 @@ class FindingPlanAndEventTables(SchemaCase):
         sid = self.step()
         self.run_cases(
             "step_commits", lambda n: {"step_id": sid, "commit_sha": f"{n:040x}"},
-            good=[("no repository", {"repository_id": None}),
-                  # characterization: ISS-0153 — step_commits.commit_sha has no hex or length check.
-                  ("non-sha text accepted", {"commit_sha": "not a sha"})],
+            good=[("no repository", {"repository_id": None})],
+            # ISS-0153 fixed by step 47 (schema 2): step_commits.commit_sha is a full lowercase hex hash.
             bad=[("no sha", {"commit_sha": None}, nn("step_commits.commit_sha")),
+                 ("not a sha", {"commit_sha": "not a sha"}, ck("(length(commit_sha)")),
+                 ("short sha", {"commit_sha": "abc1234"}, ck("(length(commit_sha)")),
                  ("unknown repository", {"repository_id": 9999}, FK)],
             dup=[("same step and sha", {"summary": "again"}, uq("step_commits.step_id", "step_commits.commit_sha"))])
 

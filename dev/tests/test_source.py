@@ -24,7 +24,7 @@ class Source(unittest.TestCase):
         self.assertNotIn("git_error", s)
         self.assertEqual([l["n"] for l in s["lines"]], list(range(7, 16)))
         self.assertEqual(s["lines"][0], {"n": 7, "text": "line 7"})
-        self.assertEqual(s["git_command"], f"git -C . show {self.sha}:src/a.py | sed -n '10,12p'")
+        self.assertEqual(s["git_command"], f"git -C '.' show '{self.sha}:src/a.py' | sed -n '10,12p'")
         for k in ("path", "commit_sha", "line_start", "line_end", "symbol", "excerpt", "permalink", "repo_name",
                   "blob_sha"):
             self.assertIn(k, s)
@@ -37,7 +37,7 @@ class Source(unittest.TestCase):
         # context=0 is exactly the cited lines (what `show` prints); line_end NULL means one line.
         s = self.src(ref(L, self.rid, "src/a.py", 5, None), context=0)
         self.assertEqual(s["lines"], [{"n": 5, "text": "line 5"}])
-        self.assertEqual(s["git_command"], f"git -C . show {self.sha}:src/a.py | sed -n '5,5p'")
+        self.assertEqual(s["git_command"], f"git -C '.' show '{self.sha}:src/a.py' | sed -n '5,5p'")
 
     def test_source_excerpt_matches(self):
         L = self.make()
@@ -83,7 +83,7 @@ class Source(unittest.TestCase):
         self.assertEqual(s["source"], "excerpt")
         self.assertTrue(s["git_error"])
         self.assertEqual([l["text"] for l in s["lines"]], ["line 2", "line 3"])
-        self.assertTrue(s["git_command"].startswith(f"git -C sub show {ssha}:b.py"))
+        self.assertTrue(s["git_command"].startswith(f"git -C 'sub' show '{ssha}:b.py'"))
 
     def test_source_none(self):
         L = self.make()
@@ -107,7 +107,7 @@ class Source(unittest.TestCase):
         self.assertEqual(s["source"], "git")
         # First 40 lines plus the context.
         self.assertEqual([l["n"] for l in s["lines"]], list(range(1, 49)))
-        self.assertEqual(s["git_command"], f"git -C . show {self.sha}:src/a.py")  # no sed without lines
+        self.assertEqual(s["git_command"], f"git -C '.' show '{self.sha}:src/a.py'")  # no sed without lines
         s = self.src(ref(L, self.rid, "src/short.py", None, None, symbol="x"), context=8)
         self.assertEqual([l["n"] for l in s["lines"]], [1, 2, 3, 4, 5])
         # With an excerpt but no lines, excerpt_matches is not computed.

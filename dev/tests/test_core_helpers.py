@@ -37,12 +37,13 @@ class RepoDir(unittest.TestCase):
         self.assertEqual(m.repo_dir(root, ""), root.resolve())
         self.assertEqual(m.repo_dir(root, "."), root.resolve())
         self.assertEqual(m.repo_dir(root, "sub"), (root / "sub").resolve())
-        # characterization: TEST-T41 (ISS-0285, decision) - a repository path outside the project is not refused
-        # today; '../x' resolves next to the project. The owner decided to refuse paths outside the project unless
-        # listed explicitly; the root-detection step in phase 3 flips this assertion.
-        self.assertEqual(m.repo_dir(root, "../x"), (root.parent / "x").resolve())
-        # characterization: TEST-T41 - an absolute path replaces the root entirely.
-        self.assertEqual(m.repo_dir(root, "/tmp"), Path("/tmp").resolve())
+        # TEST-T41 (ISS-0285) fixed by step 46 (D-0007): a path outside the project is refused unless the
+        # repository is listed explicitly (allow_outside_root), and then used as given.
+        for outside in ("../x", "/tmp"):
+            with self.assertRaises(RuntimeError):
+                m.repo_dir(root, outside)
+        self.assertEqual(m.repo_dir(root, "../x", allow_outside=True), (root.parent / "x").resolve())
+        self.assertEqual(m.repo_dir(root, "/tmp", allow_outside=True), Path("/tmp").resolve())
 
 
 class FileAt(unittest.TestCase):

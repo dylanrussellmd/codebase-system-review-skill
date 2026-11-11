@@ -32,7 +32,16 @@ REVIEWED_COMMIT = "ea00196"
 
 SOURCES = ("dev/core.py", "dev/build.py", "dev/page.html", "references/schema.sql", "SKILL.md")
 
-# The test-only schema 2: themes gains a column through the SQLite table-rebuild recipe (themes is referenced by
+def shipped_version():
+    """The highest migration number in references/migrations (the shipped schema version)."""
+    return max(int(f.name[:4]) for f in (fixtures.REPO_ROOT / "references" / "migrations").glob("[0-9][0-9][0-9][0-9]-*.sql"))
+
+
+SHIPPED = shipped_version()
+NEXT = SHIPPED + 1          # the test-only schema: one past the shipped one
+TEST_MIGRATION = f"{NEXT:04d}-test-only"
+
+# The test-only schema NEXT: themes gains a column through the SQLite table-rebuild recipe (themes is referenced by
 # findings and issues, so the rebuild has to keep foreign keys intact).
 THEMES_V1 = """CREATE TABLE themes (
   code       TEXT PRIMARY KEY,           -- 'authorization', 'logging-audit' ...
@@ -43,7 +52,7 @@ THEMES_V2 = """CREATE TABLE themes (
   code        TEXT PRIMARY KEY,          -- 'authorization', 'logging-audit' ...
   name        TEXT NOT NULL,
   retired_at  TEXT,
-  description TEXT                       -- test-only column of schema 2
+  description TEXT                       -- test-only column of the test-only schema
 );"""
 REBUILD_THEMES = """-- test only: themes gains a description column
 CREATE TABLE themes_new (
@@ -60,13 +69,19 @@ UPDATE themes SET description = 'Theme ' || name;
 
 
 def schema_v2(text):
-    """references/schema.sql turned into the test-only schema 2 that REBUILD_THEMES produces."""
+    """references/schema.sql turned into the test-only schema NEXT that REBUILD_THEMES produces (the name is from
+    when the shipped schema was 1)."""
     assert text.count(THEMES_V1) == 1, "the themes table changed; update dev/tests/_migrate_helpers.py"
     text = text.replace(THEMES_V1, THEMES_V2)
-    text = re.sub(r"(?m)^(-- Code review ledger — schema version )\d+$", r"\g<1>2", text, count=1)
-    text = text.replace("VALUES ('schema_version','1');", "VALUES ('schema_version','2');")
-    text = text.replace("(1, 'initial ledger schema');",
-                        "(1, 'initial ledger schema'),\n  (2, 'test only: themes gains a description column');")
+    text = re.sub(r"(?m)^(-- Code review ledger — schema version )\d+$", rf"\g<1>{NEXT}", text, count=1)
+    old = f"VALUES ('schema_version','{SHIPPED}');"
+    assert text.count(old) == 1, "the meta seed changed; update dev/tests/_migrate_helpers.py"
+    text = text.replace(old, f"VALUES ('schema_version','{NEXT}');")
+    m = list(re.finditer(r"(?m)^INSERT INTO schema_migrations\(version, description\) VALUES .*?\);$", text, re.S))
+    assert len(m) == 1, "the schema_migrations seed changed; update dev/tests/_migrate_helpers.py"
+    seed = m[0]
+    text = (text[:seed.end() - 1] + f",\n  ({NEXT}, 'test only: themes gains a description column');"
+            + text[seed.end():])
     return text
 
 
@@ -89,7 +104,7 @@ def set_version(root, version):
     p.write_text(new, encoding="utf-8")
 
 
-def variant(version=None, migration=None, schema_edit=None, body_edit=None, name="0002-test-only.sql"):
+def variant(version=None, migration=None, schema_edit=None, body_edit=None, name=TEST_MIGRATION + ".sql"):
     """Build a ledger.py from a copy of the sources. version: the tool version written into SKILL.md; migration: SQL
     of an extra migration file `name`; schema_edit: function applied to references/schema.sql; body_edit: function
     applied to dev/core.py. Returns the built file's path."""

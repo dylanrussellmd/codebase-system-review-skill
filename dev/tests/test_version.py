@@ -64,12 +64,15 @@ class Stamp(unittest.TestCase):
         self.assertIn(f"schema version {mod.SCHEMA_VERSION}\n", mod.SCHEMA.split("\n", 2)[1] + "\n")
         build = fixtures.load_build_module()
         edits = (
-            ("header", lambda t: t.replace("— schema version 1", "— schema version 3", 1), "header"),
-            ("meta seed", lambda t: t.replace("('schema_version','1')", "('schema_version','2')"), "meta"),
+            ("header", lambda t: t.replace(f"— schema version {M.SHIPPED}", f"— schema version {M.NEXT + 1}", 1),
+             "header"),
+            ("meta seed", lambda t: t.replace(f"('schema_version','{M.SHIPPED}')", f"('schema_version','{M.NEXT}')"),
+             "meta"),
             ("migrations seed", lambda t: t.replace("(1, 'initial ledger schema')", "(1, 'something else')"),
              "schema_migrations"),
-            ("extra seed row", lambda t: t.replace("(1, 'initial ledger schema');",
-                                                   "(1, 'initial ledger schema'), (2, 'x');"), "schema_migrations"),
+            ("extra seed row", lambda t: t[:t.index("INSERT INTO schema_migrations")]
+             + re.sub(r"'\);", f"'), ({M.NEXT}, 'x');", t[t.index("INSERT INTO schema_migrations"):], count=1),
+             "schema_migrations"),
         )
         for label, fn, words in edits:
             with self.subTest(label):
@@ -81,7 +84,7 @@ class Stamp(unittest.TestCase):
                 self.assertIn(words, str(cm.exception))
         with self.subTest("a migration without the schema change"):
             root = M.copy_sources()
-            (root / "references" / "migrations" / "0002-x.sql").write_text("-- x\nSELECT 1;\n")
+            (root / "references" / "migrations" / f"{M.NEXT:04d}-x.sql").write_text("-- x\nSELECT 1;\n")
             with self.assertRaises(build.BuildError) as cm:
                 build.build(root)
             self.assertIn("schema", str(cm.exception))

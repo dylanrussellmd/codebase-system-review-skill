@@ -247,8 +247,10 @@ class TextNotHtml(browser.ViewerTestCase):
         repo = L.repo
         repo.write("src/x.py", f"a = 1\nb = '{XSS}'\nc = 3\n")
         sha = repo.commit("payload")
+        L.x("PRAGMA ignore_check_constraints = ON")  # schema 2 refuses a javascript: URL; plant one anyway
         rid = L.review("R-0001", commit_sha=sha, title=XSS, summary=XSS, verdict=XSS, request_text=XSS,
                        summary_doc_url="javascript:window.__xss=100")
+        L.x("PRAGMA ignore_check_constraints = OFF")
         L.review_domain(rid, "security", reason=XSS)
         fid = L.finding(rid, "SEC-H1", severity="H", domain_code="security", summary=XSS, detail=XSS,
                         before_state=XSS, recommendation=XSS, evidence=XSS)
@@ -282,10 +284,10 @@ class TextNotHtml(browser.ViewerTestCase):
         page.settle(quiet_ms=150)
         self.assertIsNone(page.js("window.__xss"))
         self.assertEqual(page.requests and [u for u in page.requests if u.endswith("/x")], [])
-        # characterization: ISS-0080 a ledger URL becomes a link with no scheme check (javascript: is kept as href)
+        # ISS-0080 fixed (step 44): a non-http(s) ledger URL is shown as text, never as a link
         page.hash("#/review/R-0001")
-        self.assertEqual(page.page.locator("a", has_text="Open the review document").get_attribute("href"),
-                         "javascript:window.__xss=100")
+        self.assertEqual(page.page.locator("a", has_text="Open the review document").count(), 0)
+        self.assertIn("Open the review document: javascript:window.__xss=100", page.text("#app"))
 
 
 if __name__ == "__main__":

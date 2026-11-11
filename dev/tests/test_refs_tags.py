@@ -54,31 +54,23 @@ class FillRefs(unittest.TestCase):
         past_end = ref(L, rid, "src/a.py", 8, 9)
         unreadable = ref(L, rid, "src/gone.py", 1, 1)
         failed, out = self.fill(L)
-        self.assertEqual(failed, 1)
-        self.assertIn("filled 2 references, 1 could not be read from git", out)
+        # TEST-T53 (ISS-0283) fixed with RES-M2 (step 47): a symbol that is not found and lines past the end of
+        # the file are failures; nothing is written for them (no permalink to #L1-L1, no empty excerpt).
+        self.assertEqual(failed, 3)
+        self.assertIn("filled 0 references, 3 could not be read from git", out)
         self.assertIn(f"ref {unreadable} src/gone.py@{sha[:10]}:", out)
-        self.assertIsNone(loc_row(L, unreadable)["excerpt"])
-
-        r = loc_row(L, missing_symbol)
-        self.assertIsNone(r["line_start"])
-        self.assertIsNone(r["excerpt"])
-        self.assertIsNotNone(r["blob_sha"])
-        # characterization: TEST-T53 (ISS-0283, probed) - a symbol that is not found still gets a permalink to line 1
-        # (#L1-L1) although the reference has no line; the fill-refs fix leaves it unlined with no line anchor.
-        self.assertTrue(r["permalink"].endswith("src/b.py#L1-L1"), r["permalink"])
-
-        r = loc_row(L, past_end)
-        # characterization: TEST-T53 (ISS-0283, probed) - lines past the end of the file save an empty excerpt,
-        # which then passes v_untraceable_refs; the fix should refuse or flag it.
-        self.assertEqual(r["excerpt"], "")
-        self.assertEqual(r["excerpt_sha256"], hashlib.sha256(b"").hexdigest())
+        self.assertIn(f"ref {missing_symbol} src/b.py@{sha[:10]}: symbol 'def gamma' not found", out)
+        self.assertIn(f"ref {past_end} src/a.py@{sha[:10]}: lines 8-9 are past the end of the file (5 lines)", out)
+        for lid in (unreadable, missing_symbol, past_end):
+            r = loc_row(L, lid)
+            self.assertEqual((r["excerpt"], r["permalink"], r["blob_sha"]), (None, None, None))
         L.x("UPDATE review_repositories SET tag_name='review/R-0001'")
-        problems = L.all("SELECT * FROM v_untraceable_refs WHERE path='src/a.py'")
-        self.assertEqual(problems, [])
+        problems = L.all("SELECT problem FROM v_untraceable_refs WHERE path='src/a.py'")
+        self.assertEqual(problems, [{"problem": "no excerpt"}])
 
-        # The unlined symbol row is selected again each run but changes nothing.
+        # They are selected again each run, and fail again.
         failed, out = self.fill(L)
-        self.assertIn("filled 0 references, 1 could not be read", out)
+        self.assertIn("filled 0 references, 3 could not be read", out)
 
     def test_fill_refs_permalink_template(self):
         tmpl = "https://h.invalid/{sha}/{path}?a={start}&b={end}&again={sha}"
@@ -148,7 +140,8 @@ class TagReview(unittest.TestCase):
         L, sha, rid, _ = project(test=self)
         other = L.repo.commit("later")
         L.repo.tag("review/R-0001", other, message="someone else's")
-        p = L.run_ok("tag-review", "R-0001")
+        p = L.run("tag-review", "R-0001")
+        self.assertEqual(p.returncode, 1)  # step 47: a repository left untagged is a failure
         self.assertIn(f"demo: tag review/R-0001 already points at {other[:10]}; left alone", p.stdout)
         self.assertEqual(L.repo.rev_parse("review/R-0001^{commit}"), other)
         self.assertIsNone(L.scalar("SELECT tag_name FROM review_repositories WHERE review_id=?", (rid,)))
@@ -160,9 +153,9 @@ class TagReview(unittest.TestCase):
         self.assertIn("no review R-9999", p.stderr)
         L.review("R-0002")  # no review_repositories rows
         p = L.run("tag-review", "R-0002")
-        # characterization: TEST-T11 (ISS-0284) - a review with no repositories prints nothing and exits 0; it
-        # should say there was nothing to tag.
-        self.assertEqual((p.returncode, p.stdout, p.stderr), (0, "", ""))
+        # TEST-T11 (ISS-0284) fixed by step 47: a review with no repositories says so and exits 1.
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("review R-0002 has no repositories; nothing to tag", p.stderr)
 
     def test_tag_review_subrepo(self):
         L, sha, rid, _ = project(test=self)

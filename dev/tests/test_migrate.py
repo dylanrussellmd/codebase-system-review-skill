@@ -1,9 +1,9 @@
 """The schema migration runner and `ledger.py migrate` (plan step 32).
 
-Every ledger in use today is schema 1 (references/schema.sql at commit ea00196, frozen in dev/tests/data/). The
-shipped tool is still schema 1 (migration 0001 is the baseline), so the runner, the backup, the refusals and the
-rollback are proven with a test-only schema 2 built from a copy of the sources (dev/tests/_migrate_helpers.py): it
-rebuilds the themes table with the SQLite 12-step recipe.
+Every ledger made before migrations existed is schema 1 (references/schema.sql at commit ea00196, frozen in
+dev/tests/data/). The shipped tool migrates it to the shipped schema (M.SHIPPED); the runner, the backup, the refusals
+and the rollback are also proven with a test-only schema one past it (M.NEXT) built from a copy of the sources
+(dev/tests/_migrate_helpers.py): it rebuilds the themes table with the SQLite 12-step recipe.
 """
 import sqlite3
 import unittest
@@ -46,16 +46,16 @@ class Embedding(unittest.TestCase):
         self.assertEqual(mod.SCHEMA_VERSION, mod.MIGRATIONS[-1][0])
         self.assertEqual(mod.MIGRATIONS[0][2], "initial ledger schema")
         v2 = fixtures.load_ledger_module(M.v2_ledger_py())
-        self.assertEqual(v2.SCHEMA_VERSION, 2)
-        self.assertEqual(v2.MIGRATIONS[-1][:3], (2, "test-only", "test only: themes gains a description column"))
+        self.assertEqual(v2.SCHEMA_VERSION, M.NEXT)
+        self.assertEqual(v2.MIGRATIONS[-1][:3], (M.NEXT, "test-only", "test only: themes gains a description column"))
 
     def test_build_rejects_bad_migrations(self):
         build = fixtures.load_build_module()
         cases = (
-            ("0003-gap.sql", "-- a gap\nSELECT 1;\n", "numbered 0001"),
-            ("0002-Bad_Name.sql", "-- bad name\n", "name"),
-            ("0002-nodesc.sql", "SELECT 1;\n", "description"),
-            ("0002-separator.sql", "-- has a separator\n-- migration: 0009-x.sql\n", "migration:"),
+            (f"{M.NEXT + 1:04d}-gap.sql", "-- a gap\nSELECT 1;\n", "numbered 0001"),
+            (f"{M.NEXT:04d}-Bad_Name.sql", "-- bad name\n", "name"),
+            (f"{M.NEXT:04d}-nodesc.sql", "SELECT 1;\n", "description"),
+            (f"{M.NEXT:04d}-separator.sql", "-- has a separator\n-- migration: 0009-x.sql\n", "migration:"),
         )
         for name, text, words in cases:
             with self.subTest(name=name):
@@ -106,8 +106,8 @@ class Migrate(unittest.TestCase):
 
     def test_migrate_v1_to_current(self):
         """test_upgrade_from_every_version / test_migrate_v1_to_v2_matches_fresh: the frozen v1 ledger, migrated by
-        the shipped tool (nothing pending: schema 1 is current) and by the test-only schema-2 tool, equals a fresh
-        init of that tool, keeps every row, passes check, and records the migration."""
+        the shipped tool and by the test-only tool one schema past it, equals a fresh init of that tool, keeps every
+        row, passes check, and records the migrations."""
         for ledger_py in (fixtures.built_ledger_path(), M.v2_ledger_py()):
             mod = fixtures.load_ledger_module(ledger_py)
             with self.subTest(schema=mod.SCHEMA_VERSION):
@@ -128,15 +128,17 @@ class Migrate(unittest.TestCase):
                     self.assertIn("already schema 1; nothing to migrate", p.stdout)
                     self.assertFalse(backup.exists())
                 else:
-                    self.assertIn(f"migrated {db} from schema 1 to 2", p.stdout)
+                    self.assertIn(f"migrated {db} from schema 1 to {mod.SCHEMA_VERSION}", p.stdout)
                     self.assertIn(str(backup), p.stdout)
                     self.assertTrue(backup.exists())
                     self.assertEqual(M.counts(backup), before)
                     self.assertEqual(M.meta(backup)["schema_version"], "1")
                     self.assertNotEqual(backup.read_bytes(), b"")
-                    con = sqlite3.connect(str(db))
-                    self.assertEqual(con.execute("SELECT count(*) FROM themes WHERE description IS NULL").fetchone()[0], 0)
-                    con.close()
+                    if mod.SCHEMA_VERSION == M.NEXT:
+                        con = sqlite3.connect(str(db))
+                        self.assertEqual(con.execute("SELECT count(*) FROM themes WHERE description IS NULL")
+                                         .fetchone()[0], 0)
+                        con.close()
                     self.assertNotEqual(db.read_bytes(), original)
                     # A second run has nothing to do and keeps the first backup.
                     p = run_ledger("--root", project, "migrate", ledger_py=ledger_py)
@@ -203,7 +205,7 @@ class Migrate(unittest.TestCase):
                 before = db.read_bytes()
                 p = run_ledger("--root", project, "migrate", ledger_py=ledger_py)
                 self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
-                self.assertIn("0002-test-only", p.stderr)
+                self.assertIn(M.TEST_MIGRATION, p.stderr)
                 self.assertIn(words, p.stderr)
                 self.assertIn("nothing was changed", p.stderr)
                 self.assertNotIn("Traceback", p.stderr)
@@ -231,14 +233,14 @@ class Migrate(unittest.TestCase):
         before = db.read_bytes()
         p = run_ledger("--root", project, "init", ledger_py=v2)
         self.assertEqual(p.returncode, 1)
-        self.assertIn("is schema 1; this ledger.py is schema 2. Run: python3 ", p.stderr)
+        self.assertIn(f"is schema 1; this ledger.py is schema {M.NEXT}. Run: python3 ", p.stderr)
         self.assertIn("ledger.py migrate", p.stderr)
         self.assertEqual(db.read_bytes(), before)
         p = run_ledger("--root", project, "migrate", ledger_py=v2)
         self.assertEqual(p.returncode, 0, p.stderr)
         p = run_ledger("--root", project, "init", ledger_py=v2)
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertIn("already exists (schema 2)", p.stdout)
+        self.assertIn(f"already exists (schema {M.NEXT})", p.stdout)
 
 
 if __name__ == "__main__":

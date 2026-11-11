@@ -116,7 +116,7 @@ class Overview(RouteCase):
     def test_overview_counts(self):
         d = self.ok("/api/overview")
         self.assertEqual(d["project"], self.L.root.name)
-        self.assertEqual(d["schema_version"], "1")
+        self.assertEqual(d["schema_version"], str(fixtures.load_ledger_module().SCHEMA_VERSION))
         self.assertEqual({r["severity"]: r["n"] for r in d["open_by_severity"]}, {"M": 2, "L": 1})
         self.assertEqual({r["status"]: r["n"] for r in d["issues_by_status"]}, {"open": 3, "verified": 1})
         self.assertEqual(d["gates_open"], 2)
@@ -551,8 +551,8 @@ class OtherRoutes(RouteCase):
             self.assertEqual(self.call(path), (404, {"error": "not found"}), path)
         # the answer route and the SQL box are POST-only (body None means GET)
         self.assertEqual(self.call("/api/gates/GATE-0001/answer"), (404, {"error": "not found"}))
-        # characterization: ISS-0019 route() ignores the first path segment, so /x/overview is the overview
-        self.assertEqual(self.call("/x/overview")[0], 200)
+        # ISS-0019 fixed (step 41): route() requires the 'api' segment, so /x/overview is not the overview
+        self.assertEqual(self.call("/x/overview"), (404, {"error": "not found"}))
 
 
 # Exact top-level keys of each route on the demo ledger. For list routes: the keys of one row.
@@ -582,7 +582,7 @@ CONTRACT = {
     "sql": ("POST", "/api/sql", {"sql": "SELECT 1 AS one"}, 200, dict, {"columns", "rows", "truncated"}),
     "source": ("GET", "/api/source/{loc}", None, 200, dict,
                {"repo_name", "path", "commit_sha", "line_start", "line_end", "symbol", "permalink", "blob_sha",
-                "git_command", "excerpt", "source", "lines"}),
+                "git_command", "excerpt", "excerpt_redacted", "source", "lines"}),
     "answer": ("POST", "/api/gates/GATE-0001/answer", {"answer_value": "use-7"}, 200, dict, {"ok"}),
     "review-404": ("GET", "/api/review/R-9999", None, 404, dict, {"error"}),
     "issue-404": ("GET", "/api/issue/ISS-9999", None, 404, dict, {"error"}),

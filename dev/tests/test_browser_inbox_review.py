@@ -232,7 +232,7 @@ class Reviews(browser.ViewerTestCase):
         self.assertEqual(ref.locator("p.note").count(), 0)  # read from git and the saved excerpt matches
         sha = self.ids["commits"][0]
         self.assertEqual(ref.locator(".refline code").last.inner_text(),
-                         f"git -C . show {sha}:src/auth.py | sed -n '1,3p'")
+                         f"git -C '.' show '{sha}:src/auth.py' | sed -n '1,3p'")
         link = ref.locator("a", has_text="Open on the code host")
         self.assertEqual(link.get_attribute("href"), f"https://github.com/example/demo/blob/{sha}/src/auth.py#L1-L3")
         self.assertEqual((link.get_attribute("target"), link.get_attribute("rel")), ("_blank", "noopener noreferrer"))
@@ -323,7 +323,7 @@ class PointsAndCode(browser.ViewerTestCase):
         self.assertEqual(none.locator(".code").count(), 0)
         self.assertIn("line 3", none.locator(".refline").first.inner_text())
         self.assertEqual(none.locator(".refline code").last.inner_text(),
-                         f"git -C . show {self.GONE}:src/a.py | sed -n '3,3p'")
+                         f"git -C '.' show '{self.GONE}:src/a.py' | sed -n '3,3p'")
         self.assertEqual(none.locator("a", has_text="Open on the code host").count(), 0)  # no permalink template
         mis = self._show(page, "SPEC-L3")
         self.assertEqual(mis.locator("p.note").inner_text(),

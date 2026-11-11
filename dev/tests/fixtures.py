@@ -402,6 +402,7 @@ class Ledger:
             shutil.copytree(str(_template_ledger(self.ledger_py)), str(self.dir))
             con = sqlite3.connect(str(self.db))
             con.execute("UPDATE meta SET value=? WHERE key='project_name'", (self.root.name,))
+            con.execute("UPDATE meta SET value=? WHERE key='ledger_location'", (str(self.dir),))
             con.commit()
             con.close()
         self.con = self.connect()
@@ -934,7 +935,8 @@ class ServerThread:
             r = srv.post("/api/...", {"a": 1})
             raw = srv.raw(b"GET / HTTP/1.0\\r\\n\\r\\n")
 
-    srv.token is read from the page (GET /) on first use. Requests send Host 127.0.0.1:<port>.
+    srv.launch_url is the URL serve() printed (http://127.0.0.1:<port>/#k=<token>); srv.token is its fragment token
+    (the page itself holds no token). Requests send Host 127.0.0.1:<port>.
     """
 
     def __init__(self, ledger=None, *, root=None, db=None, mode="thread", ledger_py=None, start_timeout=10):
@@ -952,6 +954,7 @@ class ServerThread:
         self.start_timeout = start_timeout
         self.port = None
         self._token = None
+        self.launch_url = None
         self._srv = self._thread = self._proc = None
         self.error = None
 
@@ -984,8 +987,11 @@ class ServerThread:
                 ready.set()
 
         mod.ThreadingHTTPServer = Capturing
-        mod.print = lambda *a, **k: None
+        printed = []
+        mod.print = lambda *a, **k: printed.append(" ".join(map(str, a)))
         self.error = None
+        umask = os.umask(0o022)  # serve() sets 077 for the process; give the test process its own back
+        os.umask(umask)
 
         def target():
             try:
@@ -1003,6 +1009,11 @@ class ServerThread:
                 raise self.error
             raise RuntimeError(f"serve() failed: {self.error!r}")
         self._srv, self._thread = captured[0], t
+        deadline = time.time() + self.start_timeout
+        while not printed and time.time() < deadline:
+            time.sleep(0.01)
+        os.umask(umask)
+        self._take_launch_url(" ".join(printed))
 
     def _start_process(self):
         cmd = [sys.executable, str(self.ledger_py), "--root", str(self.root), "--db", str(self.db), "serve",
@@ -1018,6 +1029,7 @@ class ServerThread:
                 raise RuntimeError(f"serve exited {code}: {err.decode(errors='replace')}")
             try:
                 socket.create_connection(("127.0.0.1", self.port), timeout=0.2).close()
+                self._take_launch_url(self._proc.stdout.readline().decode(errors="replace"))
                 return
             except OSError:
                 time.sleep(0.05)
@@ -1045,15 +1057,17 @@ class ServerThread:
     def __exit__(self, *exc):
         self.stop()
 
+    def _take_launch_url(self, printed):
+        m = re.search(r"(http://127\.0\.0\.1:\d+/#k=([A-Za-z0-9_\-]{16,}))", printed or "")
+        if not m:
+            raise RuntimeError(f"serve() printed no launch URL with a #k= token: {printed!r}")
+        self.launch_url, self._token = m.group(1), m.group(2)
+
     # -- requests
     @property
     def token(self):
         if self._token is None:
-            page = self.request("GET", "/", token=False).text
-            m = re.search(r"""TOKEN\s*=\s*["']([A-Za-z0-9_\-]{16,})["']""", page)
-            if not m:
-                raise AssertionError("no token found in the viewer page")
-            self._token = m.group(1)
+            raise AssertionError("the viewer printed no token")
         return self._token
 
     def request(self, method, path, body=None, headers=None, token=True, timeout=10):

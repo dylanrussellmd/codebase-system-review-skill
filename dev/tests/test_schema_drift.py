@@ -116,7 +116,7 @@ class ShippedObjects(unittest.TestCase):
         stored = con.execute("SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' "
                              "AND sql IS NOT NULL ORDER BY rowid").fetchall()
         self.assertEqual([(t, n, s) for t, n, _, s in mod.shipped_objects()], stored)
-        self.assertEqual(len(stored), 35 + 20 + 18 + 16)
+        self.assertEqual(len(stored), 35 + 20 + 18 + 18)  # schema 2 added tr_gate_answer_final, _cleared
 
 
 class CommandsRefuseTamperedSchema(unittest.TestCase):

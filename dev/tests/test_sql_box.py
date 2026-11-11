@@ -156,9 +156,9 @@ class SqlBox(unittest.TestCase):
             with self.assertRaises(AttributeError):
                 self.mod.run_readonly(self.L.db, bad)
 
-    def test_current_sql_has_no_time_limit(self):
-        # characterization: ISS-0071 run_readonly sets no progress handler, timeout or size cap; a long query runs
-        # to the end. Pinned by watching the connection run_readonly opens.
+    def test_sql_has_time_limit(self):
+        # ISS-0071 fixed (step 52): run_readonly installs a progress handler (SQL_SECONDS deadline) besides the
+        # authorizer, so a long query is stopped. Pinned by watching the connection run_readonly opens.
         mod = fixtures.load_ledger_module(fresh=True)
         calls = []
         real_connect = mod.connect
@@ -171,13 +171,12 @@ class SqlBox(unittest.TestCase):
                 calls.append(name)
                 return getattr(self._con, name)
 
-        mod.connect = lambda db, readonly=False: Watch(real_connect(db, readonly))
+        mod.connect = lambda db, readonly=False, **kw: Watch(real_connect(db, readonly, **kw))
         res = mod.run_readonly(self.L.db, "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c "
                                           "WHERE x < 200000) SELECT count(*) FROM c")
         self.assertEqual(res["rows"], [[200000]])
         self.assertIn("set_authorizer", calls)
-        self.assertNotIn("set_progress_handler", calls)
-        self.assertNotIn("setlimit", calls)
+        self.assertIn("set_progress_handler", calls)
 
 
 class SqlBoxOverHttp(unittest.TestCase):
@@ -213,12 +212,12 @@ class SqlBoxOverHttp(unittest.TestCase):
         r = self.srv.post("/api/sql", {"sql": 5})
         self.assertEqual(r.status, 500)
         self.assertIn("'int' object has no attribute 'strip'", r.json()["error"])
-        # characterization: ISS-0071 blobs are sent as str(bytes), about 4x their size, with no cap
+        # ISS-0071 fixed (step 52): blobs come back as their size only
         r = self.srv.post("/api/sql", {"sql": "SELECT x'41ff' AS b"})
-        self.assertEqual(r.json()["rows"], [["b'A\\xff'"]])
-        # a JSON body that is not an object is treated as {} (no sql -> empty)
+        self.assertEqual(r.json()["rows"], [[{"blob_bytes": 2}]])
+        # ISS-0084 fixed (step 41): a JSON body that is not an object is refused
         r = self.srv.post("/api/sql", ["SELECT 1"])
-        self.assertEqual((r.status, r.json()), (400, {"error": "Write a query first."}))
+        self.assertEqual((r.status, r.json()), (400, {"error": "Send a JSON object"}))
 
 
 if __name__ == "__main__":

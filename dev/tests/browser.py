@@ -134,8 +134,9 @@ def require_browser():
 class ViewerPage:
     """One page of the viewer in its own browser context, with error and request recording."""
 
-    def __init__(self, browser, base_url, *, viewport=None, color_scheme="light", permissions=None):
+    def __init__(self, browser, base_url, *, token=None, viewport=None, color_scheme="light", permissions=None):
         self.base_url = base_url
+        self.token = token  # sent once, in the #k= fragment of the first load, as serve()'s launch URL does
         host = urlsplit(base_url).hostname
         self.page_errors, self.console_errors, self.requests, self.outside_requests = [], [], [], []
         self.allow_console_errors = False
@@ -162,7 +163,10 @@ class ViewerPage:
     # -- navigation
     def goto(self, hash_="#/"):
         """Load the viewer at a hash (full page load) and wait until it has drawn."""
-        self.page.goto(self.base_url + hash_)
+        if self.token:
+            self.page.goto(self.base_url + "#k=" + self.token + (hash_ if hash_.startswith("#") else "#/"))
+        else:
+            self.page.goto(self.base_url + hash_)
         return self.settle()
 
     def hash(self, hash_):
@@ -257,6 +261,7 @@ class ViewerTestCase(unittest.TestCase):
         self._pages = []
 
     def new_page(self, **kw):
+        kw.setdefault("token", self.server.token)
         p = ViewerPage(self.browser, self.server.url, **kw)
         self._pages.append(p)
         return p

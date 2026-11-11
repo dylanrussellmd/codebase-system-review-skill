@@ -107,7 +107,20 @@ nav.rail .i,nav.rail .c{font:500 12px var(--mono);opacity:.8}
 <div class="wrap" id="app" aria-live="polite"></div>
 <script>
 "use strict";
-const TOKEN = "@@TOKEN@@";
+// The token arrives once, in the launch URL's fragment (#k=<token>, optionally followed by #/route); it is kept in
+// sessionStorage for this tab and removed from the address bar. The page itself carries no secret.
+let TOKEN = "";
+function takeToken(){
+  const m = /^#k=([A-Za-z0-9_-]+)(#.*)?$/.exec(location.hash);
+  if (m) {
+    TOKEN = m[1];
+    try { sessionStorage.setItem("ledger-token", TOKEN); } catch {}
+    history.replaceState(null, "", location.pathname + location.search + (m[2] || "#/"));
+  } else if (!TOKEN) {
+    try { TOKEN = sessionStorage.getItem("ledger-token") || ""; } catch {}
+  }
+}
+takeToken();
 let LABELS = {domains:{}, themes:{}}, OVERVIEW = null;
 
 // ---------- helpers
@@ -121,6 +134,14 @@ function h(tag, attrs, ...kids){
   }
   for (const c of kids.flat(Infinity)) { if (c == null || c === false) continue; e.append(c instanceof Node ? c : String(c)); }
   return e;
+}
+// Links built from ledger data: only http(s) URLs become links (the schema refuses others; an older or edited
+// ledger may still hold one). Anything else is shown as plain text, never as an href.
+function safeHref(u){ return typeof u === "string" && /^https?:\/\//.test(u) ? u : null; }
+function extLink(u, text){
+  const href = safeHref(u);
+  return href ? h("a", {href, target:"_blank", rel:"noopener noreferrer"}, text)
+              : h("span", {class:"muted", title:"not an http(s) link, so not shown as a link"}, `${text}: ${u}`);
 }
 function put(el, ...kids){ el.replaceChildren(...kids.flat(Infinity).filter(k => k != null && k !== false && k !== "").map(k => k instanceof Node ? k : document.createTextNode(String(k)))); return el; }
 function add(el, ...kids){ for (const k of kids.flat(Infinity)) if (k != null && k !== false && k !== "") el.append(k instanceof Node ? k : String(k)); return el; }
@@ -201,7 +222,7 @@ function codeRef(loc){
         s.lines && s.lines.length ? h("div", {class:"code"}, h("table", null, h("tbody", null, s.lines.map(l =>
           h("tr", {class: hi[0] && l.n >= hi[0] && l.n <= hi[1] ? "hit" : null}, h("td", {class:"ln"}, l.n), h("td", null, l.text)))))) : null,
         h("div", {class:"refline"}, h("code", null, s.git_command), copyBtn(s.git_command, "Copy git command"),
-          s.permalink ? h("a", {href:s.permalink, target:"_blank", rel:"noopener noreferrer"}, "Open on the code host") : null));
+          s.permalink ? extLink(s.permalink, "Open on the code host") : null));
       btn.textContent = "Hide code";
     } catch (e) { put(box, h("p", {class:"status err"}, e.message)); }
     btn.disabled = false;
@@ -362,7 +383,7 @@ VIEWS.review = async ([code]) => {
     d.gates.length ? h("div", {class:"card"}, h("h2", null, "Questions asked during this review"), table([{label:"About", get:g => lab("gate", g.kind)}, {label:"Title", key:"title"}, {label:"Status", get:g => lab("gstat", g.status)}, {label:"Answer", get:g => [g.answer_value || "", " ", g.answer_text || ""]}], d.gates, () => go("#/inbox"))) : null,
     h("div", {class:"card"}, kv([["Verdict", r.verdict], ["Summary", r.summary], ["What was asked", r.request_text], ["Run by", r.manager ? `${r.manager}${r.manager_model ? " (" + r.manager_model + ")" : ""}` : null],
       ["Domains approved by", r.approved_by ? `${r.approved_by}, ${when(r.approved_at)}` : null], ["Follows", r.previous_code ? h("a", {href:"#/review/" + r.previous_code}, r.previous_code) : null],
-      ["Write-up", r.summary_doc_url ? h("a", {href:r.summary_doc_url, target:"_blank", rel:"noopener noreferrer"}, "Open the review document") : null]])),
+      ["Write-up", r.summary_doc_url ? extLink(r.summary_doc_url, "Open the review document") : null]])),
     h("h3", null, "Code reviewed"),
     table([{label:"Repository", key:"name"}, {label:"Branch", key:"branch"}, {label:"Commit", get:x => [h("code", null, short(x.commit_sha)), " ", copyBtn(x.commit_sha, "Copy")]},
            {label:"Commit message", key:"commit_subject"}, {label:"Kept by tag", get:x => x.tag_name ? x.tag_name + (x.tag_pushed ? "" : " (not pushed)") : "Not tagged"},
@@ -466,7 +487,7 @@ VIEWS.plan = async ([code, , phaseArg]) => {
         s.owner_need !== "none" ? h("span", {class:"tag " + (s.owner_need === "production" ? "crit" : s.owner_need === "decision" ? "warn" : "info")}, lab("need", s.owner_need)) : null,
         s.behavior_change ? h("span", {class:"tag"}, "Changes behaviour") : null)),
     h("div", {class:"body"}, kv([["Change", s.change], ["Proof", s.proof], ["Depends on", s.depends.length ? (s.depends.length === 1 ? "Step " : "Steps ") + s.depends.join(", ") : null], ["Behaviour change", s.behavior_note],
-      ["Needs from you", s.owner_question], ["Progress", s.progress_note], ["Commits", s.commits.length ? s.commits.map(c => h("div", null, h("code", null, short(c.commit_sha)), c.summary ? " " + c.summary : "", c.pr_url ? [" ", h("a", {href:c.pr_url, target:"_blank", rel:"noopener noreferrer"}, "pull request")] : "")) : null]]),
+      ["Needs from you", s.owner_question], ["Progress", s.progress_note], ["Commits", s.commits.length ? s.commits.map(c => h("div", null, h("code", null, short(c.commit_sha)), c.summary ? " " + c.summary : "", c.pr_url ? [" ", extLink(c.pr_url, "pull request")] : "")) : null]]),
       s.closes.length ? h("div", {class:"ref"}, h("span", {class:"note"}, `Closes ${s.closes.length} ${s.closes.length === 1 ? "point" : "points"}`),
         s.closes.map(c => h("div", {class:"refline"}, h("code", null, `${c.review} · ${c.point_id}`), sevTag(c.severity), c.issue ? h("a", {href:"#/issue/" + c.issue}, c.issue) : null, h("span", null, c.summary)))) : null));
   const draw = () => {
@@ -533,11 +554,12 @@ VIEWS.trends = async () => {
           r => go("#/issues?q=" + encodeURIComponent(r.path))));
 };
 
+const cellText = v => v && typeof v === "object" && "blob_bytes" in v ? `<${v.blob_bytes} bytes>` : String(v);
 VIEWS.explore = async ([name]) => {
   const tables = await api("tables");
   const list = h("div", {class:"tlist"}), right = h("div", {style:"min-width:0;display:flex;flex-direction:column;gap:10px"});
   const grid = (cols, data) => data.length ? h("div", {class:"scroll card grid", style:"padding:0"}, h("table", null, h("thead", null, h("tr", null, cols.map(c => h("th", null, c)))),
-    h("tbody", null, data.map(r => h("tr", null, r.map(v => h("td", {class: typeof v === "number" ? "num mono" : null, title: v == null ? null : String(v).slice(0, 2000)}, v == null ? h("span", {class:"muted"}, "—") : String(v)))))))) : empty("No rows.");
+    h("tbody", null, data.map(r => h("tr", null, r.map(v => h("td", {class: typeof v === "number" ? "num mono" : null, title: v == null ? null : cellText(v).slice(0, 2000)}, v == null ? h("span", {class:"muted"}, "—") : cellText(v)))))))) : empty("No rows.");
   const showTable = async (t, offset=0) => {
     list.querySelectorAll("button").forEach(b => b.setAttribute("aria-current", String(b.dataset.n === t)));
     history.replaceState(null, "", "#/explore/" + t);
@@ -555,7 +577,7 @@ VIEWS.explore = async ([name]) => {
   const sql = h("textarea", {class:"mono", "aria-label":"SQL query", placeholder:"SELECT code, title, status FROM issues WHERE severity = 'H'"});
   const out = h("div");
   const run = async () => {
-    try { const d = await api("sql", {sql: sql.value}); put(out, h("p", {class:"note"}, `${d.rows.length} rows${d.truncated ? " (first 1,000 shown)" : ""}`), grid(d.columns, d.rows)); }
+    try { const d = await api("sql", {sql: sql.value}); put(out, h("p", {class:"note"}, `${d.rows.length} rows${d.truncated ? ` (first ${d.rows.length.toLocaleString("en")} shown)` : ""}`), grid(d.columns, d.rows)); }
     catch (e) { put(out, h("p", {class:"status err"}, e.message)); }
   };
   sql.addEventListener("keydown", e => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") run(); });
@@ -573,6 +595,7 @@ function drawTabs(active){
   put(document.getElementById("tabs"), ...TABS.map(([k, href, t]) => h("a", {href, "aria-current": active === k ? "page" : null}, t, k === "inbox" && n ? h("span", {class:"badge"}, n) : null)));
 }
 async function route(){
+  takeToken();
   const raw = location.hash.replace(/^#\/?/, "");
   const [pathPart, query] = raw.split("?");
   const parts = pathPart.split("/").filter(Boolean).map(decodeURIComponent);

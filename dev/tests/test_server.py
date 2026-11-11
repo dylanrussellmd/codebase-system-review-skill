@@ -102,7 +102,7 @@ class MakeServer(unittest.TestCase):
             page = http(port, "GET", "/", {"Host": f"127.0.0.1:{port}"})
             self.assertEqual(page.status, 200)
             self.assertIn("text/html", page.headers["Content-Type"])
-            self.assertIn(f'const TOKEN = "{token}";', page.text)
+            self.assertNotIn(token, page.text)  # step 42 (ISS-0078): the token travels only in the #k= launch URL
             # the Host allow-list follows the port actually bound, not the 0 that was asked for
             self.assertEqual(http(port, "GET", "/", {"Host": "127.0.0.1:0"}).status, 403)
             ov = http(port, "GET", "/api/overview", {"Host": f"localhost:{port}", "X-Ledger-Token": token})
@@ -202,7 +202,7 @@ class PageStatic(unittest.TestCase):
         # no HTML sinks: all data goes through text nodes (h/put/add)
         for sink in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function"):
             self.assertNotIn(sink, script, f"page.html uses {sink}")
-        self.assertEqual(script.count("@@TOKEN@@"), 1, "the token placeholder must appear exactly once")
+        self.assertEqual(script.count("@@TOKEN@@"), 0, "the page carries no token placeholder (step 42, ISS-0078)")
 
 
 # ---------------------------------------------------------------- step 21: Host check, CORS, headers
@@ -294,8 +294,9 @@ class HostCorsHeaders(unittest.TestCase):
                 for part in ("default-src 'none'", "connect-src 'self'", "frame-ancestors 'none'",
                              "base-uri 'none'", "form-action 'none'", "img-src data:"):
                     self.assertIn(part, csp)
-                # characterization: ISS-0218 script-src still allows 'unsafe-inline'
-                self.assertIn("script-src 'unsafe-inline'", csp)
+                # ISS-0218 fixed (step 43): the inline script is allowed by its hash, not 'unsafe-inline'
+                self.assertRegex(csp, r"script-src 'sha256-[A-Za-z0-9+/=]+';")
+                self.assertNotIn("unsafe-inline", csp.split("script-src", 1)[1].split(";")[0])
             else:
                 self.assertTrue(r.headers["Content-Type"].startswith("application/json"), f"{method} {path}")
                 self.assertIsNone(csp, f"JSON response {method} {path} should carry no CSP")
@@ -304,7 +305,7 @@ class HostCorsHeaders(unittest.TestCase):
         self.assertEqual(self.req("GET", "/api/overview", token=False).status, 403)
         r = self.req("GET", "/api/overview", token=False, headers={"X-Ledger-Token": "wrong-token-value-xxxxxxx"})
         self.assertEqual(r.status, 403)
-        self.assertEqual(r.json(), {"error": "missing token; reload the page"})
+        self.assertIn("#k=", r.json()["error"])
         self.assertEqual(self.req("GET", "/api/overview").status, 200)
         for path, body in (("/api/sql", b'{"sql":"SELECT 1"}'), ("/api/gates/GATE-0001/answer", b"{}")):
             r = self.req("POST", path, token=False, headers={"Content-Type": "application/json"}, body=body)
@@ -313,18 +314,17 @@ class HostCorsHeaders(unittest.TestCase):
     def test_token_not_required_for_page(self):
         r = self.req("GET", "/", token=False)
         self.assertEqual(r.status, 200)
-        # characterization: GET outside /api/ needs no token and is a plain 404
+        # GET outside /api/ needs no token and is a plain 404
         self.assertEqual(self.req("GET", "/x/overview", token=False).status, 404)
 
-    def test_current_non_ascii_token_drops_connection(self):
-        # characterization: ISS-0216 compare_digest raises TypeError on a non-ASCII header; the handler dies and
-        # the client gets no response at all (the fix makes this a 403)
-        data = ("GET /api/overview HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nX-Ledger-Token: é\r\n"
+    def test_non_ascii_token_403(self):
+        # ISS-0216 fixed (step 41): the tokens are compared as bytes, so a non-ASCII header is a 403, not a drop
+        data = ("GET /api/overview HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nX-Ledger-Token: \xe9\r\n"
                 "Connection: close\r\n\r\n" % self.port).encode("latin-1")
         n = len(self.srv.handler_errors)
         raw = self.srv.raw(data)
-        self.assertEqual(raw, b"")
-        self.assertTrue(any(isinstance(e, TypeError) for e in self.srv.handler_errors[n:]))
+        self.assertRegex(raw[:12], rb"^HTTP/1\.[01] 403")
+        self.assertEqual(self.srv.handler_errors[n:], [])
 
     def test_current_post_needs_json_content_type(self):
         r = self.req("POST", "/api/sql", headers={"Content-Type": "text/plain"}, body=b'{"sql":"SELECT 1"}')
@@ -368,50 +368,40 @@ class GateAnswerOverHttp(unittest.TestCase):
         self.assertEqual(r.status, 409)
         self.assertIn("-> use-7 Seven is enough.", self.L.run_ok("gates").stdout)
 
-    def test_current_post_outside_api_prefix_skips_token(self):
-        # characterization: ISS-0019 the token guard only covers paths starting with /api/, while do_POST hands
-        # every path to route(), which drops the first segment. A POST to /x/... with no token is served and the
-        # gate answer is stored. The fix makes these 403/404 and leaves the gate open.
-        r = self.srv.request("POST", "/x/gates/GATE-0002/answer", body={"answer_value": "approve"}, token=False)
-        self.assertEqual((r.status, r.json()), (200, {"ok": True}))
-        self.assertEqual(self.gate("GATE-0002")["status"], "answered")
-        r = self.srv.request("POST", "/x/sql", body={"sql": "SELECT code FROM gates ORDER BY code"}, token=False)
-        self.assertEqual(r.status, 200)
-        self.assertEqual(r.json()["rows"], [["GATE-0001"], ["GATE-0002"]])
+    def test_post_outside_api_prefix_is_rejected(self):
+        # ISS-0019 fixed (step 41): only /api/ paths reach route(), and route() requires the 'api' segment, so a
+        # POST to /x/... is a 404 whatever the token, and the gate stays open.
+        for token in (False, True):
+            r = self.srv.request("POST", "/x/gates/GATE-0002/answer", body={"answer_value": "approve"}, token=token)
+            self.assertEqual(r.status, 404)
+            self.assertEqual(self.srv.request("POST", "/x/sql", body={"sql": "SELECT 1"}, token=token).status, 404)
+        self.assertEqual(self.gate("GATE-0002")["status"], "open")
         self.assertEqual(self.srv.request("POST", "/api/sql", body={"sql": "SELECT 1"}, token=False).status, 403)
 
-    def test_current_concurrent_answers_can_both_report_saved(self):
-        # characterization: ISS-0026 the answer route reads the gate, then runs UPDATE ... WHERE status='open'
-        # without checking the row count, so when a second answer lands between the read and the write both
-        # callers get {"ok": true} while only one answer is stored. Forced deterministically here by flipping the
-        # gate to answered between route()'s SELECT and its UPDATE. The fix returns 409 to the loser.
+    def test_concurrent_answer_loser_gets_409(self):
+        # ISS-0026 fixed (step 38): the answer is read and written in one BEGIN IMMEDIATE transaction and the UPDATE
+        # must change exactly one row. A stale read (the gate was answered in chat meanwhile) gives 409, and the
+        # chat answer stays.
         mod = self.srv.module
-        con = mod.connect(self.L.db)
+        con = self.L.connect()
+        con.execute("UPDATE gates SET status='answered', answer_value='approve', answered_by='owner', "
+                    "answered_via='chat' WHERE code='GATE-0002'")
+        con.commit()
+        con.close()
         real_one = mod.one
-        state = {"done": False}
 
-        def one_then_race(c, sql, args=()):
+        def stale(c, sql, args=()):
             r = real_one(c, sql, args)
-            if not state["done"] and "FROM gates WHERE code=?" in sql:
-                state["done"] = True
-                other = self.L.connect()
-                other.execute("UPDATE gates SET status='answered', answer_value='approve', answered_by='owner', "
-                              "answered_via='chat' WHERE code='GATE-0002'")
-                other.commit()
-                other.close()
-            return r
+            return dict(r, status="open") if r and "FROM gates WHERE code=?" in sql else r
 
-        mod.one = one_then_race
+        mod.one = stale
         try:
-            res = mod.route(self.L.root, self.L.db, con, "/api/gates/GATE-0002/answer", {},
-                            {"answer_value": "add"})
+            res = mod.api(self.L.root, self.L.db, "/api/gates/GATE-0002/answer", {}, {"answer_value": "add"})
         finally:
             mod.one = real_one
-            con.close()
-        self.assertEqual(res, {"ok": True})  # reported saved ...
+        self.assertEqual(res, ({"error": "This question was already answered."}, 409))
         g = self.gate("GATE-0002")
-        self.assertEqual((g["answer_value"], g["answered_via"]), ("approve", "chat"))  # ... but not stored
-
+        self.assertEqual((g["answer_value"], g["answered_via"]), ("approve", "chat"))
 
 if __name__ == "__main__":
     unittest.main()

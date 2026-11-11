@@ -1,7 +1,7 @@
 ---
 name: codebase-system-review
 description: Run a managed, read-only, multi-reviewer audit of any codebase (tests, security, performance, architecture, UI, API, DB, docs, logging), verify findings, record every point in a per-project SQLite ledger tracked across reviews, then turn every point into a tracked fix plan.
-version: 1.1.0
+version: 1.2.0
 ---
 
 # Comprehensive review of a software system
@@ -65,14 +65,32 @@ python3 .code-review/ledger.py gates              # questions open or answered (
 python3 .code-review/ledger.py dump               # write .code-review/ledger.sql, a text copy for diffs
 ```
 
-`ledger.py` works out which project it belongs to: the nearest folder at or above the current one that already has
-`.code-review/ledger.sqlite`, else the top of the current git repository, else the current folder (`--root` overrides).
-So one global install of this skill serves every project, and each project's reviews stay in its own ledger. For a
-system spread over several repos, keep one ledger in the primary repo (or a parent folder that holds them all, created
-with `--root`) and list every repo in `repositories` with its path relative to that root.
+`ledger.py` works out which project it belongs to. Inside a git repository: the nearest folder with
+`.code-review/ledger.sqlite` from the current one up to the repository top, else (in a git worktree) the main
+checkout's ledger, else a ledger in a folder above the repository only if its `repositories` table lists this
+repository, else the repository top. Outside git (or when git cannot run, which it says in a note): the nearest
+ledger upward; with none, `init` refuses until you pass `--root`. The project's own `.code-review/ledger.py` always
+uses the ledger beside it. A ledger found this way that belongs to another user, or that every user can change, is
+refused. Any `--root DIR` (`.` included) is used exactly as given, and `init` prints `ledger at <path> (created)` or
+`(attached to existing)`. So run commands from the project root, or pass `--root`. One global install of this skill
+serves every project, and each project's reviews stay in its own ledger. For a system spread over several repos, keep
+one ledger in the primary repo (or a parent folder that holds them all, created with `--root`) and list every repo in
+`repositories` with its path relative to that root. `ledger.py` reads only repositories at or below the project root
+(the schema refuses absolute paths and `..` in `repositories.path`); a sibling checkout outside it is read only when the
+owner lists it explicitly: set `allow_outside_root = 1` on its row (decision D-0007).
 
-Write with Python's `sqlite3` (or the `sqlite3` CLI). On every connection run `PRAGMA foreign_keys = ON`. Group related
-writes in one transaction. Use the views; don't re-derive their logic.
+To keep the ledger out of the repository (when the repository is the product, or the owner wants no review data in
+it), set `CODE_REVIEW_DIR=<folder outside the repo>` for every command, or pass `--db FILE`: the ledger, its copy of
+`ledger.py`, `ledger.sql` and saved patches then live there, and nothing is written inside the repository. `--db` wins
+over `CODE_REVIEW_DIR`. `init` records the folder in `meta.ledger_location`, and `check` warns when the ledger is used
+from another place.
+
+Write with Python's `sqlite3` (or the `sqlite3` CLI). On every connection run `PRAGMA foreign_keys = ON` and wait for
+locks (`sqlite3.connect(db, timeout=30)`, or `.timeout 30000` in the CLI). Group related writes in one short
+transaction and commit it; don't keep one open while you think or run other tools (the viewer is a second writer when
+the owner answers a gate). The ledger runs in WAL mode, so readers never block your writes; run `dump` (it
+checkpoints) or close every connection before the ledger file is committed or copied. Use the views; don't re-derive
+their logic.
 
 ### What is in it (read `ledger.py schema` for every column)
 
@@ -113,7 +131,12 @@ writes in one transaction. Use the views; don't re-derive their logic.
   `.code-review/patches/R-0007-<repo>.patch` and record it, or ask the owner to commit first. After indexing, run
   `tag-review` (creates an annotated tag `review/R-0007` on each reviewed commit, so rebases, squashes and deleted
   branches can't make it unreachable) and `fill-refs` (copies the cited lines verbatim into `excerpt`, plus the blob id
-  and a permalink). `v_untraceable_refs` must then be empty. Pushing tags is the owner's call: list the push commands.
+  and a permalink). `v_untraceable_refs` must then be empty. Both exit 1 when anything was left undone (a repository
+  left untagged, a review with no repositories, a reference past the end of its file or whose symbol is not found):
+  read what they printed. Tags are local; pushing them is the owner's call: list the push commands. fill-refs stores
+  only `http(s)` permalinks; the schema refuses any other scheme in `permalink`, `summary_doc_url`, `pr_url` and
+  `permalink_template`, and refuses location paths that are absolute, contain `..`, a backslash, a control character or
+  start with `-`.
 - **Status and severity changes carry context.** When you update an issue's `status` or `severity`, set all five
   `change_*` columns in the same UPDATE (actor, review, step, commit, note; NULL the ones that don't apply). Triggers
   write the history from them. Steps likewise take `change_actor_id` and `change_commit_sha`.
@@ -122,10 +145,22 @@ writes in one transaction. Use the views; don't re-derive their logic.
   fixed again becomes verified; a fixed or verified issue matched by a new finding becomes regressed.
 - **Never edit or delete history** (findings, events, checks, decisions) to make a number look better. Correct with a
   new row or a status change that says why.
-- **Keep it in the repo.** The ledger, `ledger.py`, `ledger.sql` (run `dump` after each writing session) and saved
-  patches live in `.code-review/`. Writing there is the one change to the repository this skill makes during a review.
+- **Keep it in the repo** (unless it is kept outside with `CODE_REVIEW_DIR`, see above). The ledger, `ledger.py`,
+  `ledger.sql` (run `dump` after each writing session) and saved patches live in `.code-review/` (owner-only files). Writing there is the one change to the repository this skill makes during a review.
   Commit it only when the owner agrees (or has a standing instruction), in its own commit. If a merge conflicts on the
   binary file, rebuild from the other side's `ledger.sql` and reapply this side's rows; never pick one side blindly.
+
+### Privacy of the ledger
+
+The ledger and its dump may end up in the repository, so treat them as readable by everyone who can read the repo
+(public repositories: the world). Cite a secret by its location, never by its value, in findings, notes and gates.
+`fill-refs` masks common secret shapes in excerpts (key, token and password assignments, AWS, GitHub, Slack, Stripe and
+Google key shapes, PEM blocks) as `[redacted]` and sets `excerpt_redacted = 1` (its `excerpt_sha256` is still of the
+real lines); other secrets are not caught, so before any commit of `.code-review/` grep `ledger.sql` for secret
+patterns. Saved patches of uncommitted changes and agent prompts can hold anything: commit them only with the owner's
+consent. Redaction is the one exception to "never edit history": `UPDATE` the text to `[redacted]` and add an `events`
+row saying what was redacted and why (not the value); tell the owner that a secret already committed stays in git
+history until the history is rewritten, and must be rotated.
 
 ### Gates: waiting on the owner
 
@@ -134,7 +169,14 @@ open a gate: a `gates` row with a plain-language title, question, the context ne
 (`[{"value","label","description"}]`). Ask in the chat too (with your harness's question tool when it has one) and tell the owner they can
 also answer in the viewer. A blocking gate stops the work that depends on it.
 
-- Answer given in chat: record it on the gate (`status='answered'`, `answer_value`/`answer_text`, `answered_via='chat'`).
+- Answer given in chat: record it on the gate in one statement that only touches an open gate,
+  `UPDATE gates SET status='answered', answer_value=?, answer_text=?, answered_via='chat' WHERE code=? AND
+  status='open'`, and check that it changed one row (`cur.rowcount == 1`, or `SELECT changes()`); if not, the owner
+  already answered in the viewer: read that answer with `ledger.py gates` instead. Once a gate is not open its answer
+  cannot be changed (a trigger refuses it); to ask again, open a new gate, or reopen this one (`status='open'` with
+  both answer columns NULL; the cleared answer is kept in `events`).
+- A `production-action` or `accept-risk` answer that arrived through the viewer is confirmed by the owner in the chat
+  before you act on it (anyone on the machine who can reach the viewer could have answered).
 - Answer given in the viewer: you find it with `ledger.py gates`. Check before resuming any paused work and at the
   start of every session.
 - When you have acted on an answer, set `status='applied'` with an `applied_note` saying what you did. A decision

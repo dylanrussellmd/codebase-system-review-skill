@@ -122,28 +122,23 @@ class ReadonlyUri(unittest.TestCase):
         res = L.module.run_readonly(L.db, "SELECT count(*) FROM issues")
         self.assertEqual(res["rows"], [[0]])
 
-    def test_current_readonly_uri_breaks_on_hash_or_question_mark(self):
-        # characterization: SEC-V1 / DOC-V5 (ISS-0036). connect() builds f"file:{db}?mode=ro" without escaping, so a
-        # ? or # in the path cuts the file name there: SQLite opens (and creates) an empty database at the truncated
-        # path, the mode=ro parameter is lost, and the SQL box queries that empty file. The fix step (percent-encode
-        # the path) must flip these assertions.
+    def test_readonly_uri_with_hash_or_question_mark(self):
+        # SEC-V1 / DOC-V5 (ISS-0036) fixed (step 37): connect() percent-encodes the path into a file: URI, so a ? or
+        # # in the path no longer cuts the file name or drops mode=ro, and no stray database appears.
         for folder in ("a#b?c", "a#b", "a?b"):
             with self.subTest(folder=folder):
                 base, L = self.ledger_in(folder)
                 stray = base / "a"
-                self.assertFalse(stray.exists())
                 con = L.module.connect(L.db, readonly=True)
                 try:
-                    self.assertEqual(con.execute("SELECT count(*) FROM sqlite_master").fetchone()[0], 0)
-                    con.execute("CREATE TABLE probe(x)")  # accepted: not read-only any more
-                    con.commit()
+                    self.assertGreater(con.execute("SELECT count(*) FROM sqlite_master").fetchone()[0], 10)
+                    with self.assertRaisesRegex(sqlite3.OperationalError, "readonly"):
+                        con.execute("CREATE TABLE probe(x)")
                 finally:
                     con.close()
-                self.assertTrue(stray.exists(), H.tree_files(base))
+                self.assertFalse(stray.exists(), H.tree_files(base))
                 res = L.module.run_readonly(L.db, "SELECT count(*) FROM issues")
-                self.assertIsInstance(res, tuple)
-                self.assertIn("no such table", res[0]["error"])
-                # The real ledger was not touched.
+                self.assertEqual(res["rows"], [[0]])
                 self.assertIsNone(L.scalar("SELECT name FROM sqlite_master WHERE name='probe'"))
 
 
@@ -196,8 +191,8 @@ class ForeignKeys(unittest.TestCase):
         # main() leaves its connection open when a command ends in sys.exit; close every one at the end.
         self.addCleanup(lambda: [c.close() for c in opened])
 
-        def spy(db, readonly=False):
-            con = real(db, readonly=readonly)
+        def spy(db, readonly=False, **kw):
+            con = real(db, readonly=readonly, **kw)
             fk = H.fk_pragma(con)
             try:
                 con.execute(H.ORPHAN_SQL)

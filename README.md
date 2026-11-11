@@ -27,6 +27,21 @@ From the project root, after a review has started:
 
     python3 .code-review/ledger.py serve
 
+## Where the ledger lives
+
+By default `<project root>/.code-review/` (owner-only: the folder 0700, the files 0600). To keep review data out of
+the repository, set `CODE_REVIEW_DIR=/some/folder` for every command (or pass `--db FILE`): nothing is then written
+inside the repository.
+
+The ledger runs in SQLite's WAL mode (`init` sets it; `migrate` switches an existing ledger once), so the viewer's
+reads never block the agent's writes. While it is open, `ledger.sqlite-wal` and `ledger.sqlite-shm` sit beside it
+(`.code-review/.gitignore` lists them). That needs:
+
+- a folder where SQLite can create the `-shm` file beside the database (also for read-only use);
+- a local disk: WAL does not work on network file systems (NFS, SMB);
+- a checkpoint before the `.sqlite` file is copied or committed: `ledger.py dump` runs
+  `PRAGMA wal_checkpoint(TRUNCATE)` first, so after `dump` the file holds every commit.
+
 ## Developing
 
 `scripts/ledger.py` is generated; edit the sources, never the generated file:

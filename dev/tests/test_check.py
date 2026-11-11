@@ -241,10 +241,11 @@ class CheckCommand(unittest.TestCase):
         # Was test_current_cli_check_runs_on_other_schema_version (characterization of ISS-0035: check ran on a
         # schema-2 ledger and exited 0). Plan step 33: every command opens the ledger through open_ledger().
         with new_ledger() as L:
-            L.x("UPDATE meta SET value='2' WHERE key='schema_version'")
+            L.x("UPDATE meta SET value='99' WHERE key='schema_version'")
             p = L.run("check")
         self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
-        self.assertIn("is schema 2; this ledger.py only knows 1. Use a newer ledger.py.", p.stderr)
+        self.assertIn(f"is schema 99; this ledger.py only knows {L.module.SCHEMA_VERSION}. Use a newer ledger.py.",
+                      p.stderr)
         self.assertNotIn("Traceback", p.stderr)
 
 

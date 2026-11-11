@@ -17,17 +17,17 @@ what is waiting on the owner. Standard library only (Python 3.9+; tested on 3.9.
 Options: --root DIR (project root; default: the nearest folder upward with a ledger, else the
 top of the current git repository, else the current directory), --db FILE, --version.
 """
-import argparse, hashlib, json, re, secrets, sqlite3, subprocess, sys, threading
+import argparse, hashlib, json, os, re, secrets, shlex, sqlite3, subprocess, sys, threading
 import webbrowser
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
-TOOL_VERSION = "1.1.0"  # stamped by dev/build.py from `version:` in SKILL.md's frontmatter
-TOOL_HASH = "5a0a1a86525ed94bd5955d811fbe67718c7fc1e5c1061671c872ef523bfbe157"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
+TOOL_VERSION = "1.2.0"  # stamped by dev/build.py from `version:` in SKILL.md's frontmatter
+TOOL_HASH = "458b3f780fcdc03b02130411e16ae476ff3d92502e4ee0c13383f5c711573ea2"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
 SCHEMA = r"""-- =====================================================================
--- Code review ledger — schema version 1
+-- Code review ledger — schema version 2
 -- One SQLite file per project: <project root>/.code-review/ledger.sqlite
 -- Every connection must run:  PRAGMA foreign_keys = ON;
 -- Times are UTC ISO-8601 text (strftime('%Y-%m-%dT%H:%M:%fZ','now')).
@@ -60,9 +60,20 @@ CREATE TABLE repositories (
   path           TEXT,                   -- relative to the project root, '.' for the root repo
   remote_url     TEXT,
   default_branch TEXT,
-  permalink_template TEXT,               -- e.g. https://github.com/o/r/blob/{sha}/{path}#L{start}-L{end}
+  permalink_template TEXT CHECK (permalink_template IS NULL OR permalink_template GLOB 'https://*'
+                                 OR permalink_template GLOB 'http://*'),
+                                         -- e.g. https://github.com/o/r/blob/{sha}/{path}#L{start}-L{end}
   notes          TEXT,
-  created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  allow_outside_root INTEGER NOT NULL DEFAULT 0 CHECK (allow_outside_root IN (0,1)),
+                                         -- 1 = the owner listed this repo explicitly as living outside the
+                                         -- project root (a sibling checkout); its path may then be absolute or
+                                         -- start with ../. Otherwise ledger.py refuses to read outside the root.
+  -- path: no leading -, no control characters; and unless allow_outside_root, relative (no leading /, no
+  -- backslash) with no .. segment
+  CHECK (path IS NULL OR (path NOT GLOB '-*' AND (path NOT GLOB '*[' || char(1) || '-' || char(31) || char(127) || ']*')
+         AND (allow_outside_root = 1 OR (path NOT GLOB '/*' AND path NOT GLOB '*\*' AND path <> '..'
+              AND path NOT GLOB '../*' AND path NOT GLOB '*/../*' AND path NOT GLOB '*/..'))))
 );
 
 -- People and agents. One row per agent instance (each subagent run gets
@@ -115,7 +126,8 @@ CREATE TABLE design_goals (
 
 CREATE TABLE reviews (
   id                    INTEGER PRIMARY KEY,
-  code                  TEXT NOT NULL UNIQUE,   -- R-0001
+  code                  TEXT NOT NULL UNIQUE    -- R-0001
+                          CHECK (code GLOB 'R-[0-9][0-9][0-9][0-9]*' AND code NOT GLOB 'R-*[^0-9]*'),
   title                 TEXT NOT NULL,
   scope                 TEXT NOT NULL CHECK (scope IN
                           ('full','partial','targeted','second','fix-verification')),
@@ -130,7 +142,8 @@ CREATE TABLE reviews (
   previous_review_id    INTEGER REFERENCES reviews(id),  -- the review this one follows up
   skill_version         TEXT,
   review_folder         TEXT,                   -- scratch folder used (may not persist)
-  summary_doc_url       TEXT,
+  summary_doc_url       TEXT CHECK (summary_doc_url IS NULL OR summary_doc_url GLOB 'https://*'
+                                    OR summary_doc_url GLOB 'http://*'),
   verdict               TEXT,
   summary               TEXT,
   started_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
@@ -142,7 +155,8 @@ CREATE TABLE reviews (
 CREATE TABLE review_repositories (
   review_id     INTEGER NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
   repository_id INTEGER NOT NULL REFERENCES repositories(id),
-  commit_sha    TEXT NOT NULL CHECK (length(commit_sha) = 40 OR length(commit_sha) = 64),  -- full hash
+  commit_sha    TEXT NOT NULL CHECK ((length(commit_sha) = 40 OR length(commit_sha) = 64)
+                                   AND commit_sha NOT GLOB '*[^0-9a-f]*'),  -- full hash, lowercase hex
   branch        TEXT,
   commit_time   TEXT,
   commit_subject TEXT,
@@ -322,16 +336,24 @@ CREATE TABLE finding_locations (
   repository_id  INTEGER NOT NULL REFERENCES repositories(id),
   commit_sha     TEXT CHECK (commit_sha IS NULL OR (length(commit_sha) >= 7 AND commit_sha NOT GLOB '*[^0-9a-f]*')),
                                             -- filled from review_repositories if left NULL
-  path           TEXT NOT NULL,             -- repo-relative, forward slashes
+  path           TEXT NOT NULL,             -- repo-relative, forward slashes (see the CHECK below)
   line_start     INTEGER CHECK (line_start IS NULL OR line_start >= 1),
   line_end       INTEGER,
   symbol         TEXT,                      -- function, class, route, setting name
   blob_sha       TEXT,                      -- `git rev-parse <commit>:<path>`
   excerpt        TEXT,                      -- the cited lines, verbatim, at that commit
   excerpt_sha256 TEXT,                      -- hash of excerpt, to detect the same code later
-  permalink      TEXT,                      -- e.g. https://github.com/o/r/blob/<sha>/<path>#L10-L20
+  permalink      TEXT CHECK (permalink IS NULL OR permalink GLOB 'https://*' OR permalink GLOB 'http://*'),
+                                            -- e.g. https://github.com/o/r/blob/<sha>/<path>#L10-L20
   role           TEXT NOT NULL DEFAULT 'primary' CHECK (role IN ('primary','also','test','doc','config')),
-  CHECK (line_end IS NULL OR line_start IS NULL OR line_end >= line_start)
+  excerpt_redacted INTEGER NOT NULL DEFAULT 0 CHECK (excerpt_redacted IN (0,1)),
+                                            -- 1 = fill-refs masked secret-looking values in excerpt as [redacted];
+                                            -- excerpt_sha256 is still the hash of the real lines
+  CHECK (line_end IS NULL OR line_start IS NULL OR line_end >= line_start),
+  -- path: relative (no leading / or -), no backslash, no .. segment, no control characters
+  CHECK (length(path) > 0 AND path NOT GLOB '/*' AND path NOT GLOB '-*' AND path NOT GLOB '*\*'
+         AND path <> '..' AND path NOT GLOB '../*' AND path NOT GLOB '*/../*' AND path NOT GLOB '*/..'
+         AND (path NOT GLOB '*[' || char(1) || '-' || char(31) || char(127) || ']*'))
 );
 
 CREATE TABLE finding_goals (
@@ -500,9 +522,10 @@ CREATE TABLE step_commits (
   id            INTEGER PRIMARY KEY,
   step_id       INTEGER NOT NULL REFERENCES steps(id) ON DELETE CASCADE,
   repository_id INTEGER REFERENCES repositories(id),
-  commit_sha    TEXT NOT NULL,
+  commit_sha    TEXT NOT NULL CHECK ((length(commit_sha) = 40 OR length(commit_sha) = 64)
+                                   AND commit_sha NOT GLOB '*[^0-9a-f]*'),  -- full hash, lowercase hex
   branch        TEXT,
-  pr_url        TEXT,
+  pr_url        TEXT CHECK (pr_url IS NULL OR pr_url GLOB 'https://*' OR pr_url GLOB 'http://*'),
   summary       TEXT,
   committed_at  TEXT,
   UNIQUE (step_id, commit_sha)
@@ -767,6 +790,24 @@ WHEN OLD.status IS NOT NEW.status BEGIN
   WHERE id = NEW.id;
 END;
 
+-- An answer is final once the gate is no longer open (answered, applied or withdrawn): a later write, by the
+-- viewer or an agent, cannot silently replace what the owner said. The one way back is to reopen the gate
+-- (status 'open', both answer columns NULL), which tr_gate_answer_cleared records with the answer it removed.
+CREATE TRIGGER tr_gate_answer_final BEFORE UPDATE OF answer_value, answer_text ON gates
+WHEN OLD.status <> 'open'
+ AND (OLD.answer_value IS NOT NEW.answer_value OR OLD.answer_text IS NOT NEW.answer_text)
+ AND NOT (NEW.status = 'open' AND NEW.answer_value IS NULL AND NEW.answer_text IS NULL) BEGIN
+  SELECT RAISE(ABORT, 'the answer of a gate that is no longer open cannot be changed; open a new gate');
+END;
+
+CREATE TRIGGER tr_gate_answer_cleared AFTER UPDATE OF answer_value, answer_text ON gates
+WHEN OLD.status <> 'open' AND NEW.status = 'open'
+ AND (OLD.answer_value IS NOT NULL OR OLD.answer_text IS NOT NULL) BEGIN
+  INSERT INTO events(entity_type, entity_id, event, from_value, to_value, review_id, step_id, note)
+  VALUES ('gate', NEW.id, 'answer-cleared', OLD.answer_value, NULL, NEW.review_id, NEW.step_id,
+          'reopened; the answer was: ' || COALESCE(OLD.answer_value || ': ', '') || COALESCE(OLD.answer_text, ''));
+END;
+
 -- Plan rules enforced by the database.
 CREATE TRIGGER tr_dep_order BEFORE INSERT ON step_dependencies BEGIN
   SELECT RAISE(ABORT, 'a step may only depend on an earlier step of the same plan')
@@ -938,7 +979,10 @@ CREATE VIEW v_code_refs AS
 SELECT r.code AS review, f.point_id, i.code AS issue, fl.id AS location_id, fl.role,
        rp.name AS repository, rp.path AS repo_path, fl.commit_sha, rr.tag_name,
        fl.path, fl.line_start, fl.line_end, fl.symbol, fl.blob_sha, fl.permalink,
-       'git -C ' || COALESCE(rp.path, '.') || ' show ' || fl.commit_sha || ':' || fl.path
+       -- every argument single-quoted for a POSIX shell (an embedded quote is closed, escaped and reopened);
+       -- ledger.py show, /api/source and the viewer's Copy button all use this one command
+       'git -C ''' || replace(COALESCE(NULLIF(rp.path, ''), '.'), '''', '''\''''') || ''' show '''
+         || replace(fl.commit_sha || ':' || fl.path, '''', '''\''''') || ''''
          || CASE WHEN fl.line_start IS NOT NULL
                  THEN ' | sed -n ''' || fl.line_start || ',' || COALESCE(fl.line_end, fl.line_start) || 'p'''
                  ELSE '' END AS git_command,
@@ -1045,8 +1089,9 @@ INSERT INTO themes(code, name) VALUES
  ('docs-repo','Repo developer docs'),('docs-user','End-user docs'),('handover','Handover and ownership'),
  ('localization','Localization'),('verify','Verify'),('other','Other');
 
-INSERT INTO meta(key, value) VALUES ('schema_version','1');
-INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger schema');
+INSERT INTO meta(key, value) VALUES ('schema_version','2');
+INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger schema'),
+  (2, 'url, path, hash and code checks; repositories.allow_outside_root; finding_locations.excerpt_redacted');
 """
 PAGE = r"""<!doctype html>
 <html lang="en">
@@ -1157,7 +1202,20 @@ nav.rail .i,nav.rail .c{font:500 12px var(--mono);opacity:.8}
 <div class="wrap" id="app" aria-live="polite"></div>
 <script>
 "use strict";
-const TOKEN = "@@TOKEN@@";
+// The token arrives once, in the launch URL's fragment (#k=<token>, optionally followed by #/route); it is kept in
+// sessionStorage for this tab and removed from the address bar. The page itself carries no secret.
+let TOKEN = "";
+function takeToken(){
+  const m = /^#k=([A-Za-z0-9_-]+)(#.*)?$/.exec(location.hash);
+  if (m) {
+    TOKEN = m[1];
+    try { sessionStorage.setItem("ledger-token", TOKEN); } catch {}
+    history.replaceState(null, "", location.pathname + location.search + (m[2] || "#/"));
+  } else if (!TOKEN) {
+    try { TOKEN = sessionStorage.getItem("ledger-token") || ""; } catch {}
+  }
+}
+takeToken();
 let LABELS = {domains:{}, themes:{}}, OVERVIEW = null;
 
 // ---------- helpers
@@ -1171,6 +1229,14 @@ function h(tag, attrs, ...kids){
   }
   for (const c of kids.flat(Infinity)) { if (c == null || c === false) continue; e.append(c instanceof Node ? c : String(c)); }
   return e;
+}
+// Links built from ledger data: only http(s) URLs become links (the schema refuses others; an older or edited
+// ledger may still hold one). Anything else is shown as plain text, never as an href.
+function safeHref(u){ return typeof u === "string" && /^https?:\/\//.test(u) ? u : null; }
+function extLink(u, text){
+  const href = safeHref(u);
+  return href ? h("a", {href, target:"_blank", rel:"noopener noreferrer"}, text)
+              : h("span", {class:"muted", title:"not an http(s) link, so not shown as a link"}, `${text}: ${u}`);
 }
 function put(el, ...kids){ el.replaceChildren(...kids.flat(Infinity).filter(k => k != null && k !== false && k !== "").map(k => k instanceof Node ? k : document.createTextNode(String(k)))); return el; }
 function add(el, ...kids){ for (const k of kids.flat(Infinity)) if (k != null && k !== false && k !== "") el.append(k instanceof Node ? k : String(k)); return el; }
@@ -1251,7 +1317,7 @@ function codeRef(loc){
         s.lines && s.lines.length ? h("div", {class:"code"}, h("table", null, h("tbody", null, s.lines.map(l =>
           h("tr", {class: hi[0] && l.n >= hi[0] && l.n <= hi[1] ? "hit" : null}, h("td", {class:"ln"}, l.n), h("td", null, l.text)))))) : null,
         h("div", {class:"refline"}, h("code", null, s.git_command), copyBtn(s.git_command, "Copy git command"),
-          s.permalink ? h("a", {href:s.permalink, target:"_blank", rel:"noopener noreferrer"}, "Open on the code host") : null));
+          s.permalink ? extLink(s.permalink, "Open on the code host") : null));
       btn.textContent = "Hide code";
     } catch (e) { put(box, h("p", {class:"status err"}, e.message)); }
     btn.disabled = false;
@@ -1412,7 +1478,7 @@ VIEWS.review = async ([code]) => {
     d.gates.length ? h("div", {class:"card"}, h("h2", null, "Questions asked during this review"), table([{label:"About", get:g => lab("gate", g.kind)}, {label:"Title", key:"title"}, {label:"Status", get:g => lab("gstat", g.status)}, {label:"Answer", get:g => [g.answer_value || "", " ", g.answer_text || ""]}], d.gates, () => go("#/inbox"))) : null,
     h("div", {class:"card"}, kv([["Verdict", r.verdict], ["Summary", r.summary], ["What was asked", r.request_text], ["Run by", r.manager ? `${r.manager}${r.manager_model ? " (" + r.manager_model + ")" : ""}` : null],
       ["Domains approved by", r.approved_by ? `${r.approved_by}, ${when(r.approved_at)}` : null], ["Follows", r.previous_code ? h("a", {href:"#/review/" + r.previous_code}, r.previous_code) : null],
-      ["Write-up", r.summary_doc_url ? h("a", {href:r.summary_doc_url, target:"_blank", rel:"noopener noreferrer"}, "Open the review document") : null]])),
+      ["Write-up", r.summary_doc_url ? extLink(r.summary_doc_url, "Open the review document") : null]])),
     h("h3", null, "Code reviewed"),
     table([{label:"Repository", key:"name"}, {label:"Branch", key:"branch"}, {label:"Commit", get:x => [h("code", null, short(x.commit_sha)), " ", copyBtn(x.commit_sha, "Copy")]},
            {label:"Commit message", key:"commit_subject"}, {label:"Kept by tag", get:x => x.tag_name ? x.tag_name + (x.tag_pushed ? "" : " (not pushed)") : "Not tagged"},
@@ -1516,7 +1582,7 @@ VIEWS.plan = async ([code, , phaseArg]) => {
         s.owner_need !== "none" ? h("span", {class:"tag " + (s.owner_need === "production" ? "crit" : s.owner_need === "decision" ? "warn" : "info")}, lab("need", s.owner_need)) : null,
         s.behavior_change ? h("span", {class:"tag"}, "Changes behaviour") : null)),
     h("div", {class:"body"}, kv([["Change", s.change], ["Proof", s.proof], ["Depends on", s.depends.length ? (s.depends.length === 1 ? "Step " : "Steps ") + s.depends.join(", ") : null], ["Behaviour change", s.behavior_note],
-      ["Needs from you", s.owner_question], ["Progress", s.progress_note], ["Commits", s.commits.length ? s.commits.map(c => h("div", null, h("code", null, short(c.commit_sha)), c.summary ? " " + c.summary : "", c.pr_url ? [" ", h("a", {href:c.pr_url, target:"_blank", rel:"noopener noreferrer"}, "pull request")] : "")) : null]]),
+      ["Needs from you", s.owner_question], ["Progress", s.progress_note], ["Commits", s.commits.length ? s.commits.map(c => h("div", null, h("code", null, short(c.commit_sha)), c.summary ? " " + c.summary : "", c.pr_url ? [" ", extLink(c.pr_url, "pull request")] : "")) : null]]),
       s.closes.length ? h("div", {class:"ref"}, h("span", {class:"note"}, `Closes ${s.closes.length} ${s.closes.length === 1 ? "point" : "points"}`),
         s.closes.map(c => h("div", {class:"refline"}, h("code", null, `${c.review} · ${c.point_id}`), sevTag(c.severity), c.issue ? h("a", {href:"#/issue/" + c.issue}, c.issue) : null, h("span", null, c.summary)))) : null));
   const draw = () => {
@@ -1583,11 +1649,12 @@ VIEWS.trends = async () => {
           r => go("#/issues?q=" + encodeURIComponent(r.path))));
 };
 
+const cellText = v => v && typeof v === "object" && "blob_bytes" in v ? `<${v.blob_bytes} bytes>` : String(v);
 VIEWS.explore = async ([name]) => {
   const tables = await api("tables");
   const list = h("div", {class:"tlist"}), right = h("div", {style:"min-width:0;display:flex;flex-direction:column;gap:10px"});
   const grid = (cols, data) => data.length ? h("div", {class:"scroll card grid", style:"padding:0"}, h("table", null, h("thead", null, h("tr", null, cols.map(c => h("th", null, c)))),
-    h("tbody", null, data.map(r => h("tr", null, r.map(v => h("td", {class: typeof v === "number" ? "num mono" : null, title: v == null ? null : String(v).slice(0, 2000)}, v == null ? h("span", {class:"muted"}, "—") : String(v)))))))) : empty("No rows.");
+    h("tbody", null, data.map(r => h("tr", null, r.map(v => h("td", {class: typeof v === "number" ? "num mono" : null, title: v == null ? null : cellText(v).slice(0, 2000)}, v == null ? h("span", {class:"muted"}, "—") : cellText(v)))))))) : empty("No rows.");
   const showTable = async (t, offset=0) => {
     list.querySelectorAll("button").forEach(b => b.setAttribute("aria-current", String(b.dataset.n === t)));
     history.replaceState(null, "", "#/explore/" + t);
@@ -1605,7 +1672,7 @@ VIEWS.explore = async ([name]) => {
   const sql = h("textarea", {class:"mono", "aria-label":"SQL query", placeholder:"SELECT code, title, status FROM issues WHERE severity = 'H'"});
   const out = h("div");
   const run = async () => {
-    try { const d = await api("sql", {sql: sql.value}); put(out, h("p", {class:"note"}, `${d.rows.length} rows${d.truncated ? " (first 1,000 shown)" : ""}`), grid(d.columns, d.rows)); }
+    try { const d = await api("sql", {sql: sql.value}); put(out, h("p", {class:"note"}, `${d.rows.length} rows${d.truncated ? ` (first ${d.rows.length.toLocaleString("en")} shown)` : ""}`), grid(d.columns, d.rows)); }
     catch (e) { put(out, h("p", {class:"status err"}, e.message)); }
   };
   sql.addEventListener("keydown", e => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") run(); });
@@ -1623,6 +1690,7 @@ function drawTabs(active){
   put(document.getElementById("tabs"), ...TABS.map(([k, href, t]) => h("a", {href, "aria-current": active === k ? "page" : null}, t, k === "inbox" && n ? h("span", {class:"badge"}, n) : null)));
 }
 async function route(){
+  takeToken();
   const raw = location.hash.replace(/^#\/?/, "");
   const [pathPart, query] = raw.split("?");
   const parts = pathPart.split("/").filter(Boolean).map(decodeURIComponent);
@@ -1657,6 +1725,148 @@ MIGRATION_FILES = r"""-- migration: 0001-initial.sql
 -- every ledger made before migrations existed is schema 1, and a new ledger is made from references/schema.sql
 -- directly, so this file is never applied. Each later file NNNN-<slug>.sql takes a ledger from schema NNNN-1 to
 -- NNNN; see "Changing the schema" in README.md.
+-- migration: 0002-checks-and-columns.sql
+-- url, path, hash and code checks; repositories.allow_outside_root; finding_locations.excerpt_redacted
+-- Plan P-0001 steps 44-47 and 51. Ledger links are http(s) only (a javascript: or other link is not data worth
+-- keeping: it is set to NULL here, and fill-refs writes permalinks again from permalink_template); repository and
+-- location paths, commit hashes and review codes get CHECKs, so a row that breaks one makes this migration fail
+-- and change nothing (fix the row, then run migrate again). Five tables are rebuilt with SQLite's recipe: create
+-- <table>_new, copy the rows, drop the old table, rename the new one, re-create its indexes.
+
+UPDATE repositories SET permalink_template = NULL
+  WHERE permalink_template IS NOT NULL AND permalink_template NOT GLOB 'https://*' AND permalink_template NOT GLOB 'http://*';
+UPDATE reviews SET summary_doc_url = NULL
+  WHERE summary_doc_url IS NOT NULL AND summary_doc_url NOT GLOB 'https://*' AND summary_doc_url NOT GLOB 'http://*';
+UPDATE finding_locations SET permalink = NULL
+  WHERE permalink IS NOT NULL AND permalink NOT GLOB 'https://*' AND permalink NOT GLOB 'http://*';
+UPDATE step_commits SET pr_url = NULL
+  WHERE pr_url IS NOT NULL AND pr_url NOT GLOB 'https://*' AND pr_url NOT GLOB 'http://*';
+
+CREATE TABLE repositories_new (
+  id             INTEGER PRIMARY KEY,
+  name           TEXT NOT NULL UNIQUE,   -- short name used in the brief
+  path           TEXT,                   -- relative to the project root, '.' for the root repo
+  remote_url     TEXT,
+  default_branch TEXT,
+  permalink_template TEXT CHECK (permalink_template IS NULL OR permalink_template GLOB 'https://*'
+                                 OR permalink_template GLOB 'http://*'),
+                                         -- e.g. https://github.com/o/r/blob/{sha}/{path}#L{start}-L{end}
+  notes          TEXT,
+  created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  allow_outside_root INTEGER NOT NULL DEFAULT 0 CHECK (allow_outside_root IN (0,1)),
+                                         -- 1 = the owner listed this repo explicitly as living outside the
+                                         -- project root (a sibling checkout); its path may then be absolute or
+                                         -- start with ../. Otherwise ledger.py refuses to read outside the root.
+  -- path: no leading -, no control characters; and unless allow_outside_root, relative (no leading /, no
+  -- backslash) with no .. segment
+  CHECK (path IS NULL OR (path NOT GLOB '-*' AND (path NOT GLOB '*[' || char(1) || '-' || char(31) || char(127) || ']*')
+         AND (allow_outside_root = 1 OR (path NOT GLOB '/*' AND path NOT GLOB '*\*' AND path <> '..'
+              AND path NOT GLOB '../*' AND path NOT GLOB '*/../*' AND path NOT GLOB '*/..'))))
+);
+INSERT INTO repositories_new(id, name, path, remote_url, default_branch, permalink_template, notes, created_at)
+  SELECT id, name, path, remote_url, default_branch, permalink_template, notes, created_at FROM repositories;
+DROP TABLE repositories;
+ALTER TABLE repositories_new RENAME TO repositories;
+
+CREATE TABLE reviews_new (
+  id                    INTEGER PRIMARY KEY,
+  code                  TEXT NOT NULL UNIQUE    -- R-0001
+                          CHECK (code GLOB 'R-[0-9][0-9][0-9][0-9]*' AND code NOT GLOB 'R-*[^0-9]*'),
+  title                 TEXT NOT NULL,
+  scope                 TEXT NOT NULL CHECK (scope IN
+                          ('full','partial','targeted','second','fix-verification')),
+  status                TEXT NOT NULL DEFAULT 'planning' CHECK (status IN
+                          ('planning','awaiting-approval','approved','running','verifying',
+                           'indexing','consolidating','handed-off','abandoned')),
+  request_text          TEXT,                   -- what the owner asked for, in their words
+  requested_by_actor_id INTEGER REFERENCES actors(id),
+  manager_actor_id      INTEGER REFERENCES actors(id),
+  approved_by_actor_id  INTEGER REFERENCES actors(id),
+  approved_at           TEXT,
+  previous_review_id    INTEGER REFERENCES reviews(id),  -- the review this one follows up
+  skill_version         TEXT,
+  review_folder         TEXT,                   -- scratch folder used (may not persist)
+  summary_doc_url       TEXT CHECK (summary_doc_url IS NULL OR summary_doc_url GLOB 'https://*'
+                                    OR summary_doc_url GLOB 'http://*'),
+  verdict               TEXT,
+  summary               TEXT,
+  started_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  completed_at          TEXT,
+  updated_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+INSERT INTO reviews_new(id, code, title, scope, status, request_text, requested_by_actor_id, manager_actor_id, approved_by_actor_id, approved_at, previous_review_id, skill_version, review_folder, summary_doc_url, verdict, summary, started_at, completed_at, updated_at)
+  SELECT id, code, title, scope, status, request_text, requested_by_actor_id, manager_actor_id, approved_by_actor_id, approved_at, previous_review_id, skill_version, review_folder, summary_doc_url, verdict, summary, started_at, completed_at, updated_at FROM reviews;
+DROP TABLE reviews;
+ALTER TABLE reviews_new RENAME TO reviews;
+
+CREATE TABLE review_repositories_new (
+  review_id     INTEGER NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
+  repository_id INTEGER NOT NULL REFERENCES repositories(id),
+  commit_sha    TEXT NOT NULL CHECK ((length(commit_sha) = 40 OR length(commit_sha) = 64)
+                                   AND commit_sha NOT GLOB '*[^0-9a-f]*'),  -- full hash, lowercase hex
+  branch        TEXT,
+  commit_time   TEXT,
+  commit_subject TEXT,
+  tag_name      TEXT,                     -- e.g. review/R-0001, keeps the commit reachable
+  tag_pushed    INTEGER NOT NULL DEFAULT 0 CHECK (tag_pushed IN (0,1)),
+  is_dirty      INTEGER NOT NULL DEFAULT 0 CHECK (is_dirty IN (0,1)),
+  dirty_note    TEXT,                     -- what was uncommitted, if anything
+  dirty_patch_path TEXT,                  -- saved `git diff` of uncommitted changes, if any
+  PRIMARY KEY (review_id, repository_id)
+);
+INSERT INTO review_repositories_new(review_id, repository_id, commit_sha, branch, commit_time, commit_subject, tag_name, tag_pushed, is_dirty, dirty_note, dirty_patch_path)
+  SELECT review_id, repository_id, commit_sha, branch, commit_time, commit_subject, tag_name, tag_pushed, is_dirty, dirty_note, dirty_patch_path FROM review_repositories;
+DROP TABLE review_repositories;
+ALTER TABLE review_repositories_new RENAME TO review_repositories;
+
+CREATE TABLE finding_locations_new (
+  id             INTEGER PRIMARY KEY,
+  finding_id     INTEGER NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
+  repository_id  INTEGER NOT NULL REFERENCES repositories(id),
+  commit_sha     TEXT CHECK (commit_sha IS NULL OR (length(commit_sha) >= 7 AND commit_sha NOT GLOB '*[^0-9a-f]*')),
+                                            -- filled from review_repositories if left NULL
+  path           TEXT NOT NULL,             -- repo-relative, forward slashes (see the CHECK below)
+  line_start     INTEGER CHECK (line_start IS NULL OR line_start >= 1),
+  line_end       INTEGER,
+  symbol         TEXT,                      -- function, class, route, setting name
+  blob_sha       TEXT,                      -- `git rev-parse <commit>:<path>`
+  excerpt        TEXT,                      -- the cited lines, verbatim, at that commit
+  excerpt_sha256 TEXT,                      -- hash of excerpt, to detect the same code later
+  permalink      TEXT CHECK (permalink IS NULL OR permalink GLOB 'https://*' OR permalink GLOB 'http://*'),
+                                            -- e.g. https://github.com/o/r/blob/<sha>/<path>#L10-L20
+  role           TEXT NOT NULL DEFAULT 'primary' CHECK (role IN ('primary','also','test','doc','config')),
+  excerpt_redacted INTEGER NOT NULL DEFAULT 0 CHECK (excerpt_redacted IN (0,1)),
+                                            -- 1 = fill-refs masked secret-looking values in excerpt as [redacted];
+                                            -- excerpt_sha256 is still the hash of the real lines
+  CHECK (line_end IS NULL OR line_start IS NULL OR line_end >= line_start),
+  -- path: relative (no leading / or -), no backslash, no .. segment, no control characters
+  CHECK (length(path) > 0 AND path NOT GLOB '/*' AND path NOT GLOB '-*' AND path NOT GLOB '*\*'
+         AND path <> '..' AND path NOT GLOB '../*' AND path NOT GLOB '*/../*' AND path NOT GLOB '*/..'
+         AND (path NOT GLOB '*[' || char(1) || '-' || char(31) || char(127) || ']*'))
+);
+INSERT INTO finding_locations_new(id, finding_id, repository_id, commit_sha, path, line_start, line_end, symbol, blob_sha, excerpt, excerpt_sha256, permalink, role)
+  SELECT id, finding_id, repository_id, commit_sha, path, line_start, line_end, symbol, blob_sha, excerpt, excerpt_sha256, permalink, role FROM finding_locations;
+DROP TABLE finding_locations;
+ALTER TABLE finding_locations_new RENAME TO finding_locations;
+CREATE INDEX ix_locations_finding    ON finding_locations(finding_id);
+CREATE INDEX ix_locations_path       ON finding_locations(path, symbol);
+
+CREATE TABLE step_commits_new (
+  id            INTEGER PRIMARY KEY,
+  step_id       INTEGER NOT NULL REFERENCES steps(id) ON DELETE CASCADE,
+  repository_id INTEGER REFERENCES repositories(id),
+  commit_sha    TEXT NOT NULL CHECK ((length(commit_sha) = 40 OR length(commit_sha) = 64)
+                                   AND commit_sha NOT GLOB '*[^0-9a-f]*'),  -- full hash, lowercase hex
+  branch        TEXT,
+  pr_url        TEXT CHECK (pr_url IS NULL OR pr_url GLOB 'https://*' OR pr_url GLOB 'http://*'),
+  summary       TEXT,
+  committed_at  TEXT,
+  UNIQUE (step_id, commit_sha)
+);
+INSERT INTO step_commits_new(id, step_id, repository_id, commit_sha, branch, pr_url, summary, committed_at)
+  SELECT id, step_id, repository_id, commit_sha, branch, pr_url, summary, committed_at FROM step_commits;
+DROP TABLE step_commits;
+ALTER TABLE step_commits_new RENAME TO step_commits;
 """
 
 
@@ -1677,19 +1887,26 @@ SCHEMA_VERSION = MIGRATIONS[-1][0] if MIGRATIONS else 0
 BASELINE_VERSION = MIGRATIONS[0][0] if MIGRATIONS else 0  # the oldest schema migrate starts from
 
 HEX = re.compile(r"^[0-9a-f]{7,64}$")
+FULL_HEX = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+REVIEW_CODE = re.compile(r"R-[0-9]{4,}")
+SAFE_URL = re.compile(r"^https?://")  # the only links the ledger stores or the viewer draws (schema CHECKs agree)
 NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 # ---------------------------------------------------------------- database
 
-def connect(db, readonly=False):
-    if readonly:
-        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5, check_same_thread=False)
-    else:
-        con = sqlite3.connect(db, timeout=5, check_same_thread=False)
+def connect(db, readonly=False, create=False):
+    """A connection with foreign keys on, a 5 s busy timeout and sqlite3.Row rows. The file is opened through a
+    percent-encoded file: URI, so ?, # or % in the path cannot cut the name or drop the mode. readonly: mode=ro plus
+    PRAGMA query_only. Otherwise mode=rw, which refuses a missing file; only init and backups pass create=True."""
+    mode = "ro" if readonly else ("rwc" if create else "rw")
+    con = sqlite3.connect(Path(db).resolve().as_uri() + "?mode=" + mode, uri=True, timeout=5,
+                          check_same_thread=False)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys = ON")
     con.execute("PRAGMA busy_timeout = 5000")
+    if readonly:
+        con.execute("PRAGMA query_only = 1")
     return con
 
 
@@ -1965,7 +2182,7 @@ def migrate(db):
     backup = None
     if pending:
         backup = free_backup_name(db, v)
-        dest = connect(backup)
+        dest = connect(backup, create=True)
         try:
             con.backup(dest)
         finally:
@@ -2011,6 +2228,7 @@ def migrate(db):
             pass
     con.close()
     if pending:
+        set_wal(db)  # existing ledgers switch to WAL once, with their upgrade (D-0006)
         print(f"migrated {db} from schema {v} to {SCHEMA_VERSION} (a copy of the schema-{v} ledger is at {backup})")
         for ver, slug, desc, _ in pending:
             print(f"  {ver:04d}-{slug}: {desc}")
@@ -2070,26 +2288,167 @@ def plan_tool_copy(home, force):
              f"update the skill, or pass init --force to replace it.")
 
 
-GITIGNORE = "ledger.sqlite-journal\nledger.sqlite-wal\nledger.sqlite-shm\nledger.sqlite.bak-v*\nledger.py.bak\n"
+GITIGNORE = ("# The ledger runs in WAL mode: ledger.sqlite-wal and -shm exist while it is open, and dump checkpoints\n"
+             "# them into ledger.sqlite. The rest are local backups and temporary files of ledger.py.\n"
+             "ledger.sqlite-journal\nledger.sqlite-wal\nledger.sqlite-shm\nledger.sqlite.tmp\nledger.sqlite.bak-v*\n"
+             "ledger.py.bak\nledger.py.tmp\nledger.sql.tmp\n")
+TOOL_SIGNATURE = '"""Code review ledger:'  # the second line of every ledger.py this tool builds
 
 
-def init(root, db, force=False):
-    home = db.parent / "ledger.py"
-    copy = plan_tool_copy(home, force)
-    fresh = not db.exists()
-    if fresh:
-        db.parent.mkdir(parents=True, exist_ok=True)
+def looks_like_tool(path):
+    """True when path starts like a ledger.py built by this tool (its docstring within the first three lines)."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            head = [f.readline() for _ in range(3)]
+    except OSError:
+        return False
+    return any(l.startswith(TOOL_SIGNATURE) for l in head)
+
+
+def write_atomic(path, data, mode=0o600):
+    """Write bytes to path through path.tmp + fsync + os.replace, so path is either the old or the new content."""
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+        with open(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(str(tmp), str(path))
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def make_private(path, mode=0o600):
+    try:
+        if path.exists():
+            os.chmod(str(path), mode)
+    except OSError:
+        pass
+
+
+def repaired_gitignore(text):
+    """(new text, lines added) for an existing .gitignore: the owner's own lines first, then the tool's lines in
+    order; a line that is only the start of one of the tool's lines (a truncated write) is dropped."""
+    want = GITIGNORE.splitlines()
+    have = text.splitlines()
+    own = [l for l in have if l not in want and not any(w.startswith(l) for w in want)]
+    added = [l for l in want if l not in have and not l.startswith("#")]
+    return "".join(l + "\n" for l in own + want), added
+
+
+def require_ledger(db):
+    """Exit 1 with one line unless db is SQLite with a meta schema_version row."""
+    try:
         con = connect(db)
-        con.executescript(SCHEMA)
+        try:
+            ledger_version(con, db)
+        finally:
+            con.close()
+    except (LedgerError, sqlite3.DatabaseError) as e:
+        sys.exit(f"incomplete or foreign ledger at {db} ({e}); move it aside and run init again")
+
+
+def build_ledger(root, db):
+    """Create db atomically: the whole schema and the meta rows are built in db.tmp inside one transaction, then
+    renamed into place. On any failure nothing is left behind and init can simply run again."""
+    tmp = db.with_name(db.name + ".tmp")
+    side = [tmp.with_name(tmp.name + s) for s in ("", "-journal", "-wal", "-shm")]
+    for p in side:
+        if p.exists():
+            p.unlink()
+    con = None
+    try:
+        con = connect(tmp, create=True)  # created owner-only: init runs under umask 077
+        con.isolation_level = None
+        con.execute("BEGIN")
+        for stmt in split_sql(SCHEMA):
+            con.execute(stmt)
         con.execute("INSERT OR REPLACE INTO meta(key,value) VALUES ('project_name',?)", (root.name,))
         con.execute("INSERT OR REPLACE INTO meta(key,value) VALUES ('created_at',?)", (now(),))
+        con.execute("INSERT OR REPLACE INTO meta(key,value) VALUES ('ledger_location',?)", (str(db.parent),))
         stamp_meta(con, created_by=TOOL_VERSION)
-        con.commit()
+        con.execute("COMMIT")
+        con.close()
+        con = None
+        os.replace(str(tmp), str(db))
+    except (sqlite3.Error, OSError, ValueError) as e:
+        if con is not None:
+            try:
+                con.close()
+            except sqlite3.Error:
+                pass
+        for p in side:
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        sys.exit(f"init: could not create {db} ({e}); nothing was left behind, run init again")
+
+
+def set_wal(db):
+    """Switch the ledger to WAL (decision D-0006: readers never block the agent's writes). Kept in the file."""
+    try:
+        con = connect(db)
+        try:
+            con.execute("PRAGMA journal_mode = WAL")
+        finally:
+            con.close()
+    except sqlite3.Error as e:
+        print(f"note: could not switch {db} to WAL ({e}); it keeps its journal mode", file=sys.stderr)
+
+
+def init(root, db, force=False, copy_tool=True, gitignore=True):
+    """Create the ledger (or check and refresh an existing one), copy this ledger.py beside it and write its
+    .gitignore. copy_tool / gitignore are off for a ledger file that is not in a ledger folder (--db elsewhere).
+    Files are created owner-only (umask 077; the folder 0700, the ledger 0600)."""
+    old = os.umask(0o077)
+    try:
+        _init(root, db, force, copy_tool, gitignore)
+    finally:
+        os.umask(old)
+
+
+def _init(root, db, force, copy_tool, gitignore):
+    home = db.parent / "ledger.py"
+    if copy_tool and home.exists() and db.parent.name != ".code-review" and not looks_like_tool(home):
+        sys.exit(f"{home} is not a ledger.py made by this tool; left it unchanged. Choose another folder for the "
+                 f"ledger.")
+    copy = plan_tool_copy(home, force) if copy_tool else None  # may exit, before anything is written
+    fresh = not db.exists()
+    if not fresh:
+        require_ledger(db)
+    try:
+        db.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        sys.exit(f"init: could not create {db.parent} ({e})")
+    if db.parent.name == ".code-review":
+        make_private(db.parent, 0o700)
+    if copy is not None:  # first, so a ledger never exists without the project's copy of the tool
+        note, keep = copy
+        try:
+            if keep:
+                write_atomic(home.with_name("ledger.py.bak"), home.read_bytes())
+            write_atomic(home, Path(__file__).resolve().read_bytes())
+        except OSError as e:
+            sys.exit(f"init: could not copy ledger.py to {home} ({e}); nothing else was changed")
+        if note:
+            print(note)
+        print(f"copied ledger.py to {home}")
+    if fresh:
+        build_ledger(root, db)
+        set_wal(db)
         print(f"created {db}")
+        print(f"ledger at {db} (created)")
     else:
         con = open_ledger(db, write=True)
         v = ledger_version(con, db)
         con.isolation_level = None
+        moved = None
         try:
             con.execute("BEGIN IMMEDIATE")
             notes = sync_views_and_triggers(con)
@@ -2099,54 +2458,170 @@ def init(root, db, force=False):
                 con.close()
                 sys.exit(drift_message(db, problems))
             stamp_meta(con, created_by=UNKNOWN_CREATOR)
+            was = con.execute("SELECT value FROM meta WHERE key='ledger_location'").fetchone()
+            if was is None or was[0] != str(db.parent):
+                moved = was[0] if was else None
+                con.execute("INSERT OR REPLACE INTO meta(key,value) VALUES ('ledger_location',?)", (str(db.parent),))
             con.execute("COMMIT")
         except sqlite3.Error as e:
             if con.in_transaction:
                 con.execute("ROLLBACK")
             con.close()
             sys.exit(f"init: could not update {db}: {e}")
+        con.close()
+        set_wal(db)
         for note in notes:
             print(f"note: {note}")
+        if moved:
+            print(f"note: the ledger was last set up at {moved}; it now records {db.parent}")
         print(f"{db} already exists (schema {v})")
-    if copy is not None:
-        import shutil
-        note, keep = copy
-        if keep:
-            shutil.copyfile(home, home.with_name("ledger.py.bak"))
-        if note:
-            print(note)
-        shutil.copyfile(Path(__file__).resolve(), home)
-        print(f"copied ledger.py to {home}")
-    gi = db.parent / ".gitignore"
-    if not gi.exists():
-        gi.write_text(GITIGNORE)
-    else:  # the tool's own file: add any line a newer version ignores, keep everything else
-        have = gi.read_text().splitlines()
-        missing = [l for l in GITIGNORE.splitlines() if l not in have]
-        if missing:
-            text = gi.read_text()
-            gi.write_text(text + ("" if text.endswith("\n") or not text else "\n") + "\n".join(missing) + "\n")
-            print(f"added {', '.join(missing)} to {gi}")
-    con.close()
+        print(f"ledger at {db} (attached to existing)")
+    for p in (db, db.with_name(db.name + "-wal"), db.with_name(db.name + "-shm"), db.with_suffix(".sql")):
+        make_private(p)
+    if db.parent.name == ".code-review" and (db.parent / "patches").is_dir():
+        make_private(db.parent / "patches", 0o700)
+        for p in (db.parent / "patches").iterdir():
+            make_private(p)
+    if gitignore:
+        gi = db.parent / ".gitignore"
+        try:
+            if not gi.exists():
+                write_atomic(gi, GITIGNORE.encode(), 0o600)
+            else:
+                text = gi.read_text(encoding="utf-8", errors="replace")
+                new, added = repaired_gitignore(text)
+                if new != text:
+                    write_atomic(gi, new.encode(), 0o600)
+                    print(f"repaired {gi}" + (f": added {', '.join(added)}" if added else ""))
+        except OSError as e:
+            sys.exit(f"init: could not write {gi} ({e})")
 
 
-def find_root(start, explicit=False):
-    """The project this ledger belongs to: the nearest folder at or above `start` that already has
-    .code-review/ledger.sqlite; otherwise the top of the git repository containing `start`; otherwise `start`.
-    An explicit --root is used as given."""
-    if explicit:
-        return start
-    for d in (start, *start.parents):
-        if (d / ".code-review" / "ledger.sqlite").exists():
-            return d
+def _owner_problem(path):
+    """Why a found ledger (file or folder) must not be used without --root: another user's, or writable by
+    everyone. None when it is fine (or the platform has no user ids)."""
+    if not hasattr(os, "getuid"):
+        return None
     try:
-        top = subprocess.run(["git", "-C", str(start), "rev-parse", "--show-toplevel"],
-                             capture_output=True, timeout=10)
-        if top.returncode == 0 and top.stdout.strip():
-            return Path(top.stdout.decode().strip()).resolve()
-    except (OSError, subprocess.SubprocessError):
-        pass
-    return start
+        st = os.stat(str(path))
+    except OSError:
+        return None
+    if st.st_uid != os.getuid():
+        return f"{path} belongs to another user (uid {st.st_uid})"
+    if st.st_mode & 0o002:
+        return f"{path} can be changed by every user"
+    return None
+
+
+def _check_owner(ledger_dir):
+    for p in (ledger_dir / "ledger.sqlite", ledger_dir):
+        why = _owner_problem(p)
+        if why:
+            sys.exit(f"{why}; refusing to use that ledger. Pass --root DIR (and --db FILE) to choose the project "
+                     f"and ledger explicitly.")
+
+
+def _git_tops(start):
+    """(worktree top, main checkout top, note) for start. Outside git both tops are None; note says why git could
+    not be asked (missing, timed out, failed), else None."""
+    try:
+        p = subprocess.run(["git", "-C", str(start), "rev-parse", "--show-toplevel", "--git-common-dir"],
+                           capture_output=True, timeout=10)
+    except FileNotFoundError:
+        return None, None, "git not available"
+    except subprocess.TimeoutExpired:
+        return None, None, "git timed out"
+    except OSError as e:
+        return None, None, f"git could not run ({e})"
+    if p.returncode != 0:
+        err = p.stderr.decode("utf-8", "replace").strip()
+        if "not a git repository" in err:
+            return None, None, None
+        return None, None, f"git failed ({err.splitlines()[0] if err else p.returncode})"
+    out = p.stdout.decode("utf-8", "replace").splitlines()
+    if not out:
+        return None, None, "git gave no top folder"
+    top = Path(out[0]).resolve()
+    main = top
+    if len(out) > 1:
+        common = Path(out[1])
+        common = (common if common.is_absolute() else start / common).resolve()
+        if common.name == ".git":
+            main = common.parent
+    return top, main, None
+
+
+def _lists_repo(ledger_root, tops):
+    """True when the ledger at ledger_root/.code-review lists one of tops in repositories.path."""
+    db = ledger_root / ".code-review" / "ledger.sqlite"
+    try:
+        con = connect(db, readonly=True)
+        try:
+            paths = [r[0] for r in con.execute("SELECT path FROM repositories")]
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return False
+    for p in paths:
+        try:
+            if (ledger_root / (p or ".")).resolve() in tops:
+                return True
+        except (OSError, RuntimeError):
+            continue
+    return False
+
+
+def resolve_root(start, explicit=False, script=None):
+    """(project root, how it was found). how is 'explicit' (--root given), 'script' (this ledger.py is the copy in a
+    project's .code-review/), 'ledger' (an existing ledger found upward), 'git' (the top of the git repository) or
+    'start' (no git and no ledger: the start folder; init then requires --root).
+
+    Inside git the walk upward for an existing .code-review/ledger.sqlite stops at the repository top; for a git
+    worktree the main checkout's ledger is used; a ledger above the repository top is used only when its
+    repositories table lists that top. Outside git (or when git cannot run) the nearest ledger upward is used.
+    A found ledger owned by another user, or writable by everyone, is refused."""
+    start = Path(start)
+    if explicit:
+        return start, "explicit"
+    if script is not None:
+        here = Path(script).resolve().parent
+        if here.name == ".code-review" and (here / "ledger.sqlite").exists():
+            _check_owner(here)
+            return here.parent, "script"
+
+    def has(d):
+        return (d / ".code-review" / "ledger.sqlite").exists()
+
+    top, main, note = _git_tops(start)
+    if top is None:
+        for d in (start, *start.parents):
+            if has(d):
+                _check_owner(d / ".code-review")
+                return d, "ledger"
+        if note:
+            print(f"note: {note}; using {start} as the project root", file=sys.stderr)
+        return start, "start"
+    for d in (start, *start.parents):
+        if has(d):
+            _check_owner(d / ".code-review")
+            return d, "ledger"
+        if d == top or top not in d.parents:
+            break
+    if main != top and has(main):
+        _check_owner(main / ".code-review")
+        return main, "ledger"
+    for d in main.parents:
+        if has(d):
+            if _lists_repo(d, {top, main}):
+                _check_owner(d / ".code-review")
+                return d, "ledger"
+            break
+    return main, "git"
+
+
+def find_root(start, explicit=False, script=None):
+    """The project root for start (see resolve_root)."""
+    return resolve_root(start, explicit, script)[0]
 
 
 def now():
@@ -2214,8 +2689,21 @@ def check_schema(con):
 
 # ---------------------------------------------------------------- git
 
-def repo_dir(root, repo_path):
-    return (root / (repo_path or ".")).resolve()
+def repo_dir(root, repo_path, allow_outside=False):
+    """The folder of a repositories row: root/path, resolved (symlinks too). It must be the project root or below it
+    unless the repository is listed explicitly as outside the root (repositories.allow_outside_root, D-0007)."""
+    top = Path(root).resolve()
+    d = (top / (repo_path or ".")).resolve()
+    if not allow_outside and d != top and top not in d.parents:
+        raise RuntimeError("repository path outside the project root")
+    return d
+
+
+def bad_location_path(path):
+    """True for a finding_locations.path that must not reach git: empty, absolute, a backslash, a leading -, a ..
+    segment, or a control character (the schema CHECK refuses the same on insert)."""
+    return (not path or path.startswith(("/", "-")) or "\\" in path or ".." in path.split("/")
+            or any(ord(c) < 32 or ord(c) == 127 for c in path))
 
 
 def git(cwd, *args, timeout=15):
@@ -2225,18 +2713,67 @@ def git(cwd, *args, timeout=15):
     return p.stdout
 
 
-def file_at(root, repo_path, sha, path):
+def file_at(root, repo_path, sha, path, allow_outside=False):
+    """The file's text at commit sha. A refused path gives the fixed error 'bad path' before git runs, so no message
+    says whether some file outside the repository exists."""
     if not HEX.match(sha or ""):
         raise RuntimeError("commit is not a hex hash")
-    if path.startswith("-") or "\x00" in path:
+    if bad_location_path(path or ""):
         raise RuntimeError("bad path")
-    return git(repo_dir(root, repo_path), "show", f"{sha}:{path}").decode("utf-8", "replace")
+    return git(repo_dir(root, repo_path, allow_outside), "show", f"{sha}:{path}").decode("utf-8", "replace")
 
 
 def location(con, loc_id):
-    return one(con, """SELECT fl.*, rp.path AS repo_path, rp.name AS repo_name, rp.permalink_template
-                       FROM finding_locations fl JOIN repositories rp ON rp.id = fl.repository_id
-                       WHERE fl.id = ?""", (loc_id,))
+    loc = one(con, """SELECT fl.*, rp.path AS repo_path, rp.name AS repo_name, rp.permalink_template
+                      FROM finding_locations fl JOIN repositories rp ON rp.id = fl.repository_id
+                      WHERE fl.id = ?""", (loc_id,))
+    if loc is not None:  # allow_outside_root is schema 2; an older ledger read as it is has none (so: not allowed)
+        try:
+            loc["allow_outside_root"] = con.execute("SELECT allow_outside_root FROM repositories WHERE id=?",
+                                                    (loc["repository_id"],)).fetchone()[0]
+        except sqlite3.OperationalError:
+            loc["allow_outside_root"] = 0
+    return loc
+
+
+# Common secret shapes masked in excerpts by fill-refs (SEC-M7). Each match keeps its name and quotes and has the
+# value replaced by REDACTED; line breaks are kept so the excerpt still lines up with line_start..line_end.
+REDACTED = "[redacted]"
+_SECRET_NAME = r"[A-Za-z0-9_.-]*(?:password|passwd|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?key|credentials?)[A-Za-z0-9_.-]*"
+SECRET_PATTERNS = [
+    # PEM blocks (private keys and the like): the lines between BEGIN and END (or the excerpt's end)
+    re.compile(r"(-----BEGIN [A-Z0-9 ]+-----)(.*?)(-----END [A-Z0-9 ]+-----|\Z)", re.S),
+    # name = "value" / name: 'value' / "name": "value" (any case), a quoted literal of 4+ characters
+    re.compile(r"(?i)(\b" + _SECRET_NAME + r"[\"']?\s*(?:=|:|=>)\s*)([\"'])([^\"'\n]{4,})(\2)"),
+    # NAME=value lines of env files and shell (upper-case names), unquoted
+    re.compile(r"(?m)^(\s*(?:export\s+)?[A-Z0-9_]*(?:PASSWORD|PASSWD|SECRET|TOKEN|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|"
+               r"CREDENTIALS?)[A-Z0-9_]*\s*=\s*)([^\s'\"#][^\s#]{3,})(\s*)$"),
+    # well-known key shapes
+    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),                     # AWS access key id
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,255}\b"),                 # GitHub tokens
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{22,255}\b"),
+    re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}"),                    # Slack tokens
+    re.compile(r"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\b"),      # Stripe
+    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}"),                           # API keys of the sk-... shape
+    re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"),                         # Google API keys
+]
+
+
+def mask_secrets(text):
+    """(text with secret-looking values replaced by [redacted], whether anything was masked)."""
+    out = text
+
+    def pem(m):
+        inner = m.group(2)
+        body = "\n".join(REDACTED if l.strip() else l for l in inner.split("\n"))
+        return m.group(1) + body + m.group(3)
+
+    out = SECRET_PATTERNS[0].sub(pem, out)
+    out = SECRET_PATTERNS[1].sub(lambda m: m.group(1) + m.group(2) + REDACTED + m.group(4), out)
+    out = SECRET_PATTERNS[2].sub(lambda m: m.group(1) + REDACTED + m.group(3), out)
+    for p in SECRET_PATTERNS[3:]:
+        out = p.sub(REDACTED, out)
+    return out, out != text
 
 
 def source(root, con, loc_id, context=8):
@@ -2246,16 +2783,23 @@ def source(root, con, loc_id, context=8):
     out = {k: loc[k] for k in ("path", "commit_sha", "line_start", "line_end", "symbol",
                                "excerpt", "permalink", "repo_name", "blob_sha")}
     a, b = loc["line_start"], loc["line_end"] or loc["line_start"]
-    out["git_command"] = (f"git -C {loc['repo_path'] or '.'} show {loc['commit_sha']}:{loc['path']}"
-                          + (f" | sed -n '{a},{b}p'" if a else ""))
+    # One command for show, /api/source and the viewer: v_code_refs builds it with every argument shell-quoted.
+    r = con.execute("SELECT git_command FROM v_code_refs WHERE location_id=?", (loc_id,)).fetchone()
+    out["git_command"] = r[0] if r else None
+    out["excerpt_redacted"] = bool(loc.get("excerpt_redacted"))
     try:
-        text = file_at(root, loc["repo_path"], loc["commit_sha"], loc["path"]).splitlines()
+        text = file_at(root, loc["repo_path"], loc["commit_sha"], loc["path"],
+                       bool(loc.get("allow_outside_root"))).splitlines()
         lo = max(1, (a or 1) - context)
         hi = min(len(text), (b or a or min(len(text), 40)) + context)
         out["lines"] = [{"n": i, "text": text[i - 1]} for i in range(lo, hi + 1)]
         out["source"] = "git"
         if loc["excerpt"] is not None and a:
-            out["excerpt_matches"] = "\n".join(text[a - 1:b]) == loc["excerpt"].rstrip("\n")
+            real = "\n".join(text[a - 1:b])
+            if loc.get("excerpt_redacted"):  # the excerpt is masked; its hash is of the real lines
+                out["excerpt_matches"] = hashlib.sha256(real.encode()).hexdigest() == loc["excerpt_sha256"]
+            else:
+                out["excerpt_matches"] = real == loc["excerpt"].rstrip("\n")
     except Exception as e:  # history rewritten, repo missing, or not a git checkout
         out["git_error"] = str(e)
         out["source"] = "excerpt" if loc["excerpt"] is not None else "none"
@@ -2272,72 +2816,165 @@ def fill_refs(root, con, review_code=None):
     args = ()
     if review_code:
         sql += " AND r.code = ?"; args = (review_code,)
-    done = failed = 0
+    failed = 0
+    updates = []  # every git call happens first; the writes then go in one short transaction (DB-M8)
     for (lid,) in con.execute(sql, args).fetchall():
         loc = location(con, lid)
+        where = f"ref {lid} {loc['path']}@{loc['commit_sha'][:10]}"
+        outside = bool(loc["allow_outside_root"])
         try:
-            text = file_at(root, loc["repo_path"], loc["commit_sha"], loc["path"])
+            text = file_at(root, loc["repo_path"], loc["commit_sha"], loc["path"], outside)
         except Exception as e:
-            print(f"ref {lid} {loc['path']}@{loc['commit_sha'][:10]}: {e}"); failed += 1; continue
+            print(f"{where}: {e}"); failed += 1; continue
         lines = text.splitlines()
         a, b = loc["line_start"], loc["line_end"]
         if a is None and loc["symbol"]:
             for i, t in enumerate(lines, 1):
                 if loc["symbol"] in t:
                     a = b = i; break
+            else:
+                print(f"{where}: symbol {loc['symbol']!r} not found"); failed += 1; continue
+        if a and (b or a) > len(lines):
+            print(f"{where}: lines {a}-{b or a} are past the end of the file ({len(lines)} lines)")
+            failed += 1; continue
         upd = {}
         if a:
             b = b or a
             excerpt = "\n".join(lines[a - 1:b])
             upd.update(line_start=a, line_end=b)
             if loc["excerpt"] is None:
-                upd.update(excerpt=excerpt, excerpt_sha256=hashlib.sha256(excerpt.encode()).hexdigest())
+                shown, masked = mask_secrets(excerpt)
+                upd.update(excerpt=shown, excerpt_sha256=hashlib.sha256(excerpt.encode()).hexdigest(),
+                           excerpt_redacted=1 if masked else 0)
         if loc["blob_sha"] is None:
             try:
-                upd["blob_sha"] = git(repo_dir(root, loc["repo_path"]), "rev-parse",
+                upd["blob_sha"] = git(repo_dir(root, loc["repo_path"], outside), "rev-parse",
                                       f"{loc['commit_sha']}:{loc['path']}").decode().strip()
             except Exception:
                 pass
         if loc["permalink"] is None and loc["permalink_template"]:
-            upd["permalink"] = (loc["permalink_template"].replace("{sha}", loc["commit_sha"])
-                                .replace("{path}", loc["path"]).replace("{start}", str(a or 1))
-                                .replace("{end}", str(b or a or 1)))
+            link = (loc["permalink_template"].replace("{sha}", loc["commit_sha"])
+                    .replace("{path}", loc["path"]).replace("{start}", str(a or 1))
+                    .replace("{end}", str(b or a or 1)))
+            if SAFE_URL.match(link):
+                upd["permalink"] = link
+            else:
+                print(f"{where}: the permalink template does not give an http(s) link; no permalink written")
         if upd:
-            con.execute(f"UPDATE finding_locations SET {', '.join(k + '=?' for k in upd)} WHERE id=?",
-                        (*upd.values(), lid))
-            done += 1
-    con.commit()
-    print(f"filled {done} references, {failed} could not be read from git")
+            updates.append((lid, upd))
+    if updates:
+        if not con.in_transaction:  # a caller's own open transaction is simply continued
+            con.execute("BEGIN IMMEDIATE")
+        try:
+            for lid, upd in updates:
+                con.execute(f"UPDATE finding_locations SET {', '.join(k + '=?' for k in upd)} WHERE id=?",
+                            (*upd.values(), lid))
+            con.commit()
+        except BaseException:
+            con.rollback()
+            raise
+    print(f"filled {len(updates)} references, {failed} could not be read from git")
     return failed
 
 
+def existing_tag(d, tag):
+    """The commit a tag points at in repository d, or None when there is no such tag. Any other git problem (not a
+    repository, git missing) raises RuntimeError."""
+    if not d.is_dir():
+        raise RuntimeError(f"no folder {d}")
+    git(d, "rev-parse", "--git-dir")  # raises when d is not a git repository
+    p = subprocess.run(["git", "-C", str(d), "rev-parse", "-q", "--verify", f"refs/tags/{tag}^{{commit}}"],
+                       capture_output=True, timeout=15)
+    if p.returncode == 0:
+        return p.stdout.decode().strip()
+    if p.returncode == 1 and not p.stdout.strip():
+        return None
+    raise RuntimeError(p.stderr.decode("utf-8", "replace").strip() or "git rev-parse failed")
+
+
 def tag_review(root, con, code):
+    """Create the local annotated tag review/<code> on each reviewed commit and record it. Tags stay local
+    (D-0002): nothing is pushed. Returns 1 when a repository is left untagged, else 0."""
+    if not REVIEW_CODE.fullmatch(code or ""):
+        sys.exit(f"tag-review: {code!r} is not a review code like R-0001")
     rv = one(con, "SELECT id FROM reviews WHERE code=?", (code,))
     if not rv:
         sys.exit(f"no review {code}")
     tag = f"review/{code}"
-    for r in rows(con, """SELECT rr.repository_id, rr.commit_sha, rp.path, rp.name FROM review_repositories rr
-                          JOIN repositories rp ON rp.id = rr.repository_id WHERE rr.review_id=?""", (rv["id"],)):
-        d = repo_dir(root, r["path"])
+    repos = rows(con, """SELECT rr.repository_id, rr.commit_sha, rp.path, rp.name, rp.allow_outside_root
+                         FROM review_repositories rr JOIN repositories rp ON rp.id = rr.repository_id
+                         WHERE rr.review_id=? ORDER BY rp.id""", (rv["id"],))
+    if not repos:
+        sys.exit(f"review {code} has no repositories; nothing to tag (record them in review_repositories)")
+    left = 0
+    for r in repos:
+        sha = r["commit_sha"] or ""
+        if not FULL_HEX.fullmatch(sha):
+            print(f"{r['name']}: commit {sha!r} is not a full commit hash; not tagged", file=sys.stderr)
+            left += 1; continue
         try:
-            existing = git(d, "rev-parse", "-q", "--verify", f"refs/tags/{tag}^{{commit}}").decode().strip()
-        except RuntimeError:
-            existing = None
-        if existing and existing != r["commit_sha"]:
-            print(f"{r['name']}: tag {tag} already points at {existing[:10]}; left alone"); continue
-        if not existing:
-            git(d, "tag", "-a", tag, r["commit_sha"], "-m", f"Commit reviewed in {code}")
+            d = repo_dir(root, r["path"], bool(r["allow_outside_root"]))
+            existing = existing_tag(d, tag)
+            if existing and existing != sha:
+                print(f"{r['name']}: tag {tag} already points at {existing[:10]}; left alone")
+                left += 1; continue
+            if not existing:
+                git(d, "tag", "-a", "-m", f"Commit reviewed in {code}", "--", tag, sha)
+        except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+            print(f"{r['name']}: not tagged: {e}", file=sys.stderr)
+            left += 1; continue
+        # recorded right away, in its own short transaction, so a later repository's failure cannot lose it
         con.execute("UPDATE review_repositories SET tag_name=? WHERE review_id=? AND repository_id=?",
                     (tag, rv["id"], r["repository_id"]))
-        print(f"{r['name']}: {tag} -> {r['commit_sha'][:10]}  (push with: git -C {r['path'] or '.'} push origin {tag})")
-    con.commit()
+        con.commit()
+        hint = f"git -C {shlex.quote(r['path'] or '.')} push origin {shlex.quote(tag)}"
+        print(f"{r['name']}: {tag} -> {sha[:10]}  (push with: {hint})")
+    if left:
+        print(f"tag-review {code}: {left} of {len(repos)} repositories not tagged", file=sys.stderr)
+    return 1 if left else 0
+
+
+DUMP_HEADER = "-- ledger.py dump: a text copy of the ledger for diffs; rebuild with: sqlite3 new.sqlite < ledger.sql"
 
 
 def dump(con, db):
+    """Write <db>.sql: one consistent snapshot (a read transaction around iterdump), written to <db>.sql.tmp,
+    fsynced and renamed over the old dump, so a failed dump leaves the previous one intact. A WAL ledger is
+    checkpointed first so the .sqlite file itself holds every commit. Refuses to overwrite a .sql file that this
+    command did not write (its first line is not DUMP_HEADER, nor iterdump's own first line, which older dumps had)."""
     out = db.with_suffix(".sql")
-    with open(out, "w", encoding="utf-8") as f:
-        for line in con.iterdump():
-            f.write(line + "\n")
+    if out.exists():
+        with open(out, encoding="utf-8", errors="replace") as f:
+            first = f.readline().rstrip("\n")
+        if first not in (DUMP_HEADER, "BEGIN TRANSACTION;"):
+            sys.exit(f"{out} was not written by ledger.py dump (its first line is not the dump header); left it "
+                     f"unchanged. Move it aside, or pass --db for a ledger whose .sql name is free.")
+    try:
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except sqlite3.Error:
+        pass  # a reader elsewhere: the dump below is still complete
+    tmp = out.with_name(out.name + ".tmp")
+    if con.in_transaction:
+        con.commit()
+    con.execute("BEGIN")
+    try:
+        con.execute("SELECT count(*) FROM sqlite_master").fetchone()  # the snapshot starts here
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with open(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(DUMP_HEADER + "\n")
+            for line in con.iterdump():
+                f.write(line + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(str(tmp), str(out))
+    except OSError as e:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        sys.exit(f"dump: could not write {out} ({e}); the previous dump is unchanged")
+    finally:
+        con.rollback()
     print(f"wrote {out}")
 
 
@@ -2346,16 +2983,101 @@ def dump(con, db):
 LABEL_TABLES = ("domains", "themes")
 
 
+ROUTE_SECONDS = 3  # a viewer page read that runs longer is stopped (the SQL box has its own SQL_SECONDS)
+ANSWER_BUSY_MS = 3000  # how long a gate answer waits for another writer before it reports the ledger busy
+TOO_LONG = "The query took too long (over {} s); add a LIMIT or a WHERE."
+
+
+def with_deadline(con, seconds):
+    """Stop any statement on con that runs past `seconds` from now (it raises OperationalError 'interrupted').
+    Returns a function that tells whether the deadline was what stopped it."""
+    from time import monotonic
+    end = monotonic() + seconds
+    con.set_progress_handler(lambda: 1 if monotonic() > end else 0, 10_000)
+    return lambda: monotonic() > end
+
+
 def api(root, db, path, qs, body):
-    con = connect(db)
+    """One viewer API request. Each request opens its own connection and closes it when the answer is built:
+    sqlite3 connections are not shared between the server's threads, and a fresh one always sees the agent's latest
+    commit. That connection is read-only (mode=ro, query_only) for every route and stops after ROUTE_SECONDS; only
+    the gate answer route opens a second, writable connection of its own. A missing ledger is a 503 and is never
+    created."""
+    if not Path(db).exists():
+        return {"error": "ledger not found"}, 503
+    con = connect(db, readonly=True)
+    timed_out = with_deadline(con, ROUTE_SECONDS)
     try:
         return route(root, db, con, path, qs, body)
+    except sqlite3.OperationalError as e:
+        if "interrupted" in str(e) and timed_out():
+            return {"error": TOO_LONG.format(ROUTE_SECONDS)}, 400
+        raise
     finally:
         con.close()
 
 
+def answer_gate(db, code, body):
+    """The owner's answer to an open gate, from the viewer. Read and write happen in one BEGIN IMMEDIATE transaction
+    on a writable connection of its own, so two answers cannot both be reported saved: the loser, or an answer to a
+    gate answered meanwhile (in chat, say), gets 409. If another writer holds the ledger past ANSWER_BUSY_MS the
+    answer is not saved and the owner is told to try again (503); the page keeps what they typed."""
+    busy = {"error": "The ledger is busy; your answer was not saved, try again."}, 503
+    try:
+        w = connect(db)
+    except sqlite3.OperationalError:
+        return {"error": "ledger not found"}, 503
+    w.isolation_level = None
+    try:
+        w.execute(f"PRAGMA busy_timeout = {int(ANSWER_BUSY_MS)}")
+        try:
+            w.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e) or "busy" in str(e):
+                return busy
+            raise
+        try:
+            g = one(w, "SELECT * FROM gates WHERE code=?", (code,))
+            if not g:
+                return {"error": "no such gate"}, 404
+            if g["status"] != "open":
+                return {"error": "This question was already answered."}, 409
+            val = (body.get("answer_value") or "").strip() or None
+            txt = (body.get("answer_text") or "").strip() or None
+            opts = [o.get("value") for o in json.loads(g["options"] or "[]")]
+            if val is not None and val not in opts:
+                return {"error": "That choice is not one of the options."}, 400
+            if val is None and not txt:
+                return {"error": "Choose an option or write an answer."}, 400
+            if txt and not g["allow_text"] and val is None:
+                return {"error": "Choose one of the options."}, 400
+            cur = w.execute("""UPDATE gates SET status='answered', answer_value=?, answer_text=?,
+                               answered_by='owner', answered_via='viewer' WHERE id=? AND status='open'""",
+                            (val, txt, g["id"]))
+            if cur.rowcount != 1:
+                return {"error": "This question was already answered."}, 409
+            w.execute("COMMIT")
+            return {"ok": True}
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e) or "busy" in str(e):
+                return busy
+            raise
+        finally:
+            if w.in_transaction:
+                w.execute("ROLLBACK")
+    finally:
+        w.close()
+
+
+def quote_name(name):
+    return '"' + str(name).replace('"', '""') + '"'
+
+
 def route(root, db, con, path, qs, body):
-    p = [x for x in path.split("/") if x][1:]  # drop 'api'
+    parts = [x for x in path.split("/") if x]
+    if not parts or parts[0] != "api":
+        return {"error": "not found"}, 404
+    p = parts[1:]
     arg = lambda k, d=None: qs.get(k, [d])[0]
 
     if p == ["overview"]:
@@ -2397,25 +3119,7 @@ def route(root, db, con, path, qs, body):
         return {"gates": gates, "other": other}
 
     if len(p) == 3 and p[0] == "gates" and p[2] == "answer" and body is not None:
-        g = one(con, "SELECT * FROM gates WHERE code=?", (p[1],))
-        if not g:
-            return {"error": "no such gate"}, 404
-        if g["status"] != "open":
-            return {"error": "This question was already answered."}, 409
-        val = (body.get("answer_value") or "").strip() or None
-        txt = (body.get("answer_text") or "").strip() or None
-        opts = [o.get("value") for o in json.loads(g["options"] or "[]")]
-        if val is not None and val not in opts:
-            return {"error": "That choice is not one of the options."}, 400
-        if val is None and not txt:
-            return {"error": "Choose an option or write an answer."}, 400
-        if txt and not g["allow_text"] and val is None:
-            return {"error": "Choose one of the options."}, 400
-        con.execute("""UPDATE gates SET status='answered', answer_value=?, answer_text=?,
-                       answered_by='owner', answered_via='viewer' WHERE id=? AND status='open'""",
-                    (val, txt, g["id"]))
-        con.commit()
-        return {"ok": True}
+        return answer_gate(db, p[1], body)
 
     if p == ["reviews"]:
         return rows(con, """SELECT r.code, r.title, r.scope, r.status, r.started_at, r.completed_at, r.verdict,
@@ -2565,8 +3269,8 @@ def route(root, db, con, path, qs, body):
     if p == ["tables"]:
         out = []
         for t in rows(con, "SELECT name, type FROM sqlite_master WHERE type IN ('table','view') ORDER BY type, name"):
-            cols = [c["name"] for c in rows(con, f"PRAGMA table_info({t['name']})")]
-            n = con.execute(f'SELECT count(*) FROM "{t["name"]}"').fetchone()[0]
+            cols = [c["name"] for c in rows(con, "SELECT name FROM pragma_table_info(?)", (t["name"],))]
+            n = con.execute(f"SELECT count(*) FROM {quote_name(t['name'])}").fetchone()[0]
             out.append({**t, "columns": cols, "count": n})
         return out
 
@@ -2589,19 +3293,54 @@ def route(root, db, con, path, qs, body):
     return {"error": "not found"}, 404
 
 
+SQL_SECONDS = 4  # the SQL box stops a query after this long
+SQL_MAX_TEXT = 20_000  # characters of SQL text accepted
+SQL_MAX_CELL = 10_000  # characters of one text cell sent back; longer text is cut with a note
+SQL_MAX_RESPONSE = 5_000_000  # rows stop being added once the JSON passes about this many bytes (truncated=true)
+SQL_MAX_ROWS = 1000
+
+
+def _sql_cell(v):
+    if isinstance(v, bytes):
+        return {"blob_bytes": len(v)}
+    if isinstance(v, str) and len(v) > SQL_MAX_CELL:
+        return v[:SQL_MAX_CELL] + f" … [cut: {len(v):,} characters in all]"
+    return v
+
+
 def run_readonly(db, sql):
+    """The viewer's SQL box: one SELECT on a read-only connection whose authorizer allows reads only. Bounded by
+    SQL_SECONDS of run time, SQL_MAX_TEXT of SQL, SQL_MAX_CELL per text cell (blobs come back as {"blob_bytes": N}),
+    SQL_MAX_ROWS rows and about SQL_MAX_RESPONSE bytes of JSON; truncated says rows were left out."""
     sql = (sql or "").strip().rstrip(";")
     if not sql:
         return {"error": "Write a query first."}, 400
+    if len(sql) > SQL_MAX_TEXT:
+        return {"error": f"The query is too long (over {SQL_MAX_TEXT:,} characters)."}, 400
+    if not Path(db).exists():
+        return {"error": "ledger not found"}, 503
     con = connect(db, readonly=True)
     allowed = {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION, sqlite3.SQLITE_RECURSIVE}
     con.set_authorizer(lambda action, *a: sqlite3.SQLITE_OK if action in allowed else sqlite3.SQLITE_DENY)
+    timed_out = with_deadline(con, SQL_SECONDS)
     try:
         cur = con.execute(sql)
         cols = [d[0] for d in cur.description or []]
-        data = cur.fetchmany(1001)
-        return {"columns": cols, "rows": [list(r) for r in data[:1000]], "truncated": len(data) > 1000}
+        out, size, truncated = [], 2, False
+        for r in cur:
+            if len(out) >= SQL_MAX_ROWS:
+                truncated = True
+                break
+            row = [_sql_cell(v) for v in r]
+            size += len(json.dumps(row, ensure_ascii=False, default=str).encode()) + 1
+            if size > SQL_MAX_RESPONSE:
+                truncated = True
+                break
+            out.append(row)
+        return {"columns": cols, "rows": out, "truncated": truncated}
     except (sqlite3.Error, sqlite3.Warning) as e:  # before Python 3.11, several statements raise sqlite3.Warning
+        if isinstance(e, sqlite3.OperationalError) and "interrupted" in str(e) and timed_out():
+            return {"error": TOO_LONG.format(SQL_SECONDS)}, 400
         return {"error": f"The query did not run: {e}"}, 400
     finally:
         con.close()
@@ -2609,14 +3348,35 @@ def run_readonly(db, sql):
 
 # ---------------------------------------------------------------- HTTP
 
+REQUEST_TIMEOUT = 10  # seconds a viewer connection may sit idle or half-sent before it is dropped
+MAX_BODY = 200_000  # bytes of POST body accepted
+
+
+def page_csp(page):
+    """The viewer page's Content-Security-Policy: its one inline script is allowed by its sha256 (the page is static
+    now that the token travels in the URL fragment), not by 'unsafe-inline'."""
+    import base64
+    scripts = re.findall(r"<script>(.*?)</script>", page, re.S)
+    hashes = " ".join("'sha256-%s'" % base64.b64encode(hashlib.sha256(x.encode("utf-8")).digest()).decode()
+                      for x in scripts) or "'none'"
+    return (f"default-src 'none'; script-src {hashes}; style-src 'unsafe-inline'; "
+            "connect-src 'self'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+
+
 def make_server(root, db, port=0):
     """Build the viewer's handler and bind it to 127.0.0.1:port (0 = any free port); returns (server, token).
-    The caller runs server.serve_forever(). The Host allow-list uses the port actually bound."""
-    token = secrets.token_urlsafe(24)
-    page = PAGE.replace("@@TOKEN@@", token)
+    The caller runs server.serve_forever(). The Host allow-list uses the port actually bound. The page itself holds
+    no secret: the token reaches the browser only in the launch URL's #k= fragment (see serve), and every /api/
+    request must send it back as X-Ledger-Token."""
+    token = secrets.token_urlsafe(32)
+    token_bytes = token.encode()
+    page = PAGE.encode("utf-8")
+    csp = page_csp(PAGE)
     hosts = set()
 
     class H(BaseHTTPRequestHandler):
+        timeout = REQUEST_TIMEOUT
+
         def log_message(self, *a):
             pass
 
@@ -2630,22 +3390,30 @@ def make_server(root, db, port=0):
             self.send_header("X-Frame-Options", "DENY")
             self.send_header("Referrer-Policy", "no-referrer")
             if ctype.startswith("text/html"):
-                self.send_header("Content-Security-Policy",
-                                 "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
-                                 "connect-src 'self'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+                self.send_header("Content-Security-Policy", csp)
+            if code >= 400:
+                self.send_header("Connection", "close")
+                self.close_connection = True
             self.end_headers()
             self.wfile.write(data)
 
-        def guard(self):
+        def host_ok(self):
             if self.headers.get("Host") not in hosts:
                 self.send(403, {"error": "wrong host"}); return False
-            u = urlparse(self.path)
-            if u.path.startswith("/api/") and not secrets.compare_digest(self.headers.get("X-Ledger-Token", ""), token):
-                self.send(403, {"error": "missing token; reload the page"}); return False
             return True
 
-        def handle_api(self, body):
-            u = urlparse(self.path)
+        def token_ok(self):
+            try:  # headers are decoded as latin-1, so this gives back the bytes that were sent
+                sent = self.headers.get("X-Ledger-Token", "").encode("latin-1")
+                good = secrets.compare_digest(sent, token_bytes)
+            except (UnicodeError, TypeError):
+                good = False
+            if not good:
+                self.send(403, {"error": "missing or wrong token; open the viewer through the link that "
+                                         "ledger.py serve printed (it ends in #k=...)"})
+            return good
+
+        def handle_api(self, u, body):
             try:
                 res = api(root, db, u.path, parse_qs(u.query), body)
             except Exception as e:
@@ -2654,29 +3422,50 @@ def make_server(root, db, port=0):
             self.send(code, res)
 
         def do_GET(self):
-            if not self.guard():
+            if not self.host_ok():
                 return
             u = urlparse(self.path)
             if u.path == "/":
-                self.send(200, page.encode(), "text/html; charset=utf-8")
+                self.send(200, page, "text/html; charset=utf-8")
             elif u.path.startswith("/api/"):
-                self.handle_api(None)
+                if self.token_ok():
+                    self.handle_api(u, None)
             else:
                 self.send(404, {"error": "not found"})
 
         def do_POST(self):
-            if not self.guard():
+            if not self.host_ok():
+                return
+            u = urlparse(self.path)  # the guard below and the dispatch use this one parsed path
+            if not u.path.startswith("/api/"):
+                return self.send(404, {"error": "not found"})
+            if not self.token_ok():
                 return
             if self.headers.get("Content-Type", "").split(";")[0] != "application/json":
                 return self.send(415, {"error": "JSON only"})
-            n = int(self.headers.get("Content-Length", "0") or 0)
-            if n > 200_000:
+            raw_n = self.headers.get("Content-Length")
+            if raw_n is None:
+                n = 0
+            elif not re.fullmatch(r"[0-9]{1,12}", raw_n):
+                return self.send(400, {"error": "bad Content-Length"})
+            else:
+                n = int(raw_n)
+            if n > MAX_BODY:
                 return self.send(413, {"error": "too large"})
             try:
-                body = json.loads(self.rfile.read(n) or b"{}")
+                data = self.rfile.read(n) if n else b""
+            except OSError:  # the client stopped sending (REQUEST_TIMEOUT): drop the connection
+                self.close_connection = True
+                return
+            if len(data) < n:
+                return self.send(400, {"error": "the body is shorter than its Content-Length"})
+            try:
+                body = json.loads(data or b"{}")
             except ValueError:
                 return self.send(400, {"error": "bad JSON"})
-            self.handle_api(body if isinstance(body, dict) else {})
+            if not isinstance(body, dict):
+                return self.send(400, {"error": "Send a JSON object"})
+            self.handle_api(u, body)
 
     srv = ThreadingHTTPServer(("127.0.0.1", port), H)
     bound = srv.server_address[1]
@@ -2685,9 +3474,15 @@ def make_server(root, db, port=0):
 
 
 def serve(root, db, port, open_browser):
-    srv, _ = make_server(root, db, port)
-    url = f"http://127.0.0.1:{srv.server_address[1]}/"
-    print(f"Ledger viewer for {db} at {url}  (Ctrl+C to stop)")
+    """Run the viewer until Ctrl+C. The launch URL carries the token in its #k= fragment (never sent to the server,
+    read by the page into sessionStorage and removed from the address bar). The umask is set to 077 first, so any
+    file the viewer's connections create beside the ledger (-journal, -wal, -shm) is owner-only."""
+    import os
+    if hasattr(os, "umask"):
+        os.umask(0o077)
+    srv, token = make_server(root, db, port)
+    url = f"http://127.0.0.1:{srv.server_address[1]}/#k={token}"
+    print(f"Ledger viewer for {db} at {url}  (Ctrl+C to stop)", flush=True)
     if open_browser:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     try:
@@ -2700,7 +3495,7 @@ def serve(root, db, port, open_browser):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--root", default=".")
+    ap.add_argument("--root", default=None)
     ap.add_argument("--db")
     ap.add_argument("--version", action="version", version=f"ledger.py {TOOL_VERSION} (schema {SCHEMA_VERSION})")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -2717,14 +3512,29 @@ def main():
     sub.add_parser("dump")
     sub.add_parser("schema")
     a = ap.parse_args()
-    root = find_root(Path(a.root).resolve(), explicit=a.root != ".")
-    if a.cmd == "init":
-        print(f"project root: {root}")
-    db = Path(a.db).resolve() if a.db else root / ".code-review" / "ledger.sqlite"
     if a.cmd == "schema":
         print(SCHEMA); return
+    explicit = a.root is not None  # any --root given, '.' included, is used as given
+    root, how = resolve_root(Path(a.root if explicit else ".").resolve(), explicit, script=__file__)
+    # The ledger: --db FILE, else $CODE_REVIEW_DIR/ledger.sqlite (a ledger kept outside the repository), else
+    # <root>/.code-review/ledger.sqlite.
+    env_dir = os.environ.get("CODE_REVIEW_DIR", "").strip()
+    if a.db:
+        db, where = Path(a.db).resolve(), "db"
+    elif env_dir:
+        db, where = Path(env_dir).expanduser().resolve() / "ledger.sqlite", "env"
+    else:
+        db, where = root / ".code-review" / "ledger.sqlite", "default"
     if a.cmd == "init":
-        init(root, db, force=a.force); return
+        print(f"project root: {root}")
+        if how == "start" and where == "default":
+            sys.exit(f"init: {root} is not in a git repository and no folder above it has a ledger; pass --root DIR "
+                     f"to say which folder is the project root (init then creates DIR/.code-review/ledger.sqlite)")
+        in_ledger_folder = db.parent.name == ".code-review"
+        inside_root = db.parent == root or root in db.parent.parents
+        init(root, db, force=a.force, copy_tool=in_ledger_folder or where == "env",
+             gitignore=in_ledger_folder and inside_root)
+        return
     if a.cmd == "migrate":
         migrate(db); return
     # Writes refuse an older ledger; serve, gates and the writes also refuse a schema that differs from the shipped
@@ -2734,11 +3544,15 @@ def main():
     if a.cmd == "serve":
         con.close(); serve(root, db, a.port, not a.no_open)
     elif a.cmd == "check":
+        was = con.execute("SELECT value FROM meta WHERE key='ledger_location'").fetchone()
+        if was and was[0] != str(db.parent):
+            print(f"warning: this ledger was set up at {was[0]} and is now used from {db.parent} (fine after a move; "
+                  f"init records the new place)", file=sys.stderr)
         sys.exit(1 if check(con) else 0)
     elif a.cmd == "fill-refs":
         sys.exit(1 if fill_refs(root, con, a.review) else 0)
     elif a.cmd == "tag-review":
-        tag_review(root, con, a.review)
+        sys.exit(tag_review(root, con, a.review))
     elif a.cmd == "show":
         s = source(root, con, a.location, context=0)
         if s.get("error"):
@@ -2748,6 +3562,9 @@ def main():
             print(f"# git: {s['git_error']}")
         for l in s.get("lines", []):
             print(f"{l['n']:6d}  {l['text']}")
+        if s.get("source") == "none":
+            sys.exit(f"show: nothing to show for reference {a.location} (git could not read it and it has no "
+                     f"excerpt)")
     elif a.cmd == "gates":
         for g in rows(con, "SELECT * FROM gates WHERE status IN ('open','answered') ORDER BY created_at"):
             ans = f" -> {g['answer_value'] or ''} {g['answer_text'] or ''}".rstrip() if g["status"] == "answered" else ""
