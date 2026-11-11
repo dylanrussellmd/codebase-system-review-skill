@@ -1,0 +1,5 @@
+-- initial ledger schema
+-- Baseline. Schema 1 is references/schema.sql as it was at commit ea00196 (frozen in dev/tests/data/schema-v1.sql):
+-- every ledger made before migrations existed is schema 1, and a new ledger is made from references/schema.sql
+-- directly, so this file is never applied. Each later file NNNN-<slug>.sql takes a ledger from schema NNNN-1 to
+-- NNNN; see "Changing the schema" in README.md.

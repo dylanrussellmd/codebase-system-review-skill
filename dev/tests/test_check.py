@@ -113,7 +113,10 @@ class CheckFunction(unittest.TestCase):
                 corrupt_integrity(L.db)
                 L.con = L.connect()
                 n, out = self.run_check(L)
-            self.assertEqual(n, 1)
+            # 2: the integrity failure, and (plan step 34) the scratch table and index the corruption needs, which
+            # are not in the shipped schema.
+            self.assertEqual(n, 2)
+            self.assertIn("extra index scratch_ix", out)
             # Only the first integrity_check message is printed (fetchone).
             self.assertEqual([l for l in out.splitlines() if l.startswith("integrity_check:")],
                              ["integrity_check: row 1 missing from index scratch_ix"])
@@ -133,7 +136,7 @@ class CheckFunction(unittest.TestCase):
                 break_foreign_key(L.db)
                 L.con = L.connect()
                 n, out = self.run_check(L)
-            self.assertEqual(n, 3)
+            self.assertEqual(n, 4)  # integrity, foreign key, the view, and the scratch objects (schema drift)
 
     def test_check_each_must_be_empty_view(self):
         for view, label in self.mod.MUST_BE_EMPTY:
@@ -234,13 +237,15 @@ class CheckCommand(unittest.TestCase):
         self.assertEqual(p.returncode, 1)
         self.assertIn("foreign_key_check: 1 broken references", p.stdout)
 
-    def test_current_cli_check_runs_on_other_schema_version(self):
+    def test_cli_check_refuses_other_schema_version(self):
+        # Was test_current_cli_check_runs_on_other_schema_version (characterization of ISS-0035: check ran on a
+        # schema-2 ledger and exited 0). Plan step 33: every command opens the ledger through open_ledger().
         with new_ledger() as L:
             L.x("UPDATE meta SET value='2' WHERE key='schema_version'")
             p = L.run("check")
-        # characterization: ISS-0035 — only init checks the schema version, so check runs on a schema-2 ledger
-        # and exits 0. The fix makes it refuse.
-        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertIn("is schema 2; this ledger.py only knows 1. Use a newer ledger.py.", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
 
 
 if __name__ == "__main__":

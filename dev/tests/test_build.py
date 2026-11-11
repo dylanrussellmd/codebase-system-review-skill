@@ -11,7 +11,7 @@ from pathlib import Path
 from dev.tests import fixtures
 
 ROOT = fixtures.REPO_ROOT
-SOURCES = ("dev/build.py", "dev/core.py", "dev/page.html", "references/schema.sql", "scripts/ledger.py")
+SOURCES = ("dev/build.py", "dev/core.py", "dev/page.html", "references/schema.sql", "scripts/ledger.py", "SKILL.md")
 
 
 def copy_tree():
@@ -20,6 +20,7 @@ def copy_tree():
     for rel in SOURCES:
         (root / rel).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(str(ROOT / rel), str(root / rel))
+    shutil.copytree(str(ROOT / "references" / "migrations"), str(root / "references" / "migrations"))
     return root
 
 

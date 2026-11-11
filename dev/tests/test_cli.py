@@ -31,7 +31,22 @@ def object_counts(db):
 
 
 class Init(unittest.TestCase):
-    def test_init_creates_schema_objects(self):
+    def test_init_adds_missing_gitignore_lines(self):
+        # A .gitignore written by an older version (no backup lines) gains the new lines; custom lines are kept.
+        d = fresh_project()
+        (d / ".code-review").mkdir()
+        gi = d / ".code-review" / ".gitignore"
+        gi.write_text("ledger.sqlite-journal\nledger.sqlite-wal\nledger.sqlite-shm\nmy-notes.txt")
+        p = run_ledger("--root", d, "init")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(gi.read_text(), "ledger.sqlite-journal\nledger.sqlite-wal\nledger.sqlite-shm\nmy-notes.txt\n"
+                                         "ledger.sqlite.bak-v*\nledger.py.bak\n")
+        self.assertIn("added ledger.sqlite.bak-v*, ledger.py.bak to", p.stdout)
+        p = run_ledger("--root", d, "init")
+        self.assertNotIn("added", p.stdout)
+
+    def test_init_copies_tool_and_gitignore(self):
+        mod = fixtures.load_ledger_module()
         d = fresh_project()
         p = run_ledger("--root", d, "init")
         self.assertEqual(p.returncode, 0, p.stderr)
@@ -54,11 +69,13 @@ class Init(unittest.TestCase):
         self.assertEqual(got, want)
         self.assertEqual(meta["schema_version"], "1")
         self.assertEqual(meta["project_name"], "myproj")
+        self.assertEqual(meta["created_by_skill"], mod.TOOL_VERSION)
         self.assertRegex(meta["created_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$")
-        # ledger.py copied byte-identical; .gitignore written.
+        # ledger.py copied byte-identical; .gitignore written (local backups included).
         self.assertEqual((d / ".code-review" / "ledger.py").read_bytes(), built_ledger_path().read_bytes())
         self.assertEqual((d / ".code-review" / ".gitignore").read_text(),
-                         "ledger.sqlite-journal\nledger.sqlite-wal\nledger.sqlite-shm\n")
+                         "ledger.sqlite-journal\nledger.sqlite-wal\nledger.sqlite-shm\n"
+                         "ledger.sqlite.bak-v*\nledger.py.bak\n")
 
         # Second run: reports the existing schema, leaves the data alone, does not copy again.
         con = sqlite3.connect(str(db))
@@ -73,11 +90,13 @@ class Init(unittest.TestCase):
         self.assertEqual(con.execute("SELECT value FROM meta WHERE key='probe'").fetchone()[0], "kept")
         con.close()
 
-        # A changed ledger.py in the folder is replaced, with a note.
+        # An older (here: unversioned) ledger.py in the folder is replaced, with a note and a .bak (step 31; at
+        # ea00196 any differing copy was replaced, newer or not, and no backup was kept).
         (d / ".code-review" / "ledger.py").write_text("# old\n")
         p = run_ledger("--root", d, "init")
         self.assertIn("note: replacing", p.stdout)
         self.assertEqual((d / ".code-review" / "ledger.py").read_bytes(), built_ledger_path().read_bytes())
+        self.assertEqual((d / ".code-review" / "ledger.py.bak").read_text(), "# old\n")
 
     def test_init_keeps_existing_gitignore(self):
         d = fresh_project()
@@ -85,7 +104,8 @@ class Init(unittest.TestCase):
         (d / ".code-review" / ".gitignore").write_text("custom\n")
         p = run_ledger("--root", d, "init")
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertEqual((d / ".code-review" / ".gitignore").read_text(), "custom\n")
+        # Custom lines are kept; the tool's own lines are added after them.
+        self.assertTrue((d / ".code-review" / ".gitignore").read_text().startswith("custom\nledger.sqlite-journal\n"))
 
     def set_version(self, db, value):
         con = sqlite3.connect(str(db))
@@ -96,34 +116,55 @@ class Init(unittest.TestCase):
         con.commit()
         con.close()
 
-    def test_init_refuses_other_schema_versions(self):
+    def assertOneLineRefusal(self, p, words):
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertIn(words, p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertEqual(len(p.stderr.strip().splitlines()), 1, p.stderr)
+
+    def test_init_refuses_newer_schema(self):
         d = fresh_project()
         run_ledger("--root", d, "init")
         db = d / ".code-review" / "ledger.sqlite"
         self.set_version(db, "2")
+        before = db.read_bytes()
         p = run_ledger("--root", d, "init")
-        self.assertEqual(p.returncode, 1)
-        self.assertIn("is schema 2; this ledger.py only knows 1. Use a newer ledger.py.", p.stderr)
+        self.assertOneLineRefusal(p, f"{db} is schema 2; this ledger.py only knows 1. Use a newer ledger.py.")
+        self.assertEqual(db.read_bytes(), before)
+
+    def test_init_refuses_older_schema(self):
+        from dev.tests import _migrate_helpers as M
+        project, db = M.restore_v1()
+        p = run_ledger("--root", project, "init", ledger_py=M.v2_ledger_py())
+        self.assertOneLineRefusal(p, f"{db} is schema 1; this ledger.py is schema 2. Run: python3 ")
+        self.assertIn("ledger.py migrate", p.stderr)
+        # Below the oldest schema this tool can migrate (step 32; at ea00196: "run the migrations for 1..1 first",
+        # which did not exist).
+        d = fresh_project()
+        run_ledger("--root", d, "init")
+        db = d / ".code-review" / "ledger.sqlite"
         self.set_version(db, "0")
         p = run_ledger("--root", d, "init")
-        self.assertEqual(p.returncode, 1)
-        self.assertIn("is schema 0; run the migrations for 1..1 first.", p.stderr)
+        self.assertOneLineRefusal(p, f"{db} is schema 0, older than any schema this ledger.py can migrate (oldest 1)")
 
-    def test_current_init_tracebacks_on_bad_ledgers(self):
+    def test_init_missing_version_row_clean_error(self):
+        # Was test_current_init_tracebacks_on_bad_ledgers (TEST-T1, ISS-0282: a TypeError traceback); step 33.
         d = fresh_project()
         run_ledger("--root", d, "init")
         db = d / ".code-review" / "ledger.sqlite"
         self.set_version(db, None)
         p = run_ledger("--root", d, "init")
-        # characterization: TEST-T1 (ISS-0282, probed) - no schema_version row gives a TypeError traceback; phase 7
-        # tightens this to a clean message.
-        self.assertNotEqual(p.returncode, 0)
-        self.assertIn("TypeError", p.stderr)
+        self.assertOneLineRefusal(p, f"{db} has no schema_version in its meta table")
+
+    def test_init_non_sqlite_clean_error(self):
+        # Was test_current_init_tracebacks_on_bad_ledgers (TEST-T1, ISS-0282: a DatabaseError traceback); step 33.
+        d = fresh_project()
+        run_ledger("--root", d, "init")
+        db = d / ".code-review" / "ledger.sqlite"
         db.write_bytes(b"this is not a database at all" * 100)
         p = run_ledger("--root", d, "init")
-        # characterization: TEST-T1 (ISS-0282, probed) - a file that is not SQLite gives a DatabaseError traceback.
-        self.assertNotEqual(p.returncode, 0)
-        self.assertIn("DatabaseError", p.stderr)
+        self.assertOneLineRefusal(p, f"{db} is not a ledger")
+        self.assertEqual(db.read_bytes(), b"this is not a database at all" * 100)
 
 
 class SchemaAndGuards(unittest.TestCase):
@@ -138,7 +179,7 @@ class SchemaAndGuards(unittest.TestCase):
         d = fresh_project()
         db = d / ".code-review" / "ledger.sqlite"
         for args in (["check"], ["gates"], ["show", "1"], ["dump"], ["fill-refs"], ["tag-review", "R-0001"],
-                     ["serve", "--no-open"]):
+                     ["serve", "--no-open"], ["migrate"]):
             with self.subTest(args=args):
                 p = run_ledger("--root", d, *args, timeout=20)
                 self.assertEqual(p.returncode, 1)

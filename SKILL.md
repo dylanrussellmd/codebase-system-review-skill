@@ -1,6 +1,7 @@
 ---
 name: codebase-system-review
 description: Run a managed, read-only, multi-reviewer audit of any codebase (tests, security, performance, architecture, UI, API, DB, docs, logging), verify findings, record every point in a per-project SQLite ledger tracked across reviews, then turn every point into a tracked fix plan.
+version: 1.1.0
 ---
 
 # Comprehensive review of a software system
@@ -36,11 +37,24 @@ alone, with comments, is at `references/schema.sql`). In a project, run the bund
 the ledger and copies itself to `.code-review/ledger.py`, which is committed with the ledger so the project always has
 the version that made it. If the skill folder's copy is unavailable, use `.code-review/ledger.py` from this or another
 project, or ask the owner for it. Never rewrite it from memory or from a description: the schema must be identical
-across projects. If the project's copy is older than the skill's, `init` with the skill's copy replaces it (it refuses
-a ledger whose schema is newer than it knows).
+across projects. `init` with the skill's copy replaces the project's copy only when the project's is older (keeping it
+as `.code-review/ledger.py.bak`); when the project's copy is newer it changes nothing and exits 1 (update the skill,
+or pass `init --force` only if the owner wants the older copy). `ledger.py --version` prints the tool and schema
+versions. Every command refuses a ledger whose schema is newer than it knows; a ledger with an older schema is only
+read until you run `migrate` with the newer copy (it keeps a backup, `.code-review/ledger.sqlite.bak-v<N>`, and
+changes nothing if any step fails).
+
+The project's copy of `ledger.py` is code anyone with write access to the repository can change, and the ledger's
+own views and triggers can be changed the same way. So: run the skill's `scripts/ledger.py` (with `--root <project>`
+when you are elsewhere) in preference to the project copy, and run the project copy only after `init` has refreshed
+it from the skill; never run it from a branch or pull request nobody has reviewed. `check` compares every table, view,
+trigger and index with the shipped schema and fails on any difference, and `serve`, `gates`, `fill-refs` and
+`tag-review` refuse a ledger that fails that comparison. A change to `.code-review/ledger.py` or to the ledger's schema
+in a pull request is an owner decision: raise a gate rather than accepting it.
 
 ```
 python3 <skill folder>/scripts/ledger.py init     # first time: create the ledger, copy ledger.py into .code-review/
+python3 <skill folder>/scripts/ledger.py migrate  # init said the ledger's schema is older: upgrade it (keeps a backup)
 python3 .code-review/ledger.py schema             # print the full schema with comments: read it before writing SQL
 python3 .code-review/ledger.py serve              # the owner's local viewer at http://127.0.0.1:8765
 python3 .code-review/ledger.py check              # integrity + must-be-empty checks; exit 1 on any problem

@@ -16,6 +16,11 @@ Claude Code and OpenCode both: unzip into ~/.claude/skills/   (OpenCode reads th
 The folder name must stay `codebase-system-review` (it must match `name:` in SKILL.md).
 Restart OpenCode, then ask it to "run the comprehensive system review".
 
+Each project keeps a copy of the tool at `.code-review/ledger.py`. Treat a change to that copy, or to the ledger's
+schema, in someone else's pull request like any other code change you must review: `ledger.py check` fails when the
+ledger's tables, views or triggers differ from the shipped schema, and the skill tells agents to prefer the skill's own
+`scripts/ledger.py`.
+
 ## Use the viewer
 
 From the project root, after a review has started:
@@ -36,6 +41,7 @@ empty folder of your choice; leave it out to get a temporary one):
     python3 dev/build.py                          regenerate scripts/ledger.py
     python3 dev/build.py --check                  exit 1 if scripts/ledger.py is stale
     python3 dev/tests/seed_demo.py DEMO           a small git project with a filled ledger (reviews, a plan, gates)
+    python3 scripts/ledger.py --version           print the tool version (from SKILL.md) and the schema version
     python3 scripts/ledger.py --root DEMO check   the demo ledger passes every check
     python3 scripts/ledger.py --root DEMO serve   open the viewer on it (Ctrl+C to stop)
 
@@ -73,3 +79,35 @@ Shared test builders (scratch repositories, ledgers, the demo data, a viewer ser
 
 CI (`.github/workflows/ci.yml`) runs the build check and the suite on Python 3.9 and 3.12 for every push and pull
 request.
+
+## Changing the schema
+
+Every ledger already in use is schema 1 (`references/schema.sql` as it was at commit ea00196, frozen in
+`dev/tests/data/schema-v1.sql`). A schema change ships as a numbered migration, never as an edit alone:
+
+1. Add `references/migrations/NNNN-<slug>.sql` (the next number; lowercase slug). Its first line is
+   `-- <description>`. It holds only what changes tables, indexes and data, from schema NNNN-1 to NNNN. Views and
+   triggers are not migrated by hand: `migrate` drops every one before the steps run and re-creates them from
+   `references/schema.sql` afterwards. To change a table's columns or constraints use SQLite's table-rebuild recipe
+   (create `<table>_new`, copy the rows, drop the old table, rename the new one, re-create its indexes); foreign keys
+   are off while the steps run and `PRAGMA foreign_key_check` must be clean at the end.
+2. Edit `references/schema.sql` to the new end state, and in the same change set its header line to `schema version
+   NNNN`, the meta seed to `'NNNN'`, and add `(NNNN, '<description>')` to the `schema_migrations` seed. The build
+   refuses if any of these disagrees with the highest migration (`SCHEMA_VERSION` in ledger.py is that number).
+3. Add a test that restores the frozen v1 ledger (`dev/tests/_migrate_helpers.py`), runs `migrate`, and checks the
+   result against a fresh `init` (`dev/tests/test_migrate.py` shows how); then rebuild with `python3 dev/build.py`.
+4. Bump `version:` in SKILL.md's frontmatter and add a line to CHANGELOG.md.
+
+`migrate` refuses a ledger newer than the tool, backs the ledger up with SQLite's backup API to
+`ledger.sqlite.bak-v<old version>` (never overwriting an earlier backup), applies every pending step in one
+`BEGIN IMMEDIATE` transaction, records each in `schema_migrations`, sets `meta.schema_version` and
+`PRAGMA user_version`, and rolls everything back (removing the backup, the ledger byte-identical) if a step fails, a
+foreign key breaks, or the result differs from a fresh build of `references/schema.sql`. `check` reports any table,
+index, view or trigger that differs from the shipped schema; `serve`, `gates`, `fill-refs` and `tag-review` refuse to
+run on such a ledger, and `init` restores the shipped views and triggers. The version, the build and the ledger.py
+copy that `init` makes:
+
+    ledger.py --version     the tool version (`version:` in SKILL.md, stamped in by the build with a content hash)
+    ledger.py init          replaces .code-review/ledger.py only with a newer copy, keeping ledger.py.bak
+    ledger.py init --force  also replaces a newer or same-version copy
+    ledger.py migrate       upgrades an older ledger
