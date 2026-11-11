@@ -25,7 +25,7 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 TOOL_VERSION = "1.2.0"  # stamped by dev/build.py from `version:` in SKILL.md's frontmatter
-TOOL_HASH = "458b3f780fcdc03b02130411e16ae476ff3d92502e4ee0c13383f5c711573ea2"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
+TOOL_HASH = "bec3f6b568a3f3811829fba500e495976fb08184f928533f464c86f0de95398e"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
 SCHEMA = r"""-- =====================================================================
 -- Code review ledger — schema version 2
 -- One SQLite file per project: <project root>/.code-review/ledger.sqlite
@@ -2187,6 +2187,7 @@ def migrate(db):
             con.backup(dest)
         finally:
             dest.close()
+        make_private(backup)  # a full copy of the ledger: as private as the ledger itself
     con.isolation_level = None
     con.execute("PRAGMA foreign_keys = OFF")  # the table-rebuild recipe needs it off; a no-op inside a transaction
     step = "the update" if pending else "the check of the current schema"
@@ -2476,7 +2477,8 @@ def _init(root, db, force, copy_tool, gitignore):
             print(f"note: the ledger was last set up at {moved}; it now records {db.parent}")
         print(f"{db} already exists (schema {v})")
         print(f"ledger at {db} (attached to existing)")
-    for p in (db, db.with_name(db.name + "-wal"), db.with_name(db.name + "-shm"), db.with_suffix(".sql")):
+    for p in (db, db.with_name(db.name + "-wal"), db.with_name(db.name + "-shm"), db.with_suffix(".sql"),
+              *db.parent.glob(db.name + ".bak-v*")):
         make_private(p)
     if db.parent.name == ".code-review" and (db.parent / "patches").is_dir():
         make_private(db.parent / "patches", 0o700)

@@ -5,7 +5,9 @@ dev/tests/data/). The shipped tool migrates it to the shipped schema (M.SHIPPED)
 and the rollback are also proven with a test-only schema one past it (M.NEXT) built from a copy of the sources
 (dev/tests/_migrate_helpers.py): it rebuilds the themes table with the SQLite 12-step recipe.
 """
+import os
 import sqlite3
+import stat
 import unittest
 
 from dev.tests import fixtures
@@ -103,6 +105,20 @@ class Migrate(unittest.TestCase):
         self.assertTrue(meta.get("created_by_skill"))
         self.assertEqual(meta["written_by_tool"], mod.TOOL_VERSION)
         self.assertEqual(meta["schema_hash"], mod.shipped_schema_hash())
+
+    @unittest.skipIf(os.name == "nt", "POSIX permissions")
+    def test_migrate_backup_is_private(self):
+        """The .bak-v<N> copy holds the whole ledger, so it is 0600 like the ledger, and init makes an older,
+        world-readable backup private too."""
+        project, db = M.restore_v1()
+        p = run_ledger("--root", project, "migrate")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        backup = db.with_name("ledger.sqlite.bak-v1")
+        self.assertEqual(stat.S_IMODE(backup.stat().st_mode), 0o600)
+        os.chmod(str(backup), 0o644)
+        p = run_ledger("--root", project, "init")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(stat.S_IMODE(backup.stat().st_mode), 0o600)
 
     def test_migrate_v1_to_current(self):
         """test_upgrade_from_every_version / test_migrate_v1_to_v2_matches_fresh: the frozen v1 ledger, migrated by
