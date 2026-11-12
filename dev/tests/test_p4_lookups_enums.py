@@ -52,6 +52,11 @@ COLUMN_ENUMS = {
     ("metric_defs", "better"): "metric_better",
     ("metrics", "method"): "metric_method",
     ("artifacts", "kind"): "artifact_kind",
+    ("checklist_answers", "answer"): "checklist_answer",   # schema 14 (step 139)
+    ("step_touches", "kind"): "touch_kind",                 # schema 16 (step 143)
+    ("step_touches", "direction"): "touch_direction",
+    ("step_touches", "source"): "touch_source",
+    ("step_conflicts", "resolution"): "conflict_resolution",
     ("events", "entity_type"): "entity_type",
 }
 # Enums whose words no CHECK lists: events.event is free text, and its labels cover the names the triggers write.

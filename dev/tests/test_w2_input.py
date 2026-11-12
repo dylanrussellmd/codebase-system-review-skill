@@ -219,7 +219,7 @@ class Search(Case):
         # the search still covers code, title, sub, point id, summary and path, and filters stay exact and ANDed
         for q, want in (("ISS-0003", ["ISS-0003"]), ("hardcoded", ["ISS-0002"]), ("code-compare", ["ISS-0004"]),
                         ("SPEC-L1", ["ISS-0003"]), ("random generator", ["ISS-0001"]),
-                        ("timeoff.py", ["ISS-0002", "ISS-0003"])):
+                        ("requests.py", ["ISS-0002", "ISS-0003"])):
             self.assertEqual(self.codes(q=q), want, q)
         self.assertEqual(self.codes(q="auth.py", severity="M"), ["ISS-0004"])
         self.assertEqual(self.codes(status="ver"), [])

@@ -3,8 +3,9 @@
     python3 dev/tests/seed_demo.py [DIR] [--ledger PATH]
 
 DIR (default: a new temporary folder) must be missing or empty. It becomes a small git repository with two commits
-(src/auth.py and src/timeoff.py), a ledger made by `ledger.py init`, and the demo data from fixtures.seed_demo():
-two reviews, matching across them, a fix plan, a decision and two open gates. Then fill-refs, tag-review for both
+(src/auth.py and src/requests.py), a ledger made by `ledger.py init`, and the demo data from fixtures.seed_demo():
+two reviews, matching across them, a fix plan, a decision and two open gates, plus add_ungated_owner_items(): a
+step waiting on the owner and an open decision, neither asked through a gate. Then fill-refs, tag-review for both
 reviews and check run through the CLI. Every expectation is asserted; if one fails the script prints FAIL and the
 reason and exits 1.
 
@@ -17,6 +18,17 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from dev.tests import fixtures  # noqa: E402
+
+
+def add_ungated_owner_items(ledger, ids):
+    """What waits on the owner without a gate: step 1 of the plan set waiting on their review, with its question,
+    and the open decision D-0002. Both are in the owner's queue (v_owner_queue) and listed in the inbox under
+    'Also waiting on you'. Returns the queue refs: ('P-0001 #1', 'D-0002')."""
+    ledger.update("steps", ids["steps"][1], status="waiting-owner", owner_need="review",
+                  owner_question="Is a CI run on every push enough, or also nightly?")
+    ledger.decision("D-0002", "Keep the request limit per user or per team?", status="open")
+    ledger.commit()
+    return "P-0001 #1", "D-0002"
 
 
 def main(argv=None):
@@ -36,6 +48,7 @@ def main(argv=None):
         ledger = fixtures.Ledger(repo, real_init=True, ledger_py=a.ledger)
         try:
             ids = fixtures.seed_demo(ledger)
+            add_ungated_owner_items(ledger, ids)
             fixtures.finish_demo(ledger)
         finally:
             ledger.close()

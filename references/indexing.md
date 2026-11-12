@@ -40,7 +40,14 @@ with the report's own totals and spot-check a few sections of the report against
 
 ## Matching
 
-For each finding, find candidate issues: same fingerprint; same domain, theme and sub; an overlapping location (same
+`ledger.py match R-0001 --auto --actor A-0002` runs first. It matches a finding as `still-present`, with the rule in
+`match_rationale`, when exactly one issue fits and that issue is in an active status, by one of three rules: the
+same fingerprint; the same domain and sub; the same symbol in the same file. It never matches to a fixed, verified,
+obsolete, won't-fix, duplicate or accepted-risk issue, nor a false finding: it lists each point it leaves with its
+candidates, a closed issue first with the type the table in SKILL.md requires (`regression` or `recurrence`).
+`--dry-run` prints the same without writing; `--json` gives it as data. The same ledger gives the same matches.
+
+The points it leaves are judged. For each, find candidate issues: same fingerprint; same domain, theme and sub; an overlapping location (same
 path and symbol, or overlapping lines after following renames with `git log --follow`); the issue the report named
 (`known_issue`); the same `excerpt_sha256` (identical code). At scale give matching to read-only matcher subagents by
 domain, each returning `matches.tsv` (`references/formats/index.md#matches-matchestsv-6-columns`); you check their

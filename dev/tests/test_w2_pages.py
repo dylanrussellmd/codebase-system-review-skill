@@ -54,13 +54,15 @@ class Case(tr.RouteCase):
 class Review(Case):
     def test_review_route_sends_list_rows(self):
         d = self.ok("/api/review/R-0001")
-        self.assertEqual(set(d["findings"][0]), {"id", "point_id", "severity", "kind", "domain_code", "theme_code",
+        self.assertEqual(set(d["findings"][0]), {"id", "point_id", "severity", "domain_code",
                                                  "summary", "match_type", "verification", "issue_code"})
         self.assertEqual([f["point_id"] for f in d["findings"]], ["SEC-H1", "SPEC-M1", "SPEC-L1", "AAA-T1"])
         self.assertIn("check_counts", d)
         self.assertEqual(sum(c["n"] for c in d["check_counts"]), len(d["checks"]))
         # the per-domain summary equals the view it stands in for
         want = self.L.all("SELECT * FROM v_review_summary WHERE review='R-0001'")
+        for w in want:   # step 172: the review's page shows each area's counts; the review itself is its page
+            del w["review"], w["started_at"]
         self.assertEqual(d["summary"], want)
 
     def test_review_summary_equals_view(self):
@@ -80,8 +82,8 @@ class Review(Case):
         self.assertEqual((f["point_id"], f["review_code"], f["issue_code"]), ("SEC-H1", "R-0001", "ISS-0001"))
         self.assertTrue(f["detail"] or f["before_state"] or f["recommendation"])
         self.assertEqual([(x["path"], x["line_start"], x["repo"]) for x in f["locations"]], [("src/auth.py", 1, "demo")])
-        self.assertEqual(set(f["locations"][0]), {"id", "finding_id", "path", "line_start", "line_end", "symbol", "role",
-                                                  "commit_sha", "permalink", "repo"})
+        self.assertEqual(set(f["locations"][0]), {"id", "path", "line_start", "line_end", "symbol", "role",
+                                                  "commit_sha", "repo"})
         self.assertIn("run_label", f)
         self.assertEqual(self.call("/api/finding/999999"), (404, {"error": "no such point"}))
         self.assertEqual(self.call("/api/finding/abc"), (400, {"error": "The point id must be a whole number."}))
@@ -91,7 +93,7 @@ class Review(Case):
         by = {v: k.split("/")[1] for k, v in self.ids["findings"].items() if k.startswith("R-0001/")}
         names = lambda q: sorted(by.get(i, "?") for i in ids("R-0001", q))  # noqa: E731
         self.assertEqual(set(self.ok("/api/review/R-0001", q="auth")), {"match"})
-        self.assertEqual(names("timeoff.py"), ["SPEC-L1", "SPEC-M1"])       # a cited path
+        self.assertEqual(names("requests.py"), ["SPEC-L1", "SPEC-M1"])       # a cited path
         self.assertEqual(names("src/auth"), ["SEC-H1"])
         self.assertEqual(names("ISS-0003"), ["SPEC-L1"])                    # the issue's code
         self.assertEqual(names("sec-h1"), ["SEC-H1"])                       # the point id, any case
@@ -155,7 +157,7 @@ class Issue(Case):
         self.assertEqual([f["locations"] for f in d["findings"][:len(before["findings"])]],
                          [f["locations"] for f in before["findings"]])
         self.assertEqual(set(before["findings"][0]["locations"][0]),
-                         {"id", "path", "line_start", "line_end", "symbol", "role", "commit_sha", "permalink", "repo"})
+                         {"id", "path", "line_start", "line_end", "symbol", "role", "commit_sha", "repo"})
         self.assertEqual([loc["path"] for f in d["findings"][-2:] for loc in f["locations"]],
                          ["src/more48.py", "src/more49.py"])
 
@@ -232,10 +234,10 @@ class Plan(Case):
     def test_plan_route_sends_rows_and_one_phase_in_full(self):
         d = self.ok("/api/plan/P-0001")
         self.assertEqual(set(d), {"plan", "reviews", "artifacts", "last_updated", "gates", "discoveries", "events", "phases", "phase_rows", "steps", "unguarded"})
-        row = {"id", "number", "section", "title", "status", "owner_need", "behavior_change", "phase", "depends",
+        row = {"number", "section", "title", "status", "owner_need", "behavior_change", "phase", "depends",
                "closes", "search"}
         full = {"change", "proof", "owner_question", "behavior_note", "progress_note", "no_findings_reason",
-                "started_at", "done_at", "updated_at", "commits"}
+                "started_at", "done_at", "commits"}
         by = {s["number"]: s for s in d["steps"]}
         self.assertEqual(set(by[1]), row | full)            # phase 1, the default, in full
         self.assertEqual(set(by[2]), row)
@@ -271,7 +273,7 @@ class Plan(Case):
     def test_step_route(self):
         s = self.ok("/api/step/P-0001/2")
         self.assertEqual(set(s), {"number", "change", "proof", "owner_question", "behavior_note", "progress_note",
-                                  "no_findings_reason", "started_at", "done_at", "updated_at", "commits", "closes"})
+                                  "no_findings_reason", "started_at", "done_at", "commits", "closes"})
         self.assertEqual([(c["point_id"], c["review"], c["issue"], c["severity"]) for c in s["closes"]],
                          [("SEC-H1", "R-0001", "ISS-0001", "H")])
         self.assertTrue(s["closes"][0]["summary"])

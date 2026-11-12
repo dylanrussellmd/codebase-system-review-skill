@@ -13,7 +13,7 @@ def build(L):
         f = L.finding(r3, f"BULK-L{n}", severity="L", domain_code="spec" if n % 2 else "tests",
                       summary=f"Point number {n}.", detail="needle in the detail" if n == 150 else f"Detail {n}.")
         if n in (5, 150):
-            L.location(f, "src/timeoff.py", 3, 4, repository_id=ids["repository"], symbol="only_here")
+            L.location(f, "src/requests.py", 3, 4, repository_id=ids["repository"], symbol="only_here")
     for n in range(120):
         i = L.issue(None, first_seen_review_id=ids["reviews"]["R-0001"], title=f"Old issue {n}")
         L.check_row(r3, i, "still-present" if n % 3 else "fixed", evidence="Looked.")
@@ -60,7 +60,7 @@ class Pages(browser.ViewerTestCase):
         box.fill("only_here")
         page.settle()
         self.assertEqual(page.texts("details.item > summary .n"), ["BULK-L5", "BULK-L150"])   # a cited symbol
-        box.fill("src/timeoff")
+        box.fill("src/requests")
         page.settle()
         self.assertEqual(page.text(self.NOTE), "2 of 230 points")                              # a cited file
         box.fill("number 22")
@@ -172,7 +172,7 @@ class Pages(browser.ViewerTestCase):
                        "[r.cells[0].textContent, +r.cells[6].textContent, +r.cells[7].textContent])")
         self.assertEqual(rows, [[w["review"], w["t"], w["c"]] for w in want])
         cards = page.page.locator("h2:text('Points per review') ~ .grid2").first.locator(".card b")
-        self.assertEqual(cards.all_inner_texts(), ["Points", "Missing tests", "Confirmed by the manager"])
+        self.assertEqual(cards.all_inner_texts(), ["Points", "Missing tests", "Confirmed"])
 
 
 class HubPages(unittest.TestCase):
@@ -208,7 +208,7 @@ class HubPages(unittest.TestCase):
         item.locator("summary").click()
         p.settle()
         self.assertIn("needle in the detail", item.inner_text())
-        self.assertEqual(item.locator(".ref .refline code").first.inner_text(), "src/timeoff.py")
+        self.assertEqual(item.locator(".ref .refline code").first.inner_text(), "src/requests.py")
         box.fill("")
         p.settle()
         sec = "h2:text('Earlier issues this review looked for') + div"

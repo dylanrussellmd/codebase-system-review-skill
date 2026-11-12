@@ -31,15 +31,6 @@ WORD_LISTS = {
 }
 GLOSSARY = ("ledger", "review", "domain", "point", "finding", "issue", "plan", "step", "gate", "decision", "hub")
 GLOBAL_FLAGS = {"--root", "--db", "--version", "--help", "-h"}
-# The owner-interview commands of step 129, being built alongside step 130's SKILL.md text: until the CLI has them,
-# SKILL.md may name them (and their flags are not checked); once it has them, they are checked like any other.
-PENDING = {"interview-ask": {"--review", "--domain", "--why", "--actor"},
-           "interview-answer": {"--via", "--actor"},
-           "propose-goal": {"--domain", "--from", "--actor"},
-           "approve-goals": {"--actor"},
-           "goals": {"--domain", "--json"},
-           "interview": {"--review", "--domain"}}
-
 
 def skill_text():
     return SKILL_MD.read_text(encoding="utf-8")
@@ -137,7 +128,7 @@ def ledger_commands(span):
     for m in re.finditer(r"ledger\.py((?:\s+--\S+(?:\s+(?!-)\S+)?)*)\s+([a-z][a-z0-9-]*)(.*?)(?=ledger\.py|$)", span):
         out.append((m.group(2), m.group(3)))
     first = span.split(" ", 1)
-    if not out and (first[0] in names or first[0] in PENDING):
+    if not out and first[0] in names:
         out.append((first[0], first[1] if len(first) > 1 else ""))
     return out
 
@@ -150,11 +141,6 @@ class Commands(unittest.TestCase):
         for f in doc_files():
             for span in code_spans(f.read_text(encoding="utf-8")):
                 for cmd, rest in ledger_commands(span):
-                    if cmd not in names and cmd in PENDING:
-                        bad = set(re.findall(r"(?<![\w'=-])(--[a-z][a-z-]*)", rest)) - PENDING[cmd] - GLOBAL_FLAGS
-                        if bad:
-                            problems.append(f"{f.name}: `{span}` gives {cmd} {sorted(bad)}, not in step 129's design")
-                        continue
                     if cmd not in names:
                         if "ledger.py" in span:
                             problems.append(f"{f.name}: `{span}` names ledger.py {cmd}, which the CLI does not have")
@@ -315,12 +301,11 @@ class Structure(unittest.TestCase):
                 first = re.search(rf"\b{term}s?\b", text, re.I)
                 self.assertGreaterEqual(first.start(), start, f"{term!r} is used before the glossary")
 
-    def test_domain_catalog_moved_with_applies_index(self):
+    def test_domain_catalog_states_when_each_domain_applies(self):
+        """One copy of each 'applies when' sentence: references/domains.md, mirrored in domains.description (SKILL.md
+        keeps no index of its own; `ledger.py scan` proposes the domains by rule)."""
         _, _, _, _, domains = Schema.get()
-        text = skill_text()
-        index = re.search(r"^Index \(code: applies when\):(.*?)\n\n", text, re.M | re.S).group(1)
-        for code in domains:
-            self.assertIn(f"`{code}`", index, f"SKILL.md's domain index lacks {code}")
+        self.assertNotIn("Index (code: applies when)", skill_text())
         catalog = (REFS / "domains.md").read_text(encoding="utf-8")
         applies = {m.group(1): " ".join(m.group(2).split())
                    for m in re.finditer(r"\*\*[^*]+?, `([^`]+)`\.\*\*\s*\*([^*]*[Aa]ppl[^*]*)\*", catalog)}
@@ -355,6 +340,105 @@ class Structure(unittest.TestCase):
             text = f.read_text(encoding="utf-8")
             with self.subTest(file=f.name):
                 self.assertNotRegex(text, r"engine-A|[Tt]ime off|time-off|progress\.json|AskUserQuestion")
+
+
+# A tool or surface only some harnesses have, and the words that give the way without it (steps 135-136, K51).
+OPTIONAL_SURFACE = re.compile(r"(?i)subagent tool|question tool|Playwright|Lighthouse|design connector|"
+                              r"published page|Publishing it elsewhere|look at an image")
+FALLBACK_WORDS = re.compile(r"(?i)\bwithout\b|when it has one|\boptional\b|\botherwise\b|\bunless\b|"
+                            r"only when|when .{0,40} is installed")
+
+
+class Environment(unittest.TestCase):
+    """Steps 135-136 (OWN-8): the skill takes stock of its environment and names a fallback for every tool."""
+
+    def test_step1_takes_stock_of_the_environment(self):
+        text = skill_text()
+        s1 = section(text, "Step 1:")
+        self.assertRegex(s1, r"(?m)^ledger\.py env$")
+        self.assertIn("`ledger.py env` (Step 1) lists the tools this one offers; each step uses a tool it lists, else "
+                      "the fallback in `references/environment.md`", " ".join(text.split()))
+        self.assertRegex(section(text, "2a."), r"(?m)^ledger\.py env --review R-0001 .*--actor A-0002$")
+        self.assertIn("`references/environment.md`", section(text, "Reference files"))
+        self.assertIn("connector names", " ".join(section(text, "Privacy of the ledger").split()))
+
+    def test_every_capability_has_a_fallback(self):
+        import json
+        out = run_ledger("--root", temp_dir("env-"), "env", "--json", ledger_py=fixtures.built_ledger_path())
+        self.assertEqual(out.returncode, 0, out.stderr)
+        names = [c["capability"] for c in json.loads(out.stdout)["capabilities"]
+                 if not c["capability"].startswith("connector:")] + ["connector:<name>"]
+        doc = (REFS / "environment.md").read_text(encoding="utf-8")
+        table = {}
+        for line in doc.split("\n"):
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            if line.startswith("| `") and len(cells) == 3:
+                table[cells[0].strip("`")] = cells
+        for name in names:
+            with self.subTest(capability=name):
+                self.assertIn(name, table, f"references/environment.md has no row for {name}")
+                self.assertGreater(len(table[name][1]), 10, "what it is used for")
+                self.assertGreater(len(table[name][2]), 20, "what to do without it")
+        self.assertEqual(sorted(table), sorted(names), "a row for a capability env does not report")
+
+    def test_optional_surfaces_name_their_fallback(self):
+        """A tool only some harnesses have is named only next to what to do without it (same paragraph)."""
+        for f in doc_files():
+            for para in re.split(r"\n\s*\n", f.read_text(encoding="utf-8")):
+                if para.lstrip().startswith("|"):
+                    continue   # the tables: each row is its own fallback
+                for bullet in re.split(r"\n(?=- )", para):
+                    if OPTIONAL_SURFACE.search(bullet):
+                        with self.subTest(file=f.name, text=bullet[:70]):
+                            self.assertRegex(bullet, FALLBACK_WORDS)
+
+    def test_local_surfaces_are_the_default(self):
+        hub = " ".join(section(skill_text(), "The hub and gates").split())
+        self.assertIn("give the owner that file, or the viewer", hub)
+        self.assertIn("Publishing it elsewhere is optional", hub)
+        for f in doc_files():
+            with self.subTest(file=f.name):
+                self.assertNotRegex(f.read_text(encoding="utf-8"), r"(?i)claude\.ai|design canvas|cloud browser")
+
+
+class UiDomain(unittest.TestCase):
+    """Step 133 (OWN-6): the UI/UX domain works from the owner's design direction, distinct options, the rendered
+    pages and measurements, each tool with its fallback."""
+
+    def entry(self, name):
+        entries = re.split(r"\n(?=\*\*[A-Z])|\n(?=#)", (REFS / "domains.md").read_text(encoding="utf-8"))
+        return " ".join([e for e in entries if e.startswith(f"**{name}")][0].split())
+
+    def test_ui_entry_names_the_brief_options_screenshots_and_tools(self):
+        ui = self.entry("Front end / UI")
+        for need in ("**Design brief.**", "`ledger.py goals --domain ui`", "type scale", "palette", "density",
+                     "**Look at the pages.**", "`ledger.py ui-capture`", "390", "1280", "light and dark",
+                     "**Measure.**", "`ledger.py ui-audit`", "contrast", "page weight", "layout shift",
+                     "every colour, font size and spacing value",
+                     "**Redesign proposals.**", "three deliberately different options", "generic default",
+                     "the owner picks", "design connector", "ACCESS AUDIT"):
+            self.assertIn(need, ui)
+        for part, fallback in (("Look at the pages.", "rendered result not seen"),
+                               ("Measure.", "Without Playwright"),
+                               ("Redesign proposals.", "without one")):
+            bullet = ui[ui.index(f"**{part}**"):]
+            bullet = bullet[:bullet.index(" - **", 5)] if " - **" in bullet[5:] else bullet
+            with self.subTest(part=part):
+                self.assertIn(fallback, bullet)
+                self.assertIn("references/environment.md", ui)
+
+    def test_walkthroughs_ask_about_a_first_time_user(self):
+        walk = self.entry("Task walkthroughs")
+        for need in ("first-time user", "finish the main task unaided", "seen first", "could be deleted"):
+            self.assertIn(need, walk)
+
+    def test_interview_asks_for_the_design_direction(self):
+        doc = (REFS / "domains.md").read_text(encoding="utf-8")
+        bank = " ".join(section(doc, "Interview questions").split())
+        for need in ("`ui`", "like the look of", "three words", "never look like", "design brief",
+                     "type scale, palette and density", "`walkthroughs`"):
+            self.assertIn(need, bank)
+        self.assertIn("references/domains.md#interview-questions", skill_text())
 
 
 class OwnerRules(unittest.TestCase):

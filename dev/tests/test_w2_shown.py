@@ -44,8 +44,8 @@ class Review(Case):
                           ("report", ".code-review/reviews/R-0001/security.md", "https://example.com/reports/security",
                            run["label"])])
         t = d["test_runs"][0]
-        self.assertEqual((t["command"], t["purpose"], t["passed"], t["failed"], t["duration_ms"], t["repo"]),
-                         ("python -m unittest", "baseline", 41, 2, 12300, "demo"))
+        self.assertEqual((t["command"], t["purpose"], t["passed"], t["failed"], t["duration_ms"]),
+                         ("python -m unittest", "baseline", 41, 2, 12300))
         repo = d["repos"][0]
         self.assertEqual((repo["remote_url"], repo["default_branch"], repo["notes"]),
                          ("https://example.com/demo.git", "main", "The only repository."))
@@ -125,11 +125,15 @@ class Checks(Case):
         for name in views + ["quick_check", "integrity_check", "foreign_key_check", "check_schema"]:
             self.assertIn(name, headings, f"recipes.md 'A failing check' has no heading for {name}")
         self.assertEqual(set(self.mod.CHECK_ACTIONS), set(views))             # one sentence per check, none stale
-        for c in self.ok("/api/checks")["checks"]:
-            self.assertEqual(c["action"], self.mod.CHECK_ACTIONS[c["view"]])
+        checks = self.ok("/api/checks")["checks"]
+        self.assertEqual(len(checks), len(views))
+        for c, view in zip(checks, [r["view"] for r in self.L.all(
+                "SELECT view FROM ledger_checks ORDER BY position, view")]):
+            self.assertEqual(set(c), {"label", "n", "action", "recipe", "link"})   # step 172: what the page shows
+            self.assertEqual(c["action"], self.mod.CHECK_ACTIONS[view])
             self.assertRegex(c["action"], r"^[A-Z].*\.$")
-            self.assertEqual(c["recipe"], f'references/recipes.md, under "A failing check": {c["view"]}')
-            self.assertEqual(c["link"] is None, c["n"] == 0, c["view"])
+            self.assertEqual(c["recipe"], f'references/recipes.md, under "A failing check": {view}')
+            self.assertEqual(c["link"] is None, c["n"] == 0, view)
 
     def test_check_links_to_the_page_with_its_rows(self):
         L = Ledger()
@@ -137,7 +141,7 @@ class Checks(Case):
         ids = fixtures.seed_demo(L)
         L.finding(ids["reviews"]["R-0002"], "SPEC-L9", severity="L", summary="Unmatched probe.")
         L.commit()
-        by = {c["view"]: c for c in self.ok("/api/checks", L=L)["checks"]}
+        by = {c["recipe"].rsplit(": ", 1)[1]: c for c in self.ok("/api/checks", L=L)["checks"]}
         self.assertEqual(by["v_unmatched_findings"]["link"], "#/review/R-0002?match=none")
         self.assertEqual(by["v_untraceable_refs"]["link"], "#/explore/v_untraceable_refs")
         self.assertIsNone(by["v_coverage_problems"]["link"])

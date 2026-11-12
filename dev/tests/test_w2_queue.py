@@ -43,17 +43,17 @@ class Header(Case):
 
     def test_overview_is_the_header(self):
         d = self.ok("/api/overview")
-        self.assertEqual(set(d), {"project", "schema_version", "queue_count", "answered_count", "gates_open", "labels"})
+        self.assertEqual(set(d), {"project", "queue_count", "answered_count", "labels"})
         self.assertEqual(set(d["labels"]), {"domains", "themes", "enums"})
 
     def test_overview_queue_counts(self):
         d = self.ok("/api/overview")
         # two open gates, the waiting step, an open decision and one to look at again; the answered gate apart
-        self.assertEqual((d["queue_count"], d["answered_count"], d["gates_open"]), (5, 1, 2))
+        self.assertEqual((d["queue_count"], d["answered_count"]), (5, 1))
         q = self.L.all("SELECT kind, status FROM v_owner_queue")
         self.assertEqual(d["queue_count"] + d["answered_count"], len(q))
         e = self.ok("/api/overview", L=self._empty())
-        self.assertEqual((e["queue_count"], e["answered_count"], e["gates_open"]), (0, 0, 0))
+        self.assertEqual((e["queue_count"], e["answered_count"]), (0, 0))
 
     def _empty(self):
         L = Ledger()
@@ -66,7 +66,7 @@ class Header(Case):
         self.L.commit()
         try:
             d = self.ok("/api/home")
-            self.assertEqual(set(d), {"open_by_severity", "issues_by_status", "reviews", "plans", "discoveries"})
+            self.assertEqual(set(d), {"open_by_severity", "reviews", "plans", "discoveries"})
             plan = d["plans"][0]
             self.assertEqual(set(plan), {"code", "title", "status", "steps", "done", "doing", "waiting"})
             listed = self.ok("/api/plans")[0]
@@ -82,7 +82,7 @@ class Header(Case):
         self.assertEqual(set(d), {"checks", "recurring"})
         want = [(r["view"], r["label"], r["tier"], self.L.count(r["view"]))
                 for r in self.L.all("SELECT view, label, tier FROM ledger_checks ORDER BY position, view")]
-        self.assertEqual([(c["view"], c["label"], c["tier"], c["n"]) for c in d["checks"]], want)
+        self.assertEqual([(c["label"], c["n"]) for c in d["checks"]], [(w[1], w[3]) for w in want])
         self.assertEqual(d["recurring"], self.L.count("v_recurring_issues"))
         out = self.L.run("check").stdout
         for view, label, tier, n in want:  # the same counts `ledger.py check` prints
@@ -205,7 +205,7 @@ class Decisions(Case):
         self.assertEqual(set(by), {"D-0001", "D-0002", "D-0003", "D-0004"})
         self.assertEqual((by["D-0002"]["answer"], by["D-0002"]["issues"], by["D-0002"]["status"]),
                          ("No.", None, "decided"))
-        self.assertEqual(set(d[0]), {"code", "question", "answer", "rationale", "status", "revisit_when", "asked_at",
+        self.assertEqual(set(d[0]), {"code", "question", "answer", "rationale", "status", "revisit_when",
                                      "decided_at", "review", "issues"})
         # the ones still to settle come first
         self.assertEqual({x["code"] for x in d[:2]}, {"D-0003", "D-0004"})
@@ -271,6 +271,30 @@ class Migration(unittest.TestCase):
             self.assertIn("10000", sql)
         finally:
             c.close()
+
+
+class UngatedOwnerItems(Case):
+    """Step 150: a step waiting on the owner and an open decision, neither asked through a gate (the demo script's
+    add_ungated_owner_items), are in the owner's queue and listed with the inbox's other items."""
+    @classmethod
+    def build(cls, L):
+        from dev.tests.seed_demo import add_ungated_owner_items
+        ids = seed_demo(L)
+        cls.refs = add_ungated_owner_items(L, ids)
+        return ids
+
+    def test_ungated_owner_items_listed(self):
+        other = {r["ref"]: r for r in self.ok("/api/gates")["other"]}
+        self.assertEqual(set(other), set(self.refs))
+        step, decision = other["P-0001 #1"], other["D-0002"]
+        # what lands under each column of the inbox's table: Needs is the step's owner need, Question its question
+        self.assertEqual((step["kind"], step["need"], step["title"], step["question"]),
+                         ("step", "review", "Run every suite in CI", "Is a CI run on every push enough, or also nightly?"))
+        # a decision's question is under Question; its title is a fixed phrase; Needs is "decision"
+        self.assertEqual((decision["kind"], decision["need"], decision["title"], decision["question"]),
+                         ("decision", "decision", "A decision to make", "Keep the request limit per user or per team?"))
+        o = self.ok("/api/overview")
+        self.assertEqual(o["queue_count"], 2 + len(self.refs))   # the demo's two open gates, and these two
 
 
 if __name__ == "__main__":

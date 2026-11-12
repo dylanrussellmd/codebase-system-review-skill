@@ -5,9 +5,9 @@ A skill for a managed, multi-reviewer code review, with a per-project SQLite led
     codebase-system-review/
     ├── SKILL.md               the instructions the agent follows (read in full on every use)
     ├── scripts/ledger.py      ledger tool + viewer (Python 3.9+, no dependencies)
-    └── references/            read when SKILL.md says: domains.md, brief.md, indexing.md, fix-plan.md,
-                               recipes.md, implementer-brief.md, writing.md, formats/ (file formats), schema.sql,
-                               vale/ (optional Vale rules for writing.md; untested)
+    └── references/            read when SKILL.md says: environment.md, domains.md, brief.md, indexing.md,
+                               fix-plan.md, recipes.md, implementer-brief.md, writing.md, determinism.md,
+                               formats/ (file formats), schema.sql, vale/ (optional Vale rules for writing.md; untested)
 
 ## Install
 
@@ -20,6 +20,16 @@ A skill for a managed, multi-reviewer code review, with a per-project SQLite led
 
 Keep the folder name `codebase-system-review`: it must match `name:` in SKILL.md. Restart the harness, then ask the
 agent to "run the comprehensive system review".
+
+The skill depends on no one harness or model. `ledger.py env` lists what the machine and the harness offer (git,
+Playwright and a browser, Lighthouse, the harness's connectors by name); `references/environment.md` gives the way
+without each. Playwright is optional: `ledger.py ui-capture` and `ledger.py ui-audit` screenshot and measure rendered
+pages with it, and print the install line and exit 2 without it.
+
+Everything code can decide, the tool decides, so two runs on the same commit agree: `scan` proposes the domains by
+rule, `brief` and `prompt` generate the texts reviewers get, `lint-report` checks what they hand back, `match --auto`
+matches what the data decides, `conflicts` finds plan steps that touch the same thing, and `compare-runs` measures
+how far two runs differ (`references/determinism.md` lists what is left to judgement).
 
 Each project keeps a copy of the tool at `.code-review/ledger.py`. Review a pull request that changes that copy or the
 ledger's schema like any other code change. `ledger.py check` fails when the ledger's tables, views or triggers differ

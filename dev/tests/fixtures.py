@@ -713,7 +713,7 @@ DEMO_FILES_1 = {
                     "    return f\"{random.randint(0, 999999):06d}\"\n"
                     "def check(code, expected):\n"
                     "    return code == expected\n"),
-    "src/timeoff.py": ("NOTICE_DAYS = 14\n"
+    "src/requests.py": ("NOTICE_DAYS = 14\n"
                        "def can_request(user, days_ahead, weekend):\n"
                        "    if days_ahead < NOTICE_DAYS:\n"
                        "        return False\n"
@@ -733,7 +733,7 @@ DEMO_FILES_2 = {
 def seed_demo(ledger):
     """Fill `ledger` with the demo: two reviews of a small sample app (sign-in codes and a rule for requests),
     matching across them, a plan with a done step and a step waiting on the owner, a decision, two open gates and
-    metrics. Writes src/auth.py and src/timeoff.py into ledger.repo and commits twice (the commits the two reviews
+    metrics. Writes src/auth.py and src/requests.py into ledger.repo and commits twice (the commits the two reviews
     looked at), so every cited file exists. Every expectation is checked; a failed one raises DemoExpectationError. The work is committed.
 
     Returns a dict of the ids created:
@@ -810,10 +810,10 @@ def seed_demo(ledger):
     f2 = finding(r1, "R-0001", "spec", "SPEC-M1", "M", "defect", "spec", "spec-mismatch", "notice-period",
                  "Notice period is hardcoded to 14 days instead of a setting.",
                  "can_request refuses anything under 14 days; the owner asked for it to be a setting.",
-                 "Read the notice period from program settings.", "src/timeoff.py", 2, 4, "can_request")
+                 "Read the notice period from program settings.", "src/requests.py", 2, 4, "can_request")
     f3 = finding(r1, "R-0001", "spec", "SPEC-L1", "L", "defect", "spec", "spec-mismatch", "admin-bypass",
                  "Admins skip the weekend limit entirely.", "Admins bypass the weekend-off rule.",
-                 "Apply the same rule with an override that is recorded.", "src/timeoff.py", 5, 6, "can_request")
+                 "Apply the same rule with an override that is recorded.", "src/requests.py", 5, 6, "can_request")
     i1 = new_issue("ISS-0001", f1, r1, "Predictable sign-in codes", "security", "sign-in", "code-randomness", "H",
                    "security", "Codes generated with random.randint.")
     i2 = new_issue("ISS-0002", f2, r1, "Notice period hardcoded", "spec", "spec-mismatch", "notice-period", "M",
@@ -885,7 +885,7 @@ def seed_demo(ledger):
             "a 'fixed' check on a fixed issue should verify it")
     f4 = finding(r2, "R-0002", "spec", "SPEC-M1", "M", "defect", "spec", "spec-mismatch", "notice-period",
                  "Notice period is still 14 days in code.", "Unchanged since R-0001.", "Read it from settings.",
-                 "src/timeoff.py", 2, 4, "can_request")
+                 "src/requests.py", 2, 4, "can_request")
     L.match(f4, i2, "still-present", "certain", "Same function and lines as ISS-0002")
     L.check_row(r2, i2, "still-present", finding_id=f4, actor_id=spec)
     f5 = finding(r2, "R-0002", "security", "SEC-M1", "M", "security", "security", "sign-in", "code-compare",

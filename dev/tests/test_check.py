@@ -129,6 +129,13 @@ def offend(L, view, count=1):
         fb = traced(L, L.finding(r2, issue_id=b, match_type="still-present"))
         for a in others:
             L.check_row(r2, a, "still-present", finding_id=fb)   # cites ISS-b's finding as evidence for a
+    elif view == "v_unresolved_conflicts":   # step 143: two steps touch the same file, nobody judged the pair
+        plan = L.plan(reviews=[r1])
+        ph = L.phase(plan, 1)
+        for n in range(count):
+            a, b = [L.step(plan, ph, 2 * n + k, no_findings_reason="checks the conflict view") for k in (1, 2)]
+            L.insert("step_conflicts", step_a_id=a, step_b_id=b, kind="file", target="demo:src/app.py",
+                     reason="file demo:src/app.py: both change it")
     else:
         raise AssertionError(f"no offending fixture for {view}")
     L.commit()
@@ -257,7 +264,8 @@ class CheckFunction(unittest.TestCase):
         self.assertLessEqual({"v_unmatched_findings", "v_unchecked_known_issues", "v_untraceable_refs",
                               "v_uncovered_findings", "v_coverage_problems"}, set(self.views))
         self.assertEqual([(v, t) for v, _, t in self.checks if t == "warning"],
-                         [("v_unguarded_fixes", "warning"), ("v_artifacts_outside_ledger", "warning")])
+                         [("v_unguarded_fixes", "warning"), ("v_artifacts_outside_ledger", "warning"),
+                          ("v_late_step_conflicts", "warning")])
         for v in self.views:
             self.assertIn(v, views)
 

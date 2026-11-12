@@ -21,9 +21,9 @@ class WriteFrameworkTest(unittest.TestCase):
         self.assertEqual(L.all("SELECT domain_code, decision FROM review_domains ORDER BY domain_code"),
                          [{"domain_code": "spec", "decision": "included"},
                           {"domain_code": "tests", "decision": "included"}])
-        out = ok(L, "new-review", "--title", "Second", "--scope", "second", "--previous", "R-0001",
-                 "--skip", "ui=no pages")
+        out = ok(L, "new-review", "--title", "Second", "--scope", "second", "--previous", "R-0001")
         self.assertEqual(out[0], "R-0002")
+        ok(L, "review-domain", "R-0002", "ui", "skip", "--reason", "no pages")
         self.assertEqual(L.scalar("SELECT previous_review_id FROM reviews WHERE code='R-0002'"),
                          L.id_of("reviews", "R-0001"))
         self.assertEqual(L.scalar("SELECT reason FROM review_domains WHERE domain_code='ui'"), "no pages")
@@ -57,11 +57,11 @@ class WriteFrameworkTest(unittest.TestCase):
         self.assertEqual(L.scalar("SELECT approved_by_actor_id IS NOT NULL FROM reviews"), 1)
 
     def test_write_command_is_one_transaction(self):
-        """new-review fails on its last part (an unknown design goal) after inserting the review, its repositories
-        and domains: nothing is left, and the code is not used up."""
+        """new-review fails on its last part (an unknown design goal) after inserting the review and its
+        repositories: nothing is left, and the code is not used up."""
         repo, L, _ = project(self, approved=False)
         before = counts(L, "reviews", "review_repositories", "review_domains", "events")
-        err = refused(self, L, "new-review", "--title", "X", "--scope", "full", "--domain", "spec", "--goal", "G-07")
+        err = refused(self, L, "new-review", "--title", "X", "--scope", "full", "--goal", "G-07")
         self.assertIn("no design goal G-07", err)
         self.assertIn("nothing was written", err)
         self.assertEqual(counts(L, "reviews", "review_repositories", "review_domains", "events"), before)

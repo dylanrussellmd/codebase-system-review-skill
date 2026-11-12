@@ -44,9 +44,9 @@ def build(L):
     L.insert("artifacts", plan_id=plan, kind="plan-file", path=".code-review/plans/P-0001.md")
     L.relation(ids["issues"]["ISS-0002"], ids["issues"]["ISS-0003"], "blocks", "Same function.",
                established_in_review_id=r2)
-    req = L.insert("requirements", code="REQ-0001", text="Time off needs 14 days of notice.", source="spec.md")
+    req = L.insert("requirements", code="REQ-0001", text="A request needs 14 days of notice.", source="spec.md")
     L.insert("review_requirement_checks", review_id=r1, requirement_id=req, verdict="differs", tested="no",
-             where_implemented="src/timeoff.py", evidence="The limit is hardcoded.")
+             where_implemented="src/requests.py", evidence="The limit is hardcoded.")
     f1 = ids["findings"]["R-0001/SPEC-M1"]
     L.insert("finding_requirements", finding_id=f1, requirement_id=req, verdict="differs")
     L.insert("finding_goals", finding_id=f1, goal_id=L.id_of("design_goals", "G-01"))

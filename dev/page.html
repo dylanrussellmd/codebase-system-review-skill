@@ -129,6 +129,26 @@ nav.rail small{display:block;font-size:12px;opacity:.75}
 <div class="visually-hidden" id="live" role="status"></div>
 <script>
 "use strict";
+// The viewer page. `ledger.py serve` sends it as it is; `ledger.py progress-page` sends the same page with the
+// ledger's answers embedded before this script (window.LEDGER_SNAPSHOT: see STATIC). The viewer's key arrives in
+// the launch address (#k=...) and goes back with every request as X-Ledger-Token; the page holds no secret.
+//
+// Addresses (the part after #), the view that draws each, and what it asks the server (/api/...):
+//   #/                                   home      overview (every page), home, then checks
+//   #/guide                              guide     plans, reviews, guide
+//   #/inbox, #/inbox/GATE-0001           inbox     gates?status=pending, decisions
+//   #/decisions, #/decisions/D-0001      decisions decisions
+//   #/history, #/history/GATE-0001       history   gates?status=all, a page at a time
+//   #/reviews                            reviews   reviews
+//   #/review/R-0001?match=none           review    review/<code>; finding/<id> as a point opens; run/<id>
+//   #/goals, #/goals/G-01                goals     goals
+//   #/issues?status=&severity=&domain_code=&q=&offset=   issues   issues?...
+//   #/issue/ISS-0001                     issue     issue/<code>
+//   #/plans                              plans     plans
+//   #/plan/P-0001, #/plan/P-0001/phase/2 plan      plan/<code>?phase=N; step/<code>/<n> as a step opens
+//   #/trends                             trends    trends
+//   #/explore, #/explore/<table>?offset= explore   tables, table/<name>, sql
+// Any view: source/<id> when a code reference is opened. An unknown address draws the home page.
 // The token arrives once, in the launch URL's fragment (#k=<token>, optionally followed by #/route); it is kept in
 // sessionStorage for this tab and removed from the address bar. The page itself carries no secret.
 let TOKEN = "";
@@ -199,11 +219,11 @@ function staticApi(path, body){
     return Promise.resolve({match: S[p].findings.filter(f => JSON.stringify(S["finding/" + f.id] || f).toLowerCase().includes(t)).map(f => f.id)});
   }
   if (p.startsWith("table/")) {
-    const t = S[p]; if (!t) return Promise.reject(new Error("That table is not in this snapshot."));
+    const t = S[p]; if (!t) return Promise.reject(new Error("This copy does not hold that table."));
     const off = Number(qs.get("offset")) || 0, lim = Number(qs.get("limit")) || 100;
     return Promise.resolve({columns: t.columns, rows: copy(t.rows.slice(off, off + lim)), count: t.count, total: t.total, more: off + lim < t.count, offset: off, limit: lim});
   }
-  if (S[p] === undefined) return Promise.reject(new Error("This view is not in the snapshot."));
+  if (S[p] === undefined) return Promise.reject(new Error("This copy does not hold that page."));
   return Promise.resolve(copy(S[p]));
 }
 
@@ -248,12 +268,13 @@ function md(text){
 }
 function hubGateBody(card, g, hid){
   const saved = HUB.answers[g.code];
-  if (saved) { add(card, h("p", {class: "callout answer"}, "You answered: ", answerText({options: g.options, ...saved}, true), ". The agent records it the next time it checks (or tell it in the chat to check now).")); return card; }
+  if (saved) {
+    add(card, h("p", {class: "callout answer"}, "You answered: ", answerText({options: g.options, ...saved}, true),
+      ". The agent records it the next time it checks (or tell it in the chat to check now)."));
+    return card;
+  }
   if (!HUB.db) { add(card, h("p", {class: "note"}, "Answer in the chat with the agent; answering here needs you signed in as this page's owner.")); return card; }
-  const nm = "opt-" + g.code;
-  const opts = (g.options || []).length ? h("div", {class: "opts", role: "radiogroup", "aria-labelledby": hid},
-    g.options.map(o => h("label", null, h("input", {type: "radio", name: nm, value: o.value}), h("span", null, o.label, o.description ? h("small", null, o.description) : null)))) : null;
-  const ta = g.allow_text ? h("textarea", {class: "field", placeholder: opts ? "Add a note or a different answer (optional)" : "Your answer", id: hid + "-text", "aria-label": "Your answer", "aria-labelledby": `${hid}-text ${hid}`}) : null;
+  const {name: nm, opts, ta} = gateInputs(g, hid);
   const msg = h("div"), form = h("div", {class: "gate"});
   const send = h("button", {class: "btn", type: "button", id: hid + "-send", "aria-labelledby": `${hid}-send ${hid}`, onclick: async () => {
     const picked = card.querySelector(`input[name="${nm}"]:checked`), val = picked ? picked.value : null, txt = ta ? ta.value.trim() : "";
@@ -277,6 +298,9 @@ if (STATIC) document.addEventListener("click", e => {
 });
 
 // ---------- helpers
+// The one way the page makes elements. Text is always a text node, never parsed as HTML, so ledger text cannot
+// become markup. attrs: on* values become listeners; null and false are left out; true is an empty
+// attribute; class sets className. kids are flattened; null and false are skipped.
 function h(tag, attrs, ...kids){
   const e = document.createElement(tag);
   if (attrs) for (const [k,v] of Object.entries(attrs)) {
@@ -296,6 +320,7 @@ function extLink(u, text){
   return href ? h("a", {href, target:"_blank", rel:"noopener noreferrer"}, text)
               : h("span", {class:"muted", title:"not an http(s) link, so not shown as a link"}, `${text}: ${u}`);
 }
+// put: replace el's children with kids; add: append them. Both skip null, false and "".
 function put(el, ...kids){ el.replaceChildren(...kids.flat(Infinity).filter(k => k != null && k !== false && k !== "").map(k => k instanceof Node ? k : document.createTextNode(String(k)))); return el; }
 function add(el, ...kids){ for (const k of kids.flat(Infinity)) if (k != null && k !== false && k !== "") el.append(k instanceof Node ? k : String(k)); return el; }
 // A request the viewer refused or could not answer: the sentence to show and the HTTP status (0: no answer at all).
@@ -303,6 +328,9 @@ class ApiError extends Error { constructor(message, status){ super(message); thi
 const NOT_RUNNING = "The viewer is not running. Start it again with ledger.py serve and open the link it prints.";
 const RESTARTED = "The viewer was restarted. Copy anything you typed, then open the new link that ledger.py serve printed.";
 const NO_KEY = "This address is missing the viewer's key. Open the link that ledger.py serve printed.";
+// The server's answer to /api/<path> (a POST when there is a body). Any failure is an ApiError with a sentence for
+// the reader and the status: 0 the viewer is not running, 403 a missing or old key, otherwise the server's own
+// {"error"} text. In the shared copy the answer comes from the embedded data (staticApi).
 async function api(path, body){
   if (STATIC) return staticApi(path, body);
   const opt = {headers:{"X-Ledger-Token":TOKEN}};
@@ -317,7 +345,8 @@ async function api(path, body){
 }
 const words = s => s == null ? "" : String(s).replace(/[-_]/g," ").replace(/^./, c => c.toUpperCase());
 // The words' labels come from the ledger (GET /api/overview labels.enums, from its lookup tables); L maps the page's
-// short names to them. Without them (an older ledger) a word is shown through words(), and a severity letter
+// short names to them (ENUM_OF: which API enum feeds which map). Every value the schema allows has a label there
+// (test_page_tone_and_filters checks the step and need maps). Without them (an older ledger) a word is shown through words(), and a severity letter
 // through the fallback below, so the page never shows a raw value.
 const ENUM_OF = {sev:"severity", issue:"issue_status", match:"match_type", verif:"verification", review:"review_status",
   scope:"review_scope", step:"step_status", need:"owner_need", gate:"gate_kind", gstat:"gate_status", rel:"relation_type",
@@ -342,16 +371,21 @@ const TONE = {
   verif:{confirmed:"ok"},
   gate:{"production-action":"crit"}, gstat:{open:"you"},
   goal:{approved:"ok", proposed:"you"},
-  step:{done:"solid", doing:"ok", "waiting-owner":"you"},
-  need:{production:"crit", decision:"warn", confirm:"info", review:"info"},
+  step:{"not-started":"", doing:"ok", "waiting-owner":"you", done:"solid", dropped:""},
+  need:{none:"", decision:"warn", confirm:"info", review:"info", production:"crit"},
   area:{included:"ok"},
 };
 const tone = (map, v) => (TONE[map] && TONE[map][v]) || "";
+// A tag: text in a small coloured box (cls: its tone). labTag: a stored value by its label and tone; sevTag a
+// severity; issueTag an issue status.
 const tag = (text, cls, title) => h("span", {class:"tag" + (cls ? " " + cls : ""), title}, text);
 const labTag = (map, v) => tag(lab(map, v), tone(map, v));
 const sevTag = s => tag(lab("sev", s), s, "Severity");
 const issueTag = s => labTag("issue", s);
-const plural = (n, one, many) => `${n} ${n === 1 ? one : (many || one + "s")}`;
+const noun = (n, one, many) => n === 1 ? one : (many || one + "s");
+const plural = (n, one, many) => `${n} ${noun(n, one, many)}`;
+const sevCols = () => [{label:"High", key:"high", num:1}, {label:"Medium", key:"medium", num:1}, {label:"Low", key:"low", num:1},
+  {label:"Missing tests", key:"tests", num:1}];
 // A stored time in the reader's own words and time zone. Stored times are UTC: "2026-01-02T03:04:05.000Z", also
 // with a space for the T, without the Z, or with an offset. A date alone is shown as that day. Nothing gives "",
 // and text that is not a time gives "date unknown".
@@ -376,8 +410,11 @@ function whenCell(stored, withTime){
   const t = when(stored, withTime);
   return t === NO_DATE ? h("span", {title:String(stored)}, t) : t;
 }
-const short = sha => sha ? sha.slice(0, 10) : "";
+const SHORT_SHA = 10;   // characters of a commit id shown: enough to tell commits apart, as git does
+const short = sha => sha ? sha.slice(0, SHORT_SHA) : "";   // a commit id as shown
+// A list of [label, value] pairs; an empty value leaves its pair out.
 const kv = pairs => h("dl", {class:"kv"}, pairs.filter(p => p[1] != null && p[1] !== "" && !(Array.isArray(p[1]) && !p[1].length)).map(([k,v]) => [h("dt", null, k), h("dd", null, v)]));
+// What a list says when it has nothing to show.
 const empty = t => h("p", {class:"empty"}, t);
 const sect = title => h("h2", {class:"sec"}, title);   // a section of a page: second level, in the small style
 // Words for a screen reader about something that just happened (a count after filtering, an answer saved, an error).
@@ -439,7 +476,11 @@ function table(cols, data, href, none="Nothing here yet.", rowAttrs){
     h("tbody", null, data.map(row))));
 }
 // Under a list that comes a page at a time: which rows are shown, with Previous and Next. turn(offset) loads a page.
-const PAGE_ROWS = 200;
+const PAGE_ROWS = 200;   // rows of the issues list and the question history asked for at a time (the server's PAGE_ROWS)
+const REVIEW_FIRST = 100;   // points of a review drawn at first: a long review opens at once
+const REVIEW_MORE = 200;   // points added by Show more
+const PLAN_PAGE = 300;   // matching steps drawn at a time
+const EXPLORE_ROWS = 100;   // rows of a table or view in Explore per page
 function pager(d, shown, turn){
   if (d.total <= shown && !d.offset) return null;
   const btn = (text, to, on) => on ? h("button", {class:"btn ghost", type:"button", onclick:() => turn(to)}, text) : null;
@@ -460,6 +501,7 @@ function copyBtn(text, label="Copy", name){
     say(e.target.textContent);
   }}, label);
 }
+// Open an address of the page (in the shared copy, through nav(), which keeps the address an artifact allows).
 function go(hash){ if (STATIC) return nav(hash); location.hash = hash; }
 // Draws a view. After the first one, focus moves to the new page's heading, so the keyboard and a screen reader
 // start where the page starts.
@@ -470,7 +512,8 @@ function setView(...kids){
   if (DRAWN) focusHeading();
   DRAWN = true;
 }
-// What a code in the address names, and the list it would be in.
+// failed(): the page for a view that could not be drawn: Not found for an unknown code, else the error and what to
+// do. KINDS: what a code in the address names, and the list it would be in.
 const KINDS = {review:["review", "#/reviews", "See every review"], issue:["issue", "#/issues?status=all", "See every issue"], plan:["fix plan", "#/plans", "See every fix plan"]};
 function failed(err, name, parts){
   const kind = KINDS[name];
@@ -502,7 +545,7 @@ function codeRef(loc, point){
       const notes = [], said = s.git_error || "";
       // git words a missing commit and a missing file the same way, so one sentence covers both
       const why = /is not in commit|does not exist in|exists on disk, but not in|bad object|unknown revision|bad revision|not a valid object name|invalid object name/i.test(said)
-        ? "This file is not in that commit, or the commit is not in this copy of the repository." : "The code could not be read from git here.";
+        ? "That commit does not have this file, or this copy of the repository does not have the commit." :"The code could not be read from git here.";
       if (STATIC) notes.push(said);
       else if (s.source === "excerpt") notes.push(why + " These are the lines as they were saved at review time.");
       else if (s.source === "none") notes.push(why + " No copy of the lines was saved.");
@@ -530,6 +573,8 @@ function codeRef(loc, point){
 
 // f: a whole point (an issue's page has them) or a list row of a review, whose detail and code references are
 // fetched when it is opened.
+// opts.showReview: number the row "R-0001 · SEC-H1" (an issue's page lists points of several reviews);
+// opts.hideIssue: leave out the link to the issue (the page is that issue).
 function findingItem(f, opts={}){
   const id = opts.showReview ? `${f.review_code} · ${f.point_id}` : f.point_id;
   const body = f => [ kv([["Area", domainName(f.domain_code)], ["Theme", themeName(f.theme_code)], ["Kind", lab("kind", f.kind)],
@@ -538,7 +583,7 @@ function findingItem(f, opts={}){
           ["How it was matched", f.match_rationale ? f.match_rationale + (f.match_confidence ? ` (${lab("conf", f.match_confidence).toLowerCase()})` : "") : null],
           ["What it does now", f.before_state], ["Detail", f.detail],
           ["Recommended fix", f.recommendation], ["Test to add", f.recommended_test], ["Evidence", f.evidence],
-          ["Checked by the manager", f.verification ? lab("verif", f.verification) + (f.verification_note ? " — " + f.verification_note : "") : null],
+          ["Check", f.verification ? lab("verif", f.verification) + (f.verification_note ? " — " + f.verification_note : "") : null],
           ["Checked by", f.verified_by],
           ["Goals it touches", (f.goals || []).length ? f.goals.map(g => h("div", null, h("a", {href:"#/goals/" + g.code}, g.code), " ", g.text)) : null],
           ["Requirements", (f.requirements || []).length ? f.requirements.map(q => h("div", null, `${q.code} (${lab("verdict", q.verdict).toLowerCase()}): ${q.text}`)) : null],
@@ -573,9 +618,9 @@ VIEWS.home = async () => {
   const back = h("b", null, "…"), checks = h("div", {class:"stack"}, h("p", {class:"note"}, "Checking…"));
   setView(
     h("h1", null, o.project),
-    h("p", {class:"lede"}, "Every review of this project, every point it raised, how those points carried over between reviews, the fix plans, and anything waiting on you."),
     h("div", {class:"facts"},
-      fact(waiting, "waiting on you"), fact(openTotal, "open issues"), fact(sev.H || 0, "open and high"), h("div", null, back, h("span", null, "came back or seen again")),
+      fact(waiting, "waiting on you"), fact(openTotal, noun(openTotal, "open issue")), fact(sev.H || 0, "open and high"),
+      h("div", null, back, h("span", null, "came back or seen again")),
       o.discoveries ? fact(o.discoveries, "found during fixes") : null),
     !o.reviews.length ? h("p", {class:"callout"}, "No reviews yet. Ask your agent to run the system review.") : null,
     waiting ? h("p", {class:"callout you"}, h("a", {href:"#/inbox"}, plural(waiting, "thing needs", "things need") + " your input or approval →")) : null,
@@ -593,7 +638,7 @@ VIEWS.home = async () => {
   try {
     const c = await api("checks"), failing = c.checks.filter(x => x.n);
     back.textContent = c.recurring;
-    put(checks, h("p", {class:"note"}, "The ledger's own checks. Nothing here needs you: the agent brings each count back to zero, and a line that is not zero says how."),
+    put(checks, h("p", {class:"note"}, "Nothing here needs you: the agent brings each count to zero."),
       table([{label:"Check", key:"label", link:true}, {label:"Count", key:"n", num:1}, {label:"What the agent does", get:x => x.n ? [x.action, h("div", {class:"note"}, "Its steps: " + x.recipe)] : ""}],
         c.checks, x => x.link, "This ledger has no checks."),
       failing.length ? h("p", {class:"callout"}, plural(failing.length, "check is", "checks are") + " not at zero.") : null);
@@ -640,15 +685,15 @@ VIEWS.inbox = async ([code]) => {
   }};
   setView(
     h("h1", null, "Waiting on you"),
-    h("p", {class:"lede"}, STATIC ? "Questions and approvals the agent cannot get past without you. Answer here: your answer is saved with this page, and the agent records it the next time it checks."
-      : "Questions and approvals the agent cannot get past without you. Answer here or in the chat; the agent picks answers up the next time it checks the ledger."),
+    h("p", {class:"lede"}, STATIC ? "The agent waits for these. Your answer is saved with this page; the agent records it the next time it checks."
+      : "The agent waits for these. Answer here or in the chat; the agent records your answer the next time it checks."),
     openBox, none, doneHead, doneBox,
     d.other.length ? [sect("Also waiting on you (answer in the chat)"),
       table([{label:"What", get:queueWhat}, {label:"Needs", get:r => lab("need", r.need) || "Your input"},
              {label:"Title", key:"title"}, {label:"Question", key:"question"}, {label:"Good to know", key:"context"}], d.other)] : null,
     dec.decisions.length ? [sect("Decisions"),
       table(decisionCols, dec.decisions.slice(0, 5), x => "#/decisions/" + x.code),
-      dec.decisions.length > 5 ? h("p", null, h("a", {href:"#/decisions"}, `See all ${dec.decisions.length} decisions`)) : null] : null,
+      dec.decisions.length > 5 ? h("p", null, h("a", {href:"#/decisions"}, "See all " + plural(dec.decisions.length, "decision"))) : null] : null,
     h("p", null, h("a", {href:"#/history"}, "See every question and answer so far")));
   if (code) jumpTo(document.getElementById("gate-" + code)?.closest(".card"));
 };
@@ -657,7 +702,7 @@ VIEWS.inbox = async ([code]) => {
 VIEWS.decisions = async ([code]) => {
   const d = await api("decisions");
   setView(h("h1", null, "Decisions"),
-    h("p", {class:"lede"}, "What you have decided about this project, with the reason, so a later review does not ask again."),
+    h("p", {class:"lede"}, "Kept with the reason, so a later review does not ask again."),
     table([...decisionCols, {label:"Why", key:"rationale"}, {label:"Look again when", key:"revisit_when"}, {label:"Issues", key:"issues"}, {label:"Asked in", key:"review"}],
       d.decisions, null, "No decision has been recorded yet.", x => ({id:"decision-" + x.code})));
   if (code) jumpTo(document.getElementById("decision-" + code));
@@ -676,7 +721,7 @@ VIEWS.history = async ([code], params) => {
       if (turned) { window.scrollTo(0, 0); focusHeading(); say(`Showing from ${d.offset + 1} of ${d.total}`); }
     } catch (e) { put(box, errorBox(e)); }
   };
-  setView(h("h1", null, "Questions and answers"), h("p", {class:"lede"}, "Every question the agent has asked you and what you answered, newest first."), box);
+  setView(h("h1", null, "Questions and answers"), box);
   await load(code ? "at=" + encodeURIComponent(code) : "offset=" + (Number(params.get("offset")) || 0));
   if (code) jumpTo(document.getElementById("gate-row-" + code));
 };
@@ -685,6 +730,17 @@ const optLabel = g => g.answer_label || ((g.options || []).find(o => o.value ===
 // level: "h3" for a gate listed under a section heading. moved(card, gate, note): called once the gate is answered.
 const FINAL = "You can't change an answer once it is sent.";
 const IN_CHAT = "Answer this one in the chat with the agent.";
+// What an open gate is answered with: its options as one radio group and, where the gate takes text, a text box.
+// hid: the id of the gate's title, which names both for a screen reader.
+function gateInputs(g, hid){
+  const name = "opt-" + g.code;
+  const option = o => h("label", null, h("input", {type:"radio", name, value:o.value}),
+    h("span", null, o.label, o.description ? h("small", null, o.description) : null));
+  const opts = (g.options || []).length ? h("div", {class:"opts", role:"radiogroup", "aria-labelledby":hid}, g.options.map(option)) : null;
+  const ta = g.allow_text ? h("textarea", {class:"field", placeholder: opts ? "Add a note or a different answer (optional)" : "Your answer",
+    id:hid + "-text", "aria-label":"Your answer", "aria-labelledby":`${hid}-text ${hid}`}) : null;
+  return {name, opts, ta};
+}
 function gateCard(g, level, moved){
   const hid = "gate-" + g.code;   // the title's id: it names this gate's choices, text box and button
   const refs = [g.review_code && h("a", {href:"#/review/" + g.review_code}, "Review " + g.review_code),
@@ -704,10 +760,7 @@ function gateCard(g, level, moved){
   }
   if (!(g.options || []).length && !g.allow_text) { add(card, h("p", {class:"note"}, IN_CHAT)); return card; }
   if (STATIC) return hubGateBody(card, g, hid);
-  const name = "opt-" + g.code;
-  const opts = (g.options || []).length ? h("div", {class:"opts", role:"radiogroup", "aria-labelledby":hid},
-    g.options.map(o => h("label", null, h("input", {type:"radio", name, value:o.value}), h("span", null, o.label, o.description ? h("small", null, o.description) : null)))) : null;
-  const ta = g.allow_text ? h("textarea", {class:"field", placeholder: opts ? "Add a note or a different answer (optional)" : "Your answer", id:hid + "-text", "aria-label":"Your answer", "aria-labelledby":`${hid}-text ${hid}`}) : null;
+  const {name, opts, ta} = gateInputs(g, hid);
   const msg = h("div");
   const send = h("button", {class:"btn", type:"button", id:hid + "-send", "aria-labelledby":`${hid}-send ${hid}`, onclick:async () => {
     const picked = card.querySelector(`input[name="${name}"]:checked`);
@@ -729,11 +782,10 @@ function gateCard(g, level, moved){
 
 VIEWS.reviews = async () => {
   const list = await api("reviews");
-  setView(h("h1", null, "Reviews"), h("p", {class:"lede"}, "Every review run on this project, newest first."),
+  setView(h("h1", null, "Reviews"),
     table([{label:"Review", key:"code"}, {label:"Title", key:"title"}, {label:"Kind", get:r => lab("scope", r.scope)},
            {label:"Status", get:r => lab("review", r.status)}, {label:"Started", get:r => whenCell(r.started_at)}, {label:"Code reviewed", get:r => h("span", {class:"mono"}, r.commits || "")},
-           {label:"High", key:"high", num:1}, {label:"Medium", key:"medium", num:1}, {label:"Low", key:"low", num:1}, {label:"Missing tests", key:"tests", num:1},
-           {label:"New", key:"new_issues", num:1}, {label:"Came back", key:"came_back", num:1}],
+           ...sevCols(), {label:"New", key:"new_issues", num:1}, {label:"Came back", key:"came_back", num:1}],
           list, r => "#/review/" + r.code));
 };
 
@@ -748,8 +800,8 @@ VIEWS.review = async ([code], params) => {
   // and the search change. The search box looks through ids and summaries here at
   // once, and asks the server for points whose detail or cited files contain the text.
   const listBox = h("div", {class:"stack points"}), countNote = h("p", {class:"note"}), moreBox = h("div");
-  const FIRST = 100, MORE = 200, built = [];
-  let shown = FIRST, deep = null, asked = 0;   // deep: ids the server search matched for the text in the box
+  const built = [];
+  let shown = REVIEW_FIRST, deep = null, asked = 0;   // deep: ids the server search matched for the text in the box
   const card = i => built[i] || (built[i] = findingItem(fs[i]));
   const draw = () => {
     const t = q.value.trim().toLowerCase();
@@ -762,15 +814,15 @@ VIEWS.review = async ([code], params) => {
     let grows = cur.length <= want.length;
     for (let i = 0; grows && i < cur.length; i++) grows = cur[i] === want[i];
     if (grows) listBox.append(...want.slice(cur.length)); else listBox.replaceChildren(...want);
-    const count = `${hit.length} of ${fs.length} points`;
+    const count = `${hit.length} of ${plural(fs.length, "point")}`;
     countNote.textContent = count;
-    const more = () => { const first = hit[shown]; shown += MORE; draw(); built[first].firstChild.focus(); };
+    const more = () => { const first = hit[shown]; shown += REVIEW_MORE; draw(); built[first].firstChild.focus(); };
     put(moreBox, hit.length > shown ? h("button", {class:"btn ghost", type:"button", onclick:more}, `Show more (${hit.length - shown} left)`) : null);
     return count;
   };
   const search = async () => {
     const t = q.value.trim(), mine = ++asked;
-    deep = null; shown = FIRST; say(draw());
+    deep = null; shown = REVIEW_FIRST; say(draw());
     if (!t) return;
     try {
       const found = await api(`review/${encodeURIComponent(code)}?q=${encodeURIComponent(t)}`);
@@ -782,9 +834,10 @@ VIEWS.review = async ([code], params) => {
   if (params.get("match") && [...fm.options].some(o => o.value === params.get("match"))) fm.value = params.get("match");
   const filters = filterBar([q, fd, fsv, fm, fv], () => {
     if (q.value.trim() !== text) { text = q.value.trim(); return search(); }
-    shown = FIRST; say(draw());
+    shown = REVIEW_FIRST; say(draw());
   }, 150);
   const sumBy = k => fs.filter(f => f.severity === k).length;
+  const matched = (...types) => fs.filter(f => types.includes(f.match_type)).length;
   const about = kv([["Verdict", r.verdict], ["Summary", r.summary], ["What was asked", r.request_text], ["Run by", r.manager ? `${r.manager}${r.manager_model ? " (" + r.manager_model + ")" : ""}` : null],
       ["Domains approved by", r.approved_by ? `${r.approved_by}, ${when(r.approved_at)}` : null], ["Follows", r.previous_code ? h("a", {href:"#/review/" + r.previous_code}, r.previous_code) : null],
       ["Write-up", r.summary_doc_url ? extLink(r.summary_doc_url, "Open the review document") : null],
@@ -792,10 +845,12 @@ VIEWS.review = async ([code], params) => {
   setView(
     h("h1", null, `${r.code} · ${r.title}`),
     h("p", {class:"lede"}, `${lab("scope", r.scope)} · ${lab("review", r.status)} · started ${when(r.started_at)}` + (r.completed_at ? ` · finished ${when(r.completed_at)}` : "")),
-    h("div", {class:"facts"}, fact(fs.length, "points"), ["H","M","L","T"].map(s => fact(sumBy(s), lab("sev", s))),
-      fact(fs.filter(f => ["new","continuation"].includes(f.match_type)).length, "new issues"),
-      fact(fs.filter(f => ["recurrence","regression"].includes(f.match_type)).length, "came back")),
-    d.gates.length ? h("div", {class:"card"}, h("h2", null, "Questions asked during this review"), table([{label:"About", get:g => lab("gate", g.kind)}, {label:"Title", key:"title", link:true}, {label:"Status", get:g => lab("gstat", g.status)}, {label:"Answer", get:g => answerText(g)}],
+    h("div", {class:"facts"}, fact(fs.length, noun(fs.length, "point")), ["H","M","L","T"].map(s => fact(sumBy(s), lab("sev", s))),
+      fact(matched("new", "continuation"), noun(matched("new", "continuation"), "new issue")),
+      fact(matched("recurrence", "regression"), "came back")),
+    d.gates.length ? h("div", {class:"card"}, h("h2", null, "Questions asked during this review"),
+      table([{label:"About", get:g => lab("gate", g.kind)}, {label:"Title", key:"title", link:true},
+             {label:"Status", get:g => lab("gstat", g.status)}, {label:"Answer", get:g => answerText(g)}],
         d.gates, g => `#/${g.status === "open" ? "inbox" : "history"}/${g.code}`)) : null,
     about.childElementCount ? h("div", {class:"card"}, about) : null,
     r.report_md ? h("div", {class:"card"}, h("h2", null, "The review document"), md(r.report_md)) : null,
@@ -811,6 +866,11 @@ VIEWS.review = async ([code], params) => {
     sect("Areas reviewed and skipped"),
     table([{label:"Area", get:x => x.name}, {label:"Reviewed?", get:x => tag(x.decision === "included" ? "Reviewed" : "Skipped", tone("area", x.decision))},
            {label:"Why", key:"reason"}, {label:"Your change", get:x => x.owner_change === "none" ? "" : lab("ownerChange", x.owner_change)}, {label:"Reviewers", key:"reviewers_planned", num:1}], d.domains),
+    d.summary.length ? [sect("Points by area"),
+      table([{label:"Area", get:x => domainName(x.domain_code)}, {label:"Points", key:"points", num:1}, ...sevCols(),
+             {label:"Confirmed", key:"confirmed", num:1}, {label:"New", key:"new_issues", num:1},
+             {label:"Carried over", key:"carried_over", num:1}, {label:"Came back", key:"came_back", num:1},
+             {label:"False", key:"false_findings", num:1}], d.summary)] : null,
     sect("Reviewers"),
     d.runs.length ? h("div", {class:"stack"}, d.runs.map(reviewerRow)) : empty("No reviewer has run yet."),
     d.test_runs.length ? [sect("Test runs"),
@@ -822,13 +882,17 @@ VIEWS.review = async ([code], params) => {
       table([{label:"Issue", key:"from_issue", link:true}, {label:"Link", get:x => lab("rel", x.relation)}, {label:"To", get:x => h("a", {href:"#/issue/" + x.to_issue}, x.to_issue)}, {label:"Title", key:"to_title"},
              {label:"How sure", get:x => lab("conf", x.confidence)}, {label:"Why", key:"rationale"}], d.relations, x => "#/issue/" + x.from_issue)] : null,
     d.agents.length ? [sect("Agents"),
-      table([{label:"Agent", key:"name"}, {label:"Did", key:"role"}, {label:"Kind", get:x => lab("actorKind", x.kind)}, {label:"Model", key:"model"}, {label:"Run in", key:"harness"}, {label:"Started by", key:"parent"}], d.agents)] : null,
+      table([{label:"Agent", key:"name"}, {label:"Did", key:"role"}, {label:"Kind", get:x => lab("actorKind", x.kind)},
+             {label:"Model", key:"model"}, {label:"Run in", key:"harness"}, {label:"Started by", key:"parent"}], d.agents)] : null,
     d.requirements.length ? [sect("Requirements"),
       h("p", {class:"note"}, [...new Map(d.requirements.map(x => [x.verdict, x.verdict_count]))].map(([v, n]) => `${n} ${lab("verdict", v).toLowerCase()}`).join(" · ")),
       table([{label:"Requirement", key:"requirement"}, {label:"Says", key:"text"}, {label:"Found", get:x => lab("verdict", x.verdict)}, {label:"Where", key:"where_implemented"},
              {label:"Tested", get:x => x.tested ? lab("tested", x.tested) : ""}, {label:"Point", key:"point_id"}, {label:"Evidence", key:"evidence"}], d.requirements)] : null,
     d.checks.length ? [sect("Earlier issues this review looked for"), earlierIssues(code, d)] : null,
-    d.metrics.length ? [sect("Measurements"), table([{label:"Measure", get:m => m.label || words(m.name)}, {label:"Of", get:m => scopeName(m.scope)}, {label:"Value", get:m => `${m.value}${m.unit ? " " + m.unit : ""}`, num:1}, {label:"How", get:m => lab("method", m.method)}, {label:"Note", key:"note"}], d.metrics)] : null,
+    d.metrics.length ? [sect("Measurements"),
+      table([{label:"Measure", get:m => m.label || words(m.name)}, {label:"Of", get:m => scopeName(m.scope)},
+             {label:"Value", get:m => `${m.value}${m.unit ? " " + m.unit : ""}`, num:1},
+             {label:"How", get:m => lab("method", m.method)}, {label:"Note", key:"note"}], d.metrics)] : null,
     sect("Points raised"),
     fs.length ? [filters, h("div", {class:"stack"}, countNote, listBox, moreBox)] : empty("This review has raised no points yet."),
     d.events.length ? [sect("History"), eventList(d.events, "review")] : null);
@@ -886,7 +950,6 @@ function byDomain(list){
 const areaName = c => c ? domainName(c) : "Whole project";
 function interviewSection(qs){
   return h("div", {class:"card interview"}, h("h2", null, "Interview"),
-    h("p", {class:"note"}, "What the agent asked you about the code and your plans for it, by area, and what you said."),
     byDomain(qs).map(([dom, list]) => [h("h3", null, areaName(dom)),
       list.map(q => h("div", {class:"iq", "data-code":q.code},
         h("p", null, h("b", null, q.question)),
@@ -905,7 +968,7 @@ function goalsTable(goals){
 VIEWS.goals = async ([code]) => {
   const d = await api("goals");
   setView(h("h1", null, "Design goals"),
-    h("p", {class:"lede"}, "What you want the code to be, by area, written from your interview answers. Reviewers, fix plans and every agent work to the approved ones."),
+    h("p", {class:"lede"}, "Written from your interview answers. Reviewers, fix plans and every agent work to the approved ones."),
     d.goals.length ? byDomain(d.goals).map(([dom, list]) => [sect(areaName(dom)), goalsTable(list)])
       : empty("No design goals yet."),
     d.goals.some(g => g.status === "proposed") ? h("p", {class:"callout you"}, h("a", {href:"#/inbox"}, "Goals are waiting for your approval →")) : null);
@@ -947,7 +1010,7 @@ VIEWS.issues = async (_, params) => {
         pager(d, d.rows.length, off => { offset = off; load(true, true).then(() => { window.scrollTo(0, 0); focusHeading(); }); }));
     } catch (e) { if (mine === asked) put(box, errorBox(e)); }
   };
-  setView(h("h1", null, "Issues"), h("p", {class:"lede"}, "An issue is one underlying problem, followed across every review that raised it or looked for it."), filterBar([q, st, sv, dm], load, 250), box);
+  setView(h("h1", null, "Issues"), h("p", {class:"lede"}, "One issue per underlying problem, followed across reviews."), filterBar([q, st, sv, dm], load, 250), box);
   load();
 };
 
@@ -961,19 +1024,24 @@ VIEWS.issue = async ([code]) => {
     h("div", {class:"card"}, kv([["First found", h("span", null, h("a", {href:"#/review/" + i.first_seen}, i.first_seen), " · " + when(i.opened_at))],
       ["Last raised", i.last_seen ? h("a", {href:"#/review/" + i.last_seen}, i.last_seen) : null], ["Last looked for", i.last_checked ? h("a", {href:"#/review/" + i.last_checked}, i.last_checked) : null],
       ["Raised in", plural(i.times_seen, "review")],
-      ["Before", i.before_state], ["Now", i.current_state], ["After the fix", i.after_state], ["Agreed fix", i.recommendation], ["Resolution", i.resolution],
+      ["Before", i.before_state], ["Now", i.current_state], ["Once fixed", i.after_state], ["Agreed fix", i.recommendation], ["Resolution", i.resolution],
       ["Fixed", whenCell(i.resolved_at)], ["Fix confirmed", whenCell(i.verified_at)],
       ["Guard test", d.unguarded.length ? (d.unguarded[0].problem === "no guard test" ? "None: no test guards this fix yet." : "Removed: the test that guarded this fix is gone.") : null]])),
     d.relations.length ? [sect("Related issues"), table([{label:"Link", get:x => x.dir === "out" ? lab("rel", x.relation) : lab("relIn", x.relation)},
-      {label:"Issue", key:"other", link:true}, {label:"Title", key:"other_title"}, {label:"Status", get:x => issueTag(x.other_status)}, {label:"How sure", get:x => lab("conf", x.confidence)}, {label:"Why", key:"rationale"}, {label:"Linked in", key:"review"}],
+      {label:"Issue", key:"other", link:true}, {label:"Title", key:"other_title"}, {label:"Status", get:x => issueTag(x.other_status)},
+      {label:"How sure", get:x => lab("conf", x.confidence)}, {label:"Why", key:"rationale"}, {label:"Linked in", key:"review"}],
       d.relations, x => "#/issue/" + x.other)] : null,
-    d.decisions.length ? [sect("Your decisions about it"), table([{label:"Decision", key:"code"}, {label:"Question", key:"question"}, {label:"Answer", key:"answer"}, {label:"Why", key:"rationale"}, {label:"When", get:x => whenCell(x.decided_at)}], d.decisions)] : null,
+    d.decisions.length ? [sect("Your decisions about it"),
+      table([{label:"Decision", key:"code"}, {label:"Question", key:"question"}, {label:"Answer", key:"answer"},
+             {label:"Why", key:"rationale"}, {label:"When", get:x => whenCell(x.decided_at)}], d.decisions)] : null,
     d.steps.length ? [sect("Fix plan steps"), table([{label:"Plan", key:"plan"}, {label:"Step", key:"number", num:1}, {label:"Title", key:"title"}, {label:"Status", get:x => lab("step", x.status)},
       {label:"Commits", get:x => h("span", {class:"mono"}, x.commits || "")}, {label:"Note", key:"progress_note"}], d.steps, x => `#/plan/${x.plan}`)] : null,
     d.guard_tests.length ? [sect("Tests that guard the fix"), table([{label:"Test", get:t => h("code", null, `${t.test_path} › ${t.test_name}`)},
-      {label:"Failed before the fix", get:t => t.failed_before_fix == null ? "Not recorded" : t.failed_before_fix ? "Yes" : "No"}, {label:"Still in the code", get:t => t.still_exists ? "Yes" : "Removed"},
+      {label:"Failed without the fix", get:t => t.failed_before_fix == null ? "Not recorded" : t.failed_before_fix ? "Yes" : "No"}, {label:"Still in the code", get:t => t.still_exists ? "Yes" : "Removed"},
       {label:"Added in", get:t => h("code", null, short(t.added_commit_sha))}], d.guard_tests)] : null,
-    d.checks.length ? [sect("What each review found"), table([{label:"Review", key:"review"}, {label:"When", get:x => whenCell(x.started_at, false)}, {label:"Found", get:x => lab("check", x.outcome)}, {label:"Evidence", key:"evidence"}], d.checks, x => "#/review/" + x.review)] : null,
+    d.checks.length ? [sect("What each review found"),
+      table([{label:"Review", key:"review"}, {label:"When", get:x => whenCell(x.started_at, false)},
+             {label:"Found", get:x => lab("check", x.outcome)}, {label:"Evidence", key:"evidence"}], d.checks, x => "#/review/" + x.review)] : null,
     sect("Every time it was raised, with the code at that commit"),
     d.findings.map(f => findingItem(f, {showReview:true, hideIssue:true})),
     sect("History"),
@@ -1000,23 +1068,32 @@ VIEWS.plan = async ([code, , phaseArg]) => {
   let phase = Number(phaseArg) || (phases[0] && phases[0].number) || 1;
   const count = s => steps.filter(x => x.status === s).length;
   const q = h("input", {class:"field", type:"search", placeholder:"Search steps, or a point id", "aria-label":"Search steps or point ids"});
-  const f = select("Filter steps", [["","All steps"],["st-done","Done"],["st-doing","In progress"],["st-waiting-owner","Waiting on you"],["st-not-started","Not started"],
-    ["any","Needs you (any)"],["decision","Needs your decision"],["confirm","Needs you to confirm"],["review","Needs your review"],["production","Production action"],["behavior","Changes behaviour on purpose"]]);
+  // The filter's choices: every step status and every owner need, worded by the ledger's labels.
+  const needs = Object.entries(L.need).filter(([v, t]) => v !== "none" && t);
+  const f = select("Filter steps", [["", "All steps"], ...Object.entries(L.step).map(([v, t]) => ["st-" + v, t]),
+    ["any", "Needs you"], ...needs.map(([v, t]) => [v, "Needs " + t[0].toLowerCase() + t.slice(1)]),
+    ["behavior", "Changes behaviour"]]);
   const nav = h("nav", {class:"rail", "aria-label":"Phases"}), main = h("div", {class:"stack steps"});
   const match = s => {
     const t = q.value.trim().toLowerCase(), v = f.value;
     if (v.startsWith("st-") && s.status !== v.slice(3)) return false;
     if (v === "any" && s.owner_need === "none") return false;
-    if (["decision","confirm","review","production"].includes(v) && s.owner_need !== v) return false;
+    if (needs.some(n => n[0] === v) && s.owner_need !== v) return false;
     if (v === "behavior" && !s.behavior_change) return false;
     return !t || s.search.includes(t);
   };
-  const stepBody = (s, closes) => [ kv([["Change", s.change], ["Proof", s.proof], ["Depends on", s.depends.length ? (s.depends.length === 1 ? "Step " : "Steps ") + s.depends.join(", ") : null], ["Behaviour change", s.behavior_note],
+  const commitLine = c => h("div", null, h("code", null, short(c.commit_sha)), c.branch ? ` on ${c.branch}` : "",
+    c.summary ? " " + c.summary : "", c.pr_url ? [" ", extLink(c.pr_url, "pull request")] : "");
+  const closeLine = c => h("div", {class:"refline"}, h("code", null, `${c.review} · ${c.point_id}`), sevTag(c.severity),
+    c.issue ? h("a", {href:"#/issue/" + c.issue}, c.issue) : null, h("span", null, c.summary));
+  const stepBody = (s, closes) => [
+    kv([["Change", s.change], ["Proof", s.proof],
+      ["Depends on", s.depends.length ? `${noun(s.depends.length, "Step")} ${s.depends.join(", ")}` : null],
+      ["Behaviour change", s.behavior_note],
       ["Needs from you", s.owner_question], ["Progress", s.progress_note], ["Started", whenCell(s.started_at)], ["Done", whenCell(s.done_at)],
       ["Closes no point because", s.no_findings_reason],
-      ["Commits", (s.commits || []).length ? s.commits.map(c => h("div", null, h("code", null, short(c.commit_sha)), c.branch ? ` on ${c.branch}` : "", c.summary ? " " + c.summary : "", c.pr_url ? [" ", extLink(c.pr_url, "pull request")] : "")) : null]]),
-      closes.length ? h("div", {class:"ref"}, h("span", {class:"note"}, "Closes " + plural(closes.length, "point")),
-        closes.map(c => h("div", {class:"refline"}, h("code", null, `${c.review} · ${c.point_id}`), sevTag(c.severity), c.issue ? h("a", {href:"#/issue/" + c.issue}, c.issue) : null, h("span", null, c.summary)))) : null];
+      ["Commits", (s.commits || []).length ? s.commits.map(commitLine) : null]]),
+    closes.length ? h("div", {class:"ref"}, h("span", {class:"note"}, "Closes " + plural(closes.length, "point")), closes.map(closeLine)) : null];
   const stepItem = s => item(s.number, s.title,
     [s.status !== "not-started" ? labTag("step", s.status) : null,
      s.owner_need !== "none" ? tag(lab("need", s.owner_need), tone("need", s.owner_need) || "info") : null,
@@ -1029,18 +1106,17 @@ VIEWS.plan = async ([code, , phaseArg]) => {
     });
   // The phase buttons are built once and marked in place, so the one just pressed keeps the keyboard focus.
   const rail = phases.map(p => { const pr = prog[p.number] || {}; return h("button", {type:"button",
-    onclick:() => { phase = p.number; q.value = ""; f.value = ""; shown = PAGE_OF; setPath(`#/plan/${code}/phase/${phase}`); draw(); }},
+    onclick:() => { phase = p.number; q.value = ""; f.value = ""; shown = PLAN_PAGE; setPath(`#/plan/${code}/phase/${phase}`); draw(); }},
     h("span", {class:"i"}, p.number), h("span", null, p.title, p.first_step ? h("small", null, p.first_step === p.last_step ? `step ${p.first_step}` : `steps ${p.first_step}–${p.last_step}`) : null),
     h("span", {class:"c"}, `${pr.done || 0}/${pr.steps || 0}`)); });
   add(nav, rail);
-  const PAGE_OF = 300;   // matching steps drawn at a time
-  let shown = PAGE_OF;
+  let shown = PLAN_PAGE;
   const draw = () => {
     const filtering = q.value.trim() || f.value;
     rail.forEach((b, i) => b.setAttribute("aria-current", String(!filtering && phases[i].number === phase)));
     if (filtering) {
       const hit = steps.filter(match), count = plural(hit.length, "matching step") + " across all phases";
-      const more = () => { const first = shown; shown += PAGE_OF; draw(); main.querySelectorAll("details.item > summary")[first].focus(); };
+      const more = () => { const first = shown; shown += PLAN_PAGE; draw(); main.querySelectorAll("details.item > summary")[first].focus(); };
       put(main, h("h2", null, count), hit.length > shown ? h("p", {class:"note"}, `Showing the first ${shown}.`) : null,
         hit.length ? hit.slice(0, shown).map(stepItem) : empty("No step matches."),
         hit.length > shown ? h("button", {class:"btn ghost", type:"button", onclick:more}, `Show more (${hit.length - shown} left)`) : null);
@@ -1053,14 +1129,14 @@ VIEWS.plan = async ([code, , phaseArg]) => {
         sections.map(sec => [sec ? h("h3", null, sec) : null, ps.filter(s => (s.section || "") === sec).map(stepItem)]));
     }
   };
-  const filters = filterBar([q, f], () => { shown = PAGE_OF; say(draw()); }, 150);
-  const pl = d.plan;
-  const head = [h("h1", null, `${pl.code} · ${pl.title}`),
+  const filters = filterBar([q, f], () => { shown = PLAN_PAGE; say(draw()); }, 150);
+  const pl = d.plan, closed = new Set(steps.flatMap(s => s.closes)).size;
+  const head =[h("h1", null, `${pl.code} · ${pl.title}`),
     h("p", {class:"lede"}, lab("plan", pl.status) + (pl.approved_at ? ` · approved ${when(pl.approved_at)}` : "") + (d.last_updated ? ` · last updated ${when(d.last_updated)}` : "")),
     kv([["From", d.reviews.length ? d.reviews.map((r, i) => [i ? ", " : "", h("a", {href:"#/review/" + r.code}, r.code)]) : null],
         ["Plan document", pl.doc_url ? extLink(pl.doc_url, "Open the plan document") : null], ["Shared page", pl.page_url ? extLink(pl.page_url, "Open the shared page") : null]]),
-    h("div", {class:"facts"}, fact(steps.length, "steps"), fact(phases.length, "phases"),
-      fact(new Set(steps.flatMap(s => s.closes)).size, "points closed")),
+    h("div", {class:"facts"}, fact(steps.length, noun(steps.length, "step")), fact(phases.length, noun(phases.length, "phase")),
+      fact(closed, noun(closed, "point") + " closed")),
     progressBar(count("done"), count("doing"), count("waiting-owner"), steps.length),
     pl.narrative_md ? h("div", {class:"card"}, h("h2", null, "About this plan"), md(pl.narrative_md)) : null,
     d.gates.length ? h("div", {class:"card"}, h("h2", null, "Questions about this plan"),
@@ -1115,20 +1191,25 @@ VIEWS.trends = async () => {
   const d = await api("trends");
   const groups = {};
   for (const m of d.metrics) (groups[`${m.name}|${m.scope}|${m.repository}`] ||= []).push(m);
-  setView(h("h1", null, "Over time"), h("p", {class:"lede"}, "How the project has moved between reviews."),
+  setView(h("h1", null, "Over time"),
     sect("Points per review"),
-    table([{label:"Review", key:"review"}, {label:"Started", get:r => whenCell(r.started_at, false)}, {label:"Points", key:"points", num:1}, {label:"High", key:"high", num:1}, {label:"Medium", key:"medium", num:1}, {label:"Low", key:"low", num:1},
-           {label:"Missing tests", key:"tests", num:1}, {label:"Confirmed", key:"confirmed", num:1},
-           {label:"New", key:"new_issues", num:1}, {label:"Carried over", key:"carried_over", num:1}, {label:"Came back", key:"came_back", num:1}, {label:"False", key:"false_findings", num:1}], d.reviews, r => "#/review/" + r.review),
-    d.reviews.length > 1 ? h("div", {class:"grid2"}, [["Points", "points"], ["Missing tests", "tests"], ["Confirmed by the manager", "confirmed"]].map(([title, k]) =>
+    table([{label:"Review", key:"review"}, {label:"Started", get:r => whenCell(r.started_at, false)}, {label:"Points", key:"points", num:1},
+           ...sevCols(), {label:"Confirmed", key:"confirmed", num:1},
+           {label:"New", key:"new_issues", num:1}, {label:"Carried over", key:"carried_over", num:1},
+           {label:"Came back", key:"came_back", num:1}, {label:"False", key:"false_findings", num:1}], d.reviews, r => "#/review/" + r.review),
+    d.reviews.length > 1 ? h("div", {class:"grid2"}, [["Points", "points"], ["Missing tests", "tests"], ["Confirmed", "confirmed"]].map(([title, k]) =>
       h("div", {class:"card"}, h("b", null, title), h("div", {class:"note"}, "per review"), lineChart(d.reviews.map(r => ({review:r.review, value:r[k]})), "")))) : null,
     sect("Measurements"),
     Object.keys(groups).length ? h("div", {class:"grid2"}, Object.entries(groups).map(([k, pts]) => { const [n, sc, repo] = k.split("|");
       const better = {higher:"higher is better", lower:"lower is better"}[pts[0].better];
-      return h("div", {class:"card"}, h("b", null, pts[0].label || words(n)), h("div", {class:"note"}, [[sc !== "all" ? sc : "", repo !== "all" ? repo : ""].filter(Boolean).join(" · ") || scopeName("all"), better].filter(Boolean).join(" · ")), lineChart(pts, pts[0].unit)); }))
+      const of = [sc !== "all" ? sc : "", repo !== "all" ? repo : ""].filter(Boolean).join(" · ") || scopeName("all");
+      return h("div", {class:"card"}, h("b", null, pts[0].label || words(n)),
+        h("div", {class:"note"}, [of, better].filter(Boolean).join(" · ")), lineChart(pts, pts[0].unit)); }))
       : empty("No measurements recorded yet."),
     sect("Issues that keep coming back"),
-    table([{label:"Issue", key:"code"}, {label:"Title", key:"title"}, {label:"Severity", get:i => sevTag(i.severity)}, {label:"Status", get:i => issueTag(i.status)}, {label:"Reviews", key:"times_seen", num:1}, {label:"Came back after a fix", key:"regressions", num:1}, {label:"Raised in", key:"reviews"}],
+    table([{label:"Issue", key:"code"}, {label:"Title", key:"title"}, {label:"Severity", get:i => sevTag(i.severity)},
+           {label:"Status", get:i => issueTag(i.status)}, {label:"Reviews", key:"times_seen", num:1},
+           {label:"Came back after a fix", key:"regressions", num:1}, {label:"Raised in", key:"reviews"}],
           d.recurring, i => "#/issue/" + i.code),
     sect("Files that keep producing issues"),
     table([{label:"File", get:r => h("code", null, r.path)}, {label:"Issues", key:"issues", num:1}, {label:"Reviews", key:"reviews", num:1}, {label:"High points", key:"high_points", num:1}], d.hotspots,
@@ -1141,14 +1222,17 @@ const cellText = v => v && typeof v === "object" && "blob_bytes" in v ? `<${v.bl
 VIEWS.explore = async ([name], params) => {
   const tables = await api("tables");
   const list = h("div", {class:"tlist"}), right = h("div", {class:"stack loose"});
-  const grid = (cols, data) => data.length ? h("div", {class:"scroll card grid"}, h("table", null, h("thead", null, h("tr", null, cols.map(c => h("th", null, c)))),
-    h("tbody", null, data.map(r => h("tr", null, r.map(v => h("td", {class: typeof v === "number" ? "num mono" : null, title: v == null ? null : cellText(v).slice(0, 2000)}, v == null ? h("span", {class:"muted"}, "—") : cellText(v)))))))) : empty("No rows.");
+  const cell = v => h("td", {class: typeof v === "number" ? "num mono" : null, title: v == null ? null : cellText(v).slice(0, 2000)},
+    v == null ? h("span", {class:"muted"}, "—") : cellText(v));
+  const grid = (cols, data) => data.length ? h("div", {class:"scroll card grid"}, h("table", null,
+    h("thead", null, h("tr", null, cols.map(c => h("th", null, c)))),
+    h("tbody", null, data.map(r => h("tr", null, r.map(cell)))))) : empty("No rows.");
   const showTable = async (t, offset=0, paged=false) => {
     const info = tables.find(x => x.name === t) || {label:t, description:""};
     list.querySelectorAll("button").forEach(b => b.setAttribute("aria-current", String(b.dataset.n === t)));
     setPath("#/explore/" + t + (offset ? "?offset=" + offset : ""));
     try {
-      const d = await api(`table/${encodeURIComponent(t)}?limit=100&offset=${offset}`);
+      const d = await api(`table/${encodeURIComponent(t)}?limit=${EXPLORE_ROWS}&offset=${offset}`);
       const range = d.rows.length ? `rows ${offset + 1}–${offset + d.rows.length}` : "no rows here";
       const counted = h("span", null, d.count != null ? `${plural(d.count, "row")}` + (d.count > d.rows.length ? ` · ${range}` : "") : range);
       const count = d.count == null && !STATIC ? h("button", {class:"btn ghost", type:"button", onclick:async e => {
@@ -1156,10 +1240,10 @@ VIEWS.explore = async ([name], params) => {
         catch (err) { put(counted, errorBox(err)); } }}, "Count the rows") : null;
       put(right, h("h2", null, info.label), info.description ? h("p", {class:"lede"}, info.description) : null,
         h("p", {class:"note"}, "Stored as ", h("code", null, t), info.for_agent ? ". The agent reads this view; no page of this site shows it." : "",
-          STATIC && d.total > d.count ? ` · this copy holds the first ${d.count} of ${d.total} rows` : ""),
+          STATIC && d.total > d.count ? ` · this copy holds the first ${d.count} of ${plural(d.total, "row")}` : ""),
         h("p", {class:"note"}, counted, d.truncated ? " · some rows are too large to show here" : ""),
-        h("div", {class:"tools"}, offset > 0 ? h("button", {class:"btn ghost", type:"button", onclick:() => showTable(t, Math.max(0, offset - 100), true)}, "Previous") : null,
-          d.more ? h("button", {class:"btn ghost", type:"button", onclick:() => showTable(t, offset + 100, true)}, "Next") : null, count,
+        h("div", {class:"tools"}, offset > 0 ? h("button", {class:"btn ghost", type:"button", onclick:() => showTable(t, Math.max(0, offset - EXPLORE_ROWS), true)}, "Previous") : null,
+          d.more ? h("button", {class:"btn ghost", type:"button", onclick:() => showTable(t, offset + EXPLORE_ROWS, true)}, "Next") : null, count,
           STATIC ? null : h("button", {class:"btn ghost", type:"button", onclick:() => { sql.value = `SELECT * FROM ${t} LIMIT 50`; sql.focus(); }}, "Query this")),
         grid(d.columns, d.rows));
       if (paged) (right.querySelector("button") || right).focus();   // the pressed button was redrawn: Previous, or Next on the first page
@@ -1171,15 +1255,17 @@ VIEWS.explore = async ([name], params) => {
   const sql = h("textarea", {class:"field mono", "aria-label":"SQL query", placeholder:"SELECT code, title, status FROM issues WHERE severity = 'H'"});
   const out = h("div");
   const run = async () => {
-    try { const d = await api("sql", {sql: sql.value}); put(out, h("p", {class:"note"}, `${d.rows.length} rows${d.truncated ? ` (first ${d.rows.length.toLocaleString("en")} shown)` : ""}`), grid(d.columns, d.rows)); }
-    catch (e) { put(out, errorBox(e)); }
+    try {
+      const d = await api("sql", {sql: sql.value});
+      const count = plural(d.rows.length, "row") + (d.truncated ? ` (first ${d.rows.length.toLocaleString("en")} shown)` : "");
+      put(out, h("p", {class:"note"}, count), grid(d.columns, d.rows));
+    } catch (e) { put(out, errorBox(e)); }
   };
   sql.addEventListener("keydown", e => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") run(); });
   setView(h("h1", null, "Explore the ledger"),
-    h("p", {class:"lede"}, STATIC ? "Browse every table and saved view as they were when this copy was made."
-      : "Browse every table and saved view, or run your own read-only query. Nothing here can change the ledger."),
-    h("p", {class:"note"}, "Names and values on this page are shown as they are stored in the database."),
-    STATIC ? h("p", {class:"note"}, "The query box needs the local viewer (python3 ledger.py serve). Here each table and view shows up to 500 rows, and long values are shortened.")
+    h("p", {class:"lede"}, STATIC ? "Every table and saved view, as stored when this copy was made."
+      : "Every table and saved view, as stored. Queries only read."),
+    STATIC ? h("p", {class:"note"}, "To run queries, start the local viewer (python3 ledger.py serve). This copy holds up to 500 rows of each table and view, with long values cut.")
     : h("div", {class:"card stack"}, h("b", null, "Query"), sql, h("div", {class:"tools"}, h("button", {class:"btn", type:"button", onclick:run}, "Run query"), h("span", {class:"note"}, "Ctrl or ⌘ + Enter runs it")), out),
     h("div", {class:"split"}, list, right));
   if (name && tables.some(t => t.name === name)) showTable(name, Math.max(0, Number(params.get("offset")) || 0)); else add(right, empty("Choose a table or view on the left."));
@@ -1191,17 +1277,20 @@ VIEWS.guide = async () => {
   const r = revs[0], p = plans[0], waiting = waitingCount();
   setView(
     h("h1", null, "How it works"),
-    h("p", {class:"lede"}, "What this site is, how a review runs, what the words mean, and where things stand right now."),
     h("div", {class:"card"}, h("h2", null, "Where things stand"),
-      kv([["Latest review", r ? h("a", {href:"#/review/" + r.code}, `${r.code} · ${lab("review", r.status)} · ${r.points} points`) : "None yet"],
-          ["Fix plan", p ? h("a", {href:"#/plan/" + p.code}, `${p.code} · ${lab("plan", p.status)} · ${p.done || 0} of ${p.steps || 0} steps done`) : "None yet"],
+      kv([["Latest review", r ? h("a", {href:"#/review/" + r.code}, `${r.code} · ${lab("review", r.status)} · ${plural(r.points, "point")}`) : "None yet"],
+          ["Fix plan", p ? h("a", {href:"#/plan/" + p.code},
+            `${p.code} · ${lab("plan", p.status)} · ${p.done || 0} of ${plural(p.steps || 0, "step")} done`) : "None yet"],
           ["Waiting on you", waiting ? h("a", {href:"#/inbox"}, plural(waiting, "question")) : "Nothing right now"],
           ["This copy was made", STATIC ? whenCell(STATIC.taken) : null]])),
     md(text.guide));
 };
 
 // ---------- routing
-const TABS = [["home","#/","Overview"],["guide","#/guide","How it works"],["inbox","#/inbox","Waiting on you"],["reviews","#/reviews","Reviews"],["goals","#/goals","Design goals"],["issues","#/issues","Issues"],["plans","#/plans","Fix plans"],["trends","#/trends","Over time"],["explore","#/explore","Explore"]];
+// The tabs: [key, address, name]. drawTabs(active) draws them with the Waiting on you badge.
+const TABS = [["home","#/","Overview"], ["guide","#/guide","How it works"], ["inbox","#/inbox","Waiting on you"],
+  ["reviews","#/reviews","Reviews"], ["goals","#/goals","Design goals"], ["issues","#/issues","Issues"],
+  ["plans","#/plans","Fix plans"], ["trends","#/trends","Over time"], ["explore","#/explore","Explore"]];
 // What the badge counts: everything in the owner's queue still to act on. In the shared copy, less the open gates
 // answered there since the copy was made.
 const waitingCount = () => Math.max(0, (OVERVIEW ? OVERVIEW.queue_count : 0) - (STATIC ? hubAnsweredOpen() : 0));
@@ -1233,6 +1322,8 @@ async function refreshHeader(now){
     if (INBOX && was && (was.queue_count !== o.queue_count || was.answered_count !== o.answered_count)) await INBOX.sync();
   } catch {}   // the next navigation says what is wrong
 }
+// Draw the view the address names: one overview request (the header, the labels, the badge), then the view.
+// OVERVIEW is refreshed again only by refreshHeader().
 async function route(){
   takeToken();
   const raw = currentPath();
@@ -1261,6 +1352,7 @@ document.getElementById("skip").addEventListener("click", e => { e.preventDefaul
 })();
 
 // ---------- theme
+// The Theme button: Automatic (the system setting), Light or Dark, kept in localStorage under "ledger-theme".
 (() => {
   const btn = document.getElementById("theme"), order = ["auto","light","dark"], dark = matchMedia("(prefers-color-scheme:dark)");
   const name = {auto:"Automatic", light:"Light", dark:"Dark"}, next = () => order[(order.indexOf(t) + 1) % 3];

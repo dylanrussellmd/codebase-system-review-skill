@@ -93,9 +93,9 @@ class CheckRegistry(unittest.TestCase):
             want = L.all("SELECT view, label, tier FROM ledger_checks ORDER BY position")
         finally:
             L.close()
-        self.assertEqual([(c["view"], c["label"], c["tier"]) for c in d["checks"]],
-                         [(w["view"], w["label"], w["tier"]) for w in want])
-        self.assertEqual({c["tier"] for c in d["checks"]}, {"error", "warning"})
+        # step 172: the page shows a check's label, not its tier; the order is the registry's
+        self.assertEqual([c["label"] for c in d["checks"]], [w["label"] for w in want])
+        self.assertEqual({w["tier"] for w in want}, {"error", "warning"})
 
     def test_check_names_a_missing_check_view(self):
         """A ledger_checks row naming a view that does not exist is an error line, not a crash."""

@@ -76,8 +76,9 @@ def project(test, *, approved=True):
     ok(L, "add-repo", "demo", ".")
     ok(L, "add-actor", "owner", "Project Owner")
     ok(L, "add-actor", "manager", "review manager")
-    ok(L, "new-review", "--title", "First review", "--scope", "full", "--domain", "spec=the spec", "--domain",
-       "tests", "--actor", "A-0002")
+    ok(L, "new-review", "--title", "First review", "--scope", "full", "--actor", "A-0002")
+    ok(L, "review-domain", "R-0001", "spec", "include", "--reason", "the spec")
+    ok(L, "review-domain", "R-0001", "tests", "include", "--reason", "proposed for this review")
     if approved:
         ok(L, "review-status", "R-0001", "awaiting-approval", "--note", "domains proposed", "--actor", "A-0002")
         ok(L, "review-status", "R-0001", "approved", "--note", "the owner approved the domains", "--approved-by",

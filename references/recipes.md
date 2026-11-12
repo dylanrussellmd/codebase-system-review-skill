@@ -349,6 +349,18 @@ A warning: record one with `add-guard` for each fixed issue listed.
 A warning: copy the brief, report or index into `.code-review/reviews/R-0002/` and record it there with
 `add-artifact`. `check` also names a recorded file that is missing from disk.
 
+#### `v_unresolved_conflicts`
+
+Two steps of a plan touch the same thing and nobody has judged the pair. Read both steps and judge each pair with
+`ledger.py resolve-conflict P-0001 12 14 --resolution no-conflict|order|merge|owner --note '<why>'` (`order` also
+makes the later step depend on the earlier; `owner` needs `--gate`, the applied `decision` gate). The plan cannot be
+approved until it is empty (`references/fix-plan.md#deconflict-the-steps-8c`).
+
+#### `v_late_step_conflicts`
+
+A warning: a step added after approval touches what another step touches. Judge each pair with `resolve-conflict` as
+above; until then only that step cannot start.
+
 #### `quick_check`
 
 The file is damaged. Stop writing. `ledger.py restore .code-review/ledger.sql --to /tmp/check.sqlite` rebuilds the last

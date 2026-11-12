@@ -16,7 +16,7 @@ phase the plan already has without a phase line.
      "change": "What to change.", "proof": "test_x: what it asserts", "owner_need": "none",
      "owner_question": null, "behavior_change": true, "behavior_note": "Empty requests now get 400.",
      "depends": ["C-1"], "closes": ["SEC-H3", "R-0002:TEST-M7"], "multi_reason": {"SEC-H3": "the server half"},
-     "no_findings_reason": null}
+     "no_findings_reason": null, "touches": [{"kind": "column", "target": "findings.severity", "direction": "tightens"}]}
 
 | field | required | meaning |
 |-------|----------|---------|
@@ -31,6 +31,7 @@ phase the plan already has without a phase line.
 | closes | yes, unless no_findings_reason | point ids of the plan's reviews; `R-0001:SEC-H3` when the same id is in two reviews |
 | multi_reason | no | point id -> why it is closed by more than one step (required for each such point) |
 | no_findings_reason | no | why the step closes no point by design (the follow-up review that verifies the plan) |
+| touches | no | what the step changes beyond its points' locations: a list of `{"kind", "target", "direction"}`; kind file, symbol, table, column, setting, route or behaviour; direction adds, removes, tightens, loosens, renames or changes (the default) |
 
 Numbers: the new steps are numbered after the plan's last step, in (phase, order, line) order, so a dependency must
 point at a step that comes earlier in that order. The command then reports how many points of the plan's reviews no

@@ -4,7 +4,8 @@
   "x1 = 10,000 findings and 600 plan steps; x10 = 100,000 and 6,000. Text is generated from a 46-word vocabulary unless the name says _prose (sentences taken from real review reports).",
   "git growth: 5 consecutive commits of ledger.sqlite and its SQL dump at x1, each after 30 steps were marked done and 20 check evidences rewritten.",
   "fill_refs.* (plan step 102, PERF-V3, measured 2026-11-11 with `python3 dev/tests/scale.py fill-refs --refs 1000,10000`): wall time of the whole `ledger.py fill-refs` command (start-up and schema verification included) on fresh references over 50 files of 400 lines in one commit, through one `git cat-file --batch`. marginal_ms_per_1000 = (x10 - x1) / 9, the cost per 1,000 references once the command is running; the review estimated < 300 ms per 1,000 (before: about 3,700 ms per 1,000, two git processes per reference).",
-  "review_search.* (plan step 163, UI-X3, measured 2026-11-11 in headless Chrome on the x1 ledger's R-0005, 2,000 points, before the search was changed): time of one input event on the review page's search box (the list of the first 100 points is rebuilt in the handler), whether an open point stays open, and the page's cold load and element count."
+  "review_search.* (plan step 163, UI-X3, measured 2026-11-11 in headless Chrome on the x1 ledger's R-0005, 2,000 points, before the search was changed): time of one input event on the review page's search box (the list of the first 100 points is rebuilt in the handler), whether an open point stays open, and the page's cold load and element count.",
+  "review_page.x10.* and check.x10.* (plan steps 149 and 92, measured 2026-11-11 on a 2-CPU Linux machine with `python3 dev/tests/scale.py build --scale 10`, a 0.94 GB ledger): cold load of the largest review's page (R-0001, 20,000 points) in headless Chrome until its first points are drawn, three runs; and the whole `ledger.py check --quiet` command, with its slowest statements."
  ],
  "measured": "2026-11-10",
  "measurements": {
@@ -301,6 +302,34 @@
   "review_page.x1.dom_nodes": {
    "value": 34119,
    "unit": "elements"
+  },
+  "review_page.x10.cold_load_s": {
+   "value": 3.75,
+   "unit": "s (mean of 3: 3.82, 3.92, 3.51); estimate was 1.5 s"
+  },
+  "review_page.x10.dom_nodes": {
+   "value": 148692,
+   "unit": "elements (144,010 of them the review's 16,000 links between issues)"
+  },
+  "check.x10.seconds": {
+   "value": 7.07,
+   "unit": "s (two runs, 7.07 and 7.07); budget 2 s"
+  },
+  "check.x10.quick_check_s": {
+   "value": 2.54,
+   "unit": "s (0.9 with the file already in the page cache)"
+  },
+  "check.x10.foreign_key_check_s": {
+   "value": 1.26,
+   "unit": "s"
+  },
+  "check.x10.views_s": {
+   "value": 3.0,
+   "unit": "s for the 15 ledger_checks views (v_history_gaps 0.53 the slowest)"
+  },
+  "check.x10.schema_verify_s": {
+   "value": 0.36,
+   "unit": "s (normalizing the shipped schema's 869 statements)"
   }
  }
 }

@@ -67,10 +67,13 @@ class FirstLines(unittest.TestCase):
 class DemoWording(unittest.TestCase):
     def test_demo_wording_is_neutral(self):
         """The demo project names no particular product: nothing left of the app the skill was first written for."""
-        for name in ("fixtures.py", "seed_demo.py"):
-            text = (fixtures.REPO_ROOT / "dev" / "tests" / name).read_text(encoding="utf-8")
-            with self.subTest(file=name):
-                self.assertIsNone(re.search(r"engine-A|[Tt]ime[ -]off", text))
+        tests = fixtures.REPO_ROOT / "dev" / "tests"
+        for f in [tests / "fixtures.py", tests / "seed_demo.py", tests / "_w2_shown_helpers.py",
+                  *sorted(tests.glob("test_*.py"))]:
+            if f.name in ("test_w1_cli_schema.py", "test_skill_contract.py"):   # their patterns name the terms
+                continue
+            with self.subTest(file=f.name):   # step 116: the demo's sample file is src/requests.py
+                self.assertIsNone(re.search(r"engine-A|[Tt]ime[ -]?off", f.read_text(encoding="utf-8")))
 
 
 class Facts(unittest.TestCase):

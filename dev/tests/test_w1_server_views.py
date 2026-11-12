@@ -131,7 +131,7 @@ class IssuesRoute(unittest.TestCase):
         self.assertEqual(self.codes(q="code-compare"), ["ISS-0004"])
         self.assertEqual(self.codes(q="SPEC-L1"), ["ISS-0003"])
         self.assertEqual(self.codes(q="random generator"), ["ISS-0001"])
-        self.assertEqual(self.codes(q="timeoff.py"), ["ISS-0002", "ISS-0003"])
+        self.assertEqual(self.codes(q="requests.py"), ["ISS-0002", "ISS-0003"])
         self.assertEqual(self.codes(q="no such words"), [])
         # filters are ANDed
         self.assertEqual(self.codes(status="open", domain_code="security"), ["ISS-0004"])
@@ -220,7 +220,7 @@ class Totals(unittest.TestCase):
                     self.assertEqual((p["steps"], p["done"], p["waiting"]), (t["steps"], t["done"], t["waiting_owner"]))
             for p in api(L, "/api/plans"):
                 self.assertEqual((p["doing"], p["reviews"]), (plans[p["code"]]["doing"], plans[p["code"]]["reviews"]))
-            self.assertEqual(o["gates_open"], L.count("v_pending_gates", "status = 'open'"))
+            self.assertEqual(o["queue_count"], L.count("v_owner_queue", "NOT (kind = 'gate' AND status = 'answered')"))
             self.assertEqual([g["code"] for g in api(L, "/api/gates")["gates"]],
                              [r["code"] for r in L.all("SELECT code FROM v_pending_gates")])
             self.assertEqual(o["queue_count"] + o["answered_count"], L.count("v_owner_queue"))

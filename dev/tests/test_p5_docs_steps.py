@@ -81,13 +81,14 @@ class SkillSteps(unittest.TestCase):
 
         step1 = skill_lines(skill, "Step 1:")
         self.assertEqual([shlex.split(l)[1] for l in step1],
-                         ["init", "add-actor", "add-actor", "add-repo", "open-gate", "gates", "check"])
+                         ["env", "init", "add-actor", "add-actor", "add-repo", "open-gate", "gates", "check"])
         for line in step1:
             run_line(line)
         run_recipe(recipe(recipes, "Add a custom domain"), "add-domain")
         step2a = skill_lines(skill, "2a. Draft the selection")
-        self.assertEqual([shlex.split(l)[1] for l in step2a], ["new-review"])
-        run_line(step2a[0])
+        self.assertEqual([shlex.split(l)[1] for l in step2a], ["new-review", "env", "scan"])
+        for line in step2a:
+            run_line(line)
         run_recipe(recipe(recipes, "Add a requirement"), "add-requirement")
         (repo.path / ".code-review" / "reviews" / "R-0001").mkdir(parents=True)
         (repo.path / ".code-review" / "reviews" / "R-0001" / "proposal.md").write_text("Domains: security, tests.\n")
@@ -110,8 +111,10 @@ class SkillSteps(unittest.TestCase):
         self.addCleanup(con.close)
         q = lambda sql: con.execute(sql).fetchall()
         self.assertEqual(q("SELECT code, status, approved_by_actor_id FROM reviews"), [("R-0001", "running", 1)])
-        self.assertEqual(q("SELECT domain_code, decision FROM review_domains ORDER BY domain_code"),
-                         [("security", "included"), ("tests", "included"), ("ui", "skipped")])
+        self.assertEqual(q("SELECT domain_code, decision, proposed_by_rule FROM review_domains WHERE domain_code "
+                           "IN ('security', 'tests', 'ui') ORDER BY domain_code"),
+                         [("security", "included", "code_files >= 1"), ("tests", "included", "code_files >= 1"),
+                          ("ui", "skipped", None)])   # scan proposed them by rule (step 138)
         if have:
             self.assertEqual(q("SELECT code FROM design_goals"), [("G-01",)])
         self.assertEqual(q("SELECT code, source FROM requirements"), [("REQ-0001", "docs/spec.md")])

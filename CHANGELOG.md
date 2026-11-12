@@ -2,6 +2,17 @@
 
 The tool version is `version:` in SKILL.md's frontmatter; `ledger.py --version` prints it with the schema version.
 
+## 1.9.0 (schema 16)
+
+- Deterministic review commands: `env` (what the machine and harness offer, with fallbacks), `scan` (a file-based
+  inventory that proposes domains by rules), `brief`, `prompt` (generated from templates, approved goals, known issues
+  and 115 checklist questions), `lint-report`, `match --auto`, `compare-runs`, `conflicts` and `resolve-conflict`
+  (plan approval refused while recorded conflicts are unjudged). Optional `ui-capture` and `ui-audit` (Playwright).
+  Same inputs, same output.
+- `new-review` no longer takes domain flags: `scan` proposes them and `review-domain` changes one.
+- Migrations 0012-0016. `references/environment.md`, `references/determinism.md`, `references/writing.md`.
+- Viewer: shared helpers, only the fields each page reads, text to the writing standard, docstrings throughout.
+
 ## 1.8.0 (schema 11)
 
 - Viewer: input checked with clear 400s; answers keep drafts and show 409 and 503 in place; paged issue and gate

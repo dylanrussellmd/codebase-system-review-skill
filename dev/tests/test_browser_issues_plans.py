@@ -150,7 +150,15 @@ class IssuesPlansExplore(browser.ViewerTestCase):
 
     def test_page_plan_filters(self):
         page = self.open("#/plan/P-0001")
+        # the choices are the ledger's labels: every step status, then every owner need
+        self.assertEqual(page.js("[...document.querySelector(\"#app select[aria-label='Filter steps']\").options]"
+                                 ".map(o => o.value + '=' + o.text)"),
+                         ["=All steps", "st-not-started=Not started", "st-doing=In progress",
+                          "st-waiting-owner=Waiting on you", "st-done=Done", "st-dropped=Dropped", "any=Needs you",
+                          "decision=Needs your decision", "confirm=Needs your confirmation", "review=Needs your review",
+                          "production=Needs production action", "behavior=Changes behaviour"])
         cases = [("st-done", ["2"]), ("st-doing", []), ("st-waiting-owner", ["3"]), ("st-not-started", ["1"]),
+                 ("st-dropped", []),
                  ("any", ["3"]), ("decision", ["3"]), ("confirm", []), ("review", []), ("production", []),
                  ("behavior", ["3"]), ("", None)]
         for value, want in cases:
@@ -244,7 +252,7 @@ class IssuesPlansExplore(browser.ViewerTestCase):
         per = page.page.locator("h2:text('Points per review') ~ .grid2").first.locator(".card")
         self.assertEqual(per.evaluate_all("cs => cs.map(c => [c.querySelector('b').textContent, "
                                           "c.querySelectorAll('circle').length])"),
-                         [["Points", 2], ["Missing tests", 2], ["Confirmed by the manager", 2]])
+                         [["Points", 2], ["Missing tests", 2], ["Confirmed", 2]])
         self.assertEqual(page.contents("h2:text('Points per review') + div thead th")[6:8], ["Missing tests", "Confirmed"])
         cards = page.page.locator("h2:text('Measurements') + .grid2 .card")
         got = cards.evaluate_all("cs => cs.map(c => [c.querySelector('b').textContent, "
@@ -347,7 +355,7 @@ class IssuesPlansExplore(browser.ViewerTestCase):
         sql.fill("SELECT 1 AS one")
         page.after(lambda: sql.press("Control+Enter"))
         # characterization: ISS-0249 hand-written plurals: one row is shown as "1 rows"
-        self.assertEqual(page.text(out + " p.note"), "1 rows")
+        self.assertEqual(page.text(out + " p.note"), "1 row")
         sql.fill("WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c LIMIT 1500) SELECT n FROM c")
         page.after(lambda: sql.press("Control+Enter"))
         self.assertEqual(page.text(out + " p.note"), "1000 rows (first 1,000 shown)")

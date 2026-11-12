@@ -1,5 +1,5 @@
 -- =====================================================================
--- Code review ledger — schema version 11
+-- Code review ledger — schema version 16
 -- One SQLite file per project: <project root>/.code-review/ledger.sqlite
 -- Every connection must run:  PRAGMA foreign_keys = ON;
 -- Times are UTC ISO-8601 text with milliseconds (strftime('%Y-%m-%dT%H:%M:%fZ','now')); the tr_time_*
@@ -180,6 +180,29 @@ CREATE TABLE domains (
   retired_at  TEXT
 );
 
+-- The rule by which the scan proposes each domain for a review.
+-- `ledger.py scan` evaluates it.
+-- rule is 'fact >= N' terms joined by ' and ' and ' or ' ('ui_files >= 1 and server_files >= 1'); the facts are the
+-- counts scan takes from the repositories at the reviewed commit (references/domains.md lists them). A domain with
+-- no row is never proposed by scan. Seeded at the end of this file from the table in references/domains.md.
+CREATE TABLE domain_rules (
+  domain_code TEXT PRIMARY KEY REFERENCES domains(code),
+  rule        TEXT NOT NULL CHECK (length(trim(rule)) > 0)   -- 'db_files >= 1 or api_files >= 1'
+);
+
+-- The questions every reviewer of a domain answers, in order.
+-- brief and prompt list them; lint-report checks a report answers each with its evidence; severity is the default
+-- of a finding that names the item. Seeded at the end of this file from the table in references/domains.md.
+CREATE TABLE domain_checks (
+  code        TEXT PRIMARY KEY CHECK (length(trim(code)) > 0),        -- spec.1
+  domain_code TEXT NOT NULL REFERENCES domains(code),
+  position    INTEGER NOT NULL,
+  severity    TEXT NOT NULL REFERENCES severities(value),   -- the default of a finding that answers it
+  question    TEXT NOT NULL CHECK (length(trim(question)) > 0),
+  evidence    TEXT NOT NULL CHECK (length(trim(evidence)) > 0),     -- what counts as an answer
+  UNIQUE (domain_code, position)
+);
+
 -- The topics a point can be filed under, whatever its domain.
 -- A theme with retired_at set is not accepted for new findings; rows that already use it stay.
 CREATE TABLE themes (
@@ -297,7 +320,8 @@ CREATE TABLE review_goals (
 );
 
 -- The domains proposed for each review, and whether each was reviewed or skipped.
--- reason says why; owner_change records what the owner changed in the proposal.
+-- reason says why; owner_change records what the owner changed in the proposal; proposed_by_rule is the rule by
+-- which `ledger.py scan` proposed the domain (NULL when scan skipped it or a person added it).
 CREATE TABLE review_domains (
   review_id         INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
   domain_code       TEXT NOT NULL REFERENCES domains(code),
@@ -307,7 +331,34 @@ CREATE TABLE review_domains (
                       ('none','added-by-owner','removed-by-owner','modified-by-owner')),
   reviewers_planned INTEGER,
   split_note        TEXT,                 -- how the domain was split between reviewers
+  proposed_by_rule  TEXT,                 -- the domain_rules rule (or 'open_issues >= 1') that proposed it
   PRIMARY KEY (review_id, domain_code)
+);
+
+-- What each review's environment offered: tools, the harness and its connectors.
+-- `ledger.py env --review R-0001` writes one row per capability: git, python, sqlite, playwright, browser, node,
+-- lighthouse, harness, design-tool, one 'connector:<name>' per MCP connector configured for the harness (the name
+-- only, never a value from a config file), and the harness tools the agent states (subagents, questions, images,
+-- publishing). A capability recorded earlier and no longer found stays, with available 0.
+CREATE TABLE review_environment (
+  review_id     INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
+  capability    TEXT NOT NULL CHECK (length(trim(capability)) > 0),   -- git, playwright, connector:figma ...
+  available     INTEGER NOT NULL CHECK (available IN (0,1)),
+  detail        TEXT,                    -- a version, a name, or where a connector is configured
+  how_to_enable TEXT NOT NULL,           -- what to install or do to have it
+  position      INTEGER NOT NULL,        -- the order `env` lists them in
+  PRIMARY KEY (review_id, capability)
+);
+
+-- The answer each report gave to each item of its domain's checklist.
+-- Written by `ledger.py lint-report --record` for a report that passes; a corrected report replaces its answers.
+CREATE TABLE checklist_answers (
+  review_id  INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
+  check_code TEXT NOT NULL REFERENCES domain_checks(code),
+  report     TEXT NOT NULL,                -- the report's file name
+  answer     TEXT NOT NULL CHECK (answer IN ('yes','no','partly','not-applicable')),
+  evidence   TEXT NOT NULL CHECK (length(trim(evidence)) > 0),
+  PRIMARY KEY (review_id, check_code, report)
 );
 
 -- One row for each reviewer that ran in a review.
@@ -790,6 +841,46 @@ CREATE TABLE step_goals (
   PRIMARY KEY (step_id, goal_id)
 );
 
+-- What each plan step changes: files, functions, tables, columns, settings, routes, what a user sees.
+-- import-steps writes the touches a step declares (source declared) and the file and symbol of every location of
+-- the points it closes (source finding); report-finding does the same for a step it adds. direction says how the
+-- step changes the target; 'changes' when it does not say.
+CREATE TABLE step_touches (
+  step_id   INTEGER NOT NULL REFERENCES steps(id) ON DELETE CASCADE,
+  kind      TEXT NOT NULL CHECK (kind IN ('file','symbol','table','column','setting','route','behaviour')),
+  target    TEXT NOT NULL CHECK (length(trim(target)) > 0),   -- demo:src/app.py, findings.severity, GET /api/x
+  direction TEXT NOT NULL DEFAULT 'changes' CHECK (direction IN
+              ('adds','removes','tightens','loosens','renames','changes')),
+  source    TEXT NOT NULL CHECK (source IN ('declared','finding')),   -- steps.jsonl, or a closed finding's location
+  PRIMARY KEY (step_id, kind, target, direction, source)
+);
+
+-- Pairs of plan steps that touch the same thing, and how each pair was judged.
+-- `ledger.py conflicts` writes one row per pair and target (opposite = 1 when they change it in different
+-- directions); resolve-conflict records the resolution and its note. late_step_id is the step that was added after
+-- the plan was approved: its conflicts block only its own start (tr_step_start_conflicts), the others block the
+-- plan's approval (tr_plan_approval_conflicts).
+CREATE TABLE step_conflicts (
+  id           INTEGER PRIMARY KEY,
+  step_a_id    INTEGER NOT NULL REFERENCES steps(id) ON DELETE CASCADE,   -- the lower-numbered step
+  step_b_id    INTEGER NOT NULL REFERENCES steps(id) ON DELETE CASCADE,
+  kind         TEXT NOT NULL,
+  target       TEXT NOT NULL,
+  reason       TEXT NOT NULL CHECK (length(trim(reason)) > 0),
+  opposite     INTEGER NOT NULL DEFAULT 0 CHECK (opposite IN (0,1)),   -- they change it in different directions
+  late_step_id INTEGER REFERENCES steps(id),   -- the step added after the plan was approved, when one was
+  resolution   TEXT NOT NULL DEFAULT 'none' CHECK (resolution IN ('none','no-conflict','order','merge','owner')),
+  note         TEXT,
+  gate_id      INTEGER REFERENCES gates(id),   -- the owner's gate, for resolution owner
+  resolved_by_actor_id INTEGER REFERENCES actors(id),
+  resolved_at  TEXT,
+  CHECK (step_a_id <> step_b_id),
+  CHECK (late_step_id IS NULL OR late_step_id IN (step_a_id, step_b_id)),
+  CHECK (resolution = 'none' OR (length(trim(COALESCE(note, ''))) > 0 AND resolved_at IS NOT NULL)),
+  CHECK (resolution <> 'owner' OR gate_id IS NOT NULL),
+  UNIQUE (step_a_id, step_b_id, kind, target)
+);
+
 -- The commits that carried out each plan step.
 -- One row per step and commit (`ledger.py add-commit`); pr_url when it went through a pull request.
 CREATE TABLE step_commits (
@@ -923,7 +1014,9 @@ CREATE TABLE artifacts (
 -- goal_sources, step_goals.
 -- Not logged: finding_locations, finding_goals, finding_requirements, review_requirement_checks, test_runs,
 -- artifacts, step_commits, guard_tests, decision_issues, plan_reviews, phases, review_repositories, review_goals,
--- review_domains, review_actors, actors, repositories, domains, themes, requirements, metric_defs,
+-- review_domains, review_environment, review_actors, actors, repositories, domains, domain_rules,
+-- domain_checks, checklist_answers, step_touches, step_conflicts, themes,
+-- requirements, metric_defs,
 -- meta, schema_migrations, ledger_checks, issue_statuses, severities, match_types, relation_types, gate_kinds,
 -- goal_statuses, enum_labels.
 -- Why not: finding_locations, finding_goals and finding_requirements belong to their finding (logged when it is
@@ -1005,6 +1098,14 @@ CREATE INDEX ix_fk_reviews_previous_review_id        ON reviews(previous_review_
 CREATE INDEX ix_fk_reviews_requested_by_actor_id     ON reviews(requested_by_actor_id);
 CREATE INDEX ix_fk_review_repositories_repository_id ON review_repositories(repository_id);
 CREATE INDEX ix_fk_review_goals_goal_id              ON review_goals(goal_id);
+CREATE INDEX ix_fk_domain_checks_domain_code       ON domain_checks(domain_code);
+CREATE INDEX ix_fk_domain_checks_severity          ON domain_checks(severity);
+CREATE INDEX ix_fk_checklist_answers_check_code    ON checklist_answers(check_code);
+CREATE INDEX ix_step_touches_target                  ON step_touches(kind, target);
+CREATE INDEX ix_fk_step_conflicts_step_b_id           ON step_conflicts(step_b_id);
+CREATE INDEX ix_fk_step_conflicts_late_step_id        ON step_conflicts(late_step_id);
+CREATE INDEX ix_fk_step_conflicts_gate_id             ON step_conflicts(gate_id);
+CREATE INDEX ix_fk_step_conflicts_resolved_by_actor_id ON step_conflicts(resolved_by_actor_id);
 CREATE INDEX ix_fk_review_domains_domain_code        ON review_domains(domain_code);
 CREATE INDEX ix_fk_reviewer_runs_actor_id            ON reviewer_runs(actor_id);
 CREATE INDEX ix_fk_reviewer_runs_domain_code         ON reviewer_runs(domain_code);
@@ -2720,6 +2821,16 @@ WHEN (NEW.recorded_at IS NOT NULL AND (NEW.recorded_at NOT GLOB '[0-9][0-9][0-9]
   SELECT RAISE(ABORT, 'metrics: recorded_at must be UTC times like 2026-11-10T09:30:00.000Z');
 END;
 
+CREATE TRIGGER tr_time_step_conflicts_ins BEFORE INSERT ON step_conflicts
+WHEN (NEW.resolved_at IS NOT NULL AND (NEW.resolved_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.resolved_at) IS NOT NEW.resolved_at)) BEGIN
+  SELECT RAISE(ABORT, 'step_conflicts: resolved_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_step_conflicts_upd BEFORE UPDATE OF resolved_at ON step_conflicts
+WHEN (NEW.resolved_at IS NOT NULL AND (NEW.resolved_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.resolved_at) IS NOT NEW.resolved_at)) BEGIN
+  SELECT RAISE(ABORT, 'step_conflicts: resolved_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
 CREATE TRIGGER tr_time_artifacts_ins BEFORE INSERT ON artifacts
 WHEN (NEW.created_at IS NOT NULL AND (NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at) IS NOT NEW.created_at)) BEGIN
   SELECT RAISE(ABORT, 'artifacts: created_at must be UTC times like 2026-11-10T09:30:00.000Z');
@@ -2739,6 +2850,24 @@ CREATE TRIGGER tr_time_events_upd BEFORE UPDATE OF at ON events
 WHEN (NEW.at IS NOT NULL AND (NEW.at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.at) IS NOT NEW.at)) BEGIN
   SELECT RAISE(ABORT, 'events: at must be UTC times like 2026-11-10T09:30:00.000Z');
 END;
+
+-- ----- Plan step conflicts (plan step 143)
+
+-- A plan is not approved while two of its steps touch the same thing unjudged (v_unresolved_conflicts).
+CREATE TRIGGER tr_plan_approval_conflicts BEFORE UPDATE OF status ON plans
+WHEN NEW.status = 'approved' AND OLD.status <> 'approved' AND EXISTS (
+  SELECT 1 FROM step_conflicts c JOIN steps s ON s.id = c.step_a_id
+  WHERE s.plan_id = NEW.id AND c.resolution = 'none' AND c.late_step_id IS NULL) BEGIN
+  SELECT RAISE(ABORT, 'the plan has unresolved conflicts between steps (ledger.py conflicts lists them; judge each with resolve-conflict)');
+END;
+
+-- A step added after approval does not start while one of its conflicts is unjudged; other steps go on.
+CREATE TRIGGER tr_step_start_conflicts BEFORE UPDATE OF status ON steps
+WHEN NEW.status = 'doing' AND OLD.status <> 'doing' AND EXISTS (
+  SELECT 1 FROM step_conflicts c WHERE c.late_step_id = NEW.id AND c.resolution = 'none') BEGIN
+  SELECT RAISE(ABORT, 'this step has unresolved conflicts with other steps (ledger.py conflicts lists them; judge each with resolve-conflict)');
+END;
+
 
 -- ---------- Views ---------------------------------------------------------
 
@@ -3353,6 +3482,25 @@ FROM design_goals g
 WHERE g.status IN (SELECT value FROM goal_statuses WHERE served = 1)
 ORDER BY g.domain_code IS NOT NULL, g.domain_code, g.id;
 
+-- Pairs of plan steps that touch the same thing and have not been judged.
+-- Must be empty before a plan is approved (`ledger.py conflicts`, then resolve-conflict for each pair).
+CREATE VIEW v_unresolved_conflicts AS
+SELECT p.code AS plan, a.number AS step_a, b.number AS step_b, c.kind, c.target, c.reason, c.opposite
+FROM step_conflicts c JOIN steps a ON a.id = c.step_a_id JOIN steps b ON b.id = c.step_b_id
+JOIN plans p ON p.id = a.plan_id
+WHERE c.resolution = 'none' AND c.late_step_id IS NULL
+ORDER BY p.code, a.number, b.number, c.kind, c.target;
+
+-- Steps added after their plan was approved that touch what another step touches, not judged yet.
+-- Each blocks only the start of the step that was added.
+CREATE VIEW v_late_step_conflicts AS
+SELECT p.code AS plan, l.number AS step, CASE WHEN l.id = c.step_a_id THEN b.number ELSE a.number END AS other_step,
+       c.kind, c.target, c.reason
+FROM step_conflicts c JOIN steps a ON a.id = c.step_a_id JOIN steps b ON b.id = c.step_b_id
+JOIN steps l ON l.id = c.late_step_id JOIN plans p ON p.id = a.plan_id
+WHERE c.resolution = 'none'
+ORDER BY p.code, l.number, other_step, c.kind, c.target;
+
 -- ---------- Catalog seed (extend with custom domains/themes as needed) ---
 
 INSERT INTO domains(code, name, category, report_file) VALUES
@@ -3434,6 +3582,37 @@ WITH applies(code, text) AS (VALUES
 UPDATE domains SET description = (SELECT text FROM applies WHERE applies.code = domains.code)
  WHERE description IS NULL AND code IN (SELECT code FROM applies);
 
+-- The rule by which scan proposes each domain (the table "Scan rules" in references/domains.md).
+INSERT INTO domain_rules(domain_code, rule) VALUES
+ ('spec','requirements >= 1 or spec_files >= 1'),
+ ('tests','code_files >= 1'),
+ ('test-quality','test_files >= 5'),
+ ('time-concurrency','time_files >= 1 or concurrency_files >= 1'),
+ ('resilience','external_call_files >= 1 or job_files >= 1 or db_files >= 1'),
+ ('compatibility','db_files >= 1 or api_files >= 1 or config_files >= 1'),
+ ('decision-placement','code_files >= 10'),
+ ('contracts','components >= 2'),
+ ('server','server_files >= 1'),
+ ('database','db_files >= 1'),
+ ('client-api','ui_files >= 1 and server_files >= 1'),
+ ('abstraction','code_files >= 1'),
+ ('hotspots','history_months >= 3'),
+ ('ui','ui_files >= 1'),
+ ('walkthroughs','page_files >= 1'),
+ ('notifications','notification_files >= 1'),
+ ('localization','i18n_files >= 1'),
+ ('security','code_files >= 1'),
+ ('privacy','personal_data_files >= 1'),
+ ('logging','code_files >= 1'),
+ ('operations','deploy_files >= 1 or ci_files >= 1'),
+ ('dependencies','code_files >= 1'),
+ ('performance','server_files >= 1 or db_files >= 1 or page_files >= 1'),
+ ('cost','paid_service_files >= 1 or deploy_files >= 1'),
+ ('docs-developer','code_files >= 1'),
+ ('docs-user','user_doc_files >= 1 or page_files >= 1'),
+ ('handover','authors >= 2 or deploy_files >= 1 or history_months >= 6');
+
+
 -- The metric names the domains ask for (keep names stable between reviews so they trend).
 INSERT OR IGNORE INTO metric_defs(name, label, unit, better) VALUES
  ('mutation_score','Mutation score','%','higher'),
@@ -3449,6 +3628,12 @@ INSERT OR IGNORE INTO metric_defs(name, label, unit, better) VALUES
  ('p95_job_ms','Job time, 95th percentile','ms','lower'),
  ('dependency_count','Dependencies','packages','lower'),
  ('vulnerable_dependencies','Dependencies with known vulnerabilities','packages','lower');
+
+-- How far two runs of a review agree (`ledger.py compare-runs --record`).
+INSERT OR IGNORE INTO metric_defs(name, label, unit, better) VALUES
+ ('domain_agreement','Domains both runs chose','%','higher'),
+ ('finding_agreement','Issues both runs found','%','higher'),
+ ('severity_agreement','Shared issues given the same severity','%','higher');
 
 -- The ledger's words and their labels (see issue_statuses ... enum_labels). Migration 0006 seeds the same rows.
 INSERT INTO issue_statuses(value, label, position, active, resolved, fixed, reopens, briefed) VALUES
@@ -3623,7 +3808,142 @@ INSERT INTO enum_labels(enum, value, label, position) VALUES
 
 INSERT INTO ledger_checks(view, label, tier, position) VALUES
  ('v_artifacts_outside_ledger','Review files recorded outside the ledger''s folder','warning',110);
-INSERT INTO meta(key, value) VALUES ('schema_version','11');
+-- Each domain's checklist (the table "Checklists" in references/domains.md).
+INSERT INTO domain_checks(code, domain_code, position, severity, question, evidence) VALUES
+ ('spec.1','spec',1,'H','Is every stated requirement listed, with its source quoted?','A row per requirement: its code or quote, source and location.'),
+ ('spec.2','spec',2,'H','Does the implementation of each requirement match it at its boundaries, priority orders and exceptions?','Per requirement: path:line of every copy and a verdict (matches, differs, partly, missing, untested).'),
+ ('spec.3','spec',3,'M','Does a test assert each requirement?','The test name per requirement, or untested.'),
+ ('spec.4','spec',4,'M','Does the code do anything no requirement asks for, or do requirements contradict each other?','Each such behaviour or contradiction with path:line.'),
+ ('tests.1','tests',1,'H','Is every unit of behaviour or configuration listed with the cases it needs?','A row per function, route, command, setting, rule or flag, with its cases and expected outcomes.'),
+ ('tests.2','tests',2,'H','Is each needed case asserted by a test that would fail if the behaviour broke?','Per case: the test name and Yes, Partly or No.'),
+ ('tests.3','tests',3,'M','Is every input validated, and every validation branch and error path tested?','Inputs read with no validation; branches and error paths with no test.'),
+ ('tests.4','tests',4,'M','Are migrations and conversions tested?','Each migration or conversion with its test, or no test.'),
+ ('tests.5','tests',5,'L','Do the totals add up?','Units, cases needed, asserted and missing.'),
+ ('test-quality.1','test-quality',1,'H','What is the mutation score of the core modules?','The score per module and the surviving mutants that matter, or not measured with the hand sample.'),
+ ('test-quality.2','test-quality',2,'M','Are any tests flaky or order-dependent?','The results of repeated and shuffled runs.'),
+ ('test-quality.3','test-quality',3,'M','Do tests depend on the real clock, time zone, network or shared state?','Each such test by name.'),
+ ('test-quality.4','test-quality',4,'L','How fast is the suite, and which tests are slowest?','The run time and the slowest tests.'),
+ ('test-quality.5','test-quality',5,'M','Does every recorded guard test still exist and still guard its issue?','Per guard test: exists, and fails without its fix where tried.'),
+ ('time-concurrency.1','time-concurrency',1,'H','Is every place that creates, parses, compares, formats or stores a date or time listed with its time zone handling?','A row per place: path:line, the zone stored and converted, whose today it is.'),
+ ('time-concurrency.2','time-concurrency',2,'M','Are daylight-saving changes, month, year and leap boundaries and inclusive or exclusive ends handled?','The concrete dates to test and what happens on each.'),
+ ('time-concurrency.3','time-concurrency',3,'H','What happens when two actors change the same thing at once?','Per shared write: the guard (version check, constraint, transaction, lock) or the lost update.'),
+ ('time-concurrency.4','time-concurrency',4,'M','Does a test exercise each boundary date and each interleaving?','Test names, or the missing tests by name.'),
+ ('resilience.1','resilience',1,'H','Does every call to another service, queue, database or file system have a timeout and a retry that is safe to repeat?','A row per call: timeout, retry policy, idempotency.'),
+ ('resilience.2','resilience',2,'H','Can any multi-step change stop halfway and leave inconsistent data?','Per change: the transaction or compensating step, or the inconsistent state.'),
+ ('resilience.3','resilience',3,'M','What does each job do on failure, on a rerun, on overlap with itself and on a missed run?','The four answers per job.'),
+ ('resilience.4','resilience',4,'M','What do the user and the operator see for each failure?','At least five failures followed end to end.'),
+ ('compatibility.1','compatibility',1,'H','Can today''s code read everything older code wrote?','Per stored thing (rows, settings, files, cookies, links): the read path and the oldest version handled.'),
+ ('compatibility.2','compatibility',2,'H','Is every schema or settings migration tested from each older version in use?','Per migration: the test and the versions it starts from.'),
+ ('compatibility.3','compatibility',3,'M','Can each deploy roll back without losing or corrupting data?','The rollback path per kind of change.'),
+ ('compatibility.4','compatibility',4,'M','Are API changes versioned or additive, and do old clients keep working across a deploy?','Each breaking change waiting to happen and the test that would catch it.'),
+ ('decision-placement.1','decision-placement',1,'H','Is every business decision listed with the layer that decides it today?','A row per decision: where it is decided, path:line.'),
+ ('decision-placement.2','decision-placement',2,'H','Is any decision written more than once, and do the copies agree?','Every copy with path:line and the result of probing them.'),
+ ('decision-placement.3','decision-placement',3,'M','Is any decision checked in one path and not in another?','Each path that skips the check.'),
+ ('decision-placement.4','decision-placement',4,'M','Which decisions should move, and in what order?','Move or keep with the reason, and the tests that must pass before and after.'),
+ ('contracts.1','contracts',1,'H','Is every endpoint or message between components listed with its request, response and errors?','An inventory per boundary.'),
+ ('contracts.2','contracts',2,'H','Does each caller handle every response the callee can give?','Per call: each success shape, refusal, error and timeout, and the ones not handled.'),
+ ('contracts.3','contracts',3,'M','Do the producer''s contract and the consumer''s copy agree field by field?','Each drifted or duplicated type.'),
+ ('contracts.4','contracts',4,'M','Is every endpoint and response branch tested, failures included?','Tests per branch: timeout, 4xx, 5xx, malformed, unavailable.'),
+ ('server.1','server',1,'M','Where does the server hardcode domain or customer-specific behaviour?','Each place with path:line, whether a setting exists, and the fix.'),
+ ('server.2','server',2,'H','Is every route, job, consumer, webhook and sign-in flow listed with who may call it?','The inventory with the permission per entry.'),
+ ('server.3','server',3,'H','Does each have tests for success, each refusal, validation, stale saves and a failing dependency?','Cases against tests; the missing tests by name.'),
+ ('server.4','server',4,'H','Is any client input unvalidated, or any permission check without a negative test?','Each with path:line.'),
+ ('database.1','database',1,'M','Is everything the system consumes or produces stored and queryable later?','Anything lost, lossy or only in logs.'),
+ ('database.2','database',2,'M','Does every distinct query use an index, bound its results and avoid a query per item?','The query plan per query: scans, repeated queries, unbounded results.'),
+ ('database.3','database',3,'H','Do constraints, uniqueness and transactions keep the data consistent under concurrent writes?','Each missing constraint or unguarded write.'),
+ ('database.4','database',4,'M','Are migrations reversible, retention defined, and no secret stored in clear?','Per migration and per sensitive column.'),
+ ('client-api.1','client-api',1,'M','Does every backend capability have an API and a screen that uses it?','The capability inventory with the gaps both ways.'),
+ ('client-api.2','client-api',2,'M','Are the API styles coherent: no duplicated capability, one shape for results and errors?','Each inconsistency.'),
+ ('client-api.3','client-api',3,'H','Do two paths to one action apply the same permission check?','Each pair of paths with its checks.'),
+ ('client-api.4','client-api',4,'L','Is any identifier a display name?','Each one.'),
+ ('abstraction.1','abstraction',1,'M','Which types, contracts or logic are duplicated between packages or layers?','Each duplicate with every location.'),
+ ('abstraction.2','abstraction',2,'M','How many files change to add a new entity, rule, setting group or notification type?','The file list per walk-through.'),
+ ('abstraction.3','abstraction',3,'L','Is there dead code, an oversized module or a circular dependency?','Each with its path.'),
+ ('abstraction.4','abstraction',4,'L','What is the refactoring order that keeps the system working?','Quick wins, medium, structural.'),
+ ('hotspots.1','hotspots',1,'M','Which files change most often and are most complex?','The ranked list from git log.'),
+ ('hotspots.2','hotspots',2,'M','Which files always change together but live apart?','Each cluster.'),
+ ('hotspots.3','hotspots',3,'M','Which code has a single author, and which busy areas have few tests?','Lists with counts.'),
+ ('hotspots.4','hotspots',4,'L','Which files keep producing issues across reviews?','The rows of the hotspot view.'),
+ ('ui.1','ui',1,'H','Does each page meet the design brief (type scale, palette, density)?','Per page: the goal broken and the screenshot, or rendered result not seen.'),
+ ('ui.2','ui',2,'H','Does every text meet the required contrast, and every image, field, button and link have a name?','The audit''s output per page, or the same computed from the stylesheets and marked not measured.'),
+ ('ui.3','ui',3,'M','How many colours, font sizes and spacing values are in use against the brief''s scale?','The inventory with counts and the values to merge.'),
+ ('ui.4','ui',4,'M','Does each page work at phone width and in both themes?','Screenshots at 390 and 1280 pixels, light and dark, with what breaks.'),
+ ('ui.5','ui',5,'M','Are there internal names on screen, typing where a choice would do, or text below the writing standard?','Each with file:line, the text and the shorter version.'),
+ ('ui.6','ui',6,'H','Is any link shown to someone who is then refused, or any page shown without access?','The access matrix: kind of user by link, button and page.'),
+ ('ui.7','ui',7,'M','Can every configuration the backend allows be displayed and changed?','Each setting with no screen.'),
+ ('walkthroughs.1','walkthroughs',1,'H','Can each kind of user complete each of its main tasks?','10 to 20 tasks per kind of user, traced page by page.'),
+ ('walkthroughs.2','walkthroughs',2,'M','Where does a hand-off between pages break or confuse?','Each dead end, missing confirmation or undo, and step that needs information the user cannot see.'),
+ ('walkthroughs.3','walkthroughs',3,'M','Can a first-time user finish the main task unaided, and is what they see first what the task needs?','Per main task: the first screen and where they would stop.'),
+ ('walkthroughs.4','walkthroughs',4,'L','What on each page could be deleted without loss?','A list per page.'),
+ ('notifications.1','notifications',1,'M','Is every message type listed with its trigger, recipients, content source and opt-out?','The inventory.'),
+ ('notifications.2','notifications',2,'H','Can a message be sent twice, missed, or sent to the wrong person after a role change?','Per message type: the guard or the failure.'),
+ ('notifications.3','notifications',3,'M','Are bounces handled, and is staging kept from mailing real people?','Configuration and code, or not verified.'),
+ ('notifications.4','notifications',4,'L','Does each message render on a phone and have a plain-text alternative?','Per message type.'),
+ ('localization.1','localization',1,'M','Which user-facing strings are hardcoded?','Each with file:line.'),
+ ('localization.2','localization',2,'M','Are dates, numbers, currency and week start formatted for the reader''s locale?','Each fixed format.'),
+ ('localization.3','localization',3,'L','Will translated text fit, and is right-to-left possible?','Each layout that will not.'),
+ ('security.1','security',1,'H','For every route and API function, what is the permission check, and can a lower-privileged, other-tenant or signed-out caller reach it?','A row per route: the check with file:line and the result of changing an id.'),
+ ('security.2','security',2,'H','Where does client input reach SQL, HTML, e-mail, file paths, redirects or deserialization unescaped?','Each sink with file:line.'),
+ ('security.3','security',3,'H','How are sign-in codes, tokens and sessions stored, expired and limited?','Per method: hashing, expiry, attempt limits, cookie flags.'),
+ ('security.4','security',4,'H','Is any secret in the repository, a workflow or a log, or stored in clear?','Locations only, never the value.'),
+ ('security.5','security',5,'M','Which browser protections are set?','Per page or response: content security policy, cross-site request checks, cross-origin rules, framing, caching of private responses.'),
+ ('security.6','security',6,'M','Who can deploy, and what could each kind of misuser do today?','Workflow permissions and a short threat model.'),
+ ('security.7','security',7,'M','Which protections have a test that fails without them?','Test names and the missing tests.'),
+ ('privacy.1','privacy',1,'H','Where does each kind of personal data enter, and where is it stored or copied?','A data map: database, backups, logs, e-mail, analytics, third parties.'),
+ ('privacy.2','privacy',2,'H','Who can read it, and how long is it kept?','Per kind of data.'),
+ ('privacy.3','privacy',3,'M','How would one person''s data be exported or deleted in full?','The path, or what would be left behind.'),
+ ('privacy.4','privacy',4,'M','Which obligations apply, and where are the gaps?','Each gap, marked not legal advice.'),
+ ('logging.1','logging',1,'M','Is every important event logged?','The events that leave no trace: sign-ins, refusals, state changes, external calls, jobs, e-mail, configuration changes.'),
+ ('logging.2','logging',2,'M','Can an operator answer five realistic complaints from the logs alone?','Each complaint walked, and where the trail breaks.'),
+ ('logging.3','logging',3,'H','Do logs hold secrets, tokens, codes or personal data, or accept injected lines?','Each statement with file:line.'),
+ ('logging.4','logging',4,'L','Are structure, levels, a request id and zoned timestamps consistent, with no swallowed exception?','Each exception to it.'),
+ ('logging.5','logging',5,'M','Do errors reach a person, and where do logs go and for how long?','Alerting, retention and access.'),
+ ('operations.1','operations',1,'M','Does CI run every suite, linter and type-check on every change and block merges on failure?','The workflow files.'),
+ ('operations.2','operations',2,'M','Are builds reproducible, and are the deploy and rollback steps written down?','The steps, or what is missing.'),
+ ('operations.3','operations',3,'H','If the database, hosting account, domain or e-mail provider were lost today, what is the path back?','Per loss: the path, the time, and whether a restore was ever tested.'),
+ ('operations.4','operations',4,'M','What is backed up, how often, where, and is it encrypted?','Per store.'),
+ ('operations.5','operations',5,'M','Are scheduled jobs monitored for failure and missed runs?','Per job.'),
+ ('dependencies.1','dependencies',1,'M','Which packages are outdated, abandoned or have known problems?','From the lock files; not checked online without network.'),
+ ('dependencies.2','dependencies',2,'M','Is every version pinned, and every CI action referenced by commit hash?','Each one that is not.'),
+ ('dependencies.3','dependencies',3,'L','Is there a licence problem, an install script or a dependency used for something trivial?','Each one.'),
+ ('performance.1','performance',1,'M','Where does the time go for each page load and action?','Server calls, queries per call and repeated work; measured or reasoned, saying which.'),
+ ('performance.2','performance',2,'M','What do the heavy components cost in time and memory at realistic and larger sizes?','Numbers per job type.'),
+ ('performance.3','performance',3,'M','What is each page''s weight and layout shift?','The audit''s numbers, or not measured.'),
+ ('performance.4','performance',4,'M','What breaks first at 10x users and 3x data?','The first limit and the three changes that buy the most.'),
+ ('performance.5','performance',5,'L','Which performance tests or budgets exist?','The existing ones and the ones to add.'),
+ ('cost.1','cost',1,'M','What does each service cost now and at 10x scale?','From configuration and pricing in the repository; not verified otherwise.'),
+ ('cost.2','cost',2,'M','What could run up a bill by accident?','Runaway retries, unbounded logs or storage, no spending limit.'),
+ ('cost.3','cost',3,'L','Which account and payment method is each service billed to?','Per service.'),
+ ('docs-developer.1','docs-developer',1,'M','Does every public function, type and module say what it does, its inputs and outputs, and why?','Per module: documented, partly, undocumented.'),
+ ('docs-developer.2','docs-developer',2,'M','Which comments or docs are stale against the current code?','Each statement with file:line and what the code does.'),
+ ('docs-developer.3','docs-developer',3,'M','Do the README, setup, architecture and settings docs exist, and do their commands run?','Per document: exists, accurate, what is missing; commands run where safe.'),
+ ('docs-developer.4','docs-developer',4,'L','Does every piece of text meet the writing standard?','Each breach with the shorter version.'),
+ ('docs-user.1','docs-user',1,'M','Which tasks, settings and errors can a user meet with no explanation anywhere?','Each one.'),
+ ('docs-user.2','docs-user',2,'M','Is each piece of help accurate to current behaviour and findable where it is needed?','The inventory with a verdict per piece.'),
+ ('docs-user.3','docs-user',3,'L','Is it written for the reader, to the writing standard?','Each breach with the shorter version.'),
+ ('handover.1','handover',1,'H','Could a new maintainer clone, set up, run, test, deploy and roll back from the repository and its docs alone?','Each step walked, and where they would get stuck.'),
+ ('handover.2','handover',2,'H','Who owns each account, domain, key and secret, and is any tied to one person?','The list with the owner and how access transfers.'),
+ ('handover.3','handover',3,'M','Are there runbooks for the common incidents and the periodic chores?','Each one, present or missing.'),
+ ('handover.4','handover',4,'M','Where is knowledge held by one person?','From the history or the hotspots report.');
+
+INSERT INTO enum_labels(enum, value, label, position) VALUES
+ ('checklist_answer','yes','Yes',1), ('checklist_answer','no','No',2), ('checklist_answer','partly','Partly',3),
+ ('checklist_answer','not-applicable','Does not apply',4);
+INSERT INTO enum_labels(enum, value, label, position) VALUES
+ ('touch_kind','file','File',1), ('touch_kind','symbol','Function or name',2), ('touch_kind','table','Table',3),
+ ('touch_kind','column','Column',4), ('touch_kind','setting','Setting',5), ('touch_kind','route','Route',6),
+ ('touch_kind','behaviour','What a user sees',7),
+ ('touch_direction','adds','Adds',1), ('touch_direction','removes','Removes',2),
+ ('touch_direction','tightens','Tightens',3), ('touch_direction','loosens','Loosens',4),
+ ('touch_direction','renames','Renames',5), ('touch_direction','changes','Changes',6),
+ ('touch_source','declared','Declared by the step',1), ('touch_source','finding','Where its points are',2),
+ ('conflict_resolution','none','Not judged yet',1), ('conflict_resolution','no-conflict','No conflict',2),
+ ('conflict_resolution','order','Done in order',3), ('conflict_resolution','merge','Merged into one change',4),
+ ('conflict_resolution','owner','Decided by you',5);
+INSERT INTO ledger_checks(view, label, tier, position) VALUES
+ ('v_unresolved_conflicts','Plan steps that touch the same thing, not judged yet','error',120),
+ ('v_late_step_conflicts','Steps added after approval that touch what other steps touch','warning',130);
+INSERT INTO meta(key, value) VALUES ('schema_version','16');
 INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger schema'),
   (2, 'url, path, hash and code checks; repositories.allow_outside_root; finding_locations.excerpt_redacted'),
   (3, 'integrity rules: codes, hashes, checks, append-only history, owner actor on gate answers'),
@@ -3634,4 +3954,9 @@ INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger s
   (8, 'finding_locations.source (the reviewed text of a dirty working tree); v_next_codes for the write commands'),
   (9, 'owner interview (interview_questions, interview_answers) and per-domain design goals the owner approves'),
   (10, 'v_plan_totals, v_review_totals and v_pending_gates: the counts the viewer''s lists show'),
-  (11, 'gate answer rules in the trigger, owner queue context, event labels, the artifact check');
+  (11, 'gate answer rules in the trigger, owner queue context, event labels, the artifact check'),
+  (12, 'review_environment: what each review''s environment offered (tools, the harness, its connectors)'),
+  (13, 'domain_rules: the rule by which scan proposes each domain; review_domains.proposed_by_rule'),
+  (14, 'domain_checks and checklist_answers: each domain''s checklist, and the answers each report gave'),
+  (15, 'the agreement metrics compare-runs records: domain_agreement, finding_agreement, severity_agreement'),
+  (16, 'step_touches and step_conflicts: what each plan step touches, and the pairs of steps that touch the same thing');

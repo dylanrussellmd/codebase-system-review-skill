@@ -216,7 +216,7 @@ class Reviews(browser.ViewerTestCase):
     def test_page_review_search_paths(self):
         page = self.open("#/review/R-0001")
         search = page.page.locator("input[type=search]")
-        for term, want in (("timeoff.py", ["SPEC-M1", "SPEC-L1"]), ("src/auth", ["SEC-H1"]), ("sec-h1", ["SEC-H1"]),
+        for term, want in (("requests.py", ["SPEC-M1", "SPEC-L1"]), ("src/auth", ["SEC-H1"]), ("sec-h1", ["SEC-H1"]),
                            ("ISS-0003", ["SPEC-L1"]), ("predictable", ["SEC-H1"]), ("  WEEKEND ", ["SPEC-L1"]),
                            ("nothing like this", []), ("", ["SEC-H1", "SPEC-M1", "SPEC-L1"])):
             with self.subTest(term):
@@ -317,7 +317,7 @@ class PointsAndCode(browser.ViewerTestCase):
         it = self.item(page, "SPEC-M2")
         it.locator("summary").click()
         self.assertEqual(it.locator("dd a").get_attribute("href"), "#/issue/ISS-0001")
-        self.assertEqual(it.locator("dt").all_inner_texts(), ["Area", "Kind", "Issue", "Checked by the manager"])
+        self.assertEqual(it.locator("dt").all_inner_texts(), ["Area", "Kind", "Issue", "Check"])
         facts = dict(zip(page.texts(".facts span"), page.texts(".facts b")))
         self.assertEqual((facts["points"], facts["new issues"], facts["came back"]), ("7", "0", "2"))
         # On the issue page the cards hide the issue link and show the review code.
@@ -341,8 +341,8 @@ class PointsAndCode(browser.ViewerTestCase):
         page = self.open("#/review/R-0002")
         exc = self._show(page, "SPEC-L1")
         # step 174: a plain sentence, with what git said folded away
-        self.assertEqual(exc.locator("p.note").inner_text(), "This file is not in that commit, or the commit is not in this "
-                         "copy of the repository. These are the lines as they were saved at review time.")
+        self.assertEqual(exc.locator("p.note").inner_text(), "That commit does not have this file, or this copy of "
+                         "the repository does not have the commit. These are the lines as they were saved at review time.")
         self.assertEqual(exc.locator("details summary").inner_text(), "What git said")
         self.assertFalse(exc.locator("details").evaluate("d => d.open"))
         self.assertNotIn("fatal", exc.inner_text())
@@ -350,8 +350,8 @@ class PointsAndCode(browser.ViewerTestCase):
         self.assertEqual(exc.locator(".code tr.hit td:not(.ln)").all_inner_texts(), ["five = 5", "six = 6"])
         self.assertIn("lines 5–6", exc.locator(".refline").first.inner_text())
         none = self._show(page, "SPEC-L2")
-        self.assertEqual(none.locator("p.note").inner_text(), "This file is not in that commit, or the commit is not in "
-                         "this copy of the repository. No copy of the lines was saved.")
+        self.assertEqual(none.locator("p.note").inner_text(), "That commit does not have this file, or this copy of "
+                         "the repository does not have the commit. No copy of the lines was saved.")
         self.assertEqual(none.locator(".code").count(), 0)
         self.assertIn("line 3", none.locator(".refline").first.inner_text())
         self.assertEqual(none.locator(".refline code").last.inner_text(),
@@ -384,6 +384,30 @@ class PointsAndCode(browser.ViewerTestCase):
         page.settle()
         self.assertEqual(page.text(note), "56 of 230 points")
         self.assertEqual(more.count(), 0)
+
+
+class UngatedOwnerItems(browser.ViewerTestCase):
+    """Step 150: the inbox lists a waiting step and an open decision that no gate asks, and the badge counts them."""
+    @classmethod
+    def build_ledger(cls, ledger):
+        from dev.tests.seed_demo import add_ungated_owner_items
+        ids = fixtures.seed_demo(ledger)
+        add_ungated_owner_items(ledger, ids)
+        fixtures.finish_demo(ledger)
+        return ids
+
+    def test_ungated_owner_items_listed(self):
+        page = self.open("#/inbox")
+        rows = page.page.locator("h2:text('Also waiting on you') + div tbody tr")
+        self.assertEqual(rows.count(), 2)
+        texts = rows.all_inner_texts()
+        self.assertIn("Plan step P-0001 #1", texts[0])
+        self.assertIn("Your review", texts[0])
+        self.assertIn("Is a CI run on every push enough, or also nightly?", texts[0])
+        self.assertIn("Decision D-0002", texts[1])
+        self.assertIn("Keep the request limit per user or per team?", texts[1])
+        self.assertEqual(page.text("#tabs a[data-k=inbox] .badge"), "4")
+        self.assertClean(page)
 
 
 if __name__ == "__main__":

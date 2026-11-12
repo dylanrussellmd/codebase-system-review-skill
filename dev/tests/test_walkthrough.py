@@ -11,6 +11,10 @@ Every write is a command (plan P-0001 step 131): the walkthrough runs no SQL. It
 confirmed and false verifications, metrics, artifacts, the verdict, the plan and its statuses, step commits and guard
 tests, so the final `check` has no v_unguarded_fixes warning.
 
+It needs no artifact publishing, no subagent tool and no browser (plan P-0001 step 136, OWN-8): `env` records an
+environment without them, the hub is the file hub.html, and the owner's answer to R-0002's domains arrives as a
+JSON file through import-answers.
+
 By default each command runs in this process through the built tool's main() (the same parsing and code as the CLI,
 about 5 seconds in all); LEDGER_SLOW_TESTS=1 runs every one as its own `python3 ledger.py --root ...` process (about
 20 seconds). LEDGER_PY_UNDER_TEST=/path/to/ledger.py runs it against another build.
@@ -40,6 +44,9 @@ APP_V3 = 'import csv\n\n\ndef parse(text):\n    """Split one CSV line into field
 TEST_V2 = 'import unittest\nfrom src.app import handler\n\n\nclass T(unittest.TestCase):\n' \
           '    def test_empty_request(self):\n        self.assertIsNone(handler(""))\n'
 
+PAGE = '<!doctype html><title>Demo</title><form><input name="request"><button>Send</button></form>\n'
+
+
 def point(pid, sev, kind, theme, sub, loc, summary, before, fix, test, known=""):
     """One row of a points.tsv (references/formats/index.md: 16 columns)."""
     return T.join([pid, sev, kind, theme, sub, loc, "L1", summary, before, fix, test, "", known, "", "", ""])
@@ -51,7 +58,9 @@ class Walkthrough(unittest.TestCase):
         self.root = self.repo.path
         self.db = self.root / ".code-review" / "ledger.sqlite"
         self.ledger_py = LEDGER_PY or fixtures.built_ledger_path()
-        self.env = fixtures.git_env()
+        self.env = fixtures.git_env({"LEDGER_CHROME": str(self.root / "no-browser-here")})
+        for k in [k for k in self.env if k.startswith(("OPENCODE", "CLAUDE", "CODE_REVIEW_HARNESS"))]:
+            del self.env[k]
 
     # ------------------------------------------------------------ helpers
     def run_cmd(self, *args, expect=0):
@@ -94,9 +103,42 @@ class Walkthrough(unittest.TestCase):
         p.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return p
 
-    def approve_domains(self, review, owner, mgr):
+    def report(self, review, domain, name, points):
+        """A reviewer's report in the format the brief gives: every checklist item answered, each point with its
+        location (none when the location is empty), fix and test."""
+        checks = [r[0] for r in self.query(f"SELECT code FROM domain_checks WHERE domain_code = '{domain}' "
+                                           f"ORDER BY position")]
+        lines = [f"# {domain}: the demo", "", "## Scope and method", "", "Everything, at the reviewed commit.", "",
+                 "## Checklist", "", "| check | answer | evidence |", "|---|---|---|"]
+        lines += [f"| {c} | partly | src/app.py read in full |" for c in checks]
+        lines += ["", "## Known issues", "", "| issue | outcome | evidence | point |", "|---|---|---|---|", "",
+                  "## Findings", ""]
+        for head, where, check in points:
+            lines += [f"### {head}", ""] + ([f"- Where: `{where}`"] if where else []) + [
+                "- Before: it does what the summary says.", "- Fix: change it.", "- Test: test_x: asserts it",
+                f"- Check: {check}", ""]
+        lines += ["## Totals", "", f"{len(points)} points."]
+        return self.file(f"reviews/{review}", name, lines)
+
+    def keep_domains(self, review, keep, mgr):
+        """Step 2a: skip every domain scan proposed that this review does not run, each with its reason."""
+        proposed = [r[0] for r in self.query(
+            f"SELECT rd.domain_code FROM review_domains rd JOIN reviews r ON r.id = rd.review_id "
+            f"WHERE r.code = '{review}' AND rd.decision = 'included' ORDER BY 1")]
+        self.assertTrue(set(keep) <= set(proposed), proposed)
+        for code in proposed:
+            if code not in keep:
+                self.run_cmd("review-domain", review, code, "skip", "--reason",
+                             "the owner asked for " + ", ".join(keep) + " only", "--owner-change",
+                             "removed-by-owner", "--actor", mgr)
+        self.assertEqual([r[0] for r in self.query(
+            f"SELECT rd.domain_code FROM review_domains rd JOIN reviews r ON r.id = rd.review_id "
+            f"WHERE r.code = '{review}' AND rd.decision = 'included' ORDER BY 1")], sorted(keep))
+
+    def approve_domains(self, review, owner, mgr, answer_file=False):
         """Step 2b, in SKILL.md's order: awaiting-approval, the domain-approval gate, the hub; the owner's chat
-        answer, apply the gate, approve the review."""
+        answer (or, with answer_file, an answer exported from a copy of the hub and read by import-answers), apply
+        the gate, approve the review."""
         proposal = self.file(f"reviews/{review}", "proposal.md",
                              ["# Proposal", "", "Domains: spec, tests. Skipped: ui (no pages)."])
         self.run_cmd("review-status", review, "awaiting-approval", "--note", "domains proposed", "--actor", mgr)
@@ -106,7 +148,15 @@ class Walkthrough(unittest.TestCase):
                          "--option", "goals=Edit the goals", "--actor", mgr)
         self.run_cmd("progress-page")
         self.assertIn(f"{gate}  [open] domain-approval", self.run_cmd("gates"))
-        self.run_cmd("answer-gate", gate, "--value", "approve", "--text", "Go ahead", "--actor", mgr)
+        if answer_file:
+            answers = self.file(f"reviews/{review}", "answers.json", [json.dumps(
+                [{"gate": gate, "answer_value": "approve", "answer_text": "Go ahead",
+                  "answered_at": "2026-11-11T10:00:00.000Z"}])])
+            self.run_cmd("import-answers", answers)
+            self.assertEqual(self.query(f"SELECT status, answer_value, answered_via FROM gates WHERE code='{gate}'"),
+                             [["answered", "approve", "viewer"]])
+        else:
+            self.run_cmd("answer-gate", gate, "--value", "approve", "--text", "Go ahead", "--actor", mgr)
         self.run_cmd("apply-gate", gate, "--note", "approved as listed", "--actor", mgr)
         self.run_cmd("review-status", review, "approved", "--note", f"the owner approved the domains ({gate})",
                      "--approved-by", owner, "--actor", mgr)
@@ -116,10 +166,18 @@ class Walkthrough(unittest.TestCase):
         started = time.monotonic()
         self.repo.write("src/app.py", APP_V1)
         self.repo.write("src/test_app.py", "import unittest\n")
+        self.repo.write("web/index.html", PAGE)
+        self.repo.write("README.md", "# Demo\n\nAn empty request is refused, never a crash.\n")
         first = self.repo.commit("first")
 
         # ===== R-0001 =====
-        # --- Step 1: init, the owner and the manager, the repository, gates, check; the ledger-location gate.
+        # --- Step 1: env (what this environment offers), init, the owner and the manager, the repository, gates,
+        #     check; the ledger-location gate.
+        offered = self.run_cmd("env")
+        self.assertRegex(offered, r"(?m)^yes  git ")
+        self.assertRegex(offered, r"(?m)^no   browser .*; to enable: ")
+        self.assertRegex(offered, r"(?m)^no   subagents .*the manager runs each reviewer scope itself")
+        self.assertFalse((self.root / ".code-review").exists())  # env needs no ledger and writes nothing
         self.assertIn("(created)", self.run_cmd("init"))
         self.assertTrue((self.root / ".code-review" / "ledger.py").exists())
         owner = self.code("add-actor", "owner", "Project Owner")
@@ -136,11 +194,22 @@ class Walkthrough(unittest.TestCase):
         self.assertIn(f"{where}  [open] decision", self.run_cmd("gates"))
         self.run_cmd("check", "--quiet")
         self.query("SELECT * FROM v_open_issues")  # Step 1.2: read the history (empty on a first review)
-        # --- Step 2a: start the review with its domains, included and skipped.
+        # --- Step 2a: start the review; scan proposes the domains by rule (step 138), the same on a second run;
+        #     the manager drops what the owner did not ask for, each with a written reason.
         r1 = self.code("new-review", "--title", "First review", "--scope", "full", "--request",
-                       "Review the whole tool", "--manager", mgr, "--domain", "spec=the rules", "--domain",
-                       "tests=it has tests", "--skip", "ui=no pages", "--actor", mgr)
+                       "Review the whole tool", "--manager", mgr, "--actor", mgr)
         self.assertEqual(r1, "R-0001")
+        proposal = self.run_cmd("scan", "--review", r1, "--actor", mgr)
+        self.assertRegex(proposal, r"(?m)^  ui +included +ui_files >= 1: ui_files = 1$")
+        self.assertRegex(proposal, r"(?m)^  database +skipped +db_files >= 1 not met: db_files = 0$")
+        self.assertEqual(self.run_cmd("scan", "--review", r1, "--json"), self.run_cmd("scan", "--review", r1, "--json"))
+        self.keep_domains(r1, ("spec", "tests", "ui"), mgr)
+        # The environment recorded on the review: no subagent tool, no publishing, no browser. The rest of the
+        # walkthrough takes each fallback: the manager records every run itself, the hub is a file.
+        self.run_cmd("env", "--review", r1, "--actor", mgr)
+        self.assertEqual(self.query("SELECT capability FROM review_environment WHERE available = 0 AND capability "
+                                    "IN ('browser','subagents','publishing','questions') ORDER BY 1"),
+                         [["browser"], ["publishing"], ["questions"], ["subagents"]])
         # Step 1.3-1.4 (recorded once the review exists): the baseline test run and a requirement.
         self.assertIn("baseline", self.run_cmd("record-test-run", "--purpose", "baseline", "--command",
                                               "python3 -m unittest", "--review", r1, "--passed", "0", "--failed",
@@ -170,23 +239,61 @@ class Walkthrough(unittest.TestCase):
         self.run_cmd("answer-gate", goal_gate, "--value", "approve", "--text", "Yes, as written", "--actor", mgr)
         self.run_cmd("apply-gate", goal_gate, "--note", "goals approved; the brief gives them", "--actor", mgr)
         self.assertIn("Refuse it, never crash.", self.run_cmd("interview", "--review", r1))
+        # Step 2c, the design direction (step 133): the three questions references/domains.md asks of every project
+        # with a ui domain, the owner's answers, and the design brief proposed from them as ui goals.
+        asked = []
+        for question, answer in (
+                ("Which sites, apps or screens do you like the look of, and what about each?",
+                 "A plain text editor: nothing on screen but the task."),
+                ("Which three words should describe how this one feels?", "Quiet, dense, exact."),
+                ("What must it never look like?", "A dashboard of cards with a gradient header.")):
+            q = self.code("interview-ask", "--review", r1, "--domain", "ui", "--why",
+                          "the catalog asks it of every project with a ui domain", question, "--actor", mgr)
+            self.run_cmd("interview-answer", q, answer, "--via", "chat", "--actor", mgr)
+            asked.append(q)
+        briefed = [self.code("propose-goal", "--domain", "ui", "--from", ",".join(asked), text, "--actor", mgr)
+                   for text in ("Type scale: one family, three sizes.", "Palette: text, one accent, no gradient.",
+                                "Density: a form fits a phone screen without scrolling.")]
+        self.run_cmd("approve-goals", *briefed, "--actor", owner)
+        self.assertIn("Palette: text, one accent, no gradient.", self.run_cmd("goals", "--domain", "ui"))
         self.assertIn("G-02  An empty request is refused.", self.run_cmd("goals", "--domain", "spec"))
-        brief = self.file(f"reviews/{r1}", "BRIEF.md", ["# Brief", "", "Goals: G-01, G-02 (ledger.py goals)."])
+        # --- Step 2d: the brief, generated from the ledger (step 139), recorded as an artifact.
+        brief = self.root / ".code-review" / "reviews" / r1 / "BRIEF.md"
+        self.run_cmd("brief", "--review", r1, "--out", brief)
+        text = brief.read_text(encoding="utf-8")
+        for need in ("- G-02 An empty request is refused.", "| spec.1 |", "| tests.1 |", "## Report format"):
+            self.assertIn(need, text)
+        self.assertEqual(self.run_cmd("brief", "--review", r1), text)            # the same ledger, the same brief
         self.run_cmd("add-artifact", "brief", "--path", brief, "--review", r1, "--actor", mgr)
-        # --- Step 3: snapshot, one run per reviewer (add-run records its actor), running.
+        # --- Step 3: snapshot; each run's prompt generated (prompt), recorded with add-run; running. No subagent
+        #     tool: the manager runs each scope itself, from the same prompt.
         self.assertIn("clean", self.run_cmd("snapshot", r1, "--actor", mgr))
-        prompt = self.file(f"reviews/{r1}", "prompt.txt", ["First read BRIEF.md and follow it exactly."])
-        self.run_cmd("add-run", r1, "spec", "spec-A", "--scope", "everything", "--model", "m-2", "--prompt",
-                     f"@{prompt}", "--status", "running", "--actor", mgr)
-        self.run_cmd("add-run", r1, "tests", "tests-A", "--scope", "everything", "--model", "m-2", "--prompt",
-                     f"@{prompt}", "--status", "running", "--actor", mgr)
+        for domain, label in (("spec", "spec-A"), ("tests", "tests-A")):
+            prompt = self.root / ".code-review" / "reviews" / r1 / f"prompt-{label}.txt"
+            self.run_cmd("prompt", "--review", r1, "--domain", domain, "--scope", "everything", "--out", prompt)
+            self.assertIn(f"goals --domain {domain}", prompt.read_text(encoding="utf-8"))
+            self.run_cmd("add-run", r1, domain, label, "--scope", "everything", "--model", "m-2", "--prompt",
+                         f"@{prompt}", "--status", "running", "--actor", mgr)
         self.run_cmd("review-status", r1, "running", "--note", "reviewers started", "--actor", mgr)
-        # --- Step 4: verifying; each run finished with its report; every other agent is an actor with its role.
+        # --- Step 4: verifying; each report checked by lint-report (a first draft without a location is sent
+        #     back), its checklist answers recorded, its run finished; every other agent is an actor with its role.
         self.run_cmd("review-status", r1, "verifying", "--note", "reports arrived", "--actor", mgr)
-        for label, name, high in (("spec-A", "spec.md", "1"), ("tests-A", "tests.md", "0")):
-            report = self.file(f"reviews/{r1}", name, [f"# {label}", "", "Points in the index."])
+        reports = {"spec": ("spec-A", "spec.md", "1", [
+                       ("SPEC-H1 [H] handler crashes on an empty request.", "demo:src/app.py:5-7#handler", "spec.2"),
+                       ("SPEC-M1 [M] parse splits quoted commas.", "demo:src/app.py:1-2#parse", "spec.2")]),
+                   "tests": ("tests-A", "tests.md", "0", [
+                       ("TEST-T1 [T] No test covers handler.", "demo:src/test_app.py", "tests.2")])}
+        for domain, (label, name, high, points) in reports.items():
+            draft = self.report(r1, domain, name, [(head, "", check) for head, _, check in points])
+            out = self.run_cmd("lint-report", draft, "--domain", domain, "--review", r1, expect=1)
+            self.assertIn("no location", out)
+            report = self.report(r1, domain, name, points)
+            self.assertIn(": ok:", self.run_cmd("lint-report", report, "--domain", domain, "--review", r1,
+                                                "--record", "--actor", mgr))
             self.assertIn("-> finished", self.run_cmd("finish-run", r1, label, "--report", report, "--items", "1",
                                                       "--high", high, "--actor", mgr))
+        self.assertEqual(self.query("SELECT count(DISTINCT check_code) FROM checklist_answers")[0][0],
+                         len(self.query("SELECT code FROM domain_checks WHERE domain_code IN ('spec','tests')")))
         self.code("add-actor", "verifier", "verifier 1", "--model", "m-2", "--parent", mgr, "--review", r1,
                   "--role", "verifier for spec.md", "--actor", mgr)
         # --- Step 5: indexing; 5a indexers; 5c load-index per report, tag-review, fill-refs; 5d match; check.
@@ -215,6 +322,7 @@ class Walkthrough(unittest.TestCase):
         self.run_cmd("add-metric", r1, "test_cases_asserted", "0", "--method", "counted", "--domain", "tests",
                      "--scope", "src/test_app.py", "--unit", "cases", "--actor", mgr)
         self.assertIn("v_unmatched_findings", self.run_cmd("check", "--quiet", expect=1))
+        self.assertIn("matched 0 points; 3 left for you", self.run_cmd("match", r1, "--auto", "--actor", mgr))
         self.code("add-actor", "matcher", "matcher 1", "--parent", mgr, "--review", r1, "--role",
                   "matcher for spec", "--actor", mgr)
         matches = self.file(f"reviews/{r1}/index", "matches.tsv", [
@@ -255,7 +363,16 @@ class Walkthrough(unittest.TestCase):
              "proof": "test_parse_quoted: keeps quoted commas", "closes": ["SPEC-M1"], "depends": ["A-1"]})])
         out = self.run_cmd("import-steps", plan, steps, "--actor", mgr)
         self.assertIn("0 points of the plan's reviews closed by no step, 0 coverage problems", out)
-        # --- Step 8c: check (v_uncovered_findings and v_coverage_problems empty).
+        # --- Step 8c: check (v_uncovered_findings and v_coverage_problems empty); the deconfliction pass (step
+        #     143): steps 1 and 2 both change src/app.py, so the pair is judged before the owner sees the plan.
+        self.run_cmd("check", "--quiet")
+        pass_out = self.run_cmd("conflicts", "--plan", plan, "--actor", mgr)
+        self.assertIn("steps 1 and 2: file demo:src/app.py: both change it", pass_out)
+        self.assertIn("v_unresolved_conflicts", self.run_cmd("check", "--quiet", expect=1))
+        self.assertIn("resolved (order)", self.run_cmd(
+            "resolve-conflict", plan, "1", "2", "--resolution", "order", "--note",
+            "step 2 changes parse after step 1 guards handler", "--actor", mgr))
+        self.assertIn("0 unresolved conflicts", self.run_cmd("conflicts", "--plan", plan, "--actor", mgr))
         self.run_cmd("check", "--quiet")
         # --- Step 8d: the plan-approval gate, awaiting-approval, the hub; the owner approves; apply, approved, and
         #     the plan's issues to planned.
@@ -350,11 +467,12 @@ class Walkthrough(unittest.TestCase):
                          [[c, "fixed"] for c in ("ISS-0001", "ISS-0002", "ISS-0003", "ISS-0004")])
         # --- Step 2a: the review of the fixed commit, the same domains.
         r2 = self.code("new-review", "--title", "Second review", "--scope", "second", "--request",
-                       "Verify the fix plan", "--manager", mgr, "--domain", "spec=the rules", "--domain",
-                       "tests=it has tests", "--skip", "ui=no pages", "--previous", r1, "--actor", mgr)
+                       "Verify the fix plan", "--manager", mgr, "--previous", r1, "--actor", mgr)
         self.assertEqual(r2, "R-0002")
-        # --- Step 2b.
-        self.approve_domains(r2, owner, mgr)
+        self.run_cmd("scan", "--review", r2, "--actor", mgr)
+        self.keep_domains(r2, ("spec", "tests"), mgr)
+        # --- Step 2b: this time the owner answers in a copy of the hub; the answer arrives as a file.
+        self.approve_domains(r2, owner, mgr, answer_file=True)
         # --- Step 3.
         self.run_cmd("snapshot", r2, "--actor", mgr)
         self.run_cmd("add-run", r2, "spec", "spec-B", "--scope", "everything", "--model", "m-2", "--status",
@@ -395,7 +513,13 @@ class Walkthrough(unittest.TestCase):
         self.run_cmd("verify", f"{r2}:SPEC2-M1", "confirmed", "--note", "two lines give one row", "--actor", mgr)
         self.assertIn("unverified -> false", self.run_cmd(
             "verify", f"{r2}:TEST2-L1", "false", "--note", "test_parse_quoted calls parse", "--actor", mgr))
-        # --- Step 5d: the new point grew out of the csv fix: a continuation of ISS-0002.
+        # --- Step 5d: match --auto first (step 140): the data decides neither point, so both are left with why.
+        auto = self.run_cmd("match", r2, "--auto", "--actor", mgr)
+        self.assertIn("SPEC2-M1: a closed issue fits: judge the type", auto)
+        self.assertIn("ISS-0002 (verified) same symbol parse in src/app.py: --type regression", auto)
+        self.assertIn("TEST2-L1: a false finding: match it by hand", auto)
+        self.assertIn("matched 0 points; 2 left for you", auto)
+        # The new point grew out of the csv fix: a continuation of ISS-0002.
         self.assertIn("ISS-0005 continuation", self.run_cmd(
             "match", r2, "SPEC2-M1", "new", "--type", "continuation", "--rationale", "grew out of the csv fix",
             "--relations", "continuation-of:ISS-0002", "--actor", mgr))
@@ -409,6 +533,12 @@ class Walkthrough(unittest.TestCase):
         self.run_cmd("check", "--quiet")
         self.run_cmd("dump")
         self.run_cmd("review-status", r2, "handed-off", "--note", "handed off to the owner", "--actor", mgr)
+
+        # --- Step 6 (a rerun): how far R-0002 agrees with R-0001, recorded as metrics (step 141).
+        drift = self.run_cmd("compare-runs", r1, r2, "--record", "--actor", mgr)
+        self.assertIn("different commits", drift)
+        self.assertIn("findings: 0 shared, 4 only in R-0001, 1 only in R-0002 (agreement 0%)", drift)
+        self.assertEqual(self.query("SELECT count(*) FROM metrics WHERE name = 'finding_agreement'")[0][0], 3)
 
         # ===== The end state =====
         self.assertEqual(self.query("SELECT code, status FROM issues ORDER BY code"), [
@@ -428,6 +558,9 @@ class Walkthrough(unittest.TestCase):
         out = self.run_cmd("progress-page", plan)
         self.assertIn("no outside requests", out)
         self.assertGreater((self.root / ".code-review" / "hub.html").stat().st_size, 10_000)
+        # Nothing was published and no page was captured: the hub file and the ledger are the whole record.
+        self.assertEqual(self.query("SELECT count(*) FROM artifacts WHERE url IS NOT NULL"), [[0]])
+        self.assertEqual(self.query("SELECT count(*) FROM plans WHERE page_url IS NOT NULL"), [[0]])
         # Everything the walkthrough wrote is inside the excluded .code-review/: the repository is untouched.
         self.assertEqual(self.repo.git("status", "--porcelain"), "")
         self.assertLess(time.monotonic() - started, 60, "the walkthrough got slow; see the module docstring")

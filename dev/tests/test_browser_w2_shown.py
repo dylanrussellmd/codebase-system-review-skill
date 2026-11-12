@@ -82,6 +82,18 @@ class Shown(browser.ViewerTestCase):
         self.assertIn("Differs", page.text("h2:text('Requirements') ~ div tbody"))
         self.assertGreater(page.count("h2:text('History') + .timeline > div"), 0)
 
+    def test_review_shows_points_by_area(self):
+        """Step 172: the per-area counts the review route returns are on the review's page."""
+        page = self.open("#/review/R-0001")
+        d = self.server.get("/api/review/R-0001").json()
+        self.assertEqual(page.contents("h2:text('Points by area') + div thead th"),
+                         ["Area", "Points", "High", "Medium", "Low", "Missing tests", "Confirmed", "New", "Carried over",
+                          "Came back", "False"])
+        rows = [r.split("\t") for r in page.texts("h2:text('Points by area') + div tbody tr")]
+        labels = self.server.get("/api/overview").json()["labels"]["domains"]
+        self.assertEqual([[c.strip() for c in r[:3]] for r in rows],
+                         [[labels[x["domain_code"]], str(x["points"]), str(x["high"])] for x in d["summary"]])
+
     def test_review_header_shows_skill_version(self):
         page = self.open("#/review/R-0001")
         kv = dict(zip(page.texts("#app > .card dl.kv dt"), page.texts("#app > .card dl.kv dd")))

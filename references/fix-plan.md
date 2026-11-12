@@ -75,6 +75,28 @@ get a step that records the decision and its reason, with a `confirm` gate. Fals
 "Record false findings" that lists them, with a `confirm-false-finding` gate. Report totals in the narrative: points per
 review and domain, steps per phase, zero uncovered.
 
+## Deconflict the steps (8c)
+
+Before approval, check that no two steps undo, contradict or trip over each other:
+
+    ledger.py conflicts --plan P-0001 --actor A-0002
+
+It records each step's touches (the `touches` a drafter declared, and the file and symbol of every point the step
+closes) and lists every pair of steps that touch the same target, saying when they change it in different directions
+(one tightens a rule the other loosens). Judge each pair, or give the list to a read-only reviewer who returns a
+verdict per pair, then record it:
+
+    ledger.py resolve-conflict P-0001 12 14 --resolution order --note 'step 14 builds on the check step 12 adds' --actor A-0002
+
+- `no-conflict`: they touch the same file but not the same thing; say what each changes.
+- `order`: one must land first; the later step now depends on the earlier.
+- `merge`: one change does both; rewrite the steps so one carries it, and say which.
+- `owner`: the steps want opposite things; open a `decision` gate, apply the owner's answer, and pass `--gate`.
+
+`check` fails while `v_unresolved_conflicts` has rows, and `plan-status ... approved` is refused. A step added after
+approval (`report-finding --new-step`) is checked at once: its conflicts are a warning in `check` and a line in
+`ledger.py gates`, and only that step cannot start until each pair is judged.
+
 ## Approval (8d)
 
 Check every number and step range in the narrative against the ledger, then:

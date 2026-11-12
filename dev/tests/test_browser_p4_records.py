@@ -23,7 +23,7 @@ class RecordsInViewer(browser.ViewerTestCase):
         self.assertIn("Raised as a new issue that continues ISS-0001", page.text(".timeline"))
         page = self.open("#/review/R-0002")
         facts = page.text(".facts")
-        self.assertIn("1newissues", facts.replace("\n", "").replace(" ", ""))
+        self.assertIn("1newissue0", facts.replace("\n", "").replace(" ", ""))
 
     def test_report_and_narrative_shown(self):
         page = self.open("#/review/R-0002")

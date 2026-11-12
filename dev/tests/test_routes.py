@@ -11,7 +11,7 @@ that assertion on purpose.
 import re
 import unittest
 
-from dev.tests import fixtures
+from dev.tests import _w2_shown_helpers, fixtures
 from dev.tests.fixtures import Ledger, seed_demo
 
 PAGE_HTML = (fixtures.REPO_ROOT / "dev" / "page.html").read_text(encoding="utf-8")
@@ -118,10 +118,7 @@ class Overview(RouteCase):
         # step 161: the header is /api/overview, the home page's lists /api/home, the ledger's checks /api/checks
         d = {**self.ok("/api/overview"), **self.ok("/api/home"), **self.ok("/api/checks")}
         self.assertEqual(d["project"], self.L.root.name)
-        self.assertEqual(d["schema_version"], str(fixtures.load_ledger_module().SCHEMA_VERSION))
         self.assertEqual({r["severity"]: r["n"] for r in d["open_by_severity"]}, {"M": 2, "L": 1})
-        self.assertEqual({r["status"]: r["n"] for r in d["issues_by_status"]}, {"open": 3, "verified": 1})
-        self.assertEqual(d["gates_open"], 2)
         self.assertEqual((d["queue_count"], d["answered_count"]), (2, 0))
         self.assertEqual(d["recurring"], 1)
         self.assertEqual([r["code"] for r in d["reviews"]], ["R-0002", "R-0001"])
@@ -129,14 +126,14 @@ class Overview(RouteCase):
         # ISS-0237 fixed (step 188): the home page's plans carry the doing count too
         self.assertEqual(d["plans"], [{"code": "P-0001", "title": "Fix plan for R-0001", "status": "in-progress",
                                        "steps": 3, "done": 1, "doing": 0, "waiting": 1}])
-        # plan step 69: the checks come from the ledger's ledger_checks table, with their tier
-        got = [(c["view"], c["tier"]) for c in d["checks"]]
-        self.assertEqual(got, [(r["view"], r["tier"]) for r in self.L.all(
-            "SELECT view, tier FROM ledger_checks ORDER BY position, view")])
-        self.assertLessEqual({("v_unmatched_findings", "error"), ("v_unchecked_known_issues", "error"),
-                              ("v_untraceable_refs", "error"), ("v_uncovered_findings", "error"),
-                              ("v_coverage_problems", "error"), ("v_unguarded_fixes", "warning")}, set(got))
-        n = {c["view"]: c["n"] for c in d["checks"]}
+        # plan step 69: the checks come from the ledger's ledger_checks table, in its order; step 172: a check is
+        # its label, count, what the agent does and the page that shows its rows
+        listed = self.L.all("SELECT view, label FROM ledger_checks ORDER BY position, view")
+        self.assertEqual([c["label"] for c in d["checks"]], [r["label"] for r in listed])
+        self.assertLessEqual({"v_unmatched_findings", "v_unchecked_known_issues", "v_untraceable_refs",
+                              "v_uncovered_findings", "v_coverage_problems", "v_unguarded_fixes"},
+                             {r["view"] for r in listed})
+        n = {r["view"]: c["n"] for r, c in zip(listed, d["checks"])}
         self.assertEqual(n["v_untraceable_refs"], 5)  # fill-refs / tag-review not run on this ledger
         self.assertEqual(sum(v for k, v in n.items() if k != "v_untraceable_refs"), 0)
         self.assertEqual(set(d["labels"]), {"domains", "themes", "enums"})  # enums: schema 6, step 95
@@ -153,7 +150,6 @@ class Overview(RouteCase):
                 want[r["severity"]] = want.get(r["severity"], 0) + 1
         self.assertEqual({r["severity"]: r["n"] for r in d["open_by_severity"]}, want)
         self.assertEqual(want, {"H": 2, "M": 2, "L": 1, "T": 2})
-        self.assertEqual(d["gates_open"], 3)  # GATE-0001, -0002, -0004
         # ISS-0107 fixed (step 177): answered gates are counted apart (3 open + step + decision; 2 answered)
         self.assertEqual((d["queue_count"], d["answered_count"]), (5, 2))
         self.assertEqual(d["queue_count"] + d["answered_count"], L.count("v_owner_queue"))
@@ -166,8 +162,8 @@ class Overview(RouteCase):
     def test_overview_empty_ledger(self):
         d = {**self.ok("/api/overview", L=empty()), **self.ok("/api/home", L=empty()),
              **self.ok("/api/checks", L=empty())}
-        self.assertEqual((d["open_by_severity"], d["issues_by_status"], d["reviews"], d["plans"]), ([], [], [], []))
-        self.assertEqual((d["gates_open"], d["queue_count"], d["answered_count"], d["recurring"]), (0, 0, 0, 0))
+        self.assertEqual((d["open_by_severity"], d["reviews"], d["plans"]), ([], [], []))
+        self.assertEqual((d["queue_count"], d["answered_count"], d["recurring"]), (0, 0, 0))
         self.assertEqual([c["n"] for c in d["checks"]], [0] * empty().count("ledger_checks"))
         self.assertGreater(len(d["labels"]["domains"]), 10)
 
@@ -266,8 +262,8 @@ class Reviews(RouteCase):
         self.assertEqual((r["code"], r["previous_code"], r["manager"], r["approved_by"]),
                          ("R-0002", "R-0001", "Review manager", fixtures.DEMO_OWNER))
         self.assertEqual([g["code"] for g in d["goals"]], ["G-01", "G-02"])
-        self.assertEqual([(x["domain_code"], x["decision"]) for x in d["domains"]],
-                         [("spec", "included"), ("security", "included"), ("database", "skipped")])  # decision, category, name
+        self.assertEqual([(x["name"], x["decision"]) for x in d["domains"]],
+                         [("Spec conformance", "included"), ("Security", "included"), ("Database", "skipped")])  # decision, category, name
         self.assertEqual([x["domain_code"] for x in d["runs"]], ["security", "spec"])
         self.assertEqual([(c["issue_code"], c["outcome"]) for c in d["checks"]],
                          [("ISS-0001", "fixed"), ("ISS-0003", "not-checked"), ("ISS-0002", "still-present")])
@@ -280,7 +276,7 @@ class Reviews(RouteCase):
         f = {x["point_id"]: x for x in d["findings"]}
         self.assertEqual(f["SPEC-M1"]["issue_code"], "ISS-0002")
         whole = self.ok(f"/api/finding/{f['SPEC-M1']['id']}")
-        self.assertEqual((whole["issue_code"], whole["issue_status"], whole["run_label"]), ("ISS-0002", "open", "spec"))
+        self.assertEqual((whole["issue_code"], whole["run_label"]), ("ISS-0002", "spec"))
 
     def test_review_with_no_findings(self):
         L, _, _ = extra()
@@ -299,12 +295,9 @@ class Reviews(RouteCase):
         d = self.ok("/api/review/R-0001", L=L)
         self.assertEqual([x["point_id"] for x in d["findings"]], ["SEC-H1", "ZZZ-H2", "SPEC-M1", "SPEC-L1", "AAA-T1"])
         whole = [self.ok(f"/api/finding/{x['id']}", L=L) for x in d["findings"]]   # step 148: locations come here
-        for x in whole:
-            for loc in x["locations"]:
-                self.assertEqual(loc["finding_id"], x["id"])
         locs = {x["point_id"]: [(l["path"], l["line_start"], l["line_end"]) for l in x["locations"]] for x in whole}
         self.assertEqual(locs, {"SEC-H1": [("src/auth.py", 1, 3)], "ZZZ-H2": [("src/auth.py", 2, 2)],
-                                "SPEC-M1": [("src/timeoff.py", 2, 4)], "SPEC-L1": [("src/timeoff.py", 5, 6)],
+                                "SPEC-M1": [("src/requests.py", 2, 4)], "SPEC-L1": [("src/requests.py", 5, 6)],
                                 "AAA-T1": []})
         self.assertEqual(whole[0]["locations"][0]["repo"], "demo")
 
@@ -318,8 +311,8 @@ class Issues(RouteCase):
     def test_issues_list_order_and_fields(self):
         rows = self.ok("/api/issues")["rows"]
         self.assertEqual([r["code"] for r in rows], ["ISS-0001", "ISS-0002", "ISS-0004", "ISS-0003"])
-        self.assertEqual(set(rows[0]), {"code", "title", "severity", "status", "domain_code", "theme_code",
-                                        "times_seen", "opened_at", "updated_at", "first_seen", "last_seen"})
+        self.assertEqual(set(rows[0]), {"code", "title", "severity", "status", "domain_code",
+                                        "times_seen", "first_seen", "last_seen"})
         two = rows[1]
         self.assertEqual((two["first_seen"], two["last_seen"], two["times_seen"]), ("R-0001", "R-0002", 2))
         self.assertEqual(self.codes(L=empty()), [])
@@ -343,7 +336,7 @@ class Issues(RouteCase):
         self.assertEqual(self.codes(q="code-compare"), ["ISS-0004"])             # sub
         self.assertEqual(self.codes(q="SPEC-L1"), ["ISS-0003"])                  # finding point_id
         self.assertEqual(self.codes(q="random generator"), ["ISS-0001"])         # finding summary
-        self.assertEqual(self.codes(q="timeoff.py"), ["ISS-0002", "ISS-0003"])   # location path
+        self.assertEqual(self.codes(q="requests.py"), ["ISS-0002", "ISS-0003"])   # location path
         self.assertEqual(self.codes(q="PREDICTABLE"), ["ISS-0001"])              # LIKE is case-insensitive
         self.assertEqual(self.codes(q="no such words"), [])
         # ISS-0226 fixed (step 159): % and _ are matched as themselves (test_issues_search_wildcards_literal)
@@ -378,7 +371,7 @@ class Issues(RouteCase):
                          [("R-0001", "SPEC-M1"), ("R-0002", "SPEC-M1")])
         for f in d["findings"]:
             self.assertEqual([(l["path"], l["line_start"], l["repo"]) for l in f["locations"]],
-                             [("src/timeoff.py", 2, "demo")])
+                             [("src/requests.py", 2, "demo")])
         self.assertEqual([(c["review"], c["outcome"]) for c in d["checks"]], [("R-0002", "still-present")])
         self.assertEqual([e["event"] for e in d["timeline"]][:1], ["opened"])
         self.assertEqual(d["guard_tests"], [])
@@ -423,7 +416,6 @@ class Plans(RouteCase):
         self.assertEqual({k: p[k] for k in ("code", "status", "steps", "done", "doing", "waiting", "reviews")},
                          {"code": "P-0001", "status": "in-progress", "steps": 3, "done": 1, "doing": 0,
                           "waiting": 1, "reviews": "R-0001"})
-        self.assertIsNotNone(p["approved_at"])
         L, _, _ = extra()
         rows = self.ok("/api/plans", L=L)
         self.assertEqual([r["code"] for r in rows], ["P-0002", "P-0001"])
@@ -449,8 +441,7 @@ class Plans(RouteCase):
         self.assertEqual((c["review"], c["issue"], c["severity"]), ("R-0001", "ISS-0001", "H"))
         c2 = self.L.repo.commits[1]
         self.assertEqual([[x["commit_sha"] for x in s["commits"]] for s in full], [[], [c2], []])
-        self.assertEqual([(p["phase"], p["steps"], p["done"], p["waiting_owner"], p["not_started"])
-                          for p in d["phases"]], [(1, 1, 0, 0, 1), (2, 2, 1, 1, 0)])
+        self.assertEqual([(p["phase"], p["steps"], p["done"]) for p in d["phases"]], [(1, 1, 0), (2, 2, 1)])
         self.assertEqual([p["number"] for p in d["phase_rows"]], [1, 2])
         L, _, _ = extra()
         d = self.ok("/api/plan/P-0001", L=L)
@@ -474,7 +465,7 @@ class Trends(RouteCase):
                          {"points": 2, "high": 0, "medium": 2, "low": 0, "new_issues": 1, "carried_over": 1,
                           "came_back": 0, "false_findings": 0})
         self.assertEqual([r["code"] for r in d["recurring"]], ["ISS-0002"])
-        self.assertEqual([h["path"] for h in d["hotspots"]], ["src/auth.py", "src/timeoff.py"])
+        self.assertEqual([h["path"] for h in d["hotspots"]], ["src/auth.py", "src/requests.py"])
         self.assertEqual(self.ok("/api/trends", L=empty()),
                          {"metrics": [], "reviews": [], "recurring": [], "hotspots": []})
 
@@ -592,17 +583,17 @@ class OtherRoutes(RouteCase):
 # Exact top-level keys of each route on the demo ledger. For list routes: the keys of one row.
 CONTRACT = {
     "overview": ("GET", "/api/overview", None, 200, dict,
-                 {"project", "schema_version", "gates_open", "queue_count", "answered_count", "labels"}),
+                 {"project", "queue_count", "answered_count", "labels"}),
     "home": ("GET", "/api/home", None, 200, dict,
-             {"open_by_severity", "issues_by_status", "reviews", "plans", "discoveries"}),
+             {"open_by_severity", "reviews", "plans", "discoveries"}),
     "guide": ("GET", "/api/guide", None, 200, dict, {"guide"}),
-    "run": ("GET", "/api/run/{run}", None, 200, dict, {"id", "label", "prompt", "final_message"}),
+    "run": ("GET", "/api/run/{run}", None, 200, dict, {"prompt", "final_message"}),
     "checks": ("GET", "/api/checks", None, 200, dict, {"checks", "recurring"}),
     "decisions": ("GET", "/api/decisions", None, 200, dict, {"decisions"}),
     "gates": ("GET", "/api/gates", None, 200, dict, {"gates", "other"}),
     "gates-all": ("GET", "/api/gates?status=all", None, 200, dict, {"gates", "total", "limit", "offset"}),
     "reviews": ("GET", "/api/reviews", None, 200, list,
-                {"code", "title", "scope", "status", "started_at", "completed_at", "verdict", "commits", "points",
+                {"code", "title", "scope", "status", "started_at", "commits", "points",
                  "high", "medium", "low", "tests", "new_issues", "came_back"}),
     "review": ("GET", "/api/review/R-0001", None, 200, dict,
                {"review", "repos", "goals", "domains", "runs", "checks", "check_counts", "summary", "metrics",
@@ -613,13 +604,13 @@ CONTRACT = {
     "finding": ("GET", "/api/finding/{finding}", None, 200, dict, None),
     "step": ("GET", "/api/step/P-0001/2", None, 200, dict,
              {"number", "change", "proof", "owner_question", "behavior_note", "progress_note", "no_findings_reason",
-              "started_at", "done_at", "updated_at", "commits", "closes"}),
+              "started_at", "done_at", "commits", "closes"}),
     "issues": ("GET", "/api/issues", None, 200, dict, {"rows", "total", "limit", "offset"}),
     "issue": ("GET", "/api/issue/ISS-0002", None, 200, dict,
               {"issue", "findings", "relations", "checks", "timeline", "guard_tests", "decisions", "steps",
                "unguarded"}),
     "plans": ("GET", "/api/plans", None, 200, list,
-              {"code", "title", "status", "created_at", "approved_at", "steps", "done", "doing", "waiting",
+              {"code", "title", "status", "steps", "done", "doing", "waiting",
                "reviews"}),
     "plan": ("GET", "/api/plan/P-0001", None, 200, dict,
              {"plan", "reviews", "artifacts", "last_updated", "gates", "discoveries", "events", "phases", "phase_rows", "steps", "unguarded"}),
@@ -630,8 +621,7 @@ CONTRACT = {
               {"columns", "rows", "count", "more", "truncated", "offset", "limit"}),
     "sql": ("POST", "/api/sql", {"sql": "SELECT 1 AS one"}, 200, dict, {"columns", "rows", "truncated"}),
     "source": ("GET", "/api/source/{loc}", None, 200, dict,
-               {"repo_name", "path", "commit_sha", "line_start", "line_end", "symbol", "permalink", "blob_sha",
-                "git_command", "excerpt", "excerpt_redacted", "source", "lines"}),
+               {"line_start", "line_end", "permalink", "git_command", "source", "lines"}),
     "answer": ("POST", "/api/gates/GATE-0001/answer", {"answer_value": "use-7"}, 200, dict, {"ok"}),
     "review-404": ("GET", "/api/review/R-9999", None, 404, dict, {"error"}),
     "issue-404": ("GET", "/api/issue/ISS-9999", None, 404, dict, {"error"}),
@@ -676,10 +666,8 @@ class Contract(RouteCase):
                 self.assertEqual(got_status, status, f"{name}: {res}")
                 self.assertIsInstance(res, shape)
                 got = set(res[0]) if shape is list else set(res)
-                if keys is None:   # a point in full: every column of findings, and what the route adds
-                    keys = set(self.L.columns("findings")) | {
-                        "review_code", "issue_code", "issue_status", "run_label", "locations", "verified_by",
-                        "discovered_in_step", "discovered_in_plan", "goals", "requirements"}
+                if keys is None:   # a point in full: the keys ROUTE_KEYS pins
+                    keys = {k.split("[")[0] for k in re.sub(r"\[[^\]]*\]", "[", ROUTE_KEYS["finding/*"]).split()}
                 self.assertEqual(got, keys, name)
 
     def test_page_reads_only_returned_fields(self):
@@ -714,6 +702,226 @@ class Contract(RouteCase):
                 problems.append(f"OVERVIEW.{p} is not returned by /api/overview")
         self.assertGreater(checked, 30, "the page scan found too few property reads; the pattern is stale")
         self.assertEqual(problems, [])
+
+
+# ---------------------------------------------------------------- step 172: every field of every route
+
+def full_ledger(L):
+    """A demo ledger with a row in every list a route returns: the shown-data demo, an owner queue beyond its
+    gates, an interview with a goal written from it, a decision about an issue, and a test guarding a fix."""
+    ids = _w2_shown_helpers.build(L)
+    r1 = ids["reviews"]["R-0001"]
+    L.update("steps", ids["steps"][1], status="waiting-owner")
+    L.decision("D-0002", "Keep weekends off?", status="open")
+    L.x("INSERT INTO decision_issues(decision_id, issue_id) VALUES (?, ?)",
+        (ids["decisions"]["D-0001"], ids["issues"]["ISS-0002"]))
+    q = L.insert("interview_questions", code="IQ-0001", review_id=r1, domain_code="spec", question="Which inputs?",
+                 why_asked="The parser accepts two formats.")
+    L.insert("interview_answers", question_id=q, answer="JSON only.", answered_via="chat")
+    goal = L.id_of("design_goals", "G-01")
+    L.update("design_goals", goal, review_id=r1)
+    L.insert("goal_sources", goal_id=goal, question_id=q)
+    L.dependency(ids["steps"][3], ids["steps"][2])
+    L.update("issues", L.id_of("issues", ids["found_issue"]), status="fixed",
+             after_state="The retry stops after five tries.")   # fixed, with no test guarding it
+    L.commit()
+    return ids
+
+
+def merged(a, b):
+    """Two shapes of the same answer taken together: every key of either, an empty list filled from the other."""
+    if isinstance(a, dict) and isinstance(b, dict):
+        return {k: merged(a[k], b[k]) if k in a and k in b else a.get(k, b.get(k)) for k in [*a, *[k for k in b if k not in a]]}
+    if isinstance(a, list) and isinstance(b, list):
+        return [merged(a[0], b[0])] if a and b else a or b
+    return b if a == [] or a is None else a   # [] next to a list of plain values (a leaf) is that leaf
+
+
+def shape(v):
+    """The keys of an answer, nested: a dict's keys, and for a list the keys of its rows taken together. A list
+    of plain values is a leaf; an empty list is []."""
+    if isinstance(v, dict):
+        return {k: shape(x) for k, x in v.items()}
+    if isinstance(v, list):
+        out = None
+        for x in v:
+            s = shape(x)
+            if isinstance(s, dict):
+                out = s if out is None else merged(out, s)
+        return [out] if out else [] if not v else None
+    return None
+
+
+def compact(s):
+    """A shape as the text ROUTE_KEYS holds: a{b c[d e]} is key a (a dict with b and c, c a list of rows d, e)."""
+    if isinstance(s, list):
+        return "[" + compact(s[0]) + "]" if s else "[]"
+    if isinstance(s, dict):
+        return " ".join(k + ("{" + compact(v) + "}" if isinstance(v, dict) else compact(v) if isinstance(v, list) else "")
+                        for k, v in s.items())
+    return ""
+
+
+def names(s):
+    """Every key a shape names, at any depth."""
+    if isinstance(s, list):
+        s = s[0] if s else {}
+    for k, v in (s or {}).items():
+        yield k
+        if v:
+            yield from names(v)
+
+
+# What each GET route returns on full_ledger(), by route pattern: every key, down to the rows of its lists (the
+# text compact() gives). A field added to a route is added here and read by the page; one the page stops reading
+# is dropped from the route. labels and the rows of Explore's tables are data, not fields.
+ROUTE_KEYS = {
+    "overview":
+        "project queue_count answered_count labels",
+    "home":
+        "open_by_severity[severity n] reviews[code title status started_at points high] plans[code title "
+        "status steps done doing waiting] discoveries",
+    "checks":
+        "checks[label n action recipe link] recurring",
+    "decisions":
+        "decisions[code question answer rationale status revisit_when decided_at review issues]",
+    "gates?status=pending":
+        "gates[code kind title question context options[value label description] allow_text blocking status "
+        "answer_value answer_text answered_at created_at review_code plan_code step_number issue_code "
+        "decision_code] other[kind ref need title question context]",
+    "gates?status=all":
+        "gates[code kind title status blocking created_at answered_at answer_value answer_text applied_note "
+        "review_code plan_code step_number issue_code decision_code answer_label] total limit offset",
+    "reviews":
+        "[code title scope status started_at commits points high medium low tests new_issues came_back]",
+    "review/*":
+        "review{code title scope status request_text approved_at skill_version review_folder summary_doc_url "
+        "verdict summary started_at completed_at report_md manager manager_model approved_by previous_code} "
+        "repos[name remote_url default_branch notes commit_sha branch commit_subject tag_name tag_pushed "
+        "is_dirty dirty_note] goals[code text] test_runs[command purpose passed failed skipped errored "
+        "duration_ms notes started_at] relations[from_issue relation to_issue to_title confidence rationale] "
+        "events[at event from_value to_value note actor] domains[name decision reason owner_change "
+        "reviewers_planned] runs[id domain_code label scope report_path status items_reviewed high_count "
+        "medium_count low_count test_count started_at finished_at actor model harness session] checks[outcome "
+        "evidence issue_code title status] check_counts[outcome n] summary[domain_code points high medium low "
+        "tests confirmed false_findings new_issues carried_over came_back] agents[role kind name model "
+        "harness parent] requirements[requirement text verdict where_implemented tested point_id evidence "
+        "verdict_count] metrics[name scope value unit method note label] artifacts[kind path url created_at "
+        "run] gates[answer_label code kind title status answer_value answer_text] interview[code domain "
+        "question why_asked gate answers[answer answered_via answered_at]] review_goals[code domain text "
+        "status approved_at note adopted_at retired_at used_by sources[code question]] findings[id point_id "
+        "severity domain_code summary match_type verification issue_code]",
+    "review/*/checks":
+        "rows[outcome evidence issue_code title status] total limit offset",
+    "finding/*":
+        "id point_id match_type match_confidence match_rationale severity kind domain_code theme_code summary "
+        "detail before_state recommendation recommended_test evidence where_report verification "
+        "verification_note review_code issue_code run_label verified_by discovered_in_step discovered_in_plan "
+        "goals[code text] requirements[code text verdict] locations[id path line_start line_end symbol role "
+        "commit_sha repo]",
+    "issues":
+        "rows[code title severity status domain_code times_seen first_seen last_seen] total limit offset",
+    "issue/*":
+        "issue{code title domain_code theme_code severity status before_state current_state after_state "
+        "recommendation resolution times_seen opened_at resolved_at verified_at first_seen last_seen "
+        "last_checked} findings[id point_id match_type match_confidence match_rationale severity kind "
+        "domain_code theme_code summary detail before_state recommendation recommended_test evidence "
+        "where_report verification verification_note review_code verified_by discovered_in_step "
+        "discovered_in_plan locations[id path line_start line_end symbol role commit_sha repo]] relations[dir "
+        "relation other other_title other_status confidence rationale review] unguarded[problem] "
+        "checks[review started_at outcome evidence] timeline[at event from_value to_value review step "
+        "commit_sha actor note] guard_tests[test_path test_name failed_before_fix still_exists "
+        "added_commit_sha] decisions[code question answer rationale decided_at] steps[plan number title "
+        "status progress_note commits]",
+    "plans":
+        "[code title status steps done doing waiting reviews]",
+    "plan/*":
+        "plan{code title status approved_at doc_url page_url narrative_md} reviews[code] artifacts[kind path "
+        "url created_at] last_updated gates[code title status step] discoveries[point_id summary severity "
+        "review issue found_in_step closing_step] events[at event from_value to_value note actor] "
+        "unguarded[code title problem step] phases[phase steps done] phase_rows[number title goal why "
+        "first_step last_step] steps[number section title status owner_need behavior_change phase change "
+        "proof owner_question behavior_note progress_note no_findings_reason started_at done_at depends "
+        "closes search commits[commit_sha branch pr_url summary]]",
+    "step/*/*":
+        "number change proof owner_question behavior_note progress_note no_findings_reason started_at done_at "
+        "commits[commit_sha branch pr_url summary] closes[point_id severity summary review issue]",
+    "goals":
+        "goals[code domain text status approved_at note adopted_at retired_at used_by sources[code question]]",
+    "guide":
+        "guide",
+    "run/*":
+        "prompt final_message",
+    "trends":
+        "metrics[name scope repository review value unit label better] reviews[review started_at points high "
+        "medium low tests confirmed new_issues carried_over came_back false_findings] recurring[code title "
+        "severity status times_seen regressions reviews] hotspots[path issues reviews high_points]",
+    "tables":
+        "[name type label description for_agent count]",
+    "table/*?limit=500&offset=0":
+        "columns rows count more truncated offset limit",
+    "source/*":
+        "line_start line_end permalink git_command lines[n text] source",
+}
+# Keys only the shared copy reads (dev/core.py hub_snapshot, the page's staticApi).
+HUB_KEYS = {"search", "total", "findings"}
+# Row keys that are data the page walks rather than names it reads: a label map's values, a table's cells.
+DATA_KEYS = {"overview": ("labels",), "table/*?limit=500&offset=0": ("columns", "rows")}
+
+
+class RouteKeys(RouteCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.L = Ledger()
+        full_ledger(cls.L)
+        cls.mod = cls.L.module
+        con = cls.mod.connect(cls.L.db)
+        answers = {}
+        try:
+            for r in cls.mod.ROUTES:
+                # the paths the shared copy embeds, and a step (the copy holds every step inside its plan)
+                extra = {cls.mod.get_step: ["step/P-0001/2", "step/P-0001/3"], cls.mod.get_plan: ["plan/P-0001?phase=2"]}
+                for path in (r.hub(con) if r.hub else []) + extra.get(r.handler, []):
+                    p, _, q = path.partition("?")
+                    res = cls.mod.route(cls.L.root, cls.L.db, con, "/api/" + p,
+                                        {k: [v] for k, v in (x.split("=") for x in q.split("&") if x)}, None)
+                    self_name = "/".join(r.pattern) + ("?" + q if q and r.handler is not cls.mod.get_plan else "")
+                    answers.setdefault(self_name, []).append(res)
+        finally:
+            con.close()
+        cls.shapes = {}
+        for name, got in answers.items():   # the answers of one route (one per review, say), taken together
+            s = shape(got)[0] if isinstance(got[0], dict) else shape([row for a in got for row in a])
+            for k in DATA_KEYS.get(name, ()):
+                s[k] = None
+            cls.shapes[name] = s
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.L.close()
+
+    def test_route_keys_match_whitelist(self):
+        got = {name: compact(s) for name, s in self.shapes.items()}
+        self.assertEqual(set(got), set(ROUTE_KEYS))
+        for name in got:
+            with self.subTest(route=name):
+                self.assertEqual(got[name].split(), " ".join(ROUTE_KEYS[name].split()).split(), compact(self.shapes[name]))
+        # no list is empty on this ledger, so every row's keys are pinned
+        for name, text in got.items():
+            self.assertNotIn("[]", text, name)
+
+    def test_every_returned_field_is_read(self):
+        """Every key a route returns is named by the page's script (.key, key:"key", or destructured), or is one
+        the shared copy alone reads."""
+        script = PAGE_HTML[PAGE_HTML.index('"use strict";'):]
+        unread = []
+        for name, s in self.shapes.items():
+            for k in sorted(set(names(s))):
+                if k in HUB_KEYS:
+                    continue
+                if not re.search(r'\.%s\b|key:"%s"|[{,] ?%s[,}]' % (k, k, k), script):
+                    unread.append(f"/api/{name}: {k}")
+        self.assertEqual(unread, [])
 
 
 if __name__ == "__main__":
