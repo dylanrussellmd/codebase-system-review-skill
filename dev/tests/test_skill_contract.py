@@ -366,8 +366,10 @@ class Environment(unittest.TestCase):
         import json
         out = run_ledger("--root", temp_dir("env-"), "env", "--json", ledger_py=fixtures.built_ledger_path())
         self.assertEqual(out.returncode, 0, out.stderr)
-        names = [c["capability"] for c in json.loads(out.stdout)["capabilities"]
-                 if not c["capability"].startswith("connector:")] + ["connector:<name>"]
+        report = json.loads(out.stdout)
+        names = [c["capability"] for c in report["capabilities"]
+                 if not c["capability"].startswith("connector:")] + ["connector:<name>"] \
+            + (["tool:<name>"] if report.get("tools") else [])
         doc = (REFS / "environment.md").read_text(encoding="utf-8")
         table = {}
         for line in doc.split("\n"):

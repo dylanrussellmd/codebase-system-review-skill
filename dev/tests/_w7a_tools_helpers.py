@@ -3,6 +3,7 @@
     DATA                     dev/tests/data/tools/: recorded tool outputs (references/tools.md, "How a tool is wired
                              in", says which are real runs and which are written from the documented format)
     tool_project(test)       project() with src/app.py as the samples cite it, and src/util.js
+    shared_project(test, f)  one such project per test module, for tests that only read what a skipped run prints
     shim(name, script)       a folder holding an executable `name` that runs the Python `script` (a stand-in tool)
     path_with(*dirs)         PATH with these folders first; path_without_tools() keeps only git and the shell
     leads(L)                 [(code, rule, path, line_start, level)] of every lead, by code
@@ -11,6 +12,7 @@ import os
 import shutil
 import stat
 import sys
+import unittest
 from pathlib import Path
 
 from dev.tests import fixtures
@@ -52,6 +54,24 @@ def tool_project(test, files=None):
     return repo, L, sha
 
 
+class _ModuleScope:
+    """Stands in for a test in project(): its cleanups run when the test module ends."""
+    addCleanup = staticmethod(unittest.addModuleCleanup)
+
+
+_shared = {}
+
+
+def shared_project(test, files=None):
+    """tool_project() made once per test module for these files, for tests that only read what a command prints
+    (a tool skipped for want of its input): each such test adds runs to the same ledger. It is closed when the
+    module's tests end."""
+    key = (type(test).__module__, tuple(sorted((files or {}).items())))
+    if key not in _shared:
+        _shared[key] = tool_project(_ModuleScope, files=files)
+    return _shared[key]
+
+
 def shim(name, script):
     """A temporary folder with an executable `name` that runs `script` with this Python."""
     d = fixtures.temp_dir("w7a-bin-")
@@ -85,4 +105,4 @@ def leads(L):
             for r in L.all("SELECT code, rule, path, line_start, level FROM tool_results ORDER BY code")]
 
 
-__all__ = ["skill_ledger_path", "DATA", "APP_PY", "UTIL_JS", "tool_project", "shim", "bare_bin", "env_with", "leads", "ok"]
+__all__ = ["skill_ledger_path", "DATA", "APP_PY", "UTIL_JS", "tool_project", "shared_project", "shim", "bare_bin", "env_with", "leads", "ok"]

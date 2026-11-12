@@ -34,6 +34,7 @@ either way; say in the report which fallbacks were used.
 | `questions` | putting a gate's question to the owner in chat | write the question in chat as plain text; the gate in the hub is the record either way |
 | `images` | judging screenshots | judge from `ui-audit`'s numbers and the source, and write "screenshots not looked at" in the report |
 | `publishing` | a copy of the hub at an address | give the owner `.code-review/hub.html` or the viewer (`ledger.py serve`); answers arrive in the viewer or in chat |
+| `tool:<name>` | one picked tool `tool-run` can run (references/tools.md, "How a tool is wired in"): `yes` with the version found and the one `references/tools.lock` pins, `no` with how to install it and what to do without it; a tool that needs something the commit lacks (CSS, an API description, migrations) is listed all the same and skipped by `tool-run` with the reason | `tool-run` records the tool as absent with its fallback, never as a failure; the reviewer does that part by reading and writes "not machine-checked" |
 | `connector:<name>` | whatever the connector offers (an issue tracker, a design tool, documentation) | work from the repository and the owner's answers; ask the owner for an export of what the connector holds |
 
 ## Harnesses
@@ -62,7 +63,9 @@ ledger.py ui-audit http://127.0.0.1:3000/ http://127.0.0.1:3000/settings
   file, or a route of the ledger's own viewer (`'#/issues'`, served by `ledger.py serve`; `--base` for another port).
 - `ui-audit` reports, per page: texts below the required contrast (4.5:1, or 3:1 for large text), images, fields,
   buttons and links with no name, every colour, font size and spacing value in use with its count, page weight and
-  layout shift (`--json` for the same as data). Lighthouse scores are added only when Lighthouse is installed.
+  layout shift (`--json` for the same as data). Lighthouse scores are added only when Lighthouse is installed, and
+  axe-core's violations only when axe-core is (`LEDGER_AXE=<folder>`, the project's `node_modules`, or
+  `npm install -g axe-core`); `ledger.py tool-run axe --review R-0001 --from <the --json file>` makes them leads.
 - Both load only the pages given: requests to any other host are stopped. The owner starts the system under review;
   never point either command at a production address without the owner's word.
 

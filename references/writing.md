@@ -24,6 +24,6 @@ every statement that is stale against the current code.
 
 - This skill's own text: `dev/tests/test_writing_lint.py` refuses the history, filler, wordy and announcing phrases
   in SKILL.md, README.md and `references/`. `CHANGELOG.md` is exempt.
-- Any project, optional: `vale --config <skill folder>/references/vale/.vale.ini --output=JSON --no-exit <paths>`
-  (after `vale sync` with the same `--config`). Untested: no Vale run has checked these rules. Without Vale, the
-  reviewer reads for the same phrases (`references/vale/styles/Plain/*.yml` lists them).
+- Any project: `ledger.py tool-run vale --review R-0001` runs these rules (`references/vale/`, checked with the
+  Vale version `tools.lock` pins) on the reviewed commit, offline, and records each alert as a lead. Without Vale,
+  the reviewer reads for the same phrases (`references/vale/styles/Plain/*.yml` lists them).

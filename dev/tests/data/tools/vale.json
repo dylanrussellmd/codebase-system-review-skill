@@ -1,0 +1,494 @@
+{
+  "docs/guide.md": [
+    {
+      "Action": {
+        "Name": "",
+        "Params": null
+      },
+      "Suggestions": [],
+      "Span": [
+        3,
+        10
+      ],
+      "Check": "Plain.Headings",
+      "Description": "",
+      "Link": "",
+      "Message": "Heading 'Overview' says nothing; name the subject or remove it.",
+      "Severity": "warning",
+      "Match": "Overview",
+      "Line": 1
+    },
+    {
+      "Action": {
+        "Name": "",
+        "Params": null
+      },
+      "Suggestions": [],
+      "Span": [
+        1,
+        22
+      ],
+      "Check": "Plain.Announce",
+      "Description": "",
+      "Link": "",
+      "Message": "Show it; don't announce it ('This section describes').",
+      "Severity": "error",
+      "Match": "This section describes",
+      "Line": 3
+    },
+    {
+      "Action": {
+        "Name": "",
+        "Params": null
+      },
+      "Suggestions": [],
+      "Span": [
+        38,
+        48
+      ],
+      "Check": "Plain.History",
+      "Description": "",
+      "Link": "",
+      "Message": "Describe what is true now; drop the history ('was changed').",
+      "Severity": "error",
+      "Match": "was changed",
+      "Line": 3
+    },
+    {
+      "Action": {
+        "Name": "",
+        "Params": null
+      },
+      "Suggestions": [],
+      "Span": [
+        82,
+        91
+      ],
+      "Check": "Plain.History",
+      "Description": "",
+      "Link": "",
+      "Message": "Describe what is true now; drop the history ('previously').",
+      "Severity": "error",
+      "Match": "previously",
+      "Line": 3
+    },
+    {
+      "Action": {
+        "Name": "",
+        "Params": null
+      },
+      "Suggestions": [],
+      "Span": [
+        1,
+        9
+      ],
+      "Check": "Plain.Filler",
+      "Description": "",
+      "Link": "",
+      "Message": "Cut 'Note that'.",
+      "Severity": "error",
+      "Match": "Note that",
+      "Line": 5
+    },
+    {
+      "Action": {
+        "Name": "",
+        "Params": null
+      },
+      "Suggestions": [],
+      "Span": [
+        11,
+        21
+      ],
+      "Check": "Plain.Wordy",
+      "Description": "",
+      "Link": "",
+      "Message": "Use 'to', not 'in order to'.",
+      "Severity": "error",
+      "Match": "in order to",
+      "Line": 5
+    },
+    {
+      "Action": {
+        "Name": "",
+        "Params": null
+      },
+      "Suggestions": [],
+      "Span": [
+        37,
+        42
+      ],
+      "Check": "Plain.Filler",
+      "Description": "",
+      "Link": "",
+      "Message": "Cut 'simply'.",
+      "Severity": "error",
+      "Match": "simply",
+      "Line": 5
+    },
+    {
+      "Action": {
+        "Name": "",
+        "Params": null
+      },
+      "Suggestions": [],
+      "Span": [
+        1,
+        7
+      ],
+      "Check": "Plain.LabelLead",
+      "Description": "",
+      "Link": "",
+      "Message": "Drop the label '**Note:' and state the content.",
+      "Severity": "warning",
+      "Match": "**Note:",
+      "Line": 7
+    },
+    {
+      "Action": {
+        "Name": "",
+        "Params": null
+      },
+      "Suggestions": [],
+      "Span": [
+        15,
+        19
+      ],
+      "Check": "Plain.Terms",
+      "Description": "",
+      "Link": "",
+      "Message": "Use 'sign in', not 'login'.",
+      "Severity": "error",
+      "Match": "login",
+      "Line": 7
+    },
+    {
+      "Action": {
+        "Name": "",
+        "Params": null
+      },
+      "Suggestions": [],
+      "Span": [
+        35,
+        40
+      ],
+      "Check": "Plain.Terms",
+      "Description": "",
+      "Link": "",
+      "Message": "Use 'email', not 'e-mail'.",
+      "Severity": "error",
+      "Match": "e-mail",
+      "Line": 7
+    },
+    {
+      "Action": {
+        "Name": "",
+        "Params": null
+      },
+      "Suggestions": [],
+      "Span": [
+        33,
+        38
+      ],
+      "Check": "Plain.Consistency",
+      "Description": "",
+      "Link": "",
+      "Message": "Inconsistent term: 'log in'. Pick one.",
+      "Severity": "error",
+      "Match": "log in",
+      "Line": 9
+    },
+    {
+      "Action": {
+        "Name": "",
+        "Params": null
+      },
+      "Suggestions": [],
+      "Span": [
+        1,
+        4
+      ],
+      "Check": "Plain.SentenceLength",
+      "Description": "",
+      "Link": "",
+      "Message": "Sentence is over 25 words; split it.",
+      "Severity": "warning",
+      "Match": "This",
+      "Line": 11
+    },
+    {
+      "Action": {
+        "Name": "",
+        "Params": null
+      },
+      "Suggestions": [],
+      "Span": [
+        1,
+        4
+      ],
+      "Check": "Plain.ParagraphLength",
+      "Description": "",
+      "Link": "",
+      "Message": "Paragraph is over 90 words; split it or cut it.",
+      "Severity": "warning",
+      "Match": "Word",
+      "Line": 13
+    }
+  ],
+  "src/notes.py": [
+    {
+      "Action": {
+        "Name": "",
+        "Params": null
+      },
+      "Suggestions": [],
+      "Span": [
+        3,
+        13
+      ],
+      "Check": "Plain.CommentRestates",
+      "Description": "",
+      "Link": "",
+      "Message": "This comment restates the code ('Constructor'); say why, or delete it.",
+      "Severity": "warning",
+      "Match": "Constructor",
+      "Line": 1
+    },
+    {
+      "Action": {
+        "Name": "",
+        "Params": null
+      },
+      "Suggestions": [],
+      "Span": [
+        7,
+        25
+      ],
+      "Check": "Plain.CommentRestates",
+      "Description": "",
+      "Link": "",
+      "Message": "This comment restates the code ('Loop over the items'); say why, or delete it.",
+      "Severity": "warning",
+      "Match": "Loop over the items",
+      "Line": 3
+    }
+  ],
+  "ui-strings.md": [
+    {
+      "Action": {
+        "Name": "",
+        "Params": null
+      },
+      "Suggestions": [],
+      "Span": [
+        1,
+        12
+      ],
+      "Check": "PlainUI.Confirm",
+      "Description": "",
+      "Link": "",
+      "Message": "Name the action and its consequence, not 'Are you sure'.",
+      "Severity": "error",
+      "Match": "Are you sure",
+      "Line": 1
+    },
+    {
+      "Action": {
+        "Name": "",
+        "Params": null
+      },
+      "Suggestions": [],
+      "Span": [
+        15,
+        24
+      ],
+      "Check": "PlainUI.LinkText",
+      "Description": "",
+      "Link": "",
+      "Message": "Name the destination, not 'Click here'.",
+      "Severity": "error",
+      "Match": "Click here",
+      "Line": 1
+    },
+    {
+      "Action": {
+        "Name": "",
+        "Params": null
+      },
+      "Suggestions": [],
+      "Span": [
+        29,
+        37
+      ],
+      "Check": "PlainUI.LinkText",
+      "Description": "",
+      "Link": "",
+      "Message": "Name the destination, not 'read more'.",
+      "Severity": "error",
+      "Match": "read more",
+      "Line": 1
+    },
+    {
+      "Action": {
+        "Name": "",
+        "Params": null
+      },
+      "Suggestions": [],
+      "Span": [
+        38,
+        38
+      ],
+      "Check": "PlainUI.Exclaim",
+      "Description": "",
+      "Link": "",
+      "Message": "No exclamation marks.",
+      "Severity": "error",
+      "Match": "!",
+      "Line": 1
+    },
+    {
+      "Action": {
+        "Name": "",
+        "Params": null
+      },
+      "Suggestions": [],
+      "Span": [
+        1,
+        6
+      ],
+      "Check": "PlainUI.Prefix",
+      "Description": "",
+      "Link": "",
+      "Message": "The styling already says it ('Error:').",
+      "Severity": "error",
+      "Match": "Error:",
+      "Line": 3
+    },
+    {
+      "Action": {
+        "Name": "",
+        "Params": null
+      },
+      "Suggestions": [],
+      "Span": [
+        8,
+        27
+      ],
+      "Check": "PlainUI.Vague",
+      "Description": "",
+      "Link": "",
+      "Message": "Say what failed and what the user can do ('something went wrong').",
+      "Severity": "error",
+      "Match": "something went wrong",
+      "Line": 3
+    },
+    {
+      "Action": {
+        "Name": "",
+        "Params": null
+      },
+      "Suggestions": [],
+      "Span": [
+        30,
+        35
+      ],
+      "Check": "PlainUI.Please",
+      "Description": "",
+      "Link": "",
+      "Message": "Give the instruction without 'Please'.",
+      "Severity": "error",
+      "Match": "Please",
+      "Line": 3
+    },
+    {
+      "Action": {
+        "Name": "",
+        "Params": null
+      },
+      "Suggestions": [],
+      "Span": [
+        37,
+        51
+      ],
+      "Check": "PlainUI.Vague",
+      "Description": "",
+      "Link": "",
+      "Message": "Say what failed and what the user can do ('try again later').",
+      "Severity": "error",
+      "Match": "try again later",
+      "Line": 3
+    },
+    {
+      "Action": {
+        "Name": "",
+        "Params": null
+      },
+      "Suggestions": [],
+      "Span": [
+        7,
+        18
+      ],
+      "Check": "PlainUI.Success",
+      "Description": "",
+      "Link": "",
+      "Message": "Say 'Saved', not 'Saved successfully' ('successfully').",
+      "Severity": "error",
+      "Match": "successfully",
+      "Line": 5
+    },
+    {
+      "Action": {
+        "Name": "",
+        "Params": null
+      },
+      "Suggestions": [],
+      "Span": [
+        25,
+        31
+      ],
+      "Check": "PlainUI.Internal",
+      "Description": "",
+      "Link": "",
+      "Message": "Internal name or raw value on screen ('user_id').",
+      "Severity": "error",
+      "Match": "user_id",
+      "Line": 5
+    },
+    {
+      "Action": {
+        "Name": "",
+        "Params": null
+      },
+      "Suggestions": [],
+      "Span": [
+        36,
+        39
+      ],
+      "Check": "PlainUI.Internal",
+      "Description": "",
+      "Link": "",
+      "Message": "Internal name or raw value on screen ('null').",
+      "Severity": "error",
+      "Match": "null",
+      "Line": 5
+    },
+    {
+      "Action": {
+        "Name": "",
+        "Params": null
+      },
+      "Suggestions": [],
+      "Span": [
+        1,
+        6
+      ],
+      "Check": "PlainUI.Length",
+      "Description": "",
+      "Link": "",
+      "Message": "Interface sentences stay under 20 words.",
+      "Severity": "warning",
+      "Match": "Choose",
+      "Line": 7
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+[log] 
+Detected the following changes (3) between schemas:
+
+[log] ✖  Argument active: Boolean! added to field Query.user
+[log] ✖  Field email was removed from object type User
+[log] ✔  Field nickname was added to object type User
+[error] Detected 2 breaking changes

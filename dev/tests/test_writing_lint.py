@@ -118,14 +118,15 @@ class WritingLint(unittest.TestCase):
         self.assertNotIn(REPO / "CHANGELOG.md", linted_files())
         self.assertIn(REPO / "references" / "domains.md", linted_files())
 
-    def test_vale_config_ships_and_says_untested(self):
+    def test_vale_config_ships_and_names_the_checked_version(self):
+        """The config names the Vale version its rules were checked with, which is the one tools.lock pins."""
         ini = (REPO / "references" / "vale" / ".vale.ini").read_text(encoding="utf-8")
-        self.assertIn("Untested", ini.splitlines()[0])
+        pin = re.search(r'(?m)^"?(?:pipx:)?vale"? = "([^"]+)"', (REPO / "references" / "tools.lock").read_text())
+        self.assertIn(f"Vale {pin.group(1)}", ini.splitlines()[0])
         for style in re.findall(r"^BasedOnStyles = (.*)$", ini, re.M):
             for name in (s.strip() for s in style.split(",")):
                 if name != "Vale":
                     self.assertTrue((PLAIN.parent / name).is_dir(), name)
-
 
 if __name__ == "__main__":
     unittest.main()

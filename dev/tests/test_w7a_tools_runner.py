@@ -143,10 +143,10 @@ class Runner(unittest.TestCase):
         mod = fixtures.load_ledger_module()
         pins = mod.read_tools_lock(fixtures.REPO_ROOT / "references" / "tools.lock")
         for name, adapter in mod.TOOL_ADAPTERS.items():
-            if adapter.binary:
+            if adapter.binary or adapter.locate:
                 with self.subTest(tool=name):
-                    self.assertIn(name, pins)
-                    self.assertRegex(pins[name], r"^\d+(\.\d+)+$")
+                    self.assertIn(adapter.lock_key, pins)
+                    self.assertRegex(pins[adapter.lock_key], r"^\d+(\.\d+)+$")
 
 
 class Leads(unittest.TestCase):

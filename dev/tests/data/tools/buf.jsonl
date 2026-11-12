@@ -1,0 +1,2 @@
+{"path":"proto/user.proto","start_line":3,"start_column":1,"end_line":5,"end_column":2,"type":"FIELD_NO_DELETE","message":"Previously present field \"2\" with name \"email\" on message \"User\" was deleted."}
+{"path":"proto/user.proto","start_line":4,"start_column":3,"end_line":4,"end_column":9,"type":"FIELD_SAME_TYPE","message":"Field \"1\" with name \"id\" on message \"User\" changed type from \"int64\" to \"string\"."}

@@ -1,0 +1,8 @@
+[
+ {"id": "api-path-removed-without-deprecation", "text": "api path removed without deprecation", "level": 3,
+  "operation": "GET", "operationId": "getUser", "path": "/api/users/{id}", "source": "openapi.yaml", "section": "paths"},
+ {"id": "response-required-property-removed", "text": "removed the required property 'id' from the response with the '200' status",
+  "level": 3, "operation": "GET", "path": "/api/users", "source": "openapi.yaml", "section": "paths"},
+ {"id": "endpoint-added", "text": "endpoint added", "level": 1, "operation": "POST", "path": "/api/users",
+  "source": "openapi.yaml", "section": "paths"}
+]

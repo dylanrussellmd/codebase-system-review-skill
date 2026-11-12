@@ -178,8 +178,9 @@ class ForeignKeys(unittest.TestCase):
                             and isinstance(n.func.value, ast.Name) and n.func.value.id == "sqlite3"):
                         callers.append(fn.name)
         self.assertTrue(callers)
-        # sqlite_problem() opens an in-memory database to probe for the JSON functions; it never opens a ledger.
-        self.assertEqual(set(callers), {"connect", "sqlite_problem"})
+        # sqlite_problem() opens an in-memory database to probe for the JSON functions, and query_plan() one to hold
+        # the reviewed project's schema for EXPLAIN QUERY PLAN; neither opens a ledger.
+        self.assertEqual(set(callers), {"connect", "sqlite_problem", "query_plan"})
 
     def test_foreign_keys_enforced_on_every_tool_connection(self):
         """Drive each command and API route in-process; every connection the tool opens refuses an orphan."""

@@ -3,7 +3,7 @@ name: codebase-system-review
 description: Run a managed, read-only, multi-reviewer audit of any codebase (tests, security, performance, architecture, UI, API, DB, docs, logging), verify findings, record every point in a per-project SQLite ledger tracked across reviews, then turn every point into a tracked fix plan.
 license: MIT
 metadata:
-  version: 1.10.0
+  version: 1.11.0
 ---
 
 # Comprehensive review of a software system

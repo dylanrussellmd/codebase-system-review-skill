@@ -350,7 +350,9 @@ The facts, counted over the files tracked at the commit (vendored and build fold
   expiries), `concurrency_files` (threads, tasks, locks), `external_call_files` (HTTP clients, subprocesses, mail,
   cloud SDKs), `notification_files` (mail, SMS, push, calendar feeds), `i18n_files` (translation and locale calls),
   `personal_data_files` (names, e-mail, passwords, phone, birth dates), `paid_service_files` (payment, cloud and
-  hosted-service SDKs).
+  hosted-service SDKs), `sqlite_files` and `postgres_files` (a database driver, a connection address, or SQL only
+  PostgreSQL accepts). Scan also lists, per repository, the picked tools whose input the commit holds
+  (`tools that apply`, with the first file found); `tool-run` skips the others with the same reason.
 - From git: `history_commits`, `history_months` (first to last commit), `authors`. From the ledger: `requirements`
   (recorded with `add-requirement`) and `goals` (approved and not retired).
 

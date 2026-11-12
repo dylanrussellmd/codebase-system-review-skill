@@ -29,7 +29,7 @@ cell that says "not verified" is unconfirmed.
 | Playwright (Python package) | `ui-capture`, `ui-audit` | the owner saves screenshots at phone and desktop width; review from the source and write "rendered result not seen" (environment.md, Rendered pages) |
 | Chrome, Chromium or Edge | the browser Playwright drives (`LEDGER_CHROME` names one) | `python3 -m playwright install chromium`, or the Playwright fallback above |
 | Lighthouse (npx --no-install lighthouse) | category scores in `ui-audit`, only when installed; never downloaded | `ui-audit`'s own contrast, names, weight and layout-shift numbers |
-| Vale (optional, run by a reviewer) | the writing standard on a project's docs and UI text (writing.md) | the reviewer reads for the phrases in `vale/styles/Plain/*.yml` |
+| Vale (optional, `tool-run vale`) | the writing standard on a project's docs and UI text (writing.md) | the reviewer reads for the phrases in `vale/styles/Plain/*.yml` |
 
 `ledger.py env` reports which of these this machine has.
 
@@ -162,6 +162,61 @@ ledger.py cite-lead LD-0001 R-0001:SEC-H3
   installed where this was built). Each run is a `test_runs`
   row and a `tool_runs` row; a test that fails in a variant and passed in the baseline (or that flips between
   repeats) is a lead `test-runs.flaky`, `.order-dependent`, `.network` or `.clock`, once per test per invocation.
+- **Documentation.** `vale` runs a copy of `references/vale/` without its `Packages` line (so nothing is fetched);
+  a `PlainUI` alert goes to `ui`, one in a user guide to `docs-user`. `lychee` checks local links and anchors with
+  `--offline --include-fragments` (web links only with `--online`); a broken link or anchor is a lead at its line.
+  Two scans are built in. `doc-references` reads every Markdown, reStructuredText and AsciiDoc file (change logs and
+  test fixtures left out): each path in a code span, link or shell block must be a file or folder at the commit,
+  each `npm run` script, `make` target and justfile recipe must exist, and each environment variable in a code span (upper case with
+  an underscore) must appear in a file other than the docs. `internal-names` lists the tables, columns and
+  enumeration values the SQL files create and the routes the code defines (names with an underscore or in
+  camelCase, and route paths: a single plain word could be ordinary text), then finds them in what users see: page
+  and template text and labelling attributes, client-script strings that read as words, locale files.
+- **Pages and styles.** `ui-audit` runs axe-core on every page when it finds `axe.min.js` (`LEDGER_AXE`, the
+  project's `node_modules/axe-core/`, or npm's global folder): its `--json` holds each page's violations, and
+  `tool-run axe --from` that file makes them leads (critical and serious are errors). `wallace` reads every
+  stylesheet of the commit as one: the distinct colours, font sizes, families, line heights, z-indexes, shadows and
+  radii are metrics, and a category over its limit is a lead. `impeccable detect --json` flags the generic
+  generated look (its `slop` category is counted) and low contrast in the files; it honours the project's own
+  config and `DESIGN.md`, and `DO_NOT_TRACK` keeps its usage data off. `odiff` compares each PNG screenshot recorded
+  on the review with the one of the same name on the review it follows up (`new-review --previous`), with
+  antialiasing ignored and a size change reported as such; the changed share per screenshot is a metric and the
+  diff images go to `reviews/R-0002/ui/odiff/`. `stylelint` runs one rule, `declaration-property-value-allowed-list`,
+  built from the project's design tokens: Style Dictionary JSON (`tokens/**/*.json`, `*.tokens.json`; a token's CSS
+  name is its path in kebab case, as Style Dictionary's `css/variables` writes it), else the custom properties its
+  stylesheets declare. A colour, spacing, font size, family, radius, shadow or z-index property may hold only
+  `var()` of its category's tokens, `calc()` over them, or a keyword; a raw value is a lead naming the token that
+  holds the same value. Style Dictionary itself is not run: its JSON is read directly. Plain `.css` only; Sass and
+  Less are counted by Wallace.
+- **The running system.** `--target` names what a tool talks to; anything not on this machine needs `--online`
+  too. `schemathesis` runs the OpenAPI description against the API at `--target` (seeded from the commit, or
+  `--seed`; deterministic generation), a lead per operation and failed check (ST101 a server error, ST108 a
+  response outside the schema), at the operation's line in the description. `hurl` runs a route-by-role access
+  matrix: one request file per operation of the description and role, from `--rules matrix.json`
+  (`{"roles": {"admin": {"headers": {"Authorization": "Bearer {{admin_token}}"}}, "anonymous": {}},
+  "expect": {"GET /api/users": {"anonymous": "denied", "admin": 200}, "*": {...}}, "params": {"id": "7"}}`;
+  `allowed` is below 400, `denied` 401 to 403, no expectation means no 5xx), plus the project's own `.hurl` files.
+  A `{{name}}` in a header is passed as `--secret` from the environment variable of that name and never recorded.
+  `mailpit` reads every message Mailpit caught (`--target`, default `http://127.0.0.1:8025`) after the walkthroughs:
+  a lead for each one sent twice, without a plain-text part, a subject or a recipient; only sizes and hashes of the
+  bodies are kept. It needs no binary on PATH: Mailpit may run in a container.
+- **Between two reviews.** `oasdiff changelog`, `buf breaking` and `graphql-inspector diff` compare the API
+  description at the commit with the same file at the commit of the review this one follows up; a breaking change
+  is an error lead. GraphQL Inspector prints text only, which `ledger.py` turns into JSON.
+- **Databases.** `squawk` checks the migrations when the code or dependencies show PostgreSQL. `query-plan` is
+  built in: the commit's `.sql` files (schema files first, then by path) applied to an empty in-memory SQLite
+  database, then `EXPLAIN QUERY PLAN` of every query the code holds as a string literal (or of a `--rules` file of
+  statements), placeholders bound to NULL; reading a whole table (`SCAN t` without an index) or sorting in a
+  temporary B-tree is a lead at the query's line. `pg-explain` does the same on PostgreSQL 16 or later: it creates
+  a throwaway database on the server at `--target`, applies the files, explains each query's generic plan with
+  sequential scans off (a `Seq Scan` left means no index fits), and drops the database.
+- **Budgets and translations.** `hyperfine` times the commands of the project's `budgets.json`
+  (`{"budgets": [{"name": "build", "command": "...", "max_ms": 500, "runs": 10}]}`); the mean and spread of each are
+  metrics measured, not counted, and a mean over its budget is a lead. `i18n-lint` runs ESLint with one rule,
+  eslint-plugin-i18next's `no-literal-string` (JSX text and attributes), from the plugin installed beside `eslint`.
+  `pseudo-locale` is built in: each locale file's keys and placeholders against the source locale (English, else
+  the first), and a pseudo-localized copy of the source (accented, 40% longer, in brackets) written to
+  `reviews/R-0001/pseudo-locale/` for the UI pass to load.
 - **Metrics.** Counts and coverage go to `metrics` (method `counted`, the run named in the note), one row per name and
   scope: `scope` is `all`, a path, or `path#function`.
 
@@ -202,7 +257,16 @@ Real outputs, from the pinned versions run on a small scratch project on 2026-11
 rule), `ast-grep.jsonl` (the shipped packs), `zizmor.sarif`, `actionlint.json`, `gitleaks.json` (run with `--redact`), `scc.json`, `jscpd.json` (its
 `detectionDate` makes each run's bytes differ; the leads do not), `junit.xml` (pytest), `coverage.lcov` and
 `coverage.xml` (coverage.py; the `<source>` folder replaced with `/project`), `osv-no-database.json` (OSV-Scanner
-offline with no database). Written from the documented format: those whose names end in `-documented`
+offline with no database). From 2026-11-12: `vale.json` (Vale 3.26.0 with the shipped rules on `vale-samples/`, where every rule raises its
+alert), `lychee.json` (lychee 0.24.2 offline; the scratch folder replaced with `/project`), `axe.json` (axe-core
+4.14.0 in Chrome, trimmed to its violations), `wallace.json` (wallace-cli 4.0.5), `impeccable.json` (Impeccable
+4.8.2), `stylelint.json` (Stylelint 18.0.0 with the generated token rule), `schemathesis.xml` (4.33.2 against a
+small local API), `buf.jsonl` (1.75.0), `graphql-inspector.txt` (7.0.2), `squawk.json` (2.71.0), `hyperfine.json`
+(2.0.0), `i18n-lint.json` (ESLint 10.14.0 with eslint-plugin-i18next 6.1.5), `pg-explain.json` (PostgreSQL 16.15).
+`oasdiff-documented.json` and `hurl-documented.xml` are written from the documented formats: neither oasdiff
+(the Go module proxy refused it here) nor Hurl (it needs a newer Rust) could be installed, so both adapters and
+the pins of oasdiff 1.30.0 and Mailpit 1.30.2 are not verified. Mailpit was not run either: its test serves the
+API as Mailpit's documentation describes it. Written from the documented format: those whose names end in `-documented`
 (`cobertura-methods-documented.xml`, since coverage.py writes no methods; `osv-documented.json`: the proxy here refused the advisory database download, so OSV-Scanner's `--online` path is
 not verified).
 
@@ -795,7 +859,7 @@ What the researchers could not confirm on 2026-11-11:
   (read from the repositories instead), a harness LSP page, the Atlas community-edition limits, the Chrome DevTools
   MCP repository page (its tool names are not listed), the Bullet repository.
 - Go and Rust binaries without a registry entry (Mailpit, Maestro, codeowners-validator, Scorecard, Runme) carry no
-  version. Vale could not be installed, so the rule set in `vale/` has not been run.
+  version. The rule set in `vale/` was run with Vale 3.26.0 on 2026-11-12 ("How a tool is wired in").
 - Semgrep's MCP server: the separate repository's last commit is 2025-10; whether the main CLI ships it is
   unconfirmed. CodeQL is free on public repositories only.
 - Licences to check before use: Brakeman (non-commercial public-use licence), mutant for Ruby (paid for private code),

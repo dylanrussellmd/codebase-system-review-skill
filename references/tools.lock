@@ -1,16 +1,34 @@
 # The versions of the picked tools (decision D-0015) that `ledger.py tool-run` runs, in mise's format:
 # `mise install` in a folder holding this file (or `mise use -g` per line) installs exactly these.
 # tool-run refuses another installed version unless --unpinned is given, and records both on the run.
-# A key with a backend ("pipx:semgrep") names the tool after the colon. Registry names not verified with mise.
-# Pinned 2026-11-11 to the releases each tool's own page listed that day; the samples in
+# A key with a backend ("pipx:semgrep") names the tool after the colon; an adapter whose name differs (odiff,
+# from npm's odiff-bin; axe, from axe-core; wallace, from wallace-cli) says so. Registry names not verified with mise.
+# Pinned on 2026-11-11 and 2026-11-12 to the releases each tool's page or registry listed that day; the samples in
 # dev/tests/data/tools/ come from these versions.
 
 [tools]
 actionlint = "1.7.8"
 ast-grep = "0.51.2"
+"npm:axe-core" = "4.14.0"
+"npm:@bufbuild/buf" = "1.75.0"
+"npm:eslint-plugin-i18next" = "6.1.5"
 gitleaks = "8.28.0"
+"npm:@graphql-inspector/cli" = "7.0.2"
+hurl = "8.1.0"
+hyperfine = "2.0.0"
+"npm:impeccable" = "4.8.2"
 "npm:jscpd" = "5.4.3"
+lychee = "0.24.2"
+mailpit = "1.30.2"
+oasdiff = "1.30.0"
+"npm:odiff-bin" = "4.5.0"
 osv-scanner = "2.2.4"
-"pipx:semgrep" = "1.185.0"
-"pipx:zizmor" = "1.32.0"
+postgres = "16.15"
 scc = "3.6.0"
+"pipx:schemathesis" = "4.33.2"
+"pipx:semgrep" = "1.185.0"
+"pipx:squawk-cli" = "2.71.0"
+"npm:stylelint" = "18.0.0"
+"pipx:vale" = "3.26.0"
+"npm:wallace-cli" = "4.0.5"
+"pipx:zizmor" = "1.32.0"

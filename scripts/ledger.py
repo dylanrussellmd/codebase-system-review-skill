@@ -36,8 +36,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote
 
-TOOL_VERSION = "1.10.0"  # stamped by dev/build.py from `metadata: version:` in SKILL.md's frontmatter
-TOOL_HASH = "d42bdd8aa6706bf411a1790572db0229b8dd4f0df5521ab8f3003ad890bb8834"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
+TOOL_VERSION = "1.11.0"  # stamped by dev/build.py from `metadata: version:` in SKILL.md's frontmatter
+TOOL_HASH = "703dceadc22f229f2b3d2a05f1513ac89839f07b6c7b5a4745e642007cd8bf77"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
 # Placeholders: dev/build.py puts references/schema.sql, dev/page.html and references/migrations/*.sql in their
 # place when it writes scripts/ledger.py. dev/core.py itself is never run as the tool.
 SCHEMA = r"""-- =====================================================================
@@ -14921,6 +14921,10 @@ def add_write_commands_131(p):
     s.add_argument("--online", action="store_true", help="allow the steps that need the network (fetching pinned "
                                                          "rules or advisory databases)")
     s.add_argument("--unpinned", action="store_true", help="run a version other than the pinned one, and say so")
+    s.add_argument("--target", help="the running system a tool talks to: the API's base URL (schemathesis, hurl), "
+                                    "Mailpit's address, a PostgreSQL server for a throwaway database (pg-explain); "
+                                    "only this machine unless --online")
+    s.add_argument("--seed", type=int, help="the seed of a tool that generates cases (default: from the commit)")
     s.add_argument("--note")
     s = p("dismiss-lead"); s.add_argument("leads", nargs="+", metavar="LEAD", help="the leads (LD-0001)")
     s.add_argument("--reason", help="why it is not a finding")
@@ -15037,7 +15041,7 @@ def working_tree_bytes(root, con, loc, committed):
 # same thing). Each prints the same bytes for the same inputs: every list is sorted and no text carries a time.
 
 import shutil
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 REVIEW_TOOLS = {}  # name -> handler(a, root, db) returning the exit code
 
@@ -15587,6 +15591,7 @@ def ui_audit_lines(result):
         lh = p["lighthouse"]
         out.append("  lighthouse: " + (", ".join(f"{k} {v}" for k, v in lh["scores"].items()) if lh.get("scores")
                                        else lh["note"]))
+        out += axe_lines(p.get("axe") or {"note": "not run"})
     return out
 
 
@@ -15616,6 +15621,7 @@ def ui_audit_command(a, root, db):
             context, page, responses = _ui_page(browser, url, width, a.theme, allowed)
             try:
                 found = page.evaluate(UI_AUDIT_SCRIPT)
+                axe = ui_axe(page, root)
                 weight = 0
                 for r in responses:
                     try:
@@ -15625,7 +15631,7 @@ def ui_audit_command(a, root, db):
                 shown = url if not url.startswith("file:") else Path(urlsplit(url).path).name
                 pages.append(dict(found, page=shown, width=width, theme=a.theme,
                                   page_weight_bytes=weight or len(page.content().encode("utf-8")),
-                                  requests=len(responses), lighthouse=_lighthouse(url, root)))
+                                  requests=len(responses), lighthouse=_lighthouse(url, root), axe=axe))
             finally:
                 context.close()
     except Exception as e:  # noqa: BLE001 - a page that cannot be opened
@@ -15702,6 +15708,9 @@ SCAN_CONTENT = {  # what a code file does, by one `git grep -i -E` of its text a
     "i18n_files": r"gettext|i18n|l10n|Intl\.(DateTimeFormat|NumberFormat)|LC_MESSAGES|react-intl",
     "personal_data_files": r"e-?mail|password|phone_?number|date_of_birth|birth_?date|first_?name|last_?name|"
                            r"postal|passport",
+    "sqlite_files": r"sqlite3|better-sqlite3|sqlite:///|\.sqlite3?['\"]|SQLite",
+    "postgres_files": r"psycopg|asyncpg|postgres(ql)?://|pg\.Pool|from ['\"]pg['\"]|require\(['\"]pg['\"]\)|jackc/pgx|"
+                      r"CREATE EXTENSION|JSONB|CONCURRENTLY|BIGSERIAL",
     "paid_service_files": r"stripe|boto3|aws-sdk|amazonaws|googleapis|azure|openai|twilio|sendgrid|mailgun|heroku|"
                           r"vercel|netlify|cloudflare|datadog|sentry",
 }
@@ -15832,7 +15841,8 @@ def repository_inventory(d, commit):
         "dependencies": {"count": len(deps), "lock_files": first(locks)},
         "signals": {k: {"files": len(v), "first": v[:5]} for k, v in sorted(content.items())},
         "areas": {k: areas[k] for k in sorted(areas)},
-        "history": {"commits": len(stamps), "months": facts["history_months"], "authors": len(authors)}}
+        "history": {"commits": len(stamps), "months": facts["history_months"], "authors": len(authors)},
+        "tools": tool_evidence([p for p, _ in files], content, deps)}
     return inventory, facts
 
 
@@ -15920,6 +15930,8 @@ def scan_lines(scan):
                              ("lock files", inv["dependencies"]["lock_files"])):
             out.append(f"  {label}: " + (", ".join(value) or "none"))
         out.append("  areas: " + ", ".join(f"{k} {v['files']}" for k, v in inv["areas"].items()))
+        out.append("  tools that apply: " + (", ".join(f"{k} ({v})" for k, v in inv.get("tools", {}).items())
+                                            or "none of the conditional ones"))
         out.append(f"  history: {inv['history']['commits']} commits over {inv['history']['months']} months by "
                    f"{inv['history']['authors']} authors")
     out.append("facts")
@@ -16973,14 +16985,19 @@ class ToolAdapter:
     env       env(call) -> extra environment variables for the tool (where it keeps a database)
     install, fallback   how to install it; what the reviewer does when it is absent
     online    'no', or 'optional' when a mode needs the network (only with --online)
+    lock_key  its name in references/tools.lock when that is not `name` (the npm package: odiff-bin)
+    locate    locate() -> the installed version ('' unknown, None absent), for a tool found otherwise than by
+              `binary --version` (a script library, a CLI that prints no version)
+    import_note  for an import-only adapter: where the file to import comes from
     """
     def __init__(self, name, *, fmt, parse, domain=None, binary=None, argv=None, version_args=("--version",),
                  stdout=False, ok_exits=(0,), store=None, run=None, install="", fallback="", online="no",
-                 source="checkout", env=None, step=218):
+                 source="checkout", env=None, step=218, lock_key=None, locate=None, import_note=None):
         self.name, self.fmt, self.parse, self.domain, self.binary, self.argv = name, fmt, parse, domain, binary, argv
         self.version_args, self.stdout, self.ok_exits, self.store, self.run = version_args, stdout, ok_exits, store, run
         self.install, self.fallback, self.online, self.source, self.step = install, fallback, online, source, step
-        self.env = env
+        self.env, self.lock_key, self.locate, self.import_note = env, lock_key or name, locate, import_note
+        self.service = False   # True: a service reached at --target, run whether or not its binary is on PATH
 
 
 class ToolCall:
@@ -16988,9 +17005,10 @@ class ToolCall:
     repository's own folder and the commit (for history tools), the rules file, whether it may go online, the
     ledger's folder (for cached rules and databases), and the parsed arguments."""
     def __init__(self, work=None, out=None, repo_dir=None, commit=None, rules=None, online=False, ledger_dir=None,
-                 a=None):
+                 a=None, root=None, con=None, review=None):
         self.work, self.out, self.repo_dir, self.commit, self.rules = work, out, repo_dir, commit, rules
         self.online, self.ledger_dir, self.a = online, ledger_dir, a
+        self.root, self.con, self.review = root, con, review  # the project root, the ledger, the review row
         self.stderr = ""
         self.placeholders = {}  # path -> placeholder, so the recorded command holds no temporary path
 
@@ -17027,13 +17045,16 @@ def read_tools_lock(path=None):
             continue
         m = re.match(r'^"?([A-Za-z0-9@:/._-]+)"?\s*=\s*"([^"]+)"$', line)
         if table == "tools" and m:
-            pins[m.group(1).rsplit(":", 1)[-1].rsplit("/", 1)[-1]] = m.group(2)
+            key = m.group(1).rsplit(":", 1)[-1]
+            pins[key if key.startswith("@") else key.rsplit("/", 1)[-1]] = m.group(2)   # npm scopes stay whole
     return pins
 
 
 def tool_version(adapter):
     """The installed version of an adapter's binary: a version string, '' when it prints none, None when the binary
     is not on PATH or does not run."""
+    if adapter.locate:
+        return adapter.locate()
     if not adapter.binary:
         return None
     exe = shutil.which(adapter.binary)
@@ -17057,10 +17078,10 @@ def tool_inventory(pins=None):
     out = []
     for name in sorted(TOOL_ADAPTERS):
         ad = TOOL_ADAPTERS[name]
-        if not ad.binary:
+        if not ad.binary and not ad.locate:
             continue
         v = tool_version(ad)
-        out.append({"tool": name, "installed": v, "pinned": pins.get(name), "how_to_install": ad.install,
+        out.append({"tool": name, "installed": v, "pinned": pins.get(ad.lock_key), "how_to_install": ad.install,
                     "fallback": ad.fallback, "online": ad.online})
     return out
 
@@ -17941,6 +17962,1884 @@ def cmd_test_runs(ctx):
     return out
 
 
+# ----- the documentation tools (step 222): Vale, lychee, the doc-reference and internal-name scans
+
+VALE_RULES = "references/vale"
+DOC_SUFFIXES = (".md", ".markdown", ".rst", ".adoc")
+DOC_EXEMPT = re.compile(r"(^|/)(changelog|history|news|upgrading|migrating)[^/]*$", re.I)
+EXPORT_TEXT_BYTES = 1_000_000   # a file in the export larger than this is not read by a built-in scan
+VALE_LEVELS = {"error": "error", "warning": "warning", "suggestion": "note"}
+
+
+def export_files(work):
+    """The regular files of an export, as sorted relative paths, without the folders scan skips."""
+    base = Path(work)
+    out = []
+    for p in base.rglob("*"):
+        if p.is_file() and not p.is_symlink():
+            rel = p.relative_to(base).as_posix()
+            if not SCAN_SKIPPED_FOLDERS & set(rel.split("/")[:-1]):
+                out.append(rel)
+    return sorted(out)
+
+
+def export_text(work, rel):
+    """A file of the export as text ('' when it is large or binary)."""
+    p = Path(work) / rel
+    try:
+        if p.stat().st_size > EXPORT_TEXT_BYTES:
+            return ""
+        data = p.read_bytes()
+    except OSError:
+        return ""
+    if b"\0" in data[:4096]:
+        return ""
+    return data.decode("utf-8", "replace")
+
+
+def doc_files(files):
+    """The documents among an export's files: Markdown, reStructuredText and AsciiDoc, without change logs and
+    test fixtures."""
+    return [f for f in files if f.lower().endswith(DOC_SUFFIXES) and not DOC_EXEMPT.search(f)
+            and not SCAN_PATHS["test"].search(f.lower())]
+
+
+def doc_domain(path):
+    """docs-user for a path scan counts as a user document, else docs-developer."""
+    return "docs-user" if path and SCAN_PATHS["user_doc"].search(path.lower()) else "docs-developer"
+
+
+def _vale_argv(call):
+    """Vale's command: a copy of the shipped rules without the Packages line (`vale sync` goes online), JSON out."""
+    src = skill_file(VALE_RULES)
+    if src is None:
+        raise ToolSkip(f"the Vale rules ({VALE_RULES}/) are not beside this ledger.py: run the skill's copy")
+    if not doc_files(export_files(call.work)):
+        raise ToolSkip("no documentation at the commit (Markdown, reStructuredText or AsciiDoc)")
+    cfg = Path(call.out).parent / "vale"
+    shutil.copytree(str(src), str(cfg))
+    ini = cfg / ".vale.ini"
+    ini.write_text("\n".join(l for l in ini.read_text(encoding="utf-8").split("\n")
+                             if not l.startswith("Packages")), encoding="utf-8")
+    call.rules = src
+    call.placeholders[str(cfg)] = "{rules}"
+    return ["vale", f"--config={ini}", "--output=JSON", "--no-exit", "--no-global", "."]
+
+
+def parse_vale(data, call):
+    """Vale's `--output=JSON`: {file: [alerts]}; one lead per alert. The PlainUI rules are the interface's."""
+    text = data.decode("utf-8", "replace").strip()
+    doc = _json_of(data, "Vale JSON") if text else {}
+    if not isinstance(doc, dict):
+        raise WriteError("cannot read the output as Vale JSON: it is not an object of files")
+    leads = []
+    for raw, alerts in sorted(doc.items()):
+        path = _relative_lead_path(raw, call)
+        for al in alerts if isinstance(alerts, list) else []:
+            if not isinstance(al, dict):
+                continue
+            check = str(al.get("Check") or "Vale")
+            leads.append(_lead(check, VALE_LEVELS.get(al.get("Severity"), "warning"), path, al.get("Line"), None,
+                               al.get("Message"), domain="ui" if check.startswith("PlainUI.") else doc_domain(path)))
+    return {"leads": leads, "metrics": [("writing_alerts", "all", len(leads), None)], "version": None}
+
+
+tool_adapter("vale", fmt="json", parse=parse_vale, domain="docs-developer", binary="vale", argv=_vale_argv,
+             stdout=True, install="pipx install vale==<pinned> (fetches the binary), or download it from vale.sh (or "
+                                  "mise install)",
+             fallback="read for the phrases in references/vale/styles/Plain/*.yml (writing.md) and say "
+                      "'not machine-checked'", step=222)
+
+
+def _lychee_argv(call):
+    """lychee's command: local files, links and anchors; web links only with --online."""
+    if not doc_files(export_files(call.work)):
+        raise ToolSkip("no documentation at the commit (Markdown, reStructuredText or AsciiDoc)")
+    return ["lychee", "--format", "json", "--output", str(call.out), "--no-progress", "--include-fragments",
+            "--root-dir", str(call.work)] + ([] if call.online else ["--offline"]) + ["."]
+
+
+def parse_lychee(data, call):
+    """lychee's `--format json`: one lead per broken link or anchor (error_map, timeout_map), at the file and line
+    that has it; the totals as metrics."""
+    doc = _json_of(data, "lychee JSON")
+    if not isinstance(doc, dict) or "error_map" not in doc:
+        raise WriteError("cannot read the output as lychee JSON: it has no error_map")
+    leads = []
+    for key in ("error_map", "timeout_map"):
+        for raw, entries in sorted((doc.get(key) or {}).items()):
+            path = _relative_lead_path(raw, call)
+            for e in entries if isinstance(entries, list) else []:
+                url = str(e.get("url") or "")
+                status = (e.get("status") or {}).get("text") or ("timed out" if key == "timeout_map" else "broken")
+                target, _, frag = url.partition("#")
+                shown = (_relative_lead_path(target, call) or target) + (f"#{frag}" if frag else "")
+                rule = "lychee.broken-anchor" if "fragment" in status.lower() else "lychee.broken-link"
+                leads.append(_lead(rule, "error", path, (e.get("span") or {}).get("line"), None,
+                                   f"{status}: {shown}", domain=doc_domain(path)))
+    metrics = [("links_checked", "all", int(doc.get("total") or 0), "links"),
+               ("links_broken", "all", len(leads), "links"),
+               ("links_not_checked", "all", sum(int(doc.get(k) or 0) for k in ("excludes", "unsupported", "unknown")),
+                "links")]
+    return {"leads": leads, "metrics": metrics, "version": None}
+
+
+tool_adapter("lychee", fmt="json", parse=parse_lychee, domain="docs-developer", binary="lychee", argv=_lychee_argv,
+             ok_exits=(0, 2), online="optional",
+             install="cargo install lychee@<pinned>, or download the release binary from github.com/lycheeverse/lychee "
+                     "(or mise install)",
+             fallback="open each relative link and anchor of the docs by hand and say 'links not machine-checked'",
+             step=222)
+
+
+PATH_SUFFIXES = set(LANGUAGES) | {".md", ".markdown", ".rst", ".adoc", ".txt", ".json", ".yml", ".yaml", ".toml",
+                                  ".ini", ".cfg", ".conf", ".lock", ".xml", ".csv", ".env", ".png", ".svg", ".jpg",
+                                  ".gif", ".pdf", ".ps1", ".bat", ".mk", ".tf", ".proto", ".graphql"}
+SHELL_FENCES = {"", "sh", "bash", "shell", "console", "zsh", "terminal", "shell-session"}
+RUNNERS = {"python", "python3", "node", "bash", "sh", "zsh", "ruby", "perl", "php", "deno", "bun", "pwsh"}
+SCRIPT_TOOLS = {"npm", "pnpm", "yarn", "bun"}
+ENV_NAME = re.compile(r"\$?\{?([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)\}?(?:=\S*)?")
+
+
+def _path_like(s):
+    """The path a code span or link names, or None: no spaces, globs, placeholders or URLs; a folder in it or a
+    known file suffix."""
+    s = s.strip()
+    if not s or re.search(r"\s|[<>{}*?$|()\[\]\"'=,;`]", s) or re.match(r"^[a-z][a-z0-9+.-]*:", s, re.I) \
+            or s[0] in "-~/@":
+        return None
+    s = re.sub(r"(#.*|:\d+(-\d+)?)$", "", s).rstrip("/") or None
+    if not s or s in (".", ".."):
+        return None
+    if "/" in s.strip("./") or Path(s).suffix.lower() in PATH_SUFFIXES:
+        return s
+    return None
+
+
+def _doc_refs(text):
+    """[(line, kind, text)] a document names: code spans (paths, commands, environment variables), link targets,
+    and the commands of its shell blocks."""
+    out, fence = [], None
+    for n, line in enumerate(text.split("\n"), 1):
+        m = re.match(r"^\s*(```+|~~~+)\s*([\w-]*)", line)
+        if m:
+            fence = None if fence else (m.group(2) or "").lower()
+            continue
+        if fence is not None:
+            if fence in SHELL_FENCES:
+                for part in re.split(r"&&|\|\||;|\|", re.sub(r"^\s*[$>]\s+", "", line)):
+                    if part.strip() and not part.strip().startswith("#"):
+                        out.append((n, "command", part.strip()))
+            continue
+        for span in re.findall(r"`([^`\n]+)`", line):
+            out.append((n, "span", span.strip()))
+        for target in re.findall(r"\]\(\s*<?([^)\s>]+)>?(?:\s+\"[^\"]*\")?\s*\)", re.sub(r"`[^`\n]*`", "", line)):
+            out.append((n, "link", target))
+    return out
+
+
+def _command_ref(words):
+    """(kind, name, extra) of a command's words: ('script', tool, name), ('make', name), ('just', name),
+    ('path', path) or None."""
+    while words and (re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=\S*", words[0]) or words[0] in ("sudo", "exec", "env")):
+        words = words[1:]
+    if not words:
+        return None
+    w0 = words[0]
+    if w0 in SCRIPT_TOOLS and len(words) >= 3 and words[1] in ("run", "run-script"):
+        return ("script", w0, words[2])
+    if w0 == "npm" and len(words) >= 2 and words[1] == "test":
+        return ("script", w0, "test")
+    if w0 in ("make", "just") and len(words) >= 2 and not words[1].startswith("-") and "=" not in words[1]:
+        return (w0, words[1])
+    if w0 in RUNNERS:
+        rest = [w for w in words[1:] if not w.startswith("-")]
+        if words[1:2] == ["-m"] or not rest:
+            return None
+        p = _path_like(rest[0])
+        return ("path", p) if p else None
+    p = _path_like(w0)
+    if p and ("/" in w0 or len(words) == 1):
+        return ("path", p)
+    return None
+
+
+def _make_targets(work, files):
+    """The targets of the Makefiles and justfiles of an export: {'make': set, 'just': set}."""
+    out = {"make": set(), "just": set()}
+    for f in files:
+        name = f.rsplit("/", 1)[-1]
+        if name in ("Makefile", "makefile", "GNUmakefile") or name.endswith(".mk"):
+            out["make"] |= set(re.findall(r"(?m)^([A-Za-z0-9_.-]+)\s*:(?!=)", export_text(work, f)))
+        elif name.lower() in ("justfile", ".justfile"):
+            out["just"] |= set(re.findall(r"(?m)^@?([A-Za-z0-9_-]+)[^\n:=]*:(?!=)", export_text(work, f)))
+    return out
+
+
+def doc_references(call):
+    """The built-in doc-reference check: every path, script and environment variable a document names, looked up
+    in the export. JSON, sorted; ToolSkip when there are no documents."""
+    work, files = call.work, export_files(call.work)
+    docs = doc_files(files)
+    if not docs:
+        raise ToolSkip("no documentation at the commit (Markdown, reStructuredText or AsciiDoc)")
+    present = set(files) | {f.rsplit("/", 1)[0] for f in files if "/" in f}
+    for f in files:
+        parts = f.split("/")
+        present |= {"/".join(parts[:i]) for i in range(1, len(parts))}
+    names = {f.rsplit("/", 1)[-1] for f in files}
+    scripts, packages = set(), 0
+    for f in files:
+        if f.rsplit("/", 1)[-1] == "package.json":
+            packages += 1
+            try:
+                scripts |= set((json.loads(export_text(work, f)) or {}).get("scripts") or {})
+            except (ValueError, AttributeError):
+                pass
+    targets = _make_targets(work, files)
+    env_seen = set()
+    for f in files:
+        if f not in docs:
+            env_seen |= set(re.findall(r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+", export_text(work, f)))
+
+    def path_ok(doc, p):
+        folder = doc.rpartition("/")[0]
+        joined = os.path.normpath(os.path.join(folder, p)).replace("\\", "/")
+        root = os.path.normpath(p).replace("\\", "/")
+        return joined in present or root in present or ("/" not in p.strip("./") and p in names)
+
+    refs = []
+    for doc in docs:
+        for line, kind, text in _doc_refs(export_text(work, doc)):
+            found = None
+            if kind == "link":
+                p = _path_like(text) if not text.startswith("#") else None
+                if p:
+                    found = ("path", p, path_ok(doc, p), "not a file or folder at the commit")
+            else:
+                env = ENV_NAME.fullmatch(text) if kind == "span" else None
+                if env:
+                    name = env.group(1)
+                    found = ("env", name, name in env_seen, "not read or set anywhere outside the docs at the commit")
+                else:
+                    c = _command_ref(text.split())
+                    if c and c[0] == "script":
+                        found = ("script", text, c[2] in scripts,
+                                 f"no package.json at the commit has a script {c[2]!r}" if packages else
+                                 "there is no package.json at the commit")
+                    elif c and c[0] in ("make", "just"):
+                        found = ("script", text, c[1] in targets[c[0]],
+                                 f"no {'Makefile' if c[0] == 'make' else 'justfile'} at the commit has a target "
+                                 f"{c[1]!r}")
+                    elif c and c[0] == "path":
+                        found = ("path", c[1], path_ok(doc, c[1]), "not a file or folder at the commit")
+                    elif kind == "span":
+                        p = _path_like(text)
+                        if p:
+                            found = ("path", p, path_ok(doc, p), "not a file or folder at the commit")
+            if found:
+                what, ref, ok, why = found
+                refs.append({"doc": doc, "line": line, "kind": what, "ref": ref, "found": bool(ok),
+                             "why": None if ok else why})
+    refs.sort(key=lambda r: (r["doc"], r["line"], r["kind"], r["ref"]))
+    return 0, (json.dumps({"documents": docs, "references": refs}, indent=1, sort_keys=True) + "\n").encode("utf-8")
+
+
+DOC_REFERENCE_RULES = {"path": "doc-references.missing-path", "script": "doc-references.missing-script",
+                       "env": "doc-references.unknown-env"}
+
+
+def parse_doc_references(data, call):
+    """doc-references' JSON: a lead for each reference not found; counts as metrics."""
+    doc = _json_of(data, "doc-references JSON")
+    if not isinstance(doc, dict) or not isinstance(doc.get("references"), list):
+        raise WriteError("cannot read the output as doc-references JSON")
+    leads = [_lead(DOC_REFERENCE_RULES.get(r.get("kind"), "doc-references.missing"), "warning", r.get("doc"),
+                   r.get("line"), None, f"'{r.get('ref')}': {r.get('why')}", domain=doc_domain(r.get("doc")))
+             for r in doc["references"] if not r.get("found")]
+    return {"leads": leads, "metrics": [("doc_references", "all", len(doc["references"]), None),
+                                        ("doc_references_missing", "all", len(leads), None)], "version": None}
+
+
+tool_adapter("doc-references", fmt="json", parse=parse_doc_references, domain="docs-developer", run=doc_references,
+             fallback="check each path, script and variable the docs name against the files by hand", step=222)
+
+
+INTERNAL_NAME = re.compile(r"^(?:[a-z][a-z0-9]*(?:_[a-z0-9]+)+|[a-z]+[A-Z][A-Za-z0-9]*)$")
+SQL_NOT_COLUMNS = {"constraint", "primary", "foreign", "unique", "check", "index", "key", "exclude", "like",
+                   "fulltext", "spatial"}
+ROUTE_PATTERNS = (
+    r"@[\w.]+\.(?:route|get|post|put|patch|delete|api_route)\(\s*['\"](/[^'\"]*)['\"]",
+    r"\b(?:app|router|server|api|routes)\.(?:get|post|put|patch|delete|all|route)\(\s*['\"`](/[^'\"`]*)['\"`]",
+    r"\b(?:re_)?path\(\s*r?['\"]\^?([a-z][^'\"$]*)\$?['\"]",
+)
+CLIENT_FOLDERS = re.compile(r"(^|/)(static|public|client|frontend|web|www|assets|components|pages|views|app|ui|"
+                            r"src/(?:components|pages|views))/")
+TEMPLATE_SUFFIXES = {".html", ".htm", ".jinja", ".jinja2", ".j2", ".hbs", ".ejs", ".erb", ".twig", ".liquid",
+                     ".mustache", ".vue", ".svelte", ".cshtml", ".razor"}
+SCRIPT_SUFFIXES = {".js", ".mjs", ".cjs", ".ts", ".jsx", ".tsx"}
+LOCALE_FILE = re.compile(r"(^|/)(locales?|i18n|lang|langs|translations|messages)/.*\.json$", re.I)
+NOT_UI_CALL = re.compile(r"(?:fetch|querySelector(?:All)?|getElementById|getElementsBy\w+|closest|matches|require|"
+                         r"import|addEventListener|removeEventListener|console\.\w+|classList\.\w+|localStorage\.\w+|"
+                         r"sessionStorage\.\w+|getItem|setItem|removeItem|matchMedia|URL|getAttribute|setAttribute|"
+                         r"hasAttribute|dataset\.\w+|createElement|postMessage|emit|on|off|dispatch)\s*\(\s*$|"
+                         r"(?:from|import)\s*$")
+SQL_TEXT = re.compile(r"^\s*(SELECT|INSERT|UPDATE|DELETE|CREATE|WITH|ALTER|DROP)\b", re.I)
+
+
+def _blank_keep_lines(text, pattern):
+    """text with each match of pattern replaced by its newlines only, so line numbers stay."""
+    return re.sub(pattern, lambda m: "\n" * m.group(0).count("\n"), text, flags=re.S | re.I)
+
+
+def internal_name_inventory(work, files):
+    """{name: (kind, where)} of the tables, columns and enumeration values the SQL files create and the routes the
+    code defines; only names a reader could not take for a word (snake_case, camelCase, a route path)."""
+    names = {}
+    for f in files:
+        low = f.lower()
+        if low.endswith(".sql"):
+            text = re.sub(r"--[^\n]*", "", export_text(work, f))
+            for m in re.finditer(r"(?is)create\s+(?:temp(?:orary)?\s+)?table\s+(?:if\s+not\s+exists\s+)?"
+                                 r"[`\"\[]?(?:\w+[`\"\]]?\.[`\"\[]?)?(\w+)[`\"\]]?\s*\(", text):
+                names.setdefault(m.group(1), ("table", f))
+                depth, i, start, body = 1, m.end(), m.end(), ""
+                while i < len(text) and depth:
+                    depth += {"(": 1, ")": -1}.get(text[i], 0)
+                    i += 1
+                body = text[start:i - 1]
+                parts, depth, cur = [], 0, ""
+                for ch in body:
+                    depth += {"(": 1, ")": -1}.get(ch, 0)
+                    if ch == "," and depth == 0:
+                        parts.append(cur); cur = ""
+                    else:
+                        cur += ch
+                parts.append(cur)
+                for p in parts:
+                    w = re.match(r"\s*[`\"\[]?(\w+)", p)
+                    if w and w.group(1).lower() not in SQL_NOT_COLUMNS:
+                        names.setdefault(w.group(1), ("column", f))
+            for m in re.finditer(r"(?is)check\s*\(\s*\w+\s+in\s*\(([^)]*)\)", text):
+                for v in re.findall(r"'([^']+)'", m.group(1)):
+                    names.setdefault(v, ("enum", f))
+            for m in re.finditer(r"(?is)create\s+type\s+\w+\s+as\s+enum\s*\(([^)]*)\)", text):
+                for v in re.findall(r"'([^']+)'", m.group(1)):
+                    names.setdefault(v, ("enum", f))
+        elif Path(f).suffix.lower() in LANGUAGES and LANGUAGES[Path(f).suffix.lower()] not in NOT_CODE:
+            text = export_text(work, f)
+            for pat in ROUTE_PATTERNS:
+                for m in re.finditer(pat, text):
+                    route = m.group(1) if m.group(1).startswith("/") else "/" + m.group(1)
+                    route = route.rstrip("/") or "/"
+                    if route.count("/") >= 1 and len(route) > 1 and not re.search(r"[<{:*(]", route):
+                        names.setdefault(route, ("route", f))
+    return {k: v for k, v in names.items() if k.startswith("/") or INTERNAL_NAME.match(k)}
+
+
+def visible_strings(work, f):
+    """[(line, text)] a user can see in one file: the text and labelling attributes of a page or template, the
+    strings of a client script that read as words, the values of a locale file."""
+    suffix = Path(f).suffix.lower()
+    text = export_text(work, f)
+    out = []
+    if LOCALE_FILE.search(f):
+        lines = text.split("\n")
+        for n, line in enumerate(lines, 1):
+            for m in re.finditer(r'"\s*:\s*"((?:[^"\\]|\\.)*)"', line):
+                out.append((n, m.group(1)))
+        return out
+    if suffix in TEMPLATE_SUFFIXES:
+        body = _blank_keep_lines(text, r"<script\b.*?</script>|<style\b.*?</style>|<!--.*?-->")
+        body = _blank_keep_lines(body, r"\{\{.*?\}\}|\{%.*?%\}|<%.*?%>|\{#.*?#\}")
+        for m in re.finditer(r">([^<>]+)<", body):
+            t = " ".join(m.group(1).split())
+            if t:
+                lead = len(m.group(1)) - len(m.group(1).lstrip())
+                out.append((body.count("\n", 0, m.start(1) + lead) + 1, t))
+        for m in re.finditer(r"\b(?:placeholder|title|alt|aria-label|label)\s*=\s*\"([^\"]*)\"", body):
+            if m.group(1).strip():
+                out.append((body.count("\n", 0, m.start(1)) + 1, m.group(1).strip()))
+        return out
+    if suffix in SCRIPT_SUFFIXES and (suffix in (".jsx", ".tsx") or CLIENT_FOLDERS.search(f.lower())):
+        for n, line in enumerate(text.split("\n"), 1):
+            code = re.sub(r"^\s*//.*$|\s//\s.*$", "", line)
+            for m in re.finditer(r"'((?:[^'\\]|\\.)*)'|\"((?:[^\"\\]|\\.)*)\"|`((?:[^`\\]|\\.)*)`", code):
+                s = next(g for g in m.groups() if g is not None)
+                if NOT_UI_CALL.search(code[:m.start()]) or SQL_TEXT.match(s):
+                    continue
+                if re.search(r"[A-Za-z']{2,} [A-Za-z'/]{2,}", s) or re.match(r"[A-Z][a-z]+$", s):
+                    out.append((n, s))
+    return out
+
+
+def internal_names(call):
+    """The built-in internal-name scan: each table, column, enumeration value and route name found in text a user
+    sees. JSON, sorted; ToolSkip when there are no such names or no such text."""
+    work, files = call.work, export_files(call.work)
+    names = internal_name_inventory(work, files)
+    if not names:
+        raise ToolSkip("no table, column, enumeration value or route names at the commit (SQL schema, route "
+                       "definitions)")
+    shown = [f for f in files if Path(f).suffix.lower() in TEMPLATE_SUFFIXES | SCRIPT_SUFFIXES or LOCALE_FILE.search(f)]
+    if not shown:
+        raise ToolSkip("no text a user sees at the commit (pages, templates, client scripts, locale files)")
+    pats = {k: re.compile(r"(?<![\w/])" + re.escape(k) + (r"(?![\w/])" if k.startswith("/") else r"(?!\w)"))
+            for k in names}
+    hits = []
+    for f in shown:
+        for line, s in visible_strings(work, f):
+            for name, pat in pats.items():
+                if pat.search(s):
+                    kind, where = names[name]
+                    hits.append({"path": f, "line": line, "name": name, "kind": kind, "defined_in": where,
+                                 "text": s[:160]})
+    hits.sort(key=lambda h: (h["path"], h["line"], h["name"]))
+    return 0, (json.dumps({"names": len(names), "hits": hits}, indent=1, sort_keys=True) + "\n").encode("utf-8")
+
+
+def parse_internal_names(data, call):
+    """internal-names' JSON: one lead per name found in visible text."""
+    doc = _json_of(data, "internal-names JSON")
+    if not isinstance(doc, dict) or not isinstance(doc.get("hits"), list):
+        raise WriteError("cannot read the output as internal-names JSON")
+    leads = [_lead(f"internal-names.{h.get('kind')}", "warning", h.get("path"), h.get("line"), None,
+                   f"'{h.get('name')}' ({'a' if h.get('kind') != 'enum' else 'an'} {h.get('kind')} in "
+                   f"{h.get('defined_in')}) is in text users see: '{h.get('text')}'") for h in doc["hits"]]
+    return {"leads": leads, "metrics": [("internal_names_known", "all", int(doc.get("names") or 0), None),
+                                        ("internal_names_shown", "all", len(leads), None)], "version": None}
+
+
+tool_adapter("internal-names", fmt="json", parse=parse_internal_names, domain="ui", run=internal_names,
+             fallback="read the pages' text for table, column, status and route names by hand", step=222)
+
+
+# ----- what each conditional tool needs at the commit (scan lists it; tool-run skips without it)
+
+OPENAPI_FILE = re.compile(r"(^|/)(openapi|swagger)[^/]*\.(ya?ml|json)$", re.I)
+TOKEN_FILE = re.compile(r"(^|/)(design-)?tokens?(/.*)?\.json$|\.tokens\.json$", re.I)
+BUDGET_FILE = re.compile(r"(^|/)(perf(ormance)?[-_.])?budgets?\.json$", re.I)
+CSS_SUFFIXES = (".css", ".scss", ".sass", ".less")
+POSTGRES_DEPS = {"psycopg", "psycopg2", "psycopg2-binary", "asyncpg", "pg", "postgres", "pgx", "pg-promise"}
+TOOL_NEEDS = {  # tool: what it needs, as the reason a run is skipped without it
+    "vale": "documentation (Markdown, reStructuredText or AsciiDoc)",
+    "lychee": "documentation (Markdown, reStructuredText or AsciiDoc)",
+    "doc-references": "documentation (Markdown, reStructuredText or AsciiDoc)",
+    "internal-names": "text users see (pages, templates, client scripts or locale files)",
+    "impeccable": "UI (pages, templates, components or stylesheets)",
+    "wallace": "stylesheets (CSS, Sass or Less)",
+    "stylelint": "plain CSS files",
+    "schemathesis": "OpenAPI description (openapi.yaml, swagger.json)",
+    "hurl": "OpenAPI description or .hurl files",
+    "oasdiff": "OpenAPI description (openapi.yaml, swagger.json)",
+    "buf": "Protocol Buffers files (.proto)",
+    "graphql-inspector": "GraphQL schema (.graphql, .gql)",
+    "squawk": "PostgreSQL migrations (.sql files in a migrations folder, and PostgreSQL in the code or dependencies)",
+    "query-plan": "SQLite schema files (.sql) with SQLite in the code",
+    "pg-explain": "PostgreSQL schema or migration files (.sql) with PostgreSQL in the code or dependencies",
+    "hyperfine": "performance budgets (budgets.json or perf-budgets.json)",
+    "mailpit": "code that sends email (smtplib, nodemailer, a mail service)",
+    "i18n-lint": "client scripts in a translated project (locale files or an i18n library)",
+    "pseudo-locale": "locale files (JSON under locales/, i18n/, lang/ or translations/)",
+}
+
+
+def tool_evidence(paths, content, deps):
+    """{tool: evidence} for each conditional tool whose input the commit holds (the first file, or a count), from
+    the paths, the content signals (files per SCAN_CONTENT name) and the dependency names. Sorted by tool."""
+    low = [(p, p.lower()) for p in sorted(paths)]
+    pick = lambda test: [p for p, l in low if test(p, l)]
+    docs = doc_files([p for p, _ in low])
+    css = pick(lambda p, l: l.endswith(CSS_SUFFIXES))
+    plain_css = [p for p in css if p.lower().endswith(".css")]
+    ui = pick(lambda p, l: Path(l).suffix in UI_SUFFIXES and not SCAN_PATHS["test"].search(l))
+    client = pick(lambda p, l: Path(l).suffix in SCRIPT_SUFFIXES and not SCAN_PATHS["test"].search(l)
+                  and (Path(l).suffix in (".jsx", ".tsx") or CLIENT_FOLDERS.search(l)))
+    locales = pick(lambda p, l: bool(LOCALE_FILE.search(p)))
+    specs = pick(lambda p, l: bool(OPENAPI_FILE.search(l)))
+    sql = pick(lambda p, l: l.endswith(".sql"))
+    migrations = [p for p in sql if SCAN_PATHS["migration"].search(p.lower())]
+    postgres = bool(content.get("postgres_files")) or bool(set(deps) & POSTGRES_DEPS)
+
+    def first(found, noun):
+        return f"{found[0]}" + (f" and {len(found) - 1} more {noun}" if len(found) > 1 else "") if found else None
+    ev = {"vale": first(docs, "documents"), "lychee": first(docs, "documents"),
+          "doc-references": first(docs, "documents"),
+          "internal-names": first(ui + client + locales, "files") if (sql or content.get("server_files")) else None,
+          "impeccable": first(ui, "files"), "wallace": first(css, "stylesheets"),
+          "stylelint": first(plain_css, "stylesheets"),
+          "schemathesis": first(specs, "descriptions"),
+          "hurl": first(specs or pick(lambda p, l: l.endswith(".hurl")), "files"),
+          "oasdiff": first(specs, "descriptions"), "buf": first(pick(lambda p, l: l.endswith(".proto")), "files"),
+          "graphql-inspector": first(pick(lambda p, l: l.endswith((".graphql", ".gql"))), "files"),
+          "squawk": first(migrations, "migrations") if postgres else None,
+          "query-plan": first(sql, "files") if content.get("sqlite_files") else None,
+          "pg-explain": first(sql, "files") if postgres else None,
+          "hyperfine": first(pick(lambda p, l: bool(BUDGET_FILE.search(l))), "files"),
+          "mailpit": first(content.get("notification_files") or [], "files"),
+          "i18n-lint": first(client, "scripts") if (locales or content.get("i18n_files")) else None,
+          "pseudo-locale": first(locales, "files")}
+    return {k: v for k, v in sorted(ev.items()) if v}
+
+
+_INVENTORY_AT = {}
+
+
+def needs(call, tool):
+    """The evidence that the commit holds what `tool` needs (scan's tools that apply); ToolSkip when it does not."""
+    key = (str(call.repo_dir), call.commit)
+    if key not in _INVENTORY_AT:
+        _INVENTORY_AT[key] = repository_inventory(call.repo_dir, call.commit)[0]
+    ev = _INVENTORY_AT[key]["tools"].get(tool)
+    if not ev:
+        raise ToolSkip(f"the commit has no {TOOL_NEEDS[tool]}")
+    return ev
+
+
+# ----- the UI tools (step 223): axe-core in ui-audit, Project Wallace, Impeccable, odiff, Stylelint with tokens
+
+AXE_LEVELS = {"critical": "error", "serious": "error", "moderate": "warning", "minor": "note"}
+AXE_NODES = 20            # the most elements of one violation that ui-audit keeps
+WALLACE_LIMITS = {        # more distinct values than this in one category is a lead (design consistency)
+    "colors": 16, "fontSizes": 10, "fontFamilies": 3, "lineHeights": 8, "zindexes": 8, "boxShadows": 6,
+    "borderRadiuses": 6}
+WALLACE_METRICS = {"colors": "css_colors", "fontSizes": "css_font_sizes", "fontFamilies": "css_font_families",
+                   "lineHeights": "css_line_heights", "zindexes": "css_z_indexes", "boxShadows": "css_box_shadows",
+                   "borderRadiuses": "css_border_radii", "units": "css_units"}
+
+# Runs in the page after axe.min.js is added: the violations only, each element's selector, HTML and summary.
+AXE_RUN_SCRIPT = r"""
+async (limit) => {
+  const r = await axe.run(document, {resultTypes: ['violations']});
+  return {version: r.testEngine.version, violations: r.violations.map(v => ({
+    id: v.id, impact: v.impact, help: v.help, helpUrl: v.helpUrl, tags: v.tags.slice().sort(),
+    nodes: v.nodes.slice(0, limit).map(n => ({target: n.target, html: (n.html || '').slice(0, 200),
+                                               failureSummary: (n.failureSummary || '').slice(0, 300)})),
+    count: v.nodes.length})).sort((a, b) => a.id < b.id ? -1 : 1)};
+}
+"""
+
+
+def _npm_package_version(start, package):
+    """The version in the package.json of `package` found by walking up from `start` (a file), or None."""
+    for d in [Path(start).resolve(), *Path(start).resolve().parents]:
+        for cand in (d / "package.json", d / "node_modules" / package / "package.json"):
+            try:
+                cfg = json.loads(cand.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if isinstance(cfg, dict) and cfg.get("name") == package and cfg.get("version"):
+                return str(cfg["version"])
+    return None
+
+
+def _npm_binary_version(binary, package):
+    """locate() for an npm CLI that prints no version: its package.json beside the script on PATH."""
+    def locate():
+        exe = shutil.which(binary)
+        if not exe:
+            return None
+        return _npm_package_version(exe, package) or ""
+    return locate
+
+
+_GLOBAL_NODE_MODULES = []
+
+
+def axe_script(root=None):
+    """axe.min.js: LEDGER_AXE (the file or its folder), the project's node_modules, or npm's global folder; None."""
+    named = os.environ.get("LEDGER_AXE")
+    cands = [Path(named) / "axe.min.js" if named and Path(named).is_dir() else Path(named)] if named else []
+    if root:
+        cands.append(Path(root) / "node_modules" / "axe-core" / "axe.min.js")
+    if not named:
+        if not _GLOBAL_NODE_MODULES:
+            npm = shutil.which("npm")
+            g = ""
+            if npm:
+                try:
+                    g = subprocess.run([npm, "root", "-g"], capture_output=True, timeout=PROBE_SECONDS,
+                                       stdin=subprocess.DEVNULL).stdout.decode("utf-8", "replace").strip()
+                except (OSError, subprocess.SubprocessError):
+                    g = ""
+            _GLOBAL_NODE_MODULES.append(g)
+        if _GLOBAL_NODE_MODULES[0]:
+            cands.append(Path(_GLOBAL_NODE_MODULES[0]) / "axe-core" / "axe.min.js")
+    return next((c for c in cands if c.is_file()), None)
+
+
+def axe_version():
+    """locate() for axe-core: the version of the axe.min.js ui-audit would use."""
+    found = axe_script(Path.cwd())
+    return None if found is None else (_npm_package_version(found, "axe-core") or "")
+
+
+def ui_axe(page, root):
+    """axe-core's violations on a loaded page, or why it did not run."""
+    found = axe_script(root)
+    if found is None:
+        return {"available": False, "note": "axe-core not found (npm install -g axe-core, or LEDGER_AXE=<its folder>);"
+                                            " contrast and names were measured without it"}
+    page.add_script_tag(path=str(found))
+    return dict(page.evaluate(AXE_RUN_SCRIPT, AXE_NODES), available=True)
+
+
+def axe_lines(axe):
+    """ui-audit's lines for one page's axe-core result."""
+    if not axe.get("available"):
+        return [f"  axe-core: {axe.get('note')}"]
+    out = [f"  axe-core {axe.get('version')}: {len(axe['violations'])} rules violated"]
+    for v in axe["violations"]:
+        where = ", ".join(" ".join(n["target"]) if isinstance(n["target"], list) else str(n["target"])
+                          for n in v["nodes"][:3])
+        out.append(f"    {v['id']} ({v.get('impact')}, {v.get('count', len(v['nodes']))}): {v['help']}: {where}")
+    return out
+
+
+def _axe_target(n):
+    """The CSS selector axe-core gives for one element, as text."""
+    t = n.get("target")
+    return " ".join(str(x) for x in t) if isinstance(t, list) else str(t or "")
+
+
+def parse_axe(data, call):
+    """axe-core's results: ui-audit's --json (each page's axe), one axe.run() result, or a list of them. One lead
+    per violated rule per page and element."""
+    doc = _json_of(data, "axe-core JSON")
+    pages = []
+    if isinstance(doc, dict) and isinstance(doc.get("pages"), list):
+        for p in doc["pages"]:
+            axe = (p or {}).get("axe") or {}
+            if axe.get("violations") is not None:
+                pages.append((f"{p.get('page')} at {p.get('width')} px, {p.get('theme')}", axe.get("violations"),
+                              axe.get("version")))
+    else:
+        for r in doc if isinstance(doc, list) else [doc]:
+            if isinstance(r, dict) and isinstance(r.get("violations"), list):
+                url = str(r.get("url") or "the page")
+                pages.append((url.rsplit("/", 1)[-1] if url.startswith("file:") else url, r["violations"],
+                              (r.get("testEngine") or {}).get("version")))
+    if not pages and not (isinstance(doc, dict) and isinstance(doc.get("pages"), list)):
+        raise WriteError("cannot read the output as axe-core JSON: no violations list and no ui-audit pages")
+    leads, version = [], None
+    for page, violations, v in pages:
+        version = version or v
+        for viol in violations or []:
+            for n in viol.get("nodes") or [{}]:
+                leads.append(_lead(f"axe.{viol.get('id')}", AXE_LEVELS.get(viol.get("impact"), "warning"), None, None,
+                                   None, f"{page}: {_axe_target(n)}: {viol.get('help')}"))
+    return {"leads": leads, "metrics": [("accessibility_violations", "all", len(leads), None)], "version": version}
+
+
+tool_adapter("axe", fmt="json", parse=parse_axe, domain="ui", locate=axe_version, lock_key="axe-core",
+             import_note="ui-audit runs axe-core on each page: ledger.py ui-audit <pages> --json > audit.json, then "
+                         "tool-run axe --from audit.json",
+             install="npm install -g axe-core@<pinned> (or LEDGER_AXE=<folder holding axe.min.js>)",
+             fallback="ui-audit's own contrast and name checks; say 'axe-core not run'", step=223)
+
+
+def _css_files(call):
+    """The export's stylesheets (CSS, Sass, Less); ToolSkip when it has none."""
+    files = [f for f in export_files(call.work) if f.lower().endswith(CSS_SUFFIXES)]
+    if not files:
+        raise ToolSkip(f"the commit has no {TOOL_NEEDS['wallace']}")
+    return files
+
+
+def wallace_run(call):
+    """Project Wallace's inventory of every stylesheet of the commit, read as one (paths sorted) on standard input."""
+    needs(call, "wallace")
+    css = "\n".join(export_text(call.work, f) for f in _css_files(call))
+    exe = shutil.which("wallace") or "wallace"
+    p = subprocess.run([exe, "--json"], input=css.encode("utf-8"), cwd=str(call.work), capture_output=True,
+                       timeout=TOOL_SECONDS, env=_tool_env(call.online))
+    call.stderr = p.stderr.decode("utf-8", "replace")
+    return p.returncode, p.stdout, ["wallace", "--json", "<", "(the commit's stylesheets)"]
+
+
+def parse_wallace(data, call):
+    """wallace --json: distinct colours, font sizes, families, z-indexes, shadows and radii as metrics (the counts
+    that trend between reviews); a category over WALLACE_LIMITS is a lead."""
+    doc = _json_of(data, "Project Wallace JSON")
+    values = (doc or {}).get("values") if isinstance(doc, dict) else None
+    if not isinstance(values, dict):
+        raise WriteError("cannot read the output as Project Wallace JSON: it has no values")
+    metrics, leads = [], []
+    for key, name in sorted(WALLACE_METRICS.items()):
+        v = values.get(key) or {}
+        unique = int(v.get("totalUnique") or 0)
+        metrics.append((name, "all", unique, "distinct values"))
+        limit = WALLACE_LIMITS.get(key)
+        if limit and unique > limit:
+            shown = ", ".join(sorted(v.get("unique") or {})[:12])
+            leads.append(_lead(f"wallace.many-{name[4:].replace('_', '-')}", "warning", None, None, None,
+                               f"{unique} distinct {name[4:].replace('_', ' ')} (more than {limit}): {shown}"))
+    decl = (doc.get("declarations") or {})
+    metrics += [("css_declarations", "all", int(decl.get("total") or 0), None),
+                ("css_important", "all", int((decl.get("importants") or {}).get("total") or 0), None),
+                ("css_lines", "all", int((doc.get("stylesheet") or {}).get("sourceLinesOfCode") or 0), "lines")]
+    return {"leads": leads, "metrics": metrics, "version": None}
+
+
+tool_adapter("wallace", fmt="json", parse=parse_wallace, domain="ui", binary="wallace", run=wallace_run,
+             locate=_npm_binary_version("wallace", "wallace-cli"), lock_key="wallace-cli",
+             install="npm install -g wallace-cli@<pinned> (or mise install)",
+             fallback="count the distinct colours, font sizes and spacing values with a search of the stylesheets",
+             step=223)
+
+
+def _impeccable_argv(call):
+    """Impeccable's command: detect, JSON, the whole export."""
+    needs(call, "impeccable")
+    return ["impeccable", "detect", "--json", "."]
+
+
+def parse_impeccable(data, call):
+    """impeccable detect --json: a list of findings (antipattern, severity, category, file, line, snippet)."""
+    text = data.decode("utf-8", "replace").strip()
+    doc = _json_of(data, "Impeccable JSON") if text else []
+    if not isinstance(doc, list):
+        raise WriteError("cannot read the output as Impeccable JSON: it is not a list")
+    leads = []
+    for f in doc:
+        if not isinstance(f, dict):
+            continue
+        level = {"error": "error", "warning": "warning"}.get(f.get("severity"), "note")
+        leads.append(_lead(f"impeccable.{f.get('antipattern') or 'finding'}", level,
+                           _relative_lead_path(f.get("file"), call), f.get("line"), None,
+                           f"{f.get('name')} ({f.get('category')}): {f.get('snippet') or f.get('description')}"))
+    return {"leads": leads, "metrics": [("generic_look_findings", "all",
+                                         sum(1 for f in doc if isinstance(f, dict) and f.get("category") == "slop"),
+                                         None)], "version": None}
+
+
+tool_adapter("impeccable", fmt="json", parse=parse_impeccable, domain="ui", binary="impeccable",
+             argv=_impeccable_argv, stdout=True, ok_exits=(0, 2),
+             install="npm install -g impeccable@<pinned> (or mise install)",
+             fallback="judge the pages against the generic generated look by eye (ui.6) and say 'not machine-checked'",
+             step=223)
+
+
+def _review_screenshots(con, root, review_id):
+    """{file name: path} of the PNG screenshots recorded on a review (ui-capture's)."""
+    out = {}
+    for r in rows(con, "SELECT path FROM artifacts WHERE review_id=? AND path LIKE '%.png' ORDER BY path",
+                  (review_id,)):
+        p = Path(r["path"]) if Path(r["path"]).is_absolute() else Path(root) / r["path"]
+        if p.is_file():
+            out.setdefault(p.name, p)
+    return out
+
+
+def odiff_run(call):
+    """odiff on each screenshot of this review against the one of the same name in the review it follows up; the
+    diff images go to <ledger folder>/reviews/<review>/ui/odiff/. JSON, sorted by name."""
+    rv, con = call.review, call.con
+    if not rv["previous_review_id"]:
+        raise ToolSkip(f"{rv['code']} follows up no review (new-review --previous): nothing to compare with")
+    prev = one(con, "SELECT id, code FROM reviews WHERE id=?", (rv["previous_review_id"],))
+    now, before = _review_screenshots(con, call.root, rv["id"]), _review_screenshots(con, call.root, prev["id"])
+    common = sorted(set(now) & set(before))
+    if not common:
+        raise ToolSkip(f"no screenshot of {rv['code']} has a namesake in {prev['code']} (ui-capture both, same pages)")
+    folder = Path(call.ledger_dir) / "reviews" / rv["code"] / "ui" / "odiff"
+    folder.mkdir(parents=True, exist_ok=True)
+    exe = shutil.which("odiff") or "odiff"
+    pairs = []
+    for name in common:
+        diff = folder / name
+        p = subprocess.run([exe, str(before[name]), str(now[name]), str(diff), "--parsable-stdout", "--antialiasing",
+                            "--fail-on-layout"], capture_output=True, timeout=TOOL_SECONDS,
+                           stdin=subprocess.DEVNULL, env=_tool_env(False))
+        out = p.stdout.decode("utf-8", "replace").strip()
+        entry = {"name": name, "exit": p.returncode, "layout_changed": p.returncode == 21, "changed_pixels": 0,
+                 "changed_percent": 0.0, "diff": None}
+        m = re.match(r"^(\d+);([\d.]+)", out)
+        if m:
+            entry.update(changed_pixels=int(m.group(1)), changed_percent=float(m.group(2)))
+        elif p.returncode not in (0, 21):
+            call.stderr = p.stderr.decode("utf-8", "replace") or out
+            return p.returncode, b""
+        if diff.is_file() and (entry["changed_pixels"] or entry["layout_changed"]):
+            try:
+                entry["diff"] = diff.relative_to(Path(call.root).resolve()).as_posix()
+            except ValueError:
+                entry["diff"] = diff.as_posix()
+        pairs.append(entry)
+    doc = {"review": rv["code"], "previous": prev["code"], "pairs": pairs,
+           "new": sorted(set(now) - set(before)), "gone": sorted(set(before) - set(now))}
+    return 0, (json.dumps(doc, indent=1, sort_keys=True) + "\n").encode("utf-8"), \
+        ["odiff", "{previous}", "{current}", "{diff}", "--parsable-stdout", "--antialiasing", "--fail-on-layout"]
+
+
+def parse_odiff(data, call):
+    """odiff's comparison: a lead for each screenshot whose pixels or size changed; the changed share per
+    screenshot as a metric."""
+    doc = _json_of(data, "odiff JSON")
+    if not isinstance(doc, dict) or not isinstance(doc.get("pairs"), list):
+        raise WriteError("cannot read the output as odiff JSON")
+    leads, metrics = [], []
+    for p in doc["pairs"]:
+        metrics.append(("screenshot_changed_percent", p["name"], float(p.get("changed_percent") or 0), "%"))
+        where = f" (diff image {p['diff']})" if p.get("diff") else ""
+        if p.get("layout_changed"):
+            leads.append(_lead("odiff.layout-changed", "warning", None, None, None,
+                               f"{p['name']}: its size differs from {doc.get('previous')}'s{where}"))
+        elif p.get("changed_pixels"):
+            leads.append(_lead("odiff.changed", "note", None, None, None,
+                               f"{p['name']}: {p['changed_percent']}% of pixels ({p['changed_pixels']}) differ from "
+                               f"{doc.get('previous')}'s{where}"))
+    metrics += [("screenshots_compared", "all", len(doc["pairs"]), None),
+                ("screenshots_new", "all", len(doc.get("new") or []), None),
+                ("screenshots_gone", "all", len(doc.get("gone") or []), None)]
+    return {"leads": leads, "metrics": metrics, "version": None}
+
+
+tool_adapter("odiff", fmt="json", parse=parse_odiff, domain="ui", binary="odiff", run=odiff_run, source="repo",
+             lock_key="odiff-bin", install="npm install -g odiff-bin@<pinned> (or mise install)",
+             fallback="open each screenshot beside the last review's and say which changed, by eye", step=223)
+
+
+TOKEN_CATEGORIES = {  # a token category: the properties it governs, the keywords always allowed
+    "color": (r"^(color|background-color|border(-(top|right|bottom|left))?-color|outline-color|fill|stroke|"
+              r"text-decoration-color|caret-color|accent-color)$",
+              ("transparent", "currentColor", "currentcolor", "inherit", "initial", "unset", "none")),
+    "spacing": (r"^((margin|padding)(-(top|right|bottom|left|inline|block)(-(start|end))?)?|gap|row-gap|column-gap)$",
+                ("0", "auto", "inherit", "initial", "unset")),
+    "font-size": (r"^font-size$", ("inherit", "initial", "unset", "smaller", "larger")),
+    "font-family": (r"^font-family$", ("inherit", "initial", "unset")),
+    "radius": (r"^border(-(top|bottom)-(left|right))?-radius$", ("0", "50%", "inherit", "initial", "unset")),
+    "shadow": (r"^box-shadow$", ("none", "inherit", "initial", "unset")),
+    "z-index": (r"^z-index$", ("auto", "0", "1", "-1", "inherit", "initial", "unset")),
+}
+TOKEN_TYPES = {"color": "color", "dimension": "spacing", "spacing": "spacing", "size": "spacing",
+               "fontsize": "font-size", "fontsizes": "font-size", "fontfamily": "font-family",
+               "fontfamilies": "font-family", "borderradius": "radius", "radius": "radius", "radii": "radius",
+               "shadow": "shadow", "boxshadow": "shadow", "shadows": "shadow", "zindex": "z-index", "z": "z-index",
+               "layer": "z-index", "colors": "color", "space": "spacing", "sizes": "spacing"}
+
+
+def _token_category(path, declared):
+    """A token's category from its $type, or from the words of its path (color.brand, font.size.body)."""
+    words = [re.sub(r"[^a-z]", "", w.lower()) for w in path]
+    if declared and re.sub(r"[^a-z]", "", str(declared).lower()) in TOKEN_TYPES:
+        cat = TOKEN_TYPES[re.sub(r"[^a-z]", "", str(declared).lower())]
+        if cat == "spacing" and "font" in words:
+            return "font-size"
+        return cat
+    if "font" in words or "typography" in words:
+        if {"family", "families", "fontfamily"} & set(words):
+            return "font-family"
+        if {"size", "sizes", "fontsize"} & set(words):
+            return "font-size"
+    for w in words:
+        if w in TOKEN_TYPES:
+            return TOKEN_TYPES[w]
+    return None
+
+
+def _kebab(words):
+    """A token path in kebab case (brand.primaryColor: brand-primary-color)."""
+    return "-".join(re.sub(r"([a-z0-9])([A-Z])", r"\1-\2", str(w)).lower().replace("_", "-") for w in words)
+
+
+def design_tokens(repo_dir, commit):
+    """The project's design tokens at the commit: Style Dictionary JSON (`value` or `$value` leaves; CSS name the
+    path in kebab case, as Style Dictionary's css/variables writes it), else the CSS custom properties its plain
+    stylesheets declare. {"source": [files], "kind": ..., "tokens": [{css, category, value}]}, sorted."""
+    paths = sorted(p for p in _git_out(repo_dir, "ls-tree", "-r", "--name-only", "-z", commit).split("\0")
+                   if p and not SCAN_SKIPPED_FOLDERS & set(p.split("/")[:-1]))
+    read = lambda p: git(repo_dir, "show", f"{commit}:{p}").decode("utf-8", "replace")
+    tokens, sources = [], [p for p in paths if TOKEN_FILE.search(p) and not p.endswith("package.json")]
+
+    def walk(node, path, inherited):
+        if not isinstance(node, dict):
+            return
+        declared = node.get("$type") or node.get("type") or inherited
+        for k in ("$value", "value"):
+            if k in node and not isinstance(node[k], (dict, list)):
+                cat = _token_category(path, declared)
+                if cat:
+                    tokens.append({"css": "--" + _kebab(path), "category": cat, "value": str(node[k])})
+                return
+        for k in sorted(node):
+            if not k.startswith("$") and k not in ("type", "comment", "description"):
+                walk(node[k], path + [k], declared)
+    for src in sources:
+        try:
+            walk(json.loads(read(src)), [], None)
+        except (ValueError, RuntimeError):
+            continue
+    kind = "style-dictionary" if tokens else None
+    if not tokens:
+        sources = []
+        for src in [p for p in paths if p.lower().endswith(".css")]:
+            before = len(tokens)
+            for name, value in re.findall(r"(--[A-Za-z0-9_-]+)\s*:\s*([^;}]+)", read(src)):
+                cat = _token_category(re.split(r"[-_]+", name.strip("-")), None)
+                value = value.strip()
+                if cat is None and re.match(r"^(#[0-9a-fA-F]{3,8}|rgba?\(|hsla?\()", value):
+                    cat = "color"
+                if cat:
+                    tokens.append({"css": name, "category": cat, "value": value})
+            if len(tokens) > before:
+                sources.append(src)
+        kind = "custom-properties" if tokens else None
+    uniq = {(t["category"], t["css"]): t for t in tokens}
+    return {"kind": kind, "source": sources, "tokens": [uniq[k] for k in sorted(uniq)]}
+
+
+def stylelint_config(tokens):
+    """A Stylelint config with one value-restricting rule: each governed property allows only var() of its
+    category's tokens (and calc() over them) and its keywords."""
+    allowed = {}
+    for cat, (props, keywords) in sorted(TOKEN_CATEGORIES.items()):
+        names = sorted({t["css"] for t in tokens if t["category"] == cat})
+        if not names:
+            continue
+        esc = lambda w: re.sub(r"([.^$*+?()\[\]{}|\\/])", r"\\\1", w)  # a JavaScript pattern: '-' stays as it is
+        var = r"var\((?:" + "|".join(esc(n) for n in names) + r")(?:,[^)]*)?\)"
+        atom = r"(?:" + var + r"|calc\([^()]*" + var + r"[^()]*\)|" + "|".join(esc(k) for k in keywords) + ")"
+        allowed["/" + props + "/"] = ["/^" + atom + r"(?:\s+" + atom + ")*$/"]
+    return {"rules": {"declaration-property-value-allowed-list": allowed}} if allowed else None
+
+
+def _stylelint_tokens(call):
+    """The commit's design tokens, kept on the call for parse_stylelint."""
+    found = design_tokens(call.repo_dir, call.commit)
+    call.tokens = found
+    return found
+
+
+def _stylelint_argv(call):
+    """Stylelint's command: plain CSS, the token rule written to {rules}, JSON to {out}."""
+    needs(call, "stylelint")
+    found = _stylelint_tokens(call)
+    cfg = stylelint_config(found["tokens"])
+    if cfg is None:
+        raise ToolSkip("no design tokens (Style Dictionary JSON) and no CSS custom properties at the commit: nothing "
+                       "to hold a raw value against; Project Wallace's counts stand in")
+    path = Path(call.out).parent / "stylelint.json"
+    path.write_text(json.dumps(cfg, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+    call.rules = path
+    call.placeholders[str(path)] = "{rules}"
+    return ["stylelint", "**/*.css", "--config", str(path), "--formatter", "json", "--output-file", str(call.out),
+            "--allow-empty-input", "--ignore-pattern", "**/node_modules/**"]
+
+
+def parse_stylelint(data, call):
+    """Stylelint's JSON formatter: one lead per warning; a raw value of a governed property names the token that
+    holds the same value, read from the commit's tokens."""
+    doc = _json_of(data, "Stylelint JSON")
+    if not isinstance(doc, list):
+        raise WriteError("cannot read the output as Stylelint JSON: it is not a list of files")
+    found = getattr(call, "tokens", None)
+    if found is None and call.repo_dir and call.commit:
+        try:
+            found = design_tokens(call.repo_dir, call.commit)
+        except (RuntimeError, OSError, subprocess.SubprocessError):
+            found = None
+    by_value = {}
+    for t in (found or {}).get("tokens") or []:
+        by_value.setdefault((t["category"], " ".join(t["value"].lower().split())), t["css"])
+    leads = []
+    for f in doc:
+        path = _relative_lead_path((f or {}).get("source"), call)
+        for w in (f or {}).get("warnings") or []:
+            text = str(w.get("text") or "")
+            m = re.match(r'(?:Disallowed|Unexpected) value "(.*)" for property "([^"]+)"', text)
+            if w.get("rule") == "declaration-property-value-allowed-list" and m:
+                value, prop = m.group(1), m.group(2)
+                cat = next((c for c, (props, _) in TOKEN_CATEGORIES.items() if re.match(props, prop)), None)
+                token = by_value.get((cat, " ".join(value.lower().split())))
+                parts = [(v, by_value.get((cat, v.lower()))) for v in value.split()] if not token else []
+                if len(parts) > 1 and any(t for _, t in parts):
+                    token = None
+                    msg = f"{prop}: {value} is a raw value; " + ", ".join(
+                        f"{v}: var({t})" if t else f"{v}: no {cat} token" for v, t in parts)
+                else:
+                    msg = None
+                msg = msg or (f"{prop}: {value} is a raw value; " + (f"var({token}) holds it" if token else
+                       f"use a {cat} token" + (f" ({', '.join((found or {}).get('source', [])[:2])})"
+                                               if found and found.get("source") else "")))
+                leads.append(_lead("stylelint.raw-value", "warning", path, w.get("line"), w.get("endLine"), msg))
+            else:
+                leads.append(_lead(f"stylelint.{w.get('rule')}", "warning", path, w.get("line"), w.get("endLine"),
+                                   text))
+    metrics = [("raw_style_values", "all", sum(1 for l in leads if l["rule"] == "stylelint.raw-value"), None)]
+    if found and found.get("tokens"):
+        metrics.append(("design_tokens", "all", len(found["tokens"]), None))
+    return {"leads": leads, "metrics": metrics, "version": None}
+
+
+tool_adapter("stylelint", fmt="json", parse=parse_stylelint, domain="ui", binary="stylelint", argv=_stylelint_argv,
+             ok_exits=(0, 2), install="npm install -g stylelint@<pinned> (or mise install)",
+             fallback="search the stylesheets for raw colours and lengths beside the tokens and say "
+                      "'not machine-checked'", step=223)
+
+
+# ----- the API, database, performance, email and translation tools (step 224)
+
+LOOPBACK = re.compile(r"^(https?|postgres(ql)?)://([^@/]*@)?(127\.\d+\.\d+\.\d+|localhost|\[::1\])(:\d+)?(/|$)", re.I)
+SCHEMATHESIS_EXAMPLES = 20   # generated cases per operation
+EXPLAIN_SECONDS = 30         # one psql call's limit
+MAILPIT_URL = "http://127.0.0.1:8025"
+MAILPIT_MESSAGES = 500       # the most messages read from Mailpit in one run
+PSEUDO_GROWTH = 0.4          # pseudo-localized text is this much longer, as translations often are
+PSEUDO_MAP = str.maketrans("aceinousyACEINOUSY", "àçéîñöûšýÀÇÉÎÑÖÛŠÝ")
+
+
+def _seed(call):
+    """The run's seed: --seed, else from the commit (as test-runs)."""
+    seed = getattr(call.a, "seed", None) if call.a else None
+    return seed if seed is not None else int(call.commit[:8], 16) % 1000000
+
+
+def _target(call, what, default=None):
+    """--target, or default; refused (ToolSkip) when missing, and when it leaves this machine without --online."""
+    url = (getattr(call.a, "target", None) if call.a else None) or default
+    if not url:
+        raise ToolSkip(f"give --target <{what}> (the owner starts it; never a production address)")
+    if not LOOPBACK.match(url) and not call.online:
+        raise ToolSkip(f"--target {url} is not on this machine: give --online to allow it (and only with the owner's "
+                       f"word)")
+    call.placeholders[url] = "{target}"
+    return url
+
+
+def _spec_at(call):
+    """The OpenAPI description at the commit (the first, sorted), as a path in the export."""
+    specs = [f for f in export_files(call.work) if OPENAPI_FILE.search(f.lower())]
+    if not specs:
+        raise ToolSkip(f"the commit has no {TOOL_NEEDS['schemathesis']}")
+    return specs[0]
+
+
+def _spec_lines(text):
+    """{(method, path): line} of an OpenAPI description's operations (YAML or JSON, by indentation)."""
+    out, cur = {}, None
+    for n, line in enumerate(text.split("\n"), 1):
+        m = re.match(r'^\s{1,4}["\']?(/[^"\':]*)["\']?\s*:', line)
+        if m:
+            cur = m.group(1)
+            out.setdefault(("*", cur), n)
+            continue
+        m = re.match(r'^\s+["\']?(get|put|post|delete|patch|head|options|trace)["\']?\s*:', line, re.I)
+        if m and cur:
+            out.setdefault((m.group(1).upper(), cur), n)
+    return out
+
+
+def _schemathesis_argv(call):
+    """Schemathesis' command: the description against --target, seeded, JUnit to {out}."""
+    needs(call, "schemathesis")
+    spec = _spec_at(call)
+    url = _target(call, "base URL of the running API")
+    call.spec = spec
+    return ["schemathesis", "run", spec, "--url", url, "--seed", str(_seed(call)), "--max-examples",
+            str(SCHEMATHESIS_EXAMPLES), "--generation-deterministic", "--report", "junit", "--report-junit-path", str(call.out), "--no-color"]
+
+
+def parse_schemathesis(data, call):
+    """Schemathesis' JUnit report: one lead per operation and failed check (ST101 server error, ST108 schema
+    violation, ...), at the operation in the OpenAPI description when the commit has it."""
+    root = _xml_of(data, "JUnit XML")
+    lines, spec = {}, getattr(call, "spec", None)
+    if call.repo_dir and call.commit:
+        try:
+            paths = _git_out(call.repo_dir, "ls-tree", "-r", "--name-only", "-z", call.commit).split("\0")
+            spec = spec or next((p for p in sorted(paths) if OPENAPI_FILE.search(p.lower())), None)
+            if spec:
+                lines = _spec_lines(git(call.repo_dir, "show", f"{call.commit}:{spec}").decode("utf-8", "replace"))
+        except RuntimeError:
+            pass
+    leads, cases = [], 0
+    for case in root.iter("testcase"):
+        cases += 1
+        op = case.get("name") or "?"
+        method, _, path = op.partition(" ")
+        line = lines.get((method.upper(), path)) or lines.get(("*", path))
+        for bad in (c for c in case if c.tag in ("failure", "error")):
+            text = bad.text or ""
+            codes = re.findall(r"\bST\d{3}\b", bad.get("message") or "") or ["error"]
+            for code in sorted(set(codes)):
+                m = re.search(rf"- {code} ([^\n]+)", text)
+                leads.append(_lead(f"schemathesis.{code}", "error", spec if line else None, line, None,
+                                   f"{op}: {m.group(1).strip() if m else bad.get('message') or code}"))
+    return {"leads": leads, "metrics": [("api_operations_tested", "all", cases, None),
+                                        ("api_check_failures", "all", len(leads), None)], "version": None}
+
+
+tool_adapter("schemathesis", fmt="junit", parse=parse_schemathesis, domain="contracts", binary="schemathesis",
+             argv=_schemathesis_argv, ok_exits=(0, 1),
+             install="pipx install schemathesis==<pinned> (or mise install)",
+             fallback="read each route against its description: status codes, required fields, error shapes", step=224)
+
+
+def access_matrix(spec_text, matrix):
+    """The Hurl request files of a route-by-role access matrix: one per operation of the description and role,
+    asserting the status the matrix expects ('allowed': below 400, 'denied': 401 or 403, a number: that status;
+    nothing given: no 5xx). [(file name, text, (method, path, role, expected))], sorted."""
+    roles = matrix.get("roles") or {"anonymous": {}}
+    params = matrix.get("params") or {}
+    expect = matrix.get("expect") or {}
+    out = []
+    for (method, path), _ in sorted(_spec_lines(spec_text).items(), key=lambda kv: (kv[0][1], kv[0][0])):
+        if method == "*":
+            continue
+        filled = re.sub(r"\{(\w+)\}", lambda m: str(params.get(m.group(1), "1")), path)
+        for role in sorted(roles):
+            want = (expect.get(f"{method} {path}") or {}).get(role, (expect.get("*") or {}).get(role))
+            headers = "".join(f"{k}: {v}\n" for k, v in sorted(((roles[role] or {}).get("headers") or {}).items()))
+            if want == "allowed":
+                check = "HTTP *\n[Asserts]\nstatus < 400\n"
+            elif want == "denied":
+                check = "HTTP *\n[Asserts]\nstatus >= 401\nstatus <= 403\n"
+            elif isinstance(want, int):
+                check = f"HTTP {want}\n"
+            else:
+                check = "HTTP *\n[Asserts]\nstatus < 500\n"
+            name = f"{len(out) + 1:04d}-{method}-{quote(path, safe='')}--{role}.hurl"
+            out.append((name, f"# {method} {path} as {role}\n{method} {{{{base}}}}{filled}\n{headers}{check}",
+                        (method, path, role, want)))
+    return out
+
+
+def _hurl_argv(call):
+    """Hurl's command: the generated access matrix and the project's own .hurl files, JUnit to {out}."""
+    needs(call, "hurl")
+    url = _target(call, "base URL of the running API")
+    matrix = {}
+    if call.rules:
+        try:
+            matrix = json.loads(Path(call.rules).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            raise WriteError(f"--rules {call.rules}: not a JSON access matrix ({_one_line(e)})")
+    folder = Path(call.out).parent / "hurl"
+    folder.mkdir()
+    files = []
+    specs = [f for f in export_files(call.work) if OPENAPI_FILE.search(f.lower())]
+    if specs:
+        for name, text, _ in access_matrix(export_text(call.work, specs[0]), matrix):
+            (folder / name).write_text(text, encoding="utf-8")
+            files.append(str(folder / name))
+    files += [str(Path(call.work) / f) for f in export_files(call.work) if f.endswith(".hurl")]
+    call.placeholders[str(folder)] = "{matrix}"
+    secrets = []
+    for var in sorted(set(re.findall(r"\{\{(\w+)\}\}", "".join(Path(f).read_text(encoding="utf-8")
+                                                              for f in files))) - {"base"}):
+        if var in os.environ:
+            secrets += ["--secret", f"{var}={os.environ[var]}"]
+            call.placeholders[f"{var}={os.environ[var]}"] = f"{var}={{{var}}}"
+    return ["hurl", "--test", "--no-color", "--variable", f"base={url}", *secrets, "--report-junit", str(call.out),
+            *files]
+
+
+def parse_hurl(data, call):
+    """hurl --report-junit: one lead per request file that failed (a matrix cell: route, role and the status it
+    should have given)."""
+    root = _xml_of(data, "JUnit XML")
+    leads, cells = [], 0
+    for case in root.iter("testcase"):
+        cells += 1
+        bad = next((c for c in case if c.tag in ("failure", "error")), None)
+        if bad is None:
+            continue
+        name = (case.get("id") or case.get("name") or "").rsplit("/", 1)[-1]
+        m = re.match(r"\d+-([A-Z]+)-(.*)--(\w+)\.hurl$", name)
+        what = f"{m.group(1)} {unquote(m.group(2))} as {m.group(3)}" if m else name
+        detail = " ".join((bad.get("message") or bad.text or "").split())[:300]
+        leads.append(_lead("hurl.access" if m else "hurl.failure", "error",
+                           None if m else _relative_lead_path(case.get("name"), call), None, None,
+                           f"{what}: {detail}"))
+    return {"leads": leads, "metrics": [("access_matrix_cells", "all", cells, None),
+                                        ("access_matrix_failures", "all", len(leads), None)], "version": None}
+
+
+tool_adapter("hurl", fmt="junit", parse=parse_hurl, domain="server", binary="hurl", argv=_hurl_argv, ok_exits=(0, 3, 4),
+             install="download the release binary from hurl.dev (or cargo install hurl, or mise install)",
+             fallback="request each route as each role by hand (curl) and fill the access matrix in the report",
+             step=224)
+
+
+def _previous_commit(call):
+    """The commit the review this one follows up recorded for the same repository; ToolSkip without one."""
+    rv, con = call.review, call.con
+    if not rv or not rv["previous_review_id"]:
+        raise ToolSkip(f"{rv['code'] if rv else 'the review'} follows up no review (new-review --previous): nothing "
+                       f"to compare the description with")
+    row = one(con, """SELECT rr.commit_sha FROM review_repositories rr JOIN review_repositories now
+                      ON now.repository_id = rr.repository_id WHERE rr.review_id=? AND now.review_id=?""",
+              (rv["previous_review_id"], rv["id"]))
+    if not row:
+        raise ToolSkip("the review it follows up did not look at this repository")
+    return row["commit_sha"]
+
+
+def _old_file(call, rel, name):
+    """A file as it was at the previous review's commit, written beside the output; ToolSkip when it was absent."""
+    old = _previous_commit(call)
+    try:
+        data = git(call.repo_dir, "show", f"{old}:{rel}")
+    except RuntimeError:
+        raise ToolSkip(f"{rel} did not exist at the previous review's commit {old[:10]}: nothing to compare")
+    target = Path(call.out).parent / name
+    target.write_bytes(data)
+    call.placeholders[str(target)] = "{previous}"
+    return target, old
+
+
+def _oasdiff_argv(call):
+    """oasdiff's command: the changelog from the previous review's description to this one."""
+    needs(call, "oasdiff")
+    spec = _spec_at(call)
+    base, _ = _old_file(call, spec, "previous-" + Path(spec).name)
+    call.spec = spec
+    return ["oasdiff", "changelog", str(base), spec, "--format", "json"]
+
+
+OASDIFF_LEVELS = {3: "error", 2: "warning", 1: "note"}
+
+
+def parse_oasdiff(data, call):
+    """oasdiff changelog --format json: one lead per change, breaking ones (level 3) as errors."""
+    text = data.decode("utf-8", "replace").strip()
+    doc = _json_of(data, "oasdiff JSON") if text else []
+    if isinstance(doc, dict):
+        doc = doc.get("changes") or []
+    if not isinstance(doc, list):
+        raise WriteError("cannot read the output as oasdiff JSON: it is not a list of changes")
+    spec = getattr(call, "spec", None)
+    leads = [_lead(f"oasdiff.{c.get('id')}", OASDIFF_LEVELS.get(c.get("level"), "warning"), spec, None, None,
+                   f"{c.get('operation') or ''} {c.get('path') or ''}: {c.get('text')}".strip())
+             for c in doc if isinstance(c, dict)]
+    return {"leads": leads, "metrics": [("api_breaking_changes", "all",
+                                         sum(1 for c in doc if isinstance(c, dict) and c.get("level") == 3), None),
+                                        ("api_changes", "all", len(leads), None)], "version": None}
+
+
+tool_adapter("oasdiff", fmt="json", parse=parse_oasdiff, domain="compatibility", binary="oasdiff",
+             argv=_oasdiff_argv, stdout=True,
+             install="download the release binary from github.com/oasdiff/oasdiff (or mise install)",
+             fallback="compare the description at the two commits by reading (git diff) and list removed or changed "
+                      "operations, fields and status codes", step=224)
+
+
+def _buf_argv(call):
+    """Buf's command: breaking changes against an export of the previous review's commit."""
+    needs(call, "buf")
+    old = _previous_commit(call)
+    folder = Path(call.out).parent / "previous"
+    folder.mkdir()
+    _export_commit(call.repo_dir, old, folder)
+    call.placeholders[str(folder)] = "{previous}"
+    return ["buf", "breaking", ".", "--against", str(folder), "--error-format", "json"]
+
+
+def parse_buf(data, call):
+    """buf breaking --error-format json: one JSON object per breaking change, at its file and lines."""
+    leads = []
+    for n, line in enumerate(data.decode("utf-8", "replace").split("\n"), 1):
+        if not line.strip():
+            continue
+        try:
+            e = json.loads(line)
+        except ValueError as err:
+            raise WriteError(f"cannot read the output as buf JSON lines: line {n}: {_one_line(err)}")
+        leads.append(_lead(f"buf.{e.get('type')}", "error", _relative_lead_path(e.get("path"), call),
+                           e.get("start_line"), e.get("end_line"), e.get("message")))
+    return {"leads": leads, "metrics": [("api_breaking_changes", "all", len(leads), None)], "version": None}
+
+
+tool_adapter("buf", fmt="jsonl", parse=parse_buf, domain="compatibility", binary="buf", argv=_buf_argv, stdout=True,
+             ok_exits=(0, 100), lock_key="@bufbuild/buf",
+             env=lambda call: {"BUF_CACHE_DIR": str(Path(call.out).parent / "buf-cache")},
+             install="npm install -g @bufbuild/buf@<pinned> (or mise install)",
+             fallback="compare the .proto files at the two commits: removed fields, changed types and numbers",
+             step=224)
+
+
+GRAPHQL_MARKS = {"✖": "breaking", "⚠": "dangerous", "✔": "safe"}
+GRAPHQL_LEVELS = {"breaking": "error", "dangerous": "warning", "safe": "note"}
+
+
+def graphql_changes(text):
+    """[{kind, text}] of graphql-inspector diff's text: a line per change, marked breaking, dangerous or safe."""
+    out = []
+    for line in text.split("\n"):
+        m = re.match(r"^\s*(?:\[\w+\]\s*)?([✖⚠✔])️?\s+(.*\S)", line)
+        if m:
+            out.append({"kind": GRAPHQL_MARKS[m.group(1)], "text": m.group(2)})
+    return out
+
+
+def graphql_run(call):
+    """graphql-inspector diff between the schema at the previous review's commit and now; its text (it has no JSON
+    output) turned into JSON."""
+    needs(call, "graphql-inspector")
+    schema = next(f for f in export_files(call.work) if f.endswith((".graphql", ".gql")))
+    base, _ = _old_file(call, schema, "previous-" + Path(schema).name)
+    argv = ["graphql-inspector", "diff", str(base), schema]
+    p = subprocess.run([shutil.which(argv[0]) or argv[0], *argv[1:]], cwd=str(call.work), capture_output=True,
+                       timeout=TOOL_SECONDS, stdin=subprocess.DEVNULL, env=_tool_env(call.online))
+    text = (p.stdout + p.stderr).decode("utf-8", "replace")
+    if p.returncode not in (0, 1) or ("Detected" not in text and "No changes" not in text):
+        call.stderr = text
+        return p.returncode or 1, b""
+    doc = {"schema": schema, "changes": graphql_changes(text)}
+    return 0, (json.dumps(doc, indent=1, sort_keys=True) + "\n").encode("utf-8"), argv
+
+
+def parse_graphql_inspector(data, call):
+    """graphql-inspector's changes (graphql_run's JSON, or the diff's own text): breaking ones are errors."""
+    if data.lstrip()[:1] == b"{":
+        doc = _json_of(data, "graphql-inspector JSON")
+    else:
+        text = data.decode("utf-8", "replace")
+        if "Detected" not in text and "No changes" not in text:
+            raise WriteError("cannot read the output as graphql-inspector diff text")
+        doc = {"changes": graphql_changes(text)}
+    schema = doc.get("schema") if isinstance(doc, dict) else None
+    changes = doc.get("changes") if isinstance(doc, dict) else None
+    if not isinstance(changes, list):
+        raise WriteError("cannot read the output as graphql-inspector JSON")
+    if schema is None and call.repo_dir and call.commit:
+        try:
+            schema = next((p for p in sorted(_git_out(call.repo_dir, "ls-tree", "-r", "--name-only", "-z",
+                                                       call.commit).split("\0")) if p.endswith((".graphql", ".gql"))),
+                          None)
+        except RuntimeError:
+            schema = None
+    leads = [_lead(f"graphql-inspector.{c.get('kind')}", GRAPHQL_LEVELS.get(c.get("kind"), "warning"), schema, None,
+                   None, c.get("text")) for c in changes]
+    return {"leads": leads, "metrics": [("api_breaking_changes", "all",
+                                         sum(1 for c in changes if c.get("kind") == "breaking"), None),
+                                        ("api_changes", "all", len(leads), None)], "version": None}
+
+
+tool_adapter("graphql-inspector", fmt="json", parse=parse_graphql_inspector, domain="compatibility",
+             binary="graphql-inspector", run=graphql_run,
+             locate=_npm_binary_version("graphql-inspector", "@graphql-inspector/cli"),
+             lock_key="@graphql-inspector/cli",
+             install="npm install -g @graphql-inspector/cli@<pinned> (or mise install)",
+             fallback="compare the schema at the two commits: removed fields and types, new required arguments",
+             step=224)
+
+
+def _squawk_argv(call):
+    """Squawk's command: every .sql file in a migrations folder, JSON out."""
+    needs(call, "squawk")
+    files = [f for f in export_files(call.work) if f.lower().endswith(".sql")
+             and SCAN_PATHS["migration"].search(f.lower())]
+    return ["squawk", "--reporter", "json", *files]
+
+
+def parse_squawk(data, call):
+    """squawk --reporter json: one lead per rule broken, at its migration and line (squawk counts from 0)."""
+    text = data.decode("utf-8", "replace").strip()
+    doc = _json_of(data, "Squawk JSON") if text else []
+    if not isinstance(doc, list):
+        raise WriteError("cannot read the output as Squawk JSON: it is not a list")
+    leads = []
+    for v in doc:
+        if not isinstance(v, dict):
+            continue
+        line = v.get("line")
+        msg = str(v.get("message") or "") + (f"; {v['help']}" if v.get("help") else "")
+        leads.append(_lead(f"squawk.{v.get('rule_name')}", "error" if v.get("level") == "Error" else "warning",
+                           _relative_lead_path(v.get("file"), call), line + 1 if isinstance(line, int) else None,
+                           (v.get("line_end") + 1) if isinstance(v.get("line_end"), int) else None, msg))
+    return {"leads": leads, "metrics": [("migration_warnings", "all", len(leads), None)], "version": None}
+
+
+tool_adapter("squawk", fmt="json", parse=parse_squawk, domain="database", binary="squawk", argv=_squawk_argv,
+             stdout=True, ok_exits=(0, 1), lock_key="squawk-cli",
+             install="pipx install squawk-cli==<pinned> (or npm install -g squawk-cli, or mise install)",
+             fallback="read each migration for locks on large tables, non-concurrent indexes and unsafe type changes",
+             step=224)
+
+
+SQL_START = r"(?:SELECT|UPDATE|DELETE|WITH)\b"
+SQL_PLACEHOLDER = re.compile(r"\?\d*|\$\d+|%\(\w+\)s|%s|(?<![:\w]):[A-Za-z_]\w*")
+
+
+def sql_queries(work, files, rules=None):
+    """[(path, line, sql)] of the queries the code holds as string literals (SELECT, UPDATE, DELETE, WITH; none
+    built with interpolation), and those of a --rules file of statements separated by ';'. Sorted."""
+    out = []
+    if rules:
+        text = Path(rules).read_text(encoding="utf-8")
+        line = 1
+        for stmt in text.split(";"):
+            body = stmt.strip()
+            if re.match(SQL_START, body, re.I):
+                out.append((Path(rules).name, line + stmt[:len(stmt) - len(stmt.lstrip())].count("\n"), body))
+            line += stmt.count("\n")
+    for f in files:
+        suffix = Path(f).suffix.lower()
+        if suffix not in LANGUAGES or LANGUAGES[suffix] in NOT_CODE or SCAN_PATHS["test"].search(f.lower()):
+            continue
+        text = export_text(work, f)
+        for m in re.finditer(r'(?<![\w"\'])([rRbBuU]?)("""|\'\'\'|"|\'|`)\s*(' + SQL_START + r'(?:(?!\2).)*?)\2',
+                             text, re.I | re.S):
+            body = m.group(3)
+            if m.group(2) in ('"', "'") and "\n" in body:
+                continue
+            if "${" in body:
+                continue
+            out.append((f, text.count("\n", 0, m.start(3)) + 1, " ".join(body.split())))
+    return sorted(set(out))
+
+
+def _numbered(sql, style):
+    """(query, count) with each placeholder written as SQLite's '?' or PostgreSQL's $1, $2, ..., for a generic plan:
+    a NULL literal in its place would let the planner fold the condition away."""
+    n = [0]
+
+    def one(_):
+        n[0] += 1
+        return "?" if style == "sqlite" else f"${n[0]}"
+    return SQL_PLACEHOLDER.sub(one, sql), n[0]
+
+
+def _schema_files(files):
+    """The .sql files that build the schema, schema files first and migrations in path order."""
+    sql = [f for f in files if f.lower().endswith(".sql") and not SCAN_PATHS["test"].search(f.lower())]
+    return sorted(sql, key=lambda f: (0 if "schema" in f.lower() else 1, f))
+
+
+def query_plan(call):
+    """The built-in SQLite planner check: the commit's .sql files applied to an empty in-memory database, then
+    EXPLAIN QUERY PLAN for each query the code holds. JSON, sorted."""
+    needs(call, "query-plan")
+    files = export_files(call.work)
+    con = sqlite3.connect(":memory:")
+    applied, failed, queries = [], [], []
+    try:
+        for f in _schema_files(files):
+            try:
+                con.executescript(export_text(call.work, f))
+                applied.append(f)
+            except sqlite3.Error as e:
+                failed.append({"file": f, "error": _one_line(e)})
+        for path, line, sql in sql_queries(call.work, files, call.rules):
+            entry = {"path": path, "line": line, "sql": sql[:500]}
+            try:
+                text, count = _numbered(sql, "sqlite")
+                entry["plan"] = [r[3] for r in con.execute("EXPLAIN QUERY PLAN " + text, (None,) * count)]
+            except sqlite3.Error as e:
+                entry["error"] = _one_line(e)
+            queries.append(entry)
+    finally:
+        con.close()
+    doc = {"engine": f"sqlite {sqlite3.sqlite_version}", "applied": applied, "failed": failed, "queries": queries}
+    return 0, (json.dumps(doc, indent=1, sort_keys=True) + "\n").encode("utf-8")
+
+
+def _plan_nodes(node):
+    """Every node of a PostgreSQL JSON plan."""
+    yield node
+    for child in node.get("Plans") or []:
+        yield from _plan_nodes(child)
+
+
+def parse_query_plan(data, call):
+    """query-plan's or pg-explain's JSON: a lead for each query that reads a whole table (SQLite 'SCAN t' without an
+    index; PostgreSQL 'Seq Scan' with sequential scans switched off) or sorts in a temporary B-tree."""
+    doc = _json_of(data, "query-plan JSON")
+    if not isinstance(doc, dict) or not isinstance(doc.get("queries"), list):
+        raise WriteError("cannot read the output as query-plan JSON")
+    tool = "pg-explain" if str(doc.get("engine", "")).startswith("postgres") else "query-plan"
+    leads, explained = [], 0
+    for q in doc["queries"]:
+        plan = q.get("plan")
+        if plan is None:
+            continue
+        explained += 1
+        short = q["sql"][:120]
+        if tool == "query-plan":
+            for detail in plan:
+                m = re.match(r"SCAN (?:TABLE )?(\w+)", detail)
+                if m and "USING" not in detail:
+                    leads.append(_lead("query-plan.full-scan", "warning", q["path"], q["line"], None,
+                                       f"reads all of {m.group(1)} ({detail}): {short}"))
+                elif "TEMP B-TREE" in detail:
+                    leads.append(_lead("query-plan.temp-sort", "note", q["path"], q["line"], None,
+                                       f"{detail}: {short}"))
+        else:
+            for node in _plan_nodes((plan[0] if isinstance(plan, list) and plan else {}).get("Plan") or {}):
+                if node.get("Node Type") == "Seq Scan":
+                    leads.append(_lead("pg-explain.seq-scan", "warning", q["path"], q["line"], None,
+                                       f"reads all of {node.get('Relation Name')} even with sequential scans off "
+                                       f"(no index fits): {short}"))
+    metrics = [("queries_found", "all", len(doc["queries"]), None), ("queries_explained", "all", explained, None),
+               ("schema_files_failed", "all", len(doc.get("failed") or []), None)]
+    return {"leads": leads, "metrics": metrics, "version": None}
+
+
+tool_adapter("query-plan", fmt="json", parse=parse_query_plan, domain="database", run=query_plan,
+             fallback="apply the schema to a scratch SQLite file and run EXPLAIN QUERY PLAN on each query by hand",
+             step=224)
+
+
+def pg_explain(call):
+    """PostgreSQL EXPLAIN on a throwaway database: created on --target's server, given the commit's .sql files, each
+    query's generic plan (GENERIC_PLAN, PostgreSQL 16 or later) explained with sequential scans off (so a Seq Scan
+    means no index fits), then dropped."""
+    needs(call, "pg-explain")
+    url = _target(call, "postgresql:// address of a PostgreSQL server where a throwaway database may be created")
+    exe = shutil.which("psql") or "psql"
+    name = f"ledger_explain_{os.getpid()}_{int(time.time())}"
+    parts = urlsplit(url)
+    db_url = parts._replace(path="/" + name).geturl()
+
+    def psql(target, *args, sql=None):
+        p = subprocess.run([exe, target, "-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1", *args],
+                           input=sql.encode("utf-8") if sql is not None else None, capture_output=True,
+                           timeout=EXPLAIN_SECONDS, env=_tool_env(False))
+        return p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
+    code, _, err = psql(url, "-c", f'CREATE DATABASE "{name}"')
+    if code != 0:
+        call.stderr = err
+        return code, b""
+    files = export_files(call.work)
+    applied, failed, queries, version = [], [], [], ""
+    try:
+        for f in _schema_files(files):
+            code, _, err = psql(db_url, "-f", "-", sql=export_text(call.work, f))
+            (applied.append(f) if code == 0 else failed.append({"file": f, "error": _one_line(err)[:300]}))
+        for path, line, sql in sql_queries(call.work, files, call.rules):
+            entry = {"path": path, "line": line, "sql": sql[:500]}
+            code, out, err = psql(db_url, sql="SET enable_seqscan = off;\nEXPLAIN (FORMAT JSON, GENERIC_PLAN) "
+                                  + _numbered(sql, "postgres")[0] + ";\n")
+            try:
+                entry["plan"] = json.loads(out) if code == 0 else None
+            except ValueError:
+                entry["plan"] = None
+            if entry["plan"] is None:
+                entry.pop("plan")
+                entry["error"] = _one_line(err)[:300] or "no plan"
+            queries.append(entry)
+        code, version, _ = psql(db_url, "-c", "SHOW server_version")
+    finally:
+        psql(url, "-c", f'DROP DATABASE IF EXISTS "{name}"')
+    doc = {"engine": f"postgresql {version.strip()}", "applied": applied, "failed": failed, "queries": queries}
+    return 0, (json.dumps(doc, indent=1, sort_keys=True) + "\n").encode("utf-8"), \
+        ["psql", "{target}", "-c", "EXPLAIN (FORMAT JSON, GENERIC_PLAN) ...", "(on a throwaway database)"]
+
+
+tool_adapter("pg-explain", fmt="json", parse=parse_query_plan, domain="database", binary="psql", run=pg_explain,
+             lock_key="postgres", install="install the PostgreSQL client (psql) of the pinned major version (or mise "
+                                          "install postgres)",
+             fallback="read each query against the indexes the migrations create", step=224)
+
+
+def _budgets(read, paths):
+    """(file, [{name, command, max_ms, runs}]) of the commit's performance budgets, or (None, [])."""
+    f = next((p for p in sorted(paths) if BUDGET_FILE.search(p.lower())), None)
+    if not f:
+        return None, []
+    try:
+        doc = json.loads(read(f))
+    except ValueError:
+        return f, []
+    items = doc.get("budgets") if isinstance(doc, dict) and "budgets" in doc else \
+        [dict(v, name=k) for k, v in sorted(doc.items()) if isinstance(v, dict)] if isinstance(doc, dict) else doc
+    return f, [b for b in items or [] if isinstance(b, dict) and b.get("command") and b.get("name")]
+
+
+def _hyperfine_argv(call):
+    """hyperfine's command: each budget's command, named, with the most runs any budget asks."""
+    needs(call, "hyperfine")
+    f, budgets = _budgets(lambda p: export_text(call.work, p), export_files(call.work))
+    if not budgets:
+        raise ToolSkip(f"{f} names no budget with a name and a command")
+    runs = max(int(b.get("runs") or 10) for b in budgets)
+    argv = ["hyperfine", "--runs", str(runs), "--warmup", "1", "--style", "none", "--export-json", str(call.out)]
+    for b in budgets:
+        argv += ["-n", str(b["name"]), str(b["command"])]
+    return argv
+
+
+def parse_hyperfine(data, call):
+    """hyperfine --export-json (1.x or 2.x): the mean and spread of each command as measured metrics; a lead for
+    each mean over its budget (read from the commit's budgets file)."""
+    doc = _json_of(data, "hyperfine JSON")
+    if not isinstance(doc, dict) or not isinstance(doc.get("results"), list):
+        raise WriteError("cannot read the output as hyperfine JSON: it has no results")
+    f, budgets = None, []
+    if call.repo_dir and call.commit:
+        try:
+            paths = _git_out(call.repo_dir, "ls-tree", "-r", "--name-only", "-z", call.commit).split("\0")
+            f, budgets = _budgets(lambda p: git(call.repo_dir, "show", f"{call.commit}:{p}").decode("utf-8"), paths)
+        except RuntimeError:
+            pass
+    limit = {str(b["name"]): b.get("max_ms") for b in budgets}
+    leads, metrics = [], []
+    for r in doc["results"]:
+        name = str(r.get("name") or r.get("command"))
+        wall = (r.get("summary") or {}).get("time_wall_clock") or r
+        mean, sd = float(wall.get("mean") or 0) * 1000, float(wall.get("stddev") or 0) * 1000
+        metrics += [("time_mean_ms", name, round(mean, 3), "ms", "measured"),
+                    ("time_stddev_ms", name, round(sd, 3), "ms", "measured")]
+        if isinstance(limit.get(name), (int, float)) and mean > limit[name]:
+            leads.append(_lead("hyperfine.over-budget", "warning", f, None, None,
+                               f"{name}: {mean:.1f} ms on average (spread {sd:.1f} ms) against a budget of "
+                               f"{limit[name]} ms"))
+    return {"leads": leads, "metrics": metrics, "version": None}
+
+
+tool_adapter("hyperfine", fmt="json", parse=parse_hyperfine, domain="performance", binary="hyperfine",
+             argv=_hyperfine_argv,
+             install="cargo install hyperfine@<pinned>, or the release binary from github.com/sharkdp/hyperfine (or "
+                     "mise install)",
+             fallback="time each budget's command a few times with `time` and give the spread; mark it 'measured "
+                      "by hand'", step=224)
+
+
+def _http_json(url):
+    """GET a JSON document from a local service, without any proxy."""
+    import urllib.request
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(req, timeout=FETCH_SECONDS) as r:
+        return json.loads(r.read(TOOL_OUTPUT_BYTES).decode("utf-8"))
+
+
+def mailpit_run(call):
+    """Every message Mailpit caught (its API at --target, default 127.0.0.1:8025): sender, recipients, subject, the
+    sizes and hashes of the text and HTML parts (no body is kept). JSON, in the order Mailpit received them."""
+    needs(call, "mailpit")
+    url = _target(call, "Mailpit's address", MAILPIT_URL).rstrip("/")
+    try:
+        info = _http_json(url + "/api/v1/info")
+        listing = _http_json(f"{url}/api/v1/messages?limit={MAILPIT_MESSAGES}")
+    except (OSError, ValueError) as e:
+        raise ToolSkip(f"no Mailpit answers at {url} ({_one_line(e)[:120]}): start it (mailpit) and point the "
+                       f"system's SMTP at 127.0.0.1:1025, then run the walkthroughs")
+    msgs = []
+    for m in sorted(listing.get("messages") or [], key=lambda m: (m.get("Created") or "", m.get("ID") or "")):
+        full = _http_json(f"{url}/api/v1/message/{m.get('ID')}")
+        text, html = full.get("Text") or "", full.get("HTML") or ""
+        addr = lambda xs: sorted(str((x or {}).get("Address") or "") for x in xs or [])
+        msgs.append({"from": str((full.get("From") or {}).get("Address") or ""), "to": addr(full.get("To")),
+                     "cc": addr(full.get("Cc")), "subject": str(full.get("Subject") or ""),
+                     "text_bytes": len(text.encode("utf-8")), "html_bytes": len(html.encode("utf-8")),
+                     "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest() if text else None,
+                     "attachments": len(full.get("Attachments") or [])})
+    doc = {"mailpit": str(info.get("Version") or ""), "total": int(listing.get("total") or len(msgs)),
+           "messages": msgs}
+    return 0, (json.dumps(doc, indent=1, sort_keys=True) + "\n").encode("utf-8"), \
+        ["(built in) mailpit", "{target}/api/v1/messages"]
+
+
+def parse_mailpit(data, call):
+    """mailpit's JSON: a lead for each message sent twice (same recipients, subject and text), each without a text
+    part or a subject, and each with no recipient; counts as metrics."""
+    doc = _json_of(data, "mailpit JSON")
+    if not isinstance(doc, dict) or not isinstance(doc.get("messages"), list):
+        raise WriteError("cannot read the output as mailpit JSON")
+    leads, seen = [], {}
+    for n, m in enumerate(doc["messages"], 1):
+        who = ", ".join(m.get("to") or []) or "nobody"
+        label = f"message {n} to {who} ('{m.get('subject')}')"
+        key = (tuple(m.get("to") or []), m.get("subject"), m.get("text_sha256"))
+        seen[key] = seen.get(key, 0) + 1
+        if seen[key] == 2:
+            leads.append(_lead("mailpit.duplicate", "warning", None, None, None, f"{label} was sent more than once"))
+        if not m.get("text_bytes"):
+            leads.append(_lead("mailpit.no-text-part", "warning", None, None, None,
+                               f"{label} has no plain-text part" + (" (HTML only)" if m.get("html_bytes") else "")))
+        if not (m.get("subject") or "").strip():
+            leads.append(_lead("mailpit.no-subject", "warning", None, None, None, f"{label} has no subject"))
+        if not m.get("to") and not m.get("cc"):
+            leads.append(_lead("mailpit.no-recipient", "error", None, None, None, f"{label} has no recipient"))
+    metrics = [("emails_caught", "all", len(doc["messages"]), None),
+               ("emails_duplicated", "all", sum(v - 1 for v in seen.values() if v > 1), None)]
+    return {"leads": leads, "metrics": metrics, "version": (doc.get("mailpit") or "").lstrip("v") or None}
+
+
+def _mailpit_version():
+    """locate() for Mailpit: the version of the binary on PATH, or None."""
+    exe = shutil.which("mailpit")
+    if not exe:
+        return None
+    return tool_version(ToolAdapter("mailpit", fmt="json", parse=None, binary="mailpit", version_args=("version",)))
+
+
+tool_adapter("mailpit", fmt="json", parse=parse_mailpit, domain="notifications", run=mailpit_run,
+             locate=_mailpit_version,
+             install="download the release binary from mailpit.axllent.org (or docker run axllent/mailpit, or mise "
+                     "install); tool-run reads it at --target whether or not it is on PATH",
+             fallback="read each sending path for duplicate sends, missing plain-text parts and recipients",
+             step=224)
+TOOL_ADAPTERS["mailpit"].service = True
+
+
+I18N_CONFIG = """// Written by ledger.py tool-run i18n-lint: the one rule, eslint-plugin-i18next's no-literal-string.
+import { createRequire } from "node:module";
+const require = createRequire(process.env.LEDGER_ESLINT_PLUGINS + "/");
+const i18next = require("eslint-plugin-i18next");
+export default [{
+  files: ["**/*.{js,jsx,mjs,cjs}"],
+  ignores: ["**/node_modules/**", "**/dist/**", "**/build/**"],
+  languageOptions: { ecmaVersion: "latest", sourceType: "module", parserOptions: { ecmaFeatures: { jsx: true } } },
+  plugins: { i18next },
+  rules: { "i18next/no-literal-string": ["warn", { mode: "jsx-only" }] },
+}];
+"""
+
+
+def _eslint_modules():
+    """The node_modules folder that holds the eslint on PATH (where its plugin is looked for), or None."""
+    exe = shutil.which("eslint")
+    if not exe:
+        return None
+    for d in Path(exe).resolve().parents:
+        if d.name == "node_modules":
+            return d
+    return None
+
+
+def _i18n_version():
+    """locate() for i18n-lint: eslint-plugin-i18next's version beside the eslint on PATH."""
+    mods = _eslint_modules()
+    if mods is None:
+        return None
+    return _npm_package_version(mods / "eslint-plugin-i18next" / "package.json", "eslint-plugin-i18next") or ""
+
+
+def _i18n_argv(call):
+    """ESLint's command with the one i18next rule, JSON to {out}."""
+    needs(call, "i18n-lint")
+    cfg = Path(call.out).parent / "eslint.config.mjs"
+    cfg.write_text(I18N_CONFIG, encoding="utf-8")
+    call.rules = cfg
+    call.placeholders[str(cfg)] = "{rules}"
+    return ["eslint", "--config", str(cfg), "--format", "json", "--output-file", str(call.out), "."]
+
+
+def parse_eslint(data, call):
+    """ESLint's JSON formatter: one lead per message (no-literal-string: text a user sees that is not translated)."""
+    doc = _json_of(data, "ESLint JSON")
+    if not isinstance(doc, list):
+        raise WriteError("cannot read the output as ESLint JSON: it is not a list of files")
+    leads = []
+    for f in doc:
+        path = _relative_lead_path((f or {}).get("filePath"), call)
+        for m in (f or {}).get("messages") or []:
+            rule = m.get("ruleId") or "parse-error"
+            leads.append(_lead(f"i18n-lint.{rule.split('/')[-1]}", "error" if m.get("severity") == 2 and
+                               rule == "parse-error" else "warning", path, m.get("line"), m.get("endLine"),
+                               m.get("message")))
+    return {"leads": leads, "metrics": [("untranslated_strings", "all",
+                                         sum(1 for l in leads if l["rule"] == "i18n-lint.no-literal-string"), None)],
+            "version": None}
+
+
+tool_adapter("i18n-lint", fmt="json", parse=parse_eslint, domain="localization", binary="eslint", argv=_i18n_argv,
+             ok_exits=(0, 1), locate=_i18n_version, lock_key="eslint-plugin-i18next",
+             env=lambda call: {"LEDGER_ESLINT_PLUGINS": str(_eslint_modules() or "")},
+             install="npm install -g eslint eslint-plugin-i18next@<pinned> (the plugin beside eslint)",
+             fallback="search the client code for text in markup that is not passed through the translation call",
+             step=224)
+
+
+def _pseudo(text):
+    """A pseudo-localized string: accented letters, placeholders kept, about PSEUDO_GROWTH longer, in brackets."""
+    parts = re.split(r"(\{\{?[^{}]*\}?\}|%\(?\w*\)?[sd]|<[^>]+>|\$\{[^}]*\})", text)
+    body = "".join(p if i % 2 else p.translate(PSEUDO_MAP) for i, p in enumerate(parts))
+    pad = max(1, round(len(text) * PSEUDO_GROWTH))
+    return f"[{body} {'~' * pad}]"
+
+
+def _flat(doc, prefix=""):
+    """{dotted key: string} of a nested locale object."""
+    out = {}
+    if isinstance(doc, dict):
+        for k in sorted(doc):
+            out.update(_flat(doc[k], f"{prefix}{k}."))
+    elif isinstance(doc, str):
+        out[prefix[:-1]] = doc
+    return out
+
+
+def _placeholders(text):
+    """The placeholders of a message ({name}, {{count}}, %s, ${x}), sorted."""
+    return sorted(re.findall(r"\{\{?\s*\w+\s*\}?\}|%\(?\w*\)?[sd]|\$\{\w+\}", text))
+
+
+def pseudo_locale(call):
+    """The built-in translation check: every locale file's keys against the source locale's (en, else the first
+    folder), placeholders compared, and a pseudo-localized copy of the source written for the UI pass
+    (<ledger folder>/reviews/<review>/pseudo-locale/). JSON, sorted."""
+    needs(call, "pseudo-locale")
+    files = [f for f in export_files(call.work) if LOCALE_FILE.search(f)]
+    locales = {}
+    for f in files:
+        try:
+            locales[f] = _flat(json.loads(export_text(call.work, f)))
+        except ValueError:
+            continue
+    if not locales:
+        raise ToolSkip("the locale files at the commit are not JSON objects")
+    english = re.compile(r"(^|/)en([-_][A-Za-z]+)?(/|\.json$)")
+    source = next((f for f in sorted(locales) if english.search(f)), sorted(locales)[0])
+    src = locales[source]
+    out_dir = Path(call.ledger_dir) / "reviews" / call.review["code"] / "pseudo-locale"
+    target = out_dir / source
+    target.parent.mkdir(parents=True, exist_ok=True)
+    pseudo = {}
+    for key, value in src.items():
+        node = pseudo
+        *head, last = key.split(".")
+        for h in head:
+            node = node.setdefault(h, {})
+        node[last] = _pseudo(value)
+    write_atomic(target, (json.dumps(pseudo, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8"),
+                 0o644)
+    problems = []
+    for f in sorted(locales):
+        if f == source:
+            continue
+        other = locales[f]
+        for key in sorted(set(src) - set(other)):
+            problems.append({"file": f, "key": key, "kind": "missing-key"})
+        for key in sorted(set(other) - set(src)):
+            problems.append({"file": f, "key": key, "kind": "extra-key"})
+        for key in sorted(set(src) & set(other)):
+            if _placeholders(src[key]) != _placeholders(other[key]):
+                problems.append({"file": f, "key": key, "kind": "placeholder-mismatch",
+                                 "source": _placeholders(src[key]), "here": _placeholders(other[key])})
+    try:
+        shown = target.relative_to(Path(call.root).resolve()).as_posix()
+    except ValueError:
+        shown = target.as_posix()
+    doc = {"source": source, "keys": len(src), "locales": sorted(locales), "pseudo": shown, "problems": problems}
+    return 0, (json.dumps(doc, indent=1, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def parse_pseudo_locale(data, call):
+    """pseudo-locale's JSON: a lead per key missing from a locale, extra in it, or whose placeholders differ."""
+    doc = _json_of(data, "pseudo-locale JSON")
+    if not isinstance(doc, dict) or not isinstance(doc.get("problems"), list):
+        raise WriteError("cannot read the output as pseudo-locale JSON")
+    words = {"missing-key": "is missing (the source {src} has it)", "extra-key": "is not in the source {src}",
+             "placeholder-mismatch": "has other placeholders than the source {src}"}
+    leads = [_lead(f"pseudo-locale.{p['kind']}", "warning" if p["kind"] != "extra-key" else "note", p["file"], None,
+                   None, f"{p['key']} " + words.get(p["kind"], p["kind"]).format(src=doc.get("source"))
+                   + (f": {p.get('source')} there, {p.get('here')} here" if p["kind"] == "placeholder-mismatch"
+                      else "")) for p in doc["problems"]]
+    return {"leads": leads, "metrics": [("translation_keys", "all", int(doc.get("keys") or 0), None),
+                                        ("locales", "all", len(doc.get("locales") or []), None),
+                                        ("translation_problems", "all", len(leads), None)], "version": None}
+
+
+tool_adapter("pseudo-locale", fmt="json", parse=parse_pseudo_locale, domain="localization", run=pseudo_locale,
+             fallback="compare the locale files' keys by hand; load a lengthened copy of the source strings to see "
+                      "what overflows", step=224)
+
+
 def _export_commit(repo_dir, sha, into):
     """Write the files of a commit into an empty folder with `git archive` (no symlink is followed out of it)."""
     p = subprocess.Popen(["git", "-C", str(repo_dir), "archive", "--format=tar", sha], stdout=subprocess.PIPE,
@@ -17993,8 +19892,9 @@ def _run_adapter(ad, call):
     """Run one adapter on its export; (exit code, output bytes, command text, duration in ms)."""
     started = time.monotonic()
     if ad.run:
-        code, data = ad.run(call)
-        return code, data, f"(built in) {ad.name}", int((time.monotonic() - started) * 1000)
+        res = ad.run(call)
+        command = _command_text(res[2], call) if len(res) > 2 else f"(built in) {ad.name}"
+        return res[0], res[1], command, int((time.monotonic() - started) * 1000)
     argv = ad.argv(call)
     exe = shutil.which(argv[0])
     p = subprocess.run([exe or argv[0], *argv[1:]], cwd=str(call.work or call.repo_dir), capture_output=True,
@@ -18084,12 +19984,15 @@ def record_tool_run(ctx, rv, repo, sha, tool, *, status, domain, fmt=None, data=
                 reason = reason if reason.startswith("carried from LD-") else f"carried from {before['code']}: {reason}"
                 ctx.x("""UPDATE tool_results SET dismissed_reason=?, disposed_by_actor_id=?, disposed_at=?,
                          carried_from_id=? WHERE id=?""", (reason, ctx.actor_id, now(), before["id"], rid))
-        for name, scope, value, unit in sorted(parsed.get("metrics") or [], key=lambda m: (m[0], m[1])):
+        for m in sorted(parsed.get("metrics") or [], key=lambda m: (m[0], m[1])):
+            name, scope, value, unit = m[:4]
+            method = m[4] if len(m) > 4 else "counted"   # 'measured' for timings (they are noisy)
             ctx.x("""INSERT INTO metrics(review_id, domain_code, repository_id, name, scope, value, unit, method, note)
-                     VALUES (?,?,?,?,?,?,?,'counted',?)
+                     VALUES (?,?,?,?,?,?,?,?,?)
                      ON CONFLICT(review_id, name, scope, repository_id) DO UPDATE SET value=excluded.value,
-                       unit=excluded.unit, note=excluded.note, domain_code=excluded.domain_code""",
-                  (rv["id"], domain, repo["id"] if repo else None, name, scope, float(value), unit,
+                       unit=excluded.unit, note=excluded.note, domain_code=excluded.domain_code,
+                       method=excluded.method""",
+                  (rv["id"], domain, repo["id"] if repo else None, name, scope, float(value), unit, method,
                    f"{tool} run {run_id}"))
     return run_id, codes, out_path
 
@@ -18138,7 +20041,7 @@ def cmd_tool_run(ctx):
         raise WriteError(f"{rv['code']} is abandoned")
     domain = _domain_or_none(con, a.domain or ad.domain, "--domain")
     repo, sha = _review_repo(con, rv, a.repo)
-    pinned = read_tools_lock().get(ad.name)
+    pinned = read_tools_lock().get(ad.lock_key)
     rules = Path(a.rules).resolve() if getattr(a, "rules", None) else None
     if rules is not None and not rules.is_file():
         raise WriteError(f"--rules {a.rules}: no such file")
@@ -18151,7 +20054,7 @@ def cmd_tool_run(ctx):
         except OSError as e:
             raise WriteError(f"--from {a.source}: {e.strerror or e}")
         call = ToolCall(repo_dir=repo_dir(ctx.root, repo["path"], bool(repo["allow_outside_root"])), commit=sha,
-                        rules=rules, ledger_dir=ledger_dir, a=a)
+                        rules=rules, ledger_dir=ledger_dir, a=a, root=ctx.root, con=con, review=rv)
         parsed = ad.parse(data, call)
         version = a.tool_version or parsed.get("version")
         base.update(status="imported", fmt=parsed.get("format") or ad.fmt, data=data, parsed=parsed,
@@ -18163,9 +20066,10 @@ def cmd_tool_run(ctx):
         return [f"tool run {run_id}: {ad.name} imported from {src.name}" + (f" ({version})" if version else "")
                 + f": {_lead_summary(codes)}"]
     if ad.argv is None and ad.run is None:
-        raise WriteError(f"{ad.name} is an import format: give --from FILE")
+        raise WriteError(f"{ad.name} is an import format: give --from FILE" + (f" ({ad.import_note})"
+                                                                             if ad.import_note else ""))
     version = None
-    if ad.binary:
+    if (ad.binary or ad.locate) and not ad.service:
         version = tool_version(ad)
         if version is None:
             run_id, _, _ = record_tool_run(ctx, rv, repo, sha, ad.name, **{**base, "status": "absent",
@@ -18184,7 +20088,7 @@ def cmd_tool_run(ctx):
             work.mkdir()
             _export_commit(d, sha, work)
         call = ToolCall(work=work, out=tmp / f"out.{FORMAT_SUFFIX.get(ad.fmt, 'out')}", repo_dir=d, commit=sha,
-                        rules=rules, online=a.online, ledger_dir=ledger_dir, a=a)
+                        rules=rules, online=a.online, ledger_dir=ledger_dir, a=a, root=ctx.root, con=con, review=rv)
         try:
             code, data, command, ms = _run_adapter(ad, call)
         except ToolSkip as e:
@@ -18213,7 +20117,8 @@ def cmd_tool_run(ctx):
 
 cmd_tool_run.cli = ("run a picked tool on the reviewed commit (or import what it wrote) and record its results as "
                     "leads", "ledger.py tool-run TOOL --review R-0001 [--domain D] [--repo NAME] [--from FILE] "
-                             "[--rules FILE] [--online] [--unpinned] [--note TEXT] [--actor A-0001]")
+                             "[--rules FILE] [--target URL] [--seed N] [--online] [--unpinned] [--note TEXT] "
+                             "[--actor A-0001]")
 WRITE_COMMANDS["tool-run"] = cmd_tool_run
 
 
@@ -18355,8 +20260,9 @@ def _add_review_tool_parsers(sub):
                        description="Load each page with Playwright and report texts below the required contrast, "
                                    "images, fields, buttons and links without a name, every colour, font size and "
                                    "spacing value in use, page weight and layout shift. Lighthouse scores are "
-                                   "added only when Lighthouse is already installed. Without Playwright it prints "
-                                   "the install line and exits 2.")
+                                   "added only when Lighthouse is already installed, axe-core's violations when "
+                                   "axe-core is (LEDGER_AXE, node_modules or npm's global folder; import them with "
+                                   "tool-run axe --from). Without Playwright it prints the install line and exits 2.")
     s.add_argument("targets", nargs="+", metavar="page")
     s.add_argument("--width", default="1280"); s.add_argument("--theme", default="light")
     s.add_argument("--base", default="http://127.0.0.1:8765", help="where viewer routes are served (serve)")

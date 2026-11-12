@@ -3,6 +3,14 @@
 The tool version is `metadata:` `version:` in SKILL.md's frontmatter; `ledger.py --version` prints it with the schema
 version.
 
+## 1.11.0 (schema 20)
+
+- Wired in: Vale (the writing-standard rules, now run and fixed), lychee, built-in `doc-references` and
+  `internal-names`; axe-core in `ui-audit`, Project Wallace, Impeccable, odiff against the last review's screenshots,
+  Stylelint with token rules; Schemathesis, a Hurl access matrix, oasdiff, Buf, GraphQL Inspector, Squawk, built-in
+  `query-plan`, `pg-explain`, hyperfine, Mailpit, i18n-lint and built-in `pseudo-locale`. `tool-run --target` and
+  `--seed`; `scan` lists the tools that apply.
+
 ## 1.10.0 (schema 20)
 
 - `tool-run` runs a picked tool on an export of the reviewed commit, or imports its output (SARIF, JUnit, LCOV,

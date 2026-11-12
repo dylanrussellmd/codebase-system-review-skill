@@ -1,0 +1,90 @@
+{
+  "total": 6,
+  "unique": 6,
+  "successful": 2,
+  "unknown": 0,
+  "unsupported": 0,
+  "timeouts": 0,
+  "redirects": 0,
+  "remaps": 0,
+  "excludes": 1,
+  "errors": 3,
+  "cached": 0,
+  "success_map": {},
+  "error_map": {
+    "./README.md": [
+      {
+        "url": "file:///project/README.md#cache",
+        "status": {
+          "text": "Cannot find fragment",
+          "details": "Cannot find fragment"
+        },
+        "span": {
+          "line": 4,
+          "column": 6
+        },
+        "duration": {
+          "secs": 0,
+          "nanos": 197020
+        }
+      },
+      {
+        "url": "file:///project/docs/setup.md",
+        "status": {
+          "text": "File not found. Check if file exists and path is correct",
+          "details": "File not found. Check if file exists and path is correct"
+        },
+        "span": {
+          "line": 3,
+          "column": 33
+        },
+        "duration": {
+          "secs": 0,
+          "nanos": 9939
+        }
+      },
+      {
+        "url": "file:///project/docs/guide.md#api",
+        "status": {
+          "text": "Cannot find fragment",
+          "details": "Cannot find fragment"
+        },
+        "span": {
+          "line": 3,
+          "column": 60
+        },
+        "duration": {
+          "secs": 0,
+          "nanos": 140421
+        }
+      }
+    ]
+  },
+  "timeout_map": {},
+  "suggestion_map": {},
+  "redirect_map": {},
+  "excluded_map": {
+    "./README.md": [
+      {
+        "url": "https://example.com/",
+        "status": {
+          "text": "Excluded",
+          "details": "This is due to your 'exclude' values"
+        },
+        "span": {
+          "line": 4,
+          "column": 38
+        },
+        "duration": {
+          "secs": 0,
+          "nanos": 187
+        }
+      }
+    ]
+  },
+  "duration": {
+    "secs": 0,
+    "nanos": 2355957
+  },
+  "detailed_stats": false
+}
