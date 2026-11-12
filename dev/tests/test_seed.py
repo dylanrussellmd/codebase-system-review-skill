@@ -45,7 +45,7 @@ class SeedDemo(unittest.TestCase):
         L, ids = self.L, self.ids
         c1, c2 = ids["commits"]
         self.assertEqual(L.repo.commits, [c1, c2])
-        # dependency order: the backward dependency was refused and left nothing behind
+        # dependency order: the dependency that closed a cycle was refused and left nothing behind
         self.assertEqual(L.all("SELECT step_id, depends_on_step_id FROM step_dependencies ORDER BY 1"),
                          [{"step_id": ids["steps"][2], "depends_on_step_id": ids["steps"][1]},
                           {"step_id": ids["steps"][3], "depends_on_step_id": ids["steps"][1]}])
@@ -144,7 +144,7 @@ class SeedDemoEndToEnd(unittest.TestCase):
         self.assertEqual(sorted(x.name for x in target.iterdir()), ["keep.txt"])
 
     def test_seed_demo_exits_nonzero_on_failed_expectation(self):
-        # A ledger.py whose schema lost the step-order rule: the demo's "backward dependency is refused"
+        # A ledger.py whose schema lost the step-order rule: the demo's "a dependency cycle is refused"
         # expectation fails, and the CLI must say so and exit 1 (it used to print FAIL and exit 0).
         mod = fixtures.load_ledger_module()
         text = fixtures.built_ledger_path().read_text(encoding="utf-8")
@@ -159,7 +159,7 @@ class SeedDemoEndToEnd(unittest.TestCase):
         p = run_cli(fixtures.temp_dir("cli-") / "demo", "--ledger", bad)
         self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
         self.assertIn("FAIL", p.stderr)
-        self.assertIn("later step", p.stderr)
+        self.assertIn("dependency cycle", p.stderr)
         self.assertNotIn("Traceback", p.stderr)
 
     def test_seed_demo_has_no_personal_name(self):

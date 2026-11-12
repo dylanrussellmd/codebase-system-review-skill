@@ -366,15 +366,13 @@ class FindingPlanAndEventTables(SchemaCase):
         s1, s2 = self.step(1), self.step(2)
         self.run_cases(
             "step_dependencies", lambda n: {"step_id": s2, "depends_on_step_id": s1},
-            bad=[("on a later step", {"step_id": s1, "depends_on_step_id": s2},
-                  "a step may only depend on an earlier step of the same plan"),
-                 # characterization: the self-dependency is refused by tr_dep_order before the table's own
+            bad=[# characterization: the self-dependency is refused by tr_dep_order before the table's own
                  # CHECK (step_id <> depends_on_step_id) is reached, so the CHECK's message is never seen.
                  ("on itself", {"depends_on_step_id": s2},
-                  "a step may only depend on an earlier step of the same plan"),
+                  "a step may only depend on another step of the same plan"),
                  ("on a step of another plan",
                   lambda t: {"depends_on_step_id": t.other_plan_step()},
-                  "a step may only depend on an earlier step of the same plan")],
+                  "a step may only depend on another step of the same plan")],
             dup=[("same pair", {}, uq("step_dependencies.step_id", "step_dependencies.depends_on_step_id"))])
 
     def test_constraints_step_findings(self):

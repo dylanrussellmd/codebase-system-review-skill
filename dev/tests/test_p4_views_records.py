@@ -84,7 +84,7 @@ class Catalogs(unittest.TestCase):
         applies = skill_applies()
         with Ledger(temp_dir("p4v-")) as L:
             domains = L.all("SELECT code, report_file, description FROM domains")
-        self.assertEqual(len(domains), 27)
+        self.assertEqual(len(domains), 28)
         for d in domains:
             with self.subTest(domain=d["code"]):
                 self.assertTrue(d["description"] and d["description"].strip())

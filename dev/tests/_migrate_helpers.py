@@ -32,6 +32,10 @@ REVIEWED_COMMIT = "ea00196"
 
 SOURCES = ("dev/core.py", "dev/build.py", "dev/page.html", "references/schema.sql", "SKILL.md")
 
+# Rows later migrations seed into tables a v1 ledger already has: 0019 adds the features domain.
+SEEDED_LATER = {"domains": 1}
+
+
 def shipped_version():
     """The highest migration number in references/migrations (the shipped schema version)."""
     return max(int(f.name[:4]) for f in (fixtures.REPO_ROOT / "references" / "migrations").glob("[0-9][0-9][0-9][0-9]-*.sql"))
@@ -99,8 +103,8 @@ def copy_sources(root=None):
 def set_version(root, version):
     p = root / "SKILL.md"
     text = p.read_text(encoding="utf-8")
-    new, n = re.subn(r"(?m)^version: .*$", f"version: {version}", text, count=1)
-    assert n == 1, "SKILL.md has no version: line"
+    new, n = re.subn(r"(?m)^  version: .*$", f"  version: {version}", text, count=1)
+    assert n == 1, "SKILL.md has no '  version:' line under metadata:"
     p.write_text(new, encoding="utf-8")
 
 

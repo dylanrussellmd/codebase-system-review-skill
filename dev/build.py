@@ -1,5 +1,5 @@
 """Build scripts/ledger.py from dev/core.py, dev/page.html, references/schema.sql, references/migrations/ and the
-version in SKILL.md's frontmatter.
+version in SKILL.md's frontmatter (metadata.version).
 
     python3 dev/build.py           write scripts/ledger.py (through a temporary file, then a rename)
     python3 dev/build.py --check   exit 1, with a short diff, if scripts/ledger.py differs from a fresh build
@@ -15,7 +15,7 @@ The migrations payload is every references/migrations/NNNN-<slug>.sql in order, 
 refuses unless references/schema.sql agrees: its header line says that version, its meta seed sets schema_version to
 it, and its schema_migrations seed holds exactly one (version, description) row per migration file.
 
-The stamps: TOOL_VERSION ("@@TOOL_VERSION@@" in core.py) becomes `version:` from SKILL.md's frontmatter (semver), and
+The stamps: TOOL_VERSION ("@@TOOL_VERSION@@" in core.py) becomes SKILL.md's frontmatter metadata.version (semver), and
 TOOL_HASH ("@@TOOL_HASH@@") becomes the sha256 of the built text in which TOOL_HASH's value is still the placeholder.
 """
 import argparse
@@ -51,14 +51,16 @@ def _read(root, rel):
 
 
 def skill_version(root):
-    """`version:` from SKILL.md's frontmatter (the one source of the tool version)."""
+    """`version:` under `metadata:` in SKILL.md's frontmatter (the one source of the tool version)."""
     text = _read(root, SKILL)
     parts = text.split("---\n", 2)
-    m = re.search(r"(?m)^version:[ \t]*(\S*)[ \t]*$", parts[1]) if text.startswith("---\n") and len(parts) == 3 else None
+    front = parts[1] if text.startswith("---\n") and len(parts) == 3 else ""
+    meta = re.search(r"(?m)^metadata:[ \t]*\n((?:[ \t]+.*(?:\n|$))*)", front)
+    m = re.search(r"(?m)^[ \t]+version:[ \t]*(\S*)[ \t]*$", meta.group(1)) if meta else None
     if not m:
-        raise BuildError(f"{SKILL} needs a 'version: X.Y.Z' line in its frontmatter")
+        raise BuildError(f"{SKILL} needs 'metadata:' with an indented 'version: X.Y.Z' under it in its frontmatter")
     if not SEMVER.match(m.group(1)):
-        raise BuildError(f"{SKILL} frontmatter version {m.group(1)!r} is not a semantic version (X.Y.Z)")
+        raise BuildError(f"{SKILL} frontmatter metadata version {m.group(1)!r} is not a semantic version (X.Y.Z)")
     return m.group(1)
 
 

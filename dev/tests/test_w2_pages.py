@@ -235,7 +235,7 @@ class Plan(Case):
         d = self.ok("/api/plan/P-0001")
         self.assertEqual(set(d), {"plan", "reviews", "artifacts", "last_updated", "gates", "discoveries", "events", "phases", "phase_rows", "steps", "unguarded"})
         row = {"number", "section", "title", "status", "owner_need", "behavior_change", "phase", "depends",
-               "closes", "search"}
+               "position", "closes", "search"}
         full = {"change", "proof", "owner_question", "behavior_note", "progress_note", "no_findings_reason",
                 "started_at", "done_at", "commits"}
         by = {s["number"]: s for s in d["steps"]}

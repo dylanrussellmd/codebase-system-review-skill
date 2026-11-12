@@ -27,13 +27,15 @@ phase the plan already has without a phase line.
 | section | no | a heading inside the phase |
 | owner_need | no | none (default), decision, confirm, review, production; anything but none needs owner_question |
 | behavior_change, behavior_note | no | true when the step changes behaviour on purpose, and what changes |
-| depends | no | keys of earlier steps (this file or already loaded), or numbers of steps already in the plan |
+| depends | no | keys of the steps it waits for (this file or already loaded), or numbers of steps already in the plan; earlier or later, never a cycle |
 | closes | yes, unless no_findings_reason | point ids of the plan's reviews; `R-0001:SEC-H3` when the same id is in two reviews |
 | multi_reason | no | point id -> why it is closed by more than one step (required for each such point) |
 | no_findings_reason | no | why the step closes no point by design (the follow-up review that verifies the plan) |
+| features | no | picked feature proposals the step builds (`FP-0001`); a step that builds one needs no closes |
 | touches | no | what the step changes beyond its points' locations: a list of `{"kind", "target", "direction"}`; kind file, symbol, table, column, setting, route or behaviour; direction adds, removes, tightens, loosens, renames or changes (the default) |
 
-Numbers: the new steps are numbered after the plan's last step, in (phase, order, line) order, so a dependency must
-point at a step that comes earlier in that order. The command then reports how many points of the plan's reviews no
+Numbers: the new steps are numbered after the plan's last step, in (phase, order, line) order. A step may wait for
+any step of the plan, a later-numbered one too; a set of dependencies that loops back is refused. `v_step_order` is
+the order to work in. The command then reports how many points of the plan's reviews no
 step closes (`v_uncovered_findings`) and the coverage problems (`v_coverage_problems`); both must reach zero before
 the plan is shown to the owner.

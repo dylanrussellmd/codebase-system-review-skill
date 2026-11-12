@@ -221,6 +221,9 @@ class Walkthrough(unittest.TestCase):
                                               "0", "--exit-code", "5", "--note", "no tests yet", "--actor", mgr))
         self.assertEqual(self.code("add-requirement", "An empty request is refused, never a crash.", "--source",
                                    "owner, chat 2026-11-11", "--review", r1, "--actor", mgr), "REQ-0001")
+        # The features domain (step 145) applies once there is a stated requirement: scan ran before it was recorded.
+        self.run_cmd("review-domain", r1, "features", "include", "--reason", "the owner states a requirement (REQ-0001)",
+                     "--actor", mgr)
         # --- Step 2b: the owner approves the domains (and answers where the ledger lives).
         self.approve_domains(r1, owner, mgr)
         self.run_cmd("answer-gate", where, "--value", "outside", "--text", "Keep it out of the repo", "--actor", mgr)
@@ -260,6 +263,11 @@ class Walkthrough(unittest.TestCase):
                    for text in ("Type scale: one family, three sizes.", "Palette: text, one accent, no gradient.",
                                 "Density: a form fits a phone screen without scrolling.")]
         self.run_cmd("approve-goals", *briefed, "--actor", owner)
+        # The question references/domains.md asks of every project with a features domain.
+        q = self.code("interview-ask", "--review", r1, "--domain", "features", "--why",
+                      "the catalog asks it of every project with a features domain",
+                      "Which capabilities do you already plan?", "--actor", mgr)
+        self.run_cmd("interview-answer", q, "None yet.", "--via", "chat", "--actor", mgr)
         self.assertIn("Palette: text, one accent, no gradient.", self.run_cmd("goals", "--domain", "ui"))
         self.assertIn("G-02  An empty request is refused.", self.run_cmd("goals", "--domain", "spec"))
         # --- Step 2d: the brief, generated from the ledger (step 139), recorded as an artifact.
@@ -273,7 +281,7 @@ class Walkthrough(unittest.TestCase):
         # --- Step 3: snapshot; each run's prompt generated (prompt), recorded with add-run; running. No subagent
         #     tool: the manager runs each scope itself, from the same prompt.
         self.assertIn("clean", self.run_cmd("snapshot", r1, "--actor", mgr))
-        for domain, label in (("spec", "spec-A"), ("tests", "tests-A")):
+        for domain, label in (("spec", "spec-A"), ("tests", "tests-A"), ("features", "features-A")):
             prompt = self.root / ".code-review" / "reviews" / r1 / f"prompt-{label}.txt"
             self.run_cmd("prompt", "--review", r1, "--domain", domain, "--scope", "everything", "--out", prompt)
             self.assertIn(f"goals --domain {domain}", prompt.read_text(encoding="utf-8"))
@@ -297,8 +305,27 @@ class Walkthrough(unittest.TestCase):
                                                 "--record", "--actor", mgr))
             self.assertIn("-> finished", self.run_cmd("finish-run", r1, label, "--report", report, "--items", "1",
                                                       "--high", high, "--actor", mgr))
+        # The features report proposes additions, not defects (step 145): a proposal with no done-test is sent back.
+        checks = [r[0] for r in self.query("SELECT code FROM domain_checks WHERE domain_code = 'features' ORDER BY position")]
+        idea = ["### FEAT-1 Keep a history of refused requests", "- Goal: REQ-0001",
+                "- Today: a refused request leaves no trace (`demo:src/app.py:5-7#handler`)",
+                "- Proposal: a log of refused requests the owner can read", "- Value: medium", "- Effort: small",
+                "- Risks: the log grows", "- Depends: none",
+                "- Done-test: test_refused_logged: an empty request adds one line to the log"]
+        body = ["# features: the demo", "", "## Scope and method", "", "The goals, REQ-0001 and src/app.py.", "",
+                "## Checklist", "", "| check | answer | evidence |", "|---|---|---|"]
+        body += [f"| {c} | yes | the goals table |" for c in checks]
+        body += ["", "## Goals", "", "| goal | what the code does toward it | evidence |", "|---|---|---|",
+                 "| REQ-0001 | handler refuses nothing yet | `demo:src/app.py:5-7` |", "", "## Proposals", ""]
+        draft = self.file(f"reviews/{r1}", "features.md", body + idea[:-1] + ["", "## Totals", "", "1 proposal."])
+        self.assertIn("no done-test", self.run_cmd("lint-report", draft, "--domain", "features", "--review", r1,
+                                                   expect=1))
+        report = self.file(f"reviews/{r1}", "features.md", body + idea + ["", "## Totals", "", "1 proposal."])
+        self.assertIn("1 proposal", self.run_cmd("lint-report", report, "--domain", "features", "--review", r1,
+                                                 "--record", "--actor", mgr))
+        self.run_cmd("finish-run", r1, "features-A", "--report", report, "--items", "1", "--actor", mgr)
         self.assertEqual(self.query("SELECT count(DISTINCT check_code) FROM checklist_answers")[0][0],
-                         len(self.query("SELECT code FROM domain_checks WHERE domain_code IN ('spec','tests')")))
+                         len(self.query("SELECT code FROM domain_checks WHERE domain_code IN ('spec','tests','features')")))
         self.code("add-actor", "verifier", "verifier 1", "--model", SUBMODEL, "--parent", mgr, "--review", r1,
                   "--role", "verifier for spec.md", "--actor", mgr)
         # --- Step 5: indexing; 5a indexers; 5c load-index per report, tag-review, fill-refs; 5d match; check.
@@ -343,6 +370,21 @@ class Walkthrough(unittest.TestCase):
         self.run_cmd("set-report", r1, self.file(f"reviews/{r1}", "review.md", ["# R-0001", "", "Three points."]))
         self.run_cmd("set-verdict", r1, "--verdict", "Usable once empty requests are refused.", "--summary",
                      "Two domains, three points.", "--actor", mgr)
+        # Step 6, the features domain: each proposal recorded, one non-blocking gate for the owner's pick; the
+        # owner picks FP-0001. No issue, finding or count of either moves.
+        self.assertEqual(self.code(
+            "propose-feature", "--review", r1, "--requirement", "REQ-0001", "--title", "Keep a history of refused "
+            "requests", "--today", "a refused request leaves no trace", "--evidence", "demo:src/app.py:5-7",
+            "--proposal", "a log of refused requests the owner can read", "--value", "medium", "--effort", "small",
+            "--done-test", "test_refused_logged: an empty request adds one line to the log", "--actor", mgr), "FP-0001")
+        pick = self.code("feature-gate", "--review", r1, "--actor", mgr)
+        self.run_cmd("progress-page")
+        self.assertIn(f"{pick}  [open] feature-pick", self.run_cmd("gates"))
+        self.run_cmd("answer-gate", pick, "--text", "FP-0001, yes", "--actor", mgr)
+        self.run_cmd("feature-status", "FP-0001", "pick", "--gate", pick, "--note", f"the owner picked it ({pick})",
+                     "--actor", mgr)
+        self.run_cmd("apply-gate", pick, "--note", "FP-0001 picked; it becomes a plan step", "--actor", mgr)
+        self.assertEqual(self.query("SELECT count(*) FROM issues"), [[3]])
         self.run_cmd("progress-page")
         # --- Step 7: check, dump, handed-off, the hub.
         self.run_cmd("check", "--quiet")
@@ -365,7 +407,9 @@ class Walkthrough(unittest.TestCase):
             {"key": "A-1", "phase": 1, "title": "Refuse empty requests", "change": "Check the input.",
              "proof": "test_empty_request: returns None", "closes": ["SPEC-H1", "TEST-T1"]},
             {"key": "A-2", "phase": 1, "title": "Parse quoted commas", "change": "Use csv.",
-             "proof": "test_parse_quoted: keeps quoted commas", "closes": ["SPEC-M1"], "depends": ["A-1"]})])
+             "proof": "test_parse_quoted: keeps quoted commas", "closes": ["SPEC-M1"], "depends": ["A-1"]},
+            {"key": "A-3", "phase": 1, "title": "Keep a history of refused requests", "change": "Log refusals.",
+             "proof": "test_refused_logged: one line per refusal", "features": ["FP-0001"], "depends": ["A-1"]})])
         out = self.run_cmd("import-steps", plan, steps, "--actor", mgr)
         self.assertIn("0 points of the plan's reviews closed by no step, 0 coverage problems", out)
         # --- Step 8c: check (v_uncovered_findings and v_coverage_problems empty); the deconfliction pass (step
@@ -432,7 +476,7 @@ class Walkthrough(unittest.TestCase):
         # --- Step 9, after each step: check, dump, progress-md, the hub, gates.
         self.run_cmd("check", "--quiet")
         self.run_cmd("dump")
-        self.assertIn("1 of 2 steps done", self.run_cmd("progress-md", plan))
+        self.assertIn("1 of 3 steps done", self.run_cmd("progress-md", plan))
         self.run_cmd("progress-page", plan)
         self.assertEqual(self.run_cmd("gates").strip(), "no open gates")
 
@@ -456,11 +500,17 @@ class Walkthrough(unittest.TestCase):
             self.run_cmd("issue-status", iss, "fixed", "--note", "step 2 done", "--after",
                          "parse uses csv.reader and has a docstring", "--step", "2", "--plan", plan,
                          "--commit", fix2, "--actor", fixer)
+        # Step 3 builds the picked proposal FP-0001; once its done-test passes the proposal is built.
+        self.run_cmd("step-status", "3", "doing", "--note", "logging refusals", "--plan", plan, "--actor", fixer)
+        self.run_cmd("step-status", "3", "done", "--note", "done", "--progress-note",
+                     "Refused requests are listed in the log.", "--plan", plan, "--actor", fixer)
+        self.run_cmd("feature-status", "FP-0001", "built", "--note", "test_refused_logged passes", "--actor", fixer)
+        self.assertEqual(self.query("SELECT status, step FROM v_feature_proposals"), [["built", "P-0001#3"]])
         self.run_cmd("plan-status", plan, "complete", "--note", "every step is done", "--actor", mgr)
         self.run_cmd("check", "--quiet")
         self.run_cmd("dump")
         md = self.run_cmd("progress-md", plan)
-        self.assertIn("Plan status: complete. 2 of 2 steps done", md)
+        self.assertIn("Plan status: complete. 3 of 3 steps done", md)
 
         # ===== R-0002: the second review checks the known issues =====
         # --- Step 1: init again (same copy: nothing to refresh), gates, check; read the history.

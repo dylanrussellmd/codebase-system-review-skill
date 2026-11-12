@@ -20,6 +20,7 @@ Reviews:      new-review, review-status, add-repo, add-actor, add-domain, review
 Points:       import-findings, import-checks, load-index, match, verify, report-finding, issue-status
 Owner:        open-gate, answer-gate, apply-gate, interview-ask, interview-answer, propose-goal, approve-goals,
               reject-goal, link-step-goals
+Ideas:        propose-feature, feature-gate, feature-status, features
 Plans:        new-plan, plan-status, plan-add-review, import-steps, step-status, add-commit, add-guard, confirm-guard,
               conflicts, resolve-conflict
 Review tools: env, scan, brief, prompt, ui-capture, ui-audit, lint-report, compare-runs
@@ -34,12 +35,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote
 
-TOOL_VERSION = "1.9.1"  # stamped by dev/build.py from `version:` in SKILL.md's frontmatter
-TOOL_HASH = "81443c7c27d0186441b6497fa3f4a340f79bdad98a1a1915ac170ea147ad9a9f"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
+TOOL_VERSION = "1.9.2"  # stamped by dev/build.py from `metadata: version:` in SKILL.md's frontmatter
+TOOL_HASH = "26113c9327be0eda7db7001f3ed70955eb4f6d41b87917762e694866a7a1c338"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
 # Placeholders: dev/build.py puts references/schema.sql, dev/page.html and references/migrations/*.sql in their
 # place when it writes scripts/ledger.py. dev/core.py itself is never run as the tool.
 SCHEMA = r"""-- =====================================================================
--- Code review ledger — schema version 16
+-- Code review ledger — schema version 19
 -- One SQLite file per project: <project root>/.code-review/ledger.sqlite
 -- Every connection must run:  PRAGMA foreign_keys = ON;
 -- Times are UTC ISO-8601 text with milliseconds (strftime('%Y-%m-%dT%H:%M:%fZ','now')); the tr_time_*
@@ -709,7 +710,7 @@ CREATE TABLE gates (
   status          TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','answered','applied','withdrawn'))
                     CHECK (status <> 'answered' OR answer_value IS NOT NULL OR answer_text IS NOT NULL)
                     CHECK (status <> 'applied' OR applied_note IS NOT NULL),
-  answer_value    TEXT,                     -- the option chosen
+  answer_value    TEXT,                     -- the option chosen; a multi-select gate's: a JSON list of them
   answer_text     TEXT,                     -- the owner's own words
   answered_by     TEXT,
   answered_via    TEXT CHECK (answered_via IS NULL OR answered_via IN ('chat','viewer','other')),
@@ -725,8 +726,11 @@ CREATE TABLE gates (
   created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   answered_by_actor_id INTEGER REFERENCES actors(id),  -- who answered (the viewer: the owner's actors row);
                                             -- answered_by keeps the text for older rows
-  change_actor_id INTEGER REFERENCES actors(id)        -- who made the next status change (applied, withdrawn);
+  change_actor_id INTEGER REFERENCES actors(id),       -- who made the next status change (applied, withdrawn);
                                             -- copied into its event, then cleared
+  multi INTEGER NOT NULL DEFAULT 0 CHECK (multi IN (0,1)),   -- takes any number of its options (schema 18)
+  preselect TEXT CHECK (preselect IS NULL OR (json_valid(preselect) AND json_type(preselect) = 'array'))
+                                            -- the option values a multi-select gate shows ticked first
 );
 
 -- ---------- The owner interview (schema 9, plan step 129) --------------
@@ -857,8 +861,9 @@ CREATE TABLE steps (
   UNIQUE (plan_id, number)
 );
 
--- The earlier steps each step has to wait for.
--- A step depends only on earlier steps of its own plan (tr_dep_order).
+-- The steps each step has to wait for.
+-- Any other step of its own plan, earlier or later, as long as no cycle forms (tr_dep_order); v_step_order is the
+-- order to work in.
 CREATE TABLE step_dependencies (
   step_id            INTEGER NOT NULL REFERENCES steps(id) ON DELETE CASCADE,
   depends_on_step_id INTEGER NOT NULL REFERENCES steps(id),
@@ -954,6 +959,60 @@ CREATE TABLE guard_tests (
   last_confirmed_review_id INTEGER REFERENCES reviews(id),
   created_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   UNIQUE (issue_id, test_path, test_name)
+);
+
+-- ---------- Feature proposals (schema 19, plan step 145) ---------------
+-- What the features domain proposes the codebase could add to meet the owner's goals. A proposal is not a defect: no
+-- severity, no issue, never counted in open issues, defect totals, regressions, coverage or the must-be-empty
+-- checks. The owner picks or declines each (`feature-status`, or the review's one non-blocking feature-pick gate);
+-- a picked one is built by a plan step (step_id), and a declined one is not proposed again for the same goal or
+-- requirement (tr_feature_not_again). A goal changes by being replaced (a new code), so a replaced goal takes the
+-- idea again.
+
+-- One addition the codebase could make to serve a goal.
+-- It names the goal or requirement it serves, what the code does toward it today and the evidence
+-- (path:line, or 'absent'), the addition, its value and effort, risks, what it needs first, and the test that shows
+-- it is built. decided_by_actor_id and decided_at are the last status change; feature_status_changes keeps them all.
+CREATE TABLE feature_proposals (
+  id                   INTEGER PRIMARY KEY,
+  code                 TEXT NOT NULL UNIQUE      -- FP-0001
+                         CHECK (code GLOB 'FP-[0-9][0-9][0-9][0-9]*' AND code NOT GLOB 'FP-*[^0-9]*'),
+  review_id            INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
+  goal_id              INTEGER REFERENCES design_goals(id),     -- the approved goal it serves, or
+  requirement_id       INTEGER REFERENCES requirements(id),     -- the active requirement it serves
+  title                TEXT NOT NULL CHECK (length(trim(title)) > 0),
+  today                TEXT NOT NULL CHECK (length(trim(today)) > 0),      -- what the code does toward it now
+  evidence             TEXT NOT NULL CHECK (length(trim(evidence)) > 0),   -- path:line, or 'absent'
+  proposal             TEXT NOT NULL CHECK (length(trim(proposal)) > 0),   -- the addition
+  value                TEXT NOT NULL CHECK (value IN ('high','medium','low')),     -- how far it advances the goal
+  effort               TEXT NOT NULL CHECK (effort IN ('small','medium','large')),
+  risks                TEXT,
+  depends              TEXT,                     -- what it needs first
+  done_test            TEXT NOT NULL CHECK (length(trim(done_test)) > 0),  -- the test that shows it is built
+  status               TEXT NOT NULL DEFAULT 'proposed' CHECK (status IN ('proposed','picked','declined','built')),
+  status_note          TEXT,                     -- why it was picked, declined or called built
+  decided_by_actor_id  INTEGER REFERENCES actors(id),   -- who made the last status change
+  decided_at           TEXT,
+  gate_id              INTEGER REFERENCES gates(id),    -- the feature-pick gate the owner answered
+  step_id              INTEGER REFERENCES steps(id),    -- the plan step that builds it
+  proposed_by_actor_id INTEGER REFERENCES actors(id),
+  created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  CHECK ((goal_id IS NULL) <> (requirement_id IS NULL)),
+  CHECK (status = 'proposed' OR (decided_by_actor_id IS NOT NULL AND decided_at IS NOT NULL
+                                 AND length(trim(COALESCE(status_note, ''))) > 0)),
+  CHECK (step_id IS NULL OR status IN ('picked','built'))
+);
+
+-- Each status a feature proposal has had, with who set it, when and why.
+-- Written by the feature triggers, never by hand.
+CREATE TABLE feature_status_changes (
+  id          INTEGER PRIMARY KEY,
+  proposal_id INTEGER NOT NULL REFERENCES feature_proposals(id) ON DELETE RESTRICT,
+  from_status TEXT,                      -- NULL when it was proposed
+  to_status   TEXT NOT NULL,
+  note        TEXT,
+  actor_id    INTEGER REFERENCES actors(id),
+  at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
 -- ---------- Measurements over time ------------------------------------
@@ -1055,11 +1114,12 @@ CREATE TABLE artifacts (
 -- Not logged: finding_locations, finding_goals, finding_requirements, review_requirement_checks, test_runs,
 -- artifacts, step_commits, guard_tests, decision_issues, plan_reviews, phases, review_repositories, review_goals,
 -- review_domains, review_environment, review_actors, actors, repositories, domains, domain_rules,
--- domain_checks, checklist_answers, step_touches, step_conflicts, themes,
--- requirements, metric_defs,
+-- domain_checks, checklist_answers, step_touches, step_conflicts, themes, feature_proposals,
+-- feature_status_changes, requirements, metric_defs,
 -- meta, schema_migrations, ledger_checks, issue_statuses, severities, match_types, relation_types, gate_kinds,
 -- goal_statuses, enum_labels.
--- Why not: finding_locations, finding_goals and finding_requirements belong to their finding (logged when it is
+-- Why not: feature_proposals keep their own history in feature_status_changes; finding_locations, finding_goals and
+-- finding_requirements belong to their finding (logged when it is
 -- created) and cannot change but for fill-refs; review_requirement_checks, test_runs and artifacts are themselves
 -- timestamped records written once; step_commits, guard_tests, decision_issues, plan_reviews and phases are plan
 -- and evidence links whose rows are their own record; the rest are setup and configuration (who, which
@@ -1208,6 +1268,16 @@ CREATE INDEX ix_fk_issue_relations_relation          ON issue_relations(relation
 CREATE INDEX ix_fk_findings_severity                 ON findings(severity);
 CREATE INDEX ix_fk_findings_match_type               ON findings(match_type);
 CREATE INDEX ix_fk_gates_kind                        ON gates(kind);
+CREATE INDEX ix_fk_feature_proposals_review_id            ON feature_proposals(review_id);
+CREATE INDEX ix_fk_feature_proposals_goal_id              ON feature_proposals(goal_id);
+CREATE INDEX ix_fk_feature_proposals_requirement_id       ON feature_proposals(requirement_id);
+CREATE INDEX ix_fk_feature_proposals_decided_by_actor_id  ON feature_proposals(decided_by_actor_id);
+CREATE INDEX ix_fk_feature_proposals_gate_id              ON feature_proposals(gate_id);
+CREATE INDEX ix_fk_feature_proposals_step_id              ON feature_proposals(step_id);
+CREATE INDEX ix_fk_feature_proposals_proposed_by_actor_id ON feature_proposals(proposed_by_actor_id);
+CREATE INDEX ix_fk_feature_status_changes_proposal_id ON feature_status_changes(proposal_id);
+CREATE INDEX ix_fk_feature_status_changes_actor_id    ON feature_status_changes(actor_id);
+CREATE UNIQUE INDEX ux_gates_one_feature_pick ON gates(review_id) WHERE kind = 'feature-pick' AND status <> 'withdrawn';
 
 -- ---------- Triggers ----------------------------------------------------
 -- (schema 3, plan steps 54-83) History is append-only, every tracked change writes an event, status and
@@ -2013,10 +2083,12 @@ CREATE TRIGGER tr_goal_no_delete BEFORE DELETE ON design_goals BEGIN
   SELECT RAISE(ABORT, 'history is append-only: design goals cannot be deleted; retire it instead');
 END;
 
--- The owner's answer to a goal-approval gate: 'approve' approves every goal still proposed on it, by whoever answered
--- (the viewer and import-answers: the owner). Any other answer leaves them proposed for the manager to reword.
+-- The owner's answer to a goal-approval gate: 'approve' (alone, or among the choices of a multi-select gate)
+-- approves every goal still proposed on it, by whoever answered (the viewer and import-answers: the owner). Any other answer leaves them proposed for the manager to reword.
 CREATE TRIGGER tr_gate_approves_goals AFTER UPDATE OF status ON gates
-WHEN OLD.status = 'open' AND NEW.status = 'answered' AND NEW.answer_value = 'approve' BEGIN
+WHEN OLD.status = 'open' AND NEW.status = 'answered'
+ AND (NEW.answer_value = 'approve' OR (NEW.multi = 1 AND json_valid(NEW.answer_value) AND EXISTS (
+        SELECT 1 FROM json_each(NEW.answer_value) WHERE value = 'approve'))) BEGIN
   UPDATE design_goals SET status = 'approved',
     approved_by_actor_id = COALESCE(NEW.answered_by_actor_id, (SELECT min(id) FROM actors WHERE kind = 'owner')),
     approved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
@@ -2237,21 +2309,51 @@ WHEN NEW.options IS NOT NULL AND json_valid(NEW.options) AND json_type(NEW.optio
 END;
 
 -- The answer rules of answer_gate() (the viewer, answer-gate, import-answers), for answers written as SQL:
--- answer_value is one of the option values; a gate without free text needs an option chosen and takes no note;
--- a note is at most 10,000 characters.
+-- answer_value is one of the option values, or on a multi-select gate a JSON list of them ('[]': none); a gate
+-- without free text needs an option chosen and takes no note; a note is at most 10,000 characters.
 CREATE TRIGGER tr_gate_answer_rules BEFORE UPDATE OF status, answer_value, answer_text ON gates
 WHEN NEW.status = 'answered' AND (OLD.status IS NOT 'answered' OR OLD.answer_value IS NOT NEW.answer_value
                                   OR OLD.answer_text IS NOT NEW.answer_text) BEGIN
   SELECT RAISE(ABORT, 'answer_value must be one of the gate''s option values')
-  WHERE NEW.answer_value IS NOT NULL
+  WHERE NEW.multi = 0 AND NEW.answer_value IS NOT NULL
     AND NOT EXISTS (SELECT 1 FROM json_each(COALESCE(NEW.options, '[]')) j
                     WHERE json_extract(j.value, '$.value') = NEW.answer_value);
+  SELECT RAISE(ABORT, 'a multi-select answer is a JSON list of the gate''s option values')
+  WHERE NEW.multi = 1 AND NEW.answer_value IS NOT NULL
+    AND (CASE WHEN json_valid(NEW.answer_value) THEN json_type(NEW.answer_value) IS NOT 'array' ELSE 1 END
+         OR EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(NEW.answer_value) AND json_type(NEW.answer_value) = 'array'
+                                                 THEN NEW.answer_value ELSE '[]' END) a
+                    WHERE a.type <> 'text' OR NOT EXISTS (
+                      SELECT 1 FROM json_each(COALESCE(NEW.options, '[]')) j
+                      WHERE json_extract(j.value, '$.value') = a.value)));
   SELECT RAISE(ABORT, 'this gate takes no free text: choose one of the options')
   WHERE NEW.allow_text = 0 AND NEW.answer_value IS NULL;
   SELECT RAISE(ABORT, 'this gate takes no free text: answer with the option alone')
   WHERE NEW.allow_text = 0 AND NEW.answer_text IS NOT NULL;
   SELECT RAISE(ABORT, 'answer_text is too long (over 10,000 characters)')
   WHERE length(NEW.answer_text) > 10000;
+END;
+
+-- A multi-select gate has options, and its preselected values are among them; only a multi-select gate preselects.
+CREATE TRIGGER tr_gate_multi_shape BEFORE INSERT ON gates
+WHEN NEW.multi = 1 OR NEW.preselect IS NOT NULL BEGIN
+  SELECT RAISE(ABORT, 'a multi-select gate needs options')
+  WHERE NEW.multi = 1 AND (NEW.options IS NULL OR json_array_length(NEW.options) = 0);
+  SELECT RAISE(ABORT, 'preselect goes with a multi-select gate, and names only its option values')
+  WHERE NEW.preselect IS NOT NULL AND (NEW.multi = 0 OR EXISTS (
+    SELECT 1 FROM json_each(NEW.preselect) p WHERE p.type <> 'text' OR NOT EXISTS (
+      SELECT 1 FROM json_each(COALESCE(NEW.options, '[]')) j WHERE json_extract(j.value, '$.value') = p.value)));
+END;
+
+-- The same when the options, the shape or the preselection change.
+CREATE TRIGGER tr_gate_multi_shape_upd BEFORE UPDATE OF multi, preselect, options ON gates
+WHEN NEW.multi = 1 OR NEW.preselect IS NOT NULL BEGIN
+  SELECT RAISE(ABORT, 'a multi-select gate needs options')
+  WHERE NEW.multi = 1 AND (NEW.options IS NULL OR json_array_length(NEW.options) = 0);
+  SELECT RAISE(ABORT, 'preselect goes with a multi-select gate, and names only its option values')
+  WHERE NEW.preselect IS NOT NULL AND (NEW.multi = 0 OR EXISTS (
+    SELECT 1 FROM json_each(NEW.preselect) p WHERE p.type <> 'text' OR NOT EXISTS (
+      SELECT 1 FROM json_each(COALESCE(NEW.options, '[]')) j WHERE json_extract(j.value, '$.value') = p.value)));
 END;
 
 -- A gate moves open -> answered -> applied (or withdrawn); it cannot be applied before it is answered. Any
@@ -2278,7 +2380,9 @@ WHEN OLD.status IS NOT NEW.status BEGIN
                ELSE NEW.change_actor_id END,
           NEW.review_id, NEW.step_id,
           CASE WHEN NEW.status = 'applied' THEN NEW.applied_note
-               ELSE COALESCE(NEW.answer_value || ': ', '') || COALESCE(NEW.answer_text, '') END);
+               ELSE COALESCE(CASE WHEN NEW.multi = 1 AND json_valid(NEW.answer_value)
+                                   THEN (SELECT COALESCE(group_concat(value, ', '), 'none') FROM json_each(NEW.answer_value))
+                                   ELSE NEW.answer_value END || ': ', '') || COALESCE(NEW.answer_text, '') END);
   UPDATE gates SET
     answered_at = CASE WHEN NEW.status = 'answered' AND answered_at IS NULL
                        THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE answered_at END,
@@ -2419,20 +2523,34 @@ END;
 
 -- ----- Plan structure: phases, steps, dependencies, coverage links
 
--- Plan rules enforced by the database, on INSERT and on UPDATE.
+-- Plan rules enforced by the database, on INSERT and on UPDATE: a step depends on another step of its own plan,
+-- of any number, and no chain of dependencies leads back to the step.
 CREATE TRIGGER tr_dep_order BEFORE INSERT ON step_dependencies BEGIN
-  SELECT RAISE(ABORT, 'a step may only depend on an earlier step of the same plan')
-  WHERE NOT EXISTS (
+  SELECT RAISE(ABORT, 'a step may only depend on another step of the same plan')
+  WHERE NEW.step_id = NEW.depends_on_step_id OR NOT EXISTS (
     SELECT 1 FROM steps a JOIN steps b ON a.plan_id = b.plan_id
-    WHERE a.id = NEW.step_id AND b.id = NEW.depends_on_step_id AND b.number < a.number);
+    WHERE a.id = NEW.step_id AND b.id = NEW.depends_on_step_id);
+  SELECT RAISE(ABORT, 'that dependency would make a cycle: the step it depends on already waits for it')
+  WHERE EXISTS (
+    WITH RECURSIVE up(id) AS (
+      SELECT NEW.depends_on_step_id
+      UNION SELECT d.depends_on_step_id FROM step_dependencies d JOIN up ON d.step_id = up.id)
+    SELECT 1 FROM up WHERE up.id = NEW.step_id);
 END;
 
 -- The same when a dependency is edited.
 CREATE TRIGGER tr_dep_order_upd BEFORE UPDATE ON step_dependencies BEGIN
-  SELECT RAISE(ABORT, 'a step may only depend on an earlier step of the same plan')
-  WHERE NOT EXISTS (
+  SELECT RAISE(ABORT, 'a step may only depend on another step of the same plan')
+  WHERE NEW.step_id = NEW.depends_on_step_id OR NOT EXISTS (
     SELECT 1 FROM steps a JOIN steps b ON a.plan_id = b.plan_id
-    WHERE a.id = NEW.step_id AND b.id = NEW.depends_on_step_id AND b.number < a.number);
+    WHERE a.id = NEW.step_id AND b.id = NEW.depends_on_step_id);
+  SELECT RAISE(ABORT, 'that dependency would make a cycle: the step it depends on already waits for it')
+  WHERE EXISTS (
+    WITH RECURSIVE up(id) AS (
+      SELECT NEW.depends_on_step_id
+      UNION SELECT d.depends_on_step_id FROM step_dependencies d JOIN up ON d.step_id = up.id
+            WHERE NOT (d.step_id = OLD.step_id AND d.depends_on_step_id = OLD.depends_on_step_id))
+    SELECT 1 FROM up WHERE up.id = NEW.step_id);
 END;
 
 -- Logs 'dependency-added' on the step, with the number of the step it depends on.
@@ -2463,15 +2581,14 @@ WHEN OLD.plan_id IS NOT NEW.plan_id BEGIN
   WHERE EXISTS (SELECT 1 FROM steps WHERE phase_id = NEW.id AND plan_id IS NOT NEW.plan_id);
 END;
 
--- Renumbering or moving a step keeps every dependency of it and on it pointing at an earlier step of the same
--- plan (renumber before loading dependencies, or renumber in an order that keeps them valid).
-CREATE TRIGGER tr_step_renumber BEFORE UPDATE OF number, plan_id ON steps
-WHEN OLD.number IS NOT NEW.number OR OLD.plan_id IS NOT NEW.plan_id BEGIN
-  SELECT RAISE(ABORT, 'a step may only depend on an earlier step of the same plan')
+-- Moving a step to another plan keeps every dependency of it and on it inside one plan; renumbering is free.
+CREATE TRIGGER tr_step_renumber BEFORE UPDATE OF plan_id ON steps
+WHEN OLD.plan_id IS NOT NEW.plan_id BEGIN
+  SELECT RAISE(ABORT, 'a step may only depend on another step of the same plan')
   WHERE EXISTS (SELECT 1 FROM step_dependencies d JOIN steps b ON b.id = d.depends_on_step_id
-                WHERE d.step_id = NEW.id AND (b.plan_id IS NOT NEW.plan_id OR b.number >= NEW.number))
+                WHERE d.step_id = NEW.id AND b.plan_id IS NOT NEW.plan_id)
      OR EXISTS (SELECT 1 FROM step_dependencies d JOIN steps a ON a.id = d.step_id
-                WHERE d.depends_on_step_id = NEW.id AND (a.plan_id IS NOT NEW.plan_id OR a.number <= NEW.number));
+                WHERE d.depends_on_step_id = NEW.id AND a.plan_id IS NOT NEW.plan_id);
 END;
 
 -- A status change needs change_note (moving to waiting-owner, owner_question will do); a step cannot start or
@@ -2909,6 +3026,100 @@ WHEN NEW.status = 'doing' AND OLD.status <> 'doing' AND EXISTS (
 END;
 
 
+-- ----- Feature proposals (schema 19, plan step 145)
+
+-- A proposal starts as proposed, serving an approved design goal or an active requirement.
+CREATE TRIGGER tr_feature_serves BEFORE INSERT ON feature_proposals BEGIN
+  SELECT RAISE(ABORT, 'a feature proposal starts as proposed')
+  WHERE NEW.status IS NOT 'proposed' OR NEW.step_id IS NOT NULL OR NEW.decided_at IS NOT NULL;
+  SELECT RAISE(ABORT, 'a feature proposal serves an approved design goal or an active requirement')
+  WHERE (NEW.goal_id IS NOT NULL AND NOT EXISTS (
+           SELECT 1 FROM design_goals g JOIN goal_statuses s ON s.value = g.status
+           WHERE g.id = NEW.goal_id AND s.served = 1))
+     OR (NEW.requirement_id IS NOT NULL AND NOT EXISTS (
+           SELECT 1 FROM requirements WHERE id = NEW.requirement_id AND status = 'active'));
+END;
+
+-- An idea the owner declined is not proposed again for the same goal or requirement.
+CREATE TRIGGER tr_feature_not_again BEFORE INSERT ON feature_proposals BEGIN
+  SELECT RAISE(ABORT, 'the owner declined this idea for the same goal; propose it again only for a changed goal')
+  WHERE EXISTS (SELECT 1 FROM feature_proposals f
+                WHERE f.status = 'declined' AND f.goal_id IS NEW.goal_id AND f.requirement_id IS NEW.requirement_id
+                  AND lower(trim(f.title)) = lower(trim(NEW.title)));
+END;
+
+-- Logs the proposal as the first row of its history.
+CREATE TRIGGER tr_feature_proposed AFTER INSERT ON feature_proposals BEGIN
+  INSERT INTO feature_status_changes(proposal_id, from_status, to_status, note, actor_id, at)
+  VALUES (NEW.id, NULL, NEW.status, NULL, NEW.proposed_by_actor_id, NEW.created_at);
+END;
+
+-- The moves: proposed to picked or declined, picked to built or declined, declined to picked; the gate, when
+-- given, is a feature-pick gate of the proposal's review.
+CREATE TRIGGER tr_feature_transition BEFORE UPDATE OF status, gate_id ON feature_proposals BEGIN
+  SELECT RAISE(ABORT, 'a feature proposal moves proposed -> picked or declined, picked -> built or declined, declined -> picked')
+  WHERE OLD.status IS NOT NEW.status
+    AND NOT ((OLD.status = 'proposed' AND NEW.status IN ('picked','declined'))
+          OR (OLD.status = 'picked' AND NEW.status IN ('built','declined'))
+          OR (OLD.status = 'declined' AND NEW.status = 'picked'));
+  SELECT RAISE(ABORT, 'the gate is not the feature-pick gate of the proposal''s review')
+  WHERE NEW.gate_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM gates g WHERE g.id = NEW.gate_id AND g.kind = 'feature-pick' AND g.review_id = NEW.review_id);
+END;
+
+-- Logs each status change with its note, who made it and when.
+CREATE TRIGGER tr_feature_status_logged AFTER UPDATE OF status ON feature_proposals
+WHEN OLD.status IS NOT NEW.status BEGIN
+  INSERT INTO feature_status_changes(proposal_id, from_status, to_status, note, actor_id, at)
+  VALUES (NEW.id, OLD.status, NEW.status, NEW.status_note, NEW.decided_by_actor_id, NEW.decided_at);
+END;
+
+-- What a proposal says stays as written: a changed idea is a new proposal.
+CREATE TRIGGER tr_feature_fixed BEFORE UPDATE ON feature_proposals
+WHEN NEW.code IS NOT OLD.code OR NEW.review_id IS NOT OLD.review_id OR NEW.goal_id IS NOT OLD.goal_id
+  OR NEW.requirement_id IS NOT OLD.requirement_id OR NEW.title IS NOT OLD.title OR NEW.today IS NOT OLD.today
+  OR NEW.evidence IS NOT OLD.evidence OR NEW.proposal IS NOT OLD.proposal OR NEW.value IS NOT OLD.value
+  OR NEW.effort IS NOT OLD.effort OR NEW.risks IS NOT OLD.risks OR NEW.depends IS NOT OLD.depends
+  OR NEW.done_test IS NOT OLD.done_test OR NEW.proposed_by_actor_id IS NOT OLD.proposed_by_actor_id
+  OR NEW.created_at IS NOT OLD.created_at BEGIN
+  SELECT RAISE(ABORT, 'a feature proposal is not edited; propose the changed idea as a new one');
+END;
+
+-- History is append-only.
+CREATE TRIGGER tr_feature_no_delete BEFORE DELETE ON feature_proposals BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: feature proposals cannot be deleted; decline one instead');
+END;
+
+-- A feature proposal's history is not changed.
+CREATE TRIGGER tr_feature_history_no_update BEFORE UPDATE ON feature_status_changes BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: feature_status_changes cannot be changed');
+END;
+
+-- Nor deleted.
+CREATE TRIGGER tr_feature_history_no_delete BEFORE DELETE ON feature_status_changes BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: feature_status_changes cannot be deleted');
+END;
+
+CREATE TRIGGER tr_time_feature_proposals_ins BEFORE INSERT ON feature_proposals
+WHEN (NEW.created_at IS NOT NULL AND (NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at) IS NOT NEW.created_at)) OR (NEW.decided_at IS NOT NULL AND (NEW.decided_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.decided_at) IS NOT NEW.decided_at)) BEGIN
+  SELECT RAISE(ABORT, 'feature_proposals: created_at and decided_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_feature_proposals_upd BEFORE UPDATE OF created_at, decided_at ON feature_proposals
+WHEN (NEW.created_at IS NOT NULL AND (NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at) IS NOT NEW.created_at)) OR (NEW.decided_at IS NOT NULL AND (NEW.decided_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.decided_at) IS NOT NEW.decided_at)) BEGIN
+  SELECT RAISE(ABORT, 'feature_proposals: created_at and decided_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_feature_status_changes_ins BEFORE INSERT ON feature_status_changes
+WHEN (NEW.at IS NOT NULL AND (NEW.at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.at) IS NOT NEW.at)) BEGIN
+  SELECT RAISE(ABORT, 'feature_status_changes: at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_feature_status_changes_upd BEFORE UPDATE OF at ON feature_status_changes
+WHEN (NEW.at IS NOT NULL AND (NEW.at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.at) IS NOT NEW.at)) BEGIN
+  SELECT RAISE(ABORT, 'feature_status_changes: at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
 -- ---------- Views ---------------------------------------------------------
 
 -- Issues still to fix, most severe first, then oldest.
@@ -3081,15 +3292,16 @@ WHERE p.status NOT IN ('superseded','abandoned') AND r.status <> 'abandoned'
                          OR EXISTS (SELECT 1 FROM decisions d WHERE d.step_id = s.id AND d.status = 'decided')));
 
 -- Plan steps that close nothing, and points closed by several steps without a reason.
--- Must be empty. A dropped step, or one whose no_findings_reason says why it closes nothing by design (the
--- follow-up review that verifies the plan), is not a problem; dropped steps do not count towards closing a finding
--- twice. Superseded and abandoned plans are not checked.
+-- Must be empty. A dropped step, one that builds a picked feature proposal, or one whose no_findings_reason says
+-- why it closes nothing by design (the follow-up review that verifies the plan), is not a problem; dropped steps do
+-- not count towards closing a finding twice. Superseded and abandoned plans are not checked.
 CREATE VIEW v_coverage_problems AS
 SELECT p.code AS plan, 'step closes nothing' AS problem, CAST(s.number AS TEXT) AS item
 FROM steps s JOIN plans p ON p.id = s.plan_id
 WHERE p.status NOT IN ('superseded','abandoned') AND s.status <> 'dropped'
   AND NULLIF(trim(s.no_findings_reason), '') IS NULL
   AND NOT EXISTS (SELECT 1 FROM step_findings sf WHERE sf.step_id = s.id)
+  AND NOT EXISTS (SELECT 1 FROM feature_proposals fp WHERE fp.step_id = s.id)
 UNION ALL
 SELECT p.code, 'finding closed by several steps without a reason', f.point_id
 FROM step_findings sf JOIN steps s ON s.id = sf.step_id JOIN plans p ON p.id = s.plan_id
@@ -3330,7 +3542,9 @@ UNION ALL SELECT 'REQ', 'REQ-' || printf('%04d', COALESCE(max(CAST(substr(code, 
 FROM requirements
 UNION ALL SELECT 'G', 'G-' || printf('%02d', COALESCE(max(CAST(substr(code, 3) AS INTEGER)), 0) + 1) FROM design_goals
 UNION ALL SELECT 'IQ', 'IQ-' || printf('%04d', COALESCE(max(CAST(substr(code, 4) AS INTEGER)), 0) + 1)
-FROM interview_questions;
+FROM interview_questions
+UNION ALL SELECT 'FP', 'FP-' || printf('%04d', COALESCE(max(CAST(substr(code, 4) AS INTEGER)), 0) + 1)
+FROM feature_proposals;
 
 -- Plan steps still to do whose issues are already closed.
 -- Closed for example by a review's check of 'fixed': mark the step done or dropped. Superseded and abandoned plans
@@ -3541,6 +3755,45 @@ JOIN steps l ON l.id = c.late_step_id JOIN plans p ON p.id = a.plan_id
 WHERE c.resolution = 'none'
 ORDER BY p.code, l.number, other_step, c.kind, c.target;
 
+-- The order to work each plan's steps in.
+-- Each step comes after every step it depends on, directly or not, and otherwise keeps its number's place. position counts from 1 per plan; depth is the longest chain of steps it waits
+-- for; depends_on lists the steps it depends on directly. A step whose dependencies all have lower numbers keeps its
+-- place; one that waits for a later-numbered step moves to just after it.
+CREATE VIEW v_step_order AS
+WITH RECURSIVE n(c) AS (SELECT count(*) FROM steps),
+walk(step_id, ancestor_id, depth) AS (
+  SELECT id, id, 0 FROM steps
+  UNION
+  SELECT w.step_id, d.depends_on_step_id, w.depth + 1
+  FROM walk w JOIN step_dependencies d ON d.step_id = w.ancestor_id JOIN n ON w.depth < n.c),
+reach(step_id, plan_id, number, after_number, depth) AS (
+  SELECT w.step_id, s.plan_id, s.number, max(a.number), max(w.depth)
+  FROM walk w JOIN steps a ON a.id = w.ancestor_id JOIN steps s ON s.id = w.step_id GROUP BY w.step_id)
+SELECT p.code AS plan, s.number AS step, s.title, s.status,
+       (SELECT count(*) FROM reach o WHERE o.plan_id = r.plan_id
+          AND (o.after_number < r.after_number OR (o.after_number = r.after_number AND (o.depth < r.depth
+               OR (o.depth = r.depth AND o.number <= r.number))))) AS position,
+       r.depth,
+       (SELECT group_concat(x.number, ',') FROM (SELECT b.number FROM step_dependencies d
+          JOIN steps b ON b.id = d.depends_on_step_id WHERE d.step_id = s.id ORDER BY b.number) x) AS depends_on
+FROM reach r JOIN steps s ON s.id = r.step_id JOIN plans p ON p.id = s.plan_id;
+
+-- Every feature proposal with what it serves and where it stands, ranked.
+-- rank orders them best first: by how far each advances its goal (value), then by how little it costs (effort); ties
+-- go by code. serves is the goal or requirement code, step the plan step that builds it (P-0001#12).
+CREATE VIEW v_feature_proposals AS
+SELECT f.code, r.code AS review, COALESCE(g.code, q.code) AS serves, COALESCE(g.text, q.text) AS serves_text,
+       g.domain_code AS domain, f.title, f.today, f.evidence, f.proposal, f.value, f.effort, f.risks, f.depends,
+       f.done_test, f.status, f.status_note, 'A-' || printf('%04d', a.id) AS decided_by, f.decided_at, gt.code AS gate,
+       CASE WHEN s.id IS NULL THEN NULL ELSE p.code || '#' || s.number END AS step,
+       vl.position * 10 + el.position AS rank, f.created_at
+FROM feature_proposals f JOIN reviews r ON r.id = f.review_id
+LEFT JOIN design_goals g ON g.id = f.goal_id LEFT JOIN requirements q ON q.id = f.requirement_id
+LEFT JOIN actors a ON a.id = f.decided_by_actor_id LEFT JOIN gates gt ON gt.id = f.gate_id
+LEFT JOIN steps s ON s.id = f.step_id LEFT JOIN plans p ON p.id = s.plan_id
+LEFT JOIN enum_labels vl ON vl.enum = 'feature_value' AND vl.value = f.value
+LEFT JOIN enum_labels el ON el.enum = 'feature_effort' AND el.value = f.effort;
+
 -- ---------- Catalog seed (extend with custom domains/themes as needed) ---
 
 INSERT INTO domains(code, name, category, report_file) VALUES
@@ -3570,7 +3823,8 @@ INSERT INTO domains(code, name, category, report_file) VALUES
  ('cost','Cost','security-operations','cost.md'),
  ('docs-developer','Developer documentation','documentation','docs-developer.md'),
  ('docs-user','End-user documentation','documentation','docs-user.md'),
- ('handover','Maintainability and handover','documentation','handover.md');
+ ('handover','Maintainability and handover','documentation','handover.md'),
+ ('features','Features toward the goals','architecture','features.md');
 
 INSERT INTO themes(code, name) VALUES
  ('spec-mismatch','Spec mismatch'),('sign-in','Sign-in and sessions'),('authorization','Authorization'),
@@ -3618,7 +3872,8 @@ WITH applies(code, text) AS (VALUES
  ('cost','Applies when the system runs on paid infrastructure or services.'),
  ('docs-developer','Almost always applies.'),
  ('docs-user','Applies when the system has users other than its developers.'),
- ('handover','Applies whenever someone other than the current author may need to run or change the system.'))
+ ('handover','Applies whenever someone other than the current author may need to run or change the system.'),
+ ('features','Applies when the review has approved goals or stated requirements.'))
 UPDATE domains SET description = (SELECT text FROM applies WHERE applies.code = domains.code)
  WHERE description IS NULL AND code IN (SELECT code FROM applies);
 
@@ -3650,7 +3905,8 @@ INSERT INTO domain_rules(domain_code, rule) VALUES
  ('cost','paid_service_files >= 1 or deploy_files >= 1'),
  ('docs-developer','code_files >= 1'),
  ('docs-user','user_doc_files >= 1 or page_files >= 1'),
- ('handover','authors >= 2 or deploy_files >= 1 or history_months >= 6');
+ ('handover','authors >= 2 or deploy_files >= 1 or history_months >= 6'),
+ ('features','goals >= 1 or requirements >= 1');
 
 
 -- The metric names the domains ask for (keep names stable between reviews so they trend).
@@ -3717,7 +3973,8 @@ INSERT INTO gate_kinds(value, label, position) VALUES
  ('production-action','Production action',7),
  ('review-handoff','Review hand-off',8),
  ('confirm','Confirm',9),
- ('other','Question',10);
+ ('other','Question',10),
+ ('feature-pick','Pick ideas to build',11);
 INSERT INTO goal_statuses(value, label, position, served) VALUES
  ('proposed','Waiting for your approval',1,0),
  ('approved','Approved',2,1),
@@ -3965,6 +4222,11 @@ INSERT INTO domain_checks(code, domain_code, position, severity, question, evide
  ('handover.2','handover',2,'H','Who owns each account, domain, key and secret, and is any tied to one person?','The list with the owner and how access transfers.'),
  ('handover.3','handover',3,'M','Are there runbooks for the common incidents and the periodic chores?','Each one, present or missing.'),
  ('handover.4','handover',4,'M','Where is knowledge held by one person?','From the history or the hotspots report.');
+INSERT INTO domain_checks(code, domain_code, position, severity, question, evidence) VALUES
+ ('features.1','features',1,'L','Is every approved goal and active requirement listed with what the code does toward it today?','A row per goal and requirement: path:line of what serves it, or absent.'),
+ ('features.2','features',2,'L','Does each proposal name the goal or requirement it serves, its value, effort, risks and dependencies?','Each proposal with its goal code and the four answers.'),
+ ('features.3','features',3,'L','Does each proposal have a test that would show it is built?','The done-test per proposal: its name and what it asserts.'),
+ ('features.4','features',4,'L','Were the proposals already on record checked again against the goals and the code?','Per earlier proposal: still wanted, built, or serving no current goal.');
 
 INSERT INTO enum_labels(enum, value, label, position) VALUES
  ('checklist_answer','yes','Yes',1), ('checklist_answer','no','No',2), ('checklist_answer','partly','Partly',3),
@@ -3983,7 +4245,12 @@ INSERT INTO enum_labels(enum, value, label, position) VALUES
 INSERT INTO ledger_checks(view, label, tier, position) VALUES
  ('v_unresolved_conflicts','Plan steps that touch the same thing, not judged yet','error',120),
  ('v_late_step_conflicts','Steps added after approval that touch what other steps touch','warning',130);
-INSERT INTO meta(key, value) VALUES ('schema_version','16');
+INSERT INTO enum_labels(enum, value, label, position) VALUES
+ ('feature_status','proposed','Proposed',1), ('feature_status','picked','Picked',2),
+ ('feature_status','declined','Declined',3), ('feature_status','built','Built',4),
+ ('feature_value','high','High',1), ('feature_value','medium','Medium',2), ('feature_value','low','Low',3),
+ ('feature_effort','small','Small',1), ('feature_effort','medium','Medium',2), ('feature_effort','large','Large',3);
+INSERT INTO meta(key, value) VALUES ('schema_version','19');
 INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger schema'),
   (2, 'url, path, hash and code checks; repositories.allow_outside_root; finding_locations.excerpt_redacted'),
   (3, 'integrity rules: codes, hashes, checks, append-only history, owner actor on gate answers'),
@@ -3999,7 +4266,10 @@ INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger s
   (13, 'domain_rules: the rule by which scan proposes each domain; review_domains.proposed_by_rule'),
   (14, 'domain_checks and checklist_answers: each domain''s checklist, and the answers each report gave'),
   (15, 'the agreement metrics compare-runs records: domain_agreement, finding_agreement, severity_agreement'),
-  (16, 'step_touches and step_conflicts: what each plan step touches, and the pairs of steps that touch the same thing');
+  (16, 'step_touches and step_conflicts: what each plan step touches, and the pairs of steps that touch the same thing'),
+  (17, 'a step may depend on any step of its plan, cycles refused; v_step_order: the order to work in'),
+  (18, 'multi-select gates: gates.multi and gates.preselect; a multi-select answer is a JSON list of option values'),
+  (19, 'the features domain and feature_proposals: additions to the reviewed codebase that would serve the owner''s goals');
 """
 PAGE = r"""<!doctype html>
 <html lang="en">
@@ -4041,7 +4311,7 @@ input,select,textarea,button{font:inherit;color:var(--fg)}
 .field{background:var(--surface);border:1px solid var(--field);border-radius:6px;padding:8px 10px;min-width:0}
 .tools input{flex:1 1 240px}
 textarea{width:100%;min-height:72px;resize:vertical}
-input[type=radio]{accent-color:var(--accent)}
+input[type=radio],input[type=checkbox]{accent-color:var(--accent)}
 button.btn{cursor:pointer;background:var(--accent);color:var(--bg);border:0;border-radius:6px;padding:8px 14px;font-weight:600}
 button.btn.ghost{background:transparent;color:var(--accent);border:1px solid var(--line)}
 button.btn:disabled{opacity:.5;cursor:default}
@@ -4145,6 +4415,7 @@ nav.rail small{display:block;font-size:12px;opacity:.75}
 //   #/reviews                            reviews   reviews
 //   #/review/R-0001?match=none           review    review/<code>; finding/<id> as a point opens; run/<id>
 //   #/goals, #/goals/G-01                goals     goals
+//   #/ideas, #/ideas/FP-0001             ideas     ideas
 //   #/issues?status=&severity=&domain_code=&q=&offset=   issues   issues?...
 //   #/issue/ISS-0001                     issue     issue/<code>
 //   #/plans                              plans     plans
@@ -4303,11 +4574,11 @@ function hubGateBody(card, g, hid){
     return card;
   }
   if (!HUB.store) { add(card, h("p", {class: "note"}, "Answer in the chat with the agent.")); return card; }
-  const {name: nm, opts, ta} = gateInputs(g, hid);
+  const {opts, ta, picked} = gateInputs(g, hid);
   const msg = h("div"), form = h("div", {class: "gate"});
   const send = h("button", {class: "btn", type: "button", id: hid + "-send", "aria-labelledby": `${hid}-send ${hid}`, onclick: async () => {
-    const picked = card.querySelector(`input[name="${nm}"]:checked`), val = picked ? picked.value : null, txt = ta ? ta.value.trim() : "";
-    if (!val && !txt) { put(msg, errorBox("Choose an option or write an answer.")); return; }
+    const val = picked(), txt = ta ? ta.value.trim() : "";
+    if (!g.multi && !val && !txt) { put(msg, errorBox("Choose an option or write an answer.")); return; }
     send.disabled = true;
     try {
       const a = {gate: g.code, answer_value: val, answer_text: txt || null, answered_at: new Date().toISOString()};
@@ -4383,7 +4654,8 @@ const ENUM_OF = {sev:"severity", issue:"issue_status", match:"match_type", verif
   relIn:"relation_type_inverse", check:"check_outcome", kind:"issue_kind", run:"run_status", plan:"plan_status",
   decision:"decision_status", goal:"goal_status", via:"answered_via", role:"location_role", ownerChange:"owner_change",
   conf:"confidence", method:"metric_method", verdict:"verdict", tested:"tested", actorKind:"actor_kind",
-  artifact:"artifact_kind", purpose:"test_purpose", event:"event"};
+  artifact:"artifact_kind", purpose:"test_purpose", event:"event", idea:"feature_status", value:"feature_value",
+  effort:"feature_effort"};
 const FALLBACK = {sev:{H:"High",M:"Medium",L:"Low",T:"Missing test"}, need:{none:""}};
 let L = {};
 const setLabels = enums => { L = Object.fromEntries(Object.entries(ENUM_OF).map(([k, e]) =>
@@ -4401,6 +4673,7 @@ const TONE = {
   verif:{confirmed:"ok"},
   gate:{"production-action":"crit"}, gstat:{open:"you"},
   goal:{approved:"ok", proposed:"you"},
+  idea:{proposed:"you", picked:"info", built:"solid", declined:""},
   step:{"not-started":"", doing:"ok", "waiting-owner":"you", done:"solid", dropped:""},
   need:{none:"", decision:"warn", confirm:"info", review:"info", production:"crit"},
   area:{included:"ok"},
@@ -4485,7 +4758,7 @@ function filterBar(controls, onChange, wait=0){
 }
 // A gate's answer as the owner gave it: the chosen option's label, then the note.
 function answerText(g, strong){
-  const label = g.answer_value ? optLabel(g) : "", note = g.answer_text || "";
+  const label = g.answer_value != null && g.answer_value !== "" ? optLabel(g) : "", note = g.answer_text || "";
   if (!strong) return [label, note].filter(Boolean).join(" — ");
   return [label ? h("b", null, label) : null, note ? (label ? " — " : "") + note : null];
 }
@@ -4755,21 +5028,31 @@ VIEWS.history = async ([code], params) => {
   await load(code ? "at=" + encodeURIComponent(code) : "offset=" + (Number(params.get("offset")) || 0));
   if (code) jumpTo(document.getElementById("gate-row-" + code));
 };
-const optLabel = g => g.answer_label || ((g.options || []).find(o => o.value === g.answer_value) || {}).label || words(g.answer_value);
+const optOf = (g, v) => ((g.options || []).find(o => o.value === v) || {}).label || words(v);
+const optLabel = g => g.answer_label || (Array.isArray(g.answer_value) ? g.answer_value.map(v => optOf(g, v)).join(", ") || "None of them" : optOf(g, g.answer_value));
 
 // level: "h3" for a gate listed under a section heading. moved(card, gate, note): called once the gate is answered.
 const FINAL = "You can't change an answer once it is sent.";
 const IN_CHAT = "Answer this one in the chat with the agent.";
-// What an open gate is answered with: its options as one radio group and, where the gate takes text, a text box.
-// hid: the id of the gate's title, which names both for a screen reader.
+// What an open gate is answered with: its options as one radio group (checkboxes, the recommended ones ticked, with
+// Select all and Select none, when it takes several) and, where the gate takes text, a text box. hid: the id of the
+// gate's title, which names them for a screen reader. picked() is the answer the choices give: a value, a list of
+// values for a multi-select gate, or null.
 function gateInputs(g, hid){
-  const name = "opt-" + g.code;
-  const option = o => h("label", null, h("input", {type:"radio", name, value:o.value}),
+  const name = "opt-" + g.code, multi = !!g.multi, pre = new Set(g.preselect || []);
+  const option = o => h("label", null, h("input", multi ? {type:"checkbox", name, value:o.value, checked: pre.has(o.value) ? "" : null} : {type:"radio", name, value:o.value}),
     h("span", null, o.label, o.description ? h("small", null, o.description) : null));
-  const opts = (g.options || []).length ? h("div", {class:"opts", role:"radiogroup", "aria-labelledby":hid}, g.options.map(option)) : null;
+  let opts = (g.options || []).length ? h("div", {class:"opts", role: multi ? "group" : "radiogroup", "aria-labelledby":hid}, g.options.map(option)) : null;
+  if (opts && multi) {
+    const all = on => () => opts.querySelectorAll("input").forEach(i => { i.checked = on; });
+    opts = h("div", null, h("div", {class:"tools"}, h("button", {type:"button", class:"btn ghost", onclick: all(true)}, "Select all"),
+      h("button", {type:"button", class:"btn ghost", onclick: all(false)}, "Select none")), opts);
+  }
   const ta = g.allow_text ? h("textarea", {class:"field", placeholder: opts ? "Add a note or a different answer (optional)" : "Your answer",
     id:hid + "-text", "aria-label":"Your answer", "aria-labelledby":`${hid}-text ${hid}`}) : null;
-  return {name, opts, ta};
+  const picked = () => { const on = [...(opts ? opts.querySelectorAll(`input[name="${name}"]:checked`) : [])].map(i => i.value);
+    return multi ? on : (on[0] || null); };
+  return {name, opts, ta, picked};
 }
 function gateCard(g, level, moved){
   const hid = "gate-" + g.code;   // the title's id: it names this gate's choices, text box and button
@@ -4785,18 +5068,17 @@ function gateCard(g, level, moved){
     g.context ? h("div", {class:"ctx"}, g.context) : null,
     refs.length ? h("div", {class:"refline"}, refs) : null);
   if (g.status !== "open") {
-    add(card, h("p", {class:"callout answer"}, g.answer_value || g.answer_text ? ["You answered: ", answerText(g, true), g.answered_at ? ` (${when(g.answered_at)})` : ""] : lab("gstat", g.status)));
+    add(card, h("p", {class:"callout answer"}, g.answer_value != null || g.answer_text ? ["You answered: ", answerText(g, true), g.answered_at ? ` (${when(g.answered_at)})` : ""] : lab("gstat", g.status)));
     return card;
   }
   if (!(g.options || []).length && !g.allow_text) { add(card, h("p", {class:"note"}, IN_CHAT)); return card; }
   if (STATIC) return hubGateBody(card, g, hid);
-  const {name, opts, ta} = gateInputs(g, hid);
+  const {opts, ta, picked} = gateInputs(g, hid);
   const msg = h("div");
   const send = h("button", {class:"btn", type:"button", id:hid + "-send", "aria-labelledby":`${hid}-send ${hid}`, onclick:async () => {
-    const picked = card.querySelector(`input[name="${name}"]:checked`);
     send.disabled = true;
     try {
-      await api(`gates/${encodeURIComponent(g.code)}/answer`, {answer_value: picked ? picked.value : null, answer_text: ta ? ta.value : null});
+      await api(`gates/${encodeURIComponent(g.code)}/answer`, {answer_value: picked(), answer_text: ta ? ta.value : null});
       say("Answer saved.");
       if (moved) await moved(card, g, "Answer saved. The agent will act on it the next time it checks."); else put(msg, h("p", {class:"status"}, "Answer saved."));
     } catch (e) {
@@ -5015,6 +5297,25 @@ VIEWS.goals = async ([code]) => {
       : empty("No design goals yet."),
     d.goals.some(g => g.status === "proposed") ? h("p", {class:"callout you"}, h("a", {href:"#/inbox"}, "Goals are waiting for your approval →")) : null);
   if (code) jumpTo(document.getElementById("goal-" + code));
+};
+
+// ---------- ideas: what the codebase could add to meet the goals (schema 19)
+// Not issues: no severity, and no other page counts them. Grouped by the goal each serves, best first.
+VIEWS.ideas = async ([code]) => {
+  const d = await api("ideas");
+  const cols = [{label:"Idea", key:"code"}, {label:"Addition", get:p => h("span", null, h("b", null, p.title), h("small", {class:"note"}, " " + p.proposal))},
+    {label:"Value", get:p => lab("value", p.value)}, {label:"Effort", get:p => lab("effort", p.effort)},
+    {label:"Today", get:p => [p.today, " ", h("span", {class:"mono"}, p.evidence)]},
+    {label:"Risks", get:p => [p.risks || "", p.depends ? h("small", {class:"note"}, " Needs first: " + p.depends) : null]},
+    {label:"Done when", key:"done_test"}, {label:"Status", get:p => labTag("idea", p.status)},
+    {label:"Step", get:p => p.step ? h("a", {href:"#/plan/" + p.step.split("#")[0]}, p.step) : (p.status_note || "")}];
+  const n = d.counts.proposed || 0;
+  setView(h("h1", null, "Ideas"),
+    h("p", {class:"lede"}, "Additions that would serve your goals. Missing them breaks nothing."),
+    n ? h("p", {class:"callout you"}, h("a", {href:"#/inbox"}, `${plural(n, "idea")} to pick from →`)) : null,
+    d.goals.length ? d.goals.map(g => [sect(g.goal + " · " + g.text), table(cols, g.proposals, null, "", p => ({id:"idea-" + p.code}))])
+      : empty("No ideas yet."));
+  if (code) jumpTo(document.getElementById("idea-" + code));
 };
 
 // The filters live in the address (#/issues?status=all&severity=H&domain_code=spec&q=text&offset=200), so a reload, a
@@ -5331,7 +5632,7 @@ VIEWS.guide = async () => {
 // ---------- routing
 // The tabs: [key, address, name]. drawTabs(active) draws them with the Waiting on you badge.
 const TABS = [["home","#/","Overview"], ["guide","#/guide","How it works"], ["inbox","#/inbox","Waiting on you"],
-  ["reviews","#/reviews","Reviews"], ["goals","#/goals","Design goals"], ["issues","#/issues","Issues"],
+  ["reviews","#/reviews","Reviews"], ["goals","#/goals","Design goals"], ["ideas","#/ideas","Ideas"], ["issues","#/issues","Issues"],
   ["plans","#/plans","Fix plans"], ["trends","#/trends","Over time"], ["explore","#/explore","Explore"]];
 // What the badge counts: everything in the owner's queue still to act on. In the shared copy, less the open gates
 // answered there since the copy was made.
@@ -7324,6 +7625,102 @@ INSERT OR IGNORE INTO step_touches(step_id, kind, target, direction, source)
   SELECT DISTINCT sf.step_id, 'symbol', r.name || ':' || fl.path || '#' || fl.symbol, 'changes', 'finding'
   FROM step_findings sf JOIN finding_locations fl ON fl.finding_id = sf.finding_id
   JOIN repositories r ON r.id = fl.repository_id WHERE fl.symbol IS NOT NULL;
+-- migration: 0017-step-order.sql
+-- a step may depend on any step of its plan, cycles refused; v_step_order: the order to work in
+-- Plan P-0001 step 216 (FIX-30). A step added after the plan was built takes the next number and may still have to
+-- run before earlier-numbered steps. tr_dep_order and tr_dep_order_upd refuse only a dependency on the step itself,
+-- on another plan's step, or one that closes a cycle; tr_step_renumber refuses only moving a step with dependencies
+-- to another plan. v_step_order puts each step behind every step it waits for and keeps the numbers' order
+-- otherwise. migrate creates the triggers and the view with the shipped schema; no table and no row changes (the
+-- dependencies already recorded all point at earlier steps, so none forms a cycle).
+
+SELECT 1;
+-- migration: 0018-multiselect-gates.sql
+-- multi-select gates: gates.multi and gates.preselect; a multi-select answer is a JSON list of option values
+-- Plan P-0001 step 217 (OWN-14). A gate opened with --multi takes any number of its options; --preselect names the
+-- recommended ones the page ticks first. Its answer_value is a JSON list of the chosen values ('[]' for none),
+-- checked against the options by answer_gate() and tr_gate_answer_rules. Gates already in the ledger stay
+-- single-select. migrate creates the triggers with the shipped schema.
+
+ALTER TABLE gates ADD COLUMN multi INTEGER NOT NULL DEFAULT 0 CHECK (multi IN (0,1));
+ALTER TABLE gates ADD COLUMN preselect TEXT CHECK (preselect IS NULL OR (json_valid(preselect) AND json_type(preselect) = 'array'));
+-- migration: 0019-feature-proposals.sql
+-- the features domain and feature_proposals: additions to the reviewed codebase that would serve the owner's goals
+-- Plan P-0001 step 145 (OWN-13). A proposal names the approved goal or active requirement it serves, what the code
+-- does toward it today with evidence, the addition, its value and effort, risks, what it depends on and a test that
+-- shows it is built. It is not a defect: it has no severity and no issue, and no count of issues, defects,
+-- regressions or coverage reads it. The owner picks or declines each (one non-blocking feature-pick gate per
+-- review); a picked one becomes a plan step (feature_proposals.step_id), and a declined one is not proposed again for
+-- the same goal (tr_feature_not_again). feature_status_changes is each proposal's history. migrate creates the
+-- triggers and views with the shipped schema.
+
+CREATE TABLE feature_proposals (
+  id                   INTEGER PRIMARY KEY,
+  code                 TEXT NOT NULL UNIQUE      -- FP-0001
+                         CHECK (code GLOB 'FP-[0-9][0-9][0-9][0-9]*' AND code NOT GLOB 'FP-*[^0-9]*'),
+  review_id            INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
+  goal_id              INTEGER REFERENCES design_goals(id),     -- the approved goal it serves, or
+  requirement_id       INTEGER REFERENCES requirements(id),     -- the active requirement it serves
+  title                TEXT NOT NULL CHECK (length(trim(title)) > 0),
+  today                TEXT NOT NULL CHECK (length(trim(today)) > 0),      -- what the code does toward it now
+  evidence             TEXT NOT NULL CHECK (length(trim(evidence)) > 0),   -- path:line, or 'absent'
+  proposal             TEXT NOT NULL CHECK (length(trim(proposal)) > 0),   -- the addition
+  value                TEXT NOT NULL CHECK (value IN ('high','medium','low')),     -- how far it advances the goal
+  effort               TEXT NOT NULL CHECK (effort IN ('small','medium','large')),
+  risks                TEXT,
+  depends              TEXT,                     -- what it needs first
+  done_test            TEXT NOT NULL CHECK (length(trim(done_test)) > 0),  -- the test that shows it is built
+  status               TEXT NOT NULL DEFAULT 'proposed' CHECK (status IN ('proposed','picked','declined','built')),
+  status_note          TEXT,                     -- why it was picked, declined or called built
+  decided_by_actor_id  INTEGER REFERENCES actors(id),   -- who made the last status change
+  decided_at           TEXT,
+  gate_id              INTEGER REFERENCES gates(id),    -- the feature-pick gate the owner answered
+  step_id              INTEGER REFERENCES steps(id),    -- the plan step that builds it
+  proposed_by_actor_id INTEGER REFERENCES actors(id),
+  created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  CHECK ((goal_id IS NULL) <> (requirement_id IS NULL)),
+  CHECK (status = 'proposed' OR (decided_by_actor_id IS NOT NULL AND decided_at IS NOT NULL
+                                 AND length(trim(COALESCE(status_note, ''))) > 0)),
+  CHECK (step_id IS NULL OR status IN ('picked','built'))
+);
+CREATE INDEX ix_fk_feature_proposals_review_id            ON feature_proposals(review_id);
+CREATE INDEX ix_fk_feature_proposals_goal_id              ON feature_proposals(goal_id);
+CREATE INDEX ix_fk_feature_proposals_requirement_id       ON feature_proposals(requirement_id);
+CREATE INDEX ix_fk_feature_proposals_decided_by_actor_id  ON feature_proposals(decided_by_actor_id);
+CREATE INDEX ix_fk_feature_proposals_gate_id              ON feature_proposals(gate_id);
+CREATE INDEX ix_fk_feature_proposals_step_id              ON feature_proposals(step_id);
+CREATE INDEX ix_fk_feature_proposals_proposed_by_actor_id ON feature_proposals(proposed_by_actor_id);
+
+CREATE TABLE feature_status_changes (
+  id          INTEGER PRIMARY KEY,
+  proposal_id INTEGER NOT NULL REFERENCES feature_proposals(id) ON DELETE RESTRICT,
+  from_status TEXT,                      -- NULL when it was proposed
+  to_status   TEXT NOT NULL,
+  note        TEXT,
+  actor_id    INTEGER REFERENCES actors(id),
+  at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX ix_fk_feature_status_changes_proposal_id ON feature_status_changes(proposal_id);
+CREATE INDEX ix_fk_feature_status_changes_actor_id    ON feature_status_changes(actor_id);
+CREATE UNIQUE INDEX ux_gates_one_feature_pick ON gates(review_id) WHERE kind = 'feature-pick' AND status <> 'withdrawn';
+
+INSERT INTO gate_kinds(value, label, position) VALUES ('feature-pick','Pick ideas to build',11);
+
+INSERT INTO domains(code, name, category, report_file, description) VALUES
+ ('features','Features toward the goals','architecture','features.md',
+  'Applies when the review has approved goals or stated requirements.');
+INSERT INTO domain_rules(domain_code, rule) VALUES ('features','goals >= 1 or requirements >= 1');
+INSERT INTO domain_checks(code, domain_code, position, severity, question, evidence) VALUES
+ ('features.1','features',1,'L','Is every approved goal and active requirement listed with what the code does toward it today?','A row per goal and requirement: path:line of what serves it, or absent.'),
+ ('features.2','features',2,'L','Does each proposal name the goal or requirement it serves, its value, effort, risks and dependencies?','Each proposal with its goal code and the four answers.'),
+ ('features.3','features',3,'L','Does each proposal have a test that would show it is built?','The done-test per proposal: its name and what it asserts.'),
+ ('features.4','features',4,'L','Were the proposals already on record checked again against the goals and the code?','Per earlier proposal: still wanted, built, or serving no current goal.');
+
+INSERT INTO enum_labels(enum, value, label, position) VALUES
+ ('feature_status','proposed','Proposed',1), ('feature_status','picked','Picked',2),
+ ('feature_status','declined','Declined',3), ('feature_status','built','Built',4),
+ ('feature_value','high','High',1), ('feature_value','medium','Medium',2), ('feature_value','low','Low',3),
+ ('feature_effort','small','Small',1), ('feature_effort','medium','Medium',2), ('feature_effort','large','Large',3);
 """
 
 
@@ -9302,14 +9699,23 @@ GATE_LINKS = """LEFT JOIN reviews r ON r.id=g.review_id LEFT JOIN plans pl ON pl
 
 
 def answer_label(options, value):
-    """The label of the option a gate was answered with (the stored value when its options do not have it)."""
+    """The label of the option a gate was answered with (the stored value when its options do not have it); for a
+    multi-select answer (a JSON list), the labels of its choices."""
     if value is None:
         return None
     try:
         opts = json.loads(options) if isinstance(options, str) else (options or [])
     except ValueError:
         opts = []
-    return next((o.get("label") for o in opts if isinstance(o, dict) and o.get("value") == value), None) or value
+    label = lambda v: next((o.get("label") for o in opts if isinstance(o, dict) and o.get("value") == v), None) or v
+    if isinstance(value, str) and value.startswith("["):
+        try:
+            chosen = json.loads(value)
+        except ValueError:
+            chosen = None
+        if isinstance(chosen, list):   # a multi-select answer: each choice's label
+            return ", ".join(label(v) for v in chosen) or "None of them"
+    return label(value)
 
 
 def get_gates(rq):
@@ -9319,13 +9725,15 @@ def get_gates(rq):
     con, st = rq.con, rq.arg("status", "pending")
     if st == "pending":
         gates = rows(con, f"""SELECT g.code, g.kind, g.title, g.question, g.context, g.options, g.allow_text,
-                g.blocking, g.status, g.answer_value, g.answer_text, g.answered_at, g.created_at,
+                g.multi, g.preselect, g.blocking, g.status, g.answer_value, g.answer_text, g.answered_at, g.created_at,
                 r.code review_code, pl.code plan_code, s.number step_number,
                 i.code issue_code, d.code decision_code FROM gates g {GATE_LINKS}
                 WHERE g.id IN (SELECT id FROM v_pending_gates)
                 ORDER BY g.status='answered', g.blocking DESC, g.created_at""")
         for g in gates:
+            g["answer_label"] = answer_label(g["options"], g["answer_value"])
             g["options"] = json.loads(g["options"]) if g["options"] else []
+            g["preselect"] = json.loads(g["preselect"]) if g["preselect"] else []
         return {"gates": gates, "other": rows(con, """SELECT kind, ref, need, title, question, context
                                                       FROM v_owner_queue WHERE kind <> 'gate'""")}
     where, args = ("1", ()) if st == "all" else ("g.status = ?", (st,))
@@ -9728,6 +10136,8 @@ def get_plan(rq):
                           WHERE s.plan_id=? ORDER BY s.number""", (pid,))
     phase = int_arg(rq.qs, "phase", min([s["phase"] for s in steps] or [1]), 0)
     deps, ids, words = {}, {}, {}
+    position = {r["step"]: r["position"] for r in rows(con, "SELECT step, position FROM v_step_order WHERE plan=?",
+                                                       (code,))}
     for d in rows(con, """SELECT sd.step_id, s.number FROM step_dependencies sd JOIN steps s ON s.id=sd.depends_on_step_id
                           WHERE s.plan_id=?""", (pid,)):
         deps.setdefault(d["step_id"], []).append(d["number"])
@@ -9742,6 +10152,7 @@ def get_plan(rq):
     for s in steps:
         sid = s.pop("id")
         s["depends"] = sorted(deps.get(sid, []))
+        s["position"] = position.get(s["number"])
         s["closes"] = ids.get(sid, [])
         s["search"] = " ".join([str(s["number"]), s["title"] or ""] + words.get(sid, [])
                                + [s["proof"] or "", s["change"] or ""]).lower()[:STEP_SEARCH]
@@ -9805,6 +10216,22 @@ def get_guide(rq):
 def get_goals(rq):
     """Every design goal by domain, with its status and sources (schema 9)."""
     return {"goals": shown_goals(rq.con)}
+
+
+def get_ideas(rq):
+    """The feature proposals by the goal or requirement each serves (goals first, by code), best first within each,
+    with the count per status. Not issues: no severity, and no other page counts them."""
+    found = rows(rq.con, """SELECT code, review, serves, serves_text, domain, title, today, evidence, proposal, value,
+                                   effort, risks, depends, done_test, status, status_note, decided_at, gate, step
+                            FROM v_feature_proposals ORDER BY rank, code""")
+    groups, counts = {}, {}
+    for p in found:
+        g = groups.setdefault(p["serves"], {"goal": p["serves"], "text": p["serves_text"], "domain": p["domain"],
+                                            "proposals": []})
+        g["proposals"].append({k: v for k, v in p.items() if k not in ("serves", "serves_text", "domain")})
+        counts[p["status"]] = counts.get(p["status"], 0) + 1
+    order = sorted(groups, key=lambda c: (not c.startswith("G-"), c))
+    return {"goals": [groups[c] for c in order], "counts": counts}
 
 
 TRENDS_RECURRING = 50  # issues that keep coming back, most often seen first: past this the list stops helping
@@ -9998,6 +10425,7 @@ ROUTES = (
     Route("GET", "plan/*", get_plan, _hub_each("plan", "SELECT code FROM plans ORDER BY code")),
     Route("GET", "step/*/*", get_step, lambda con: []),  # none in the hub: its plans carry every step in full
     Route("GET", "goals", get_goals, _hub("goals")),
+    Route("GET", "ideas", get_ideas, _hub("ideas")),
     Route("GET", "guide", get_guide, _hub("guide")),
     Route("GET", "run/*", get_run, _hub_each("run", "SELECT id FROM reviewer_runs ORDER BY id")),
     Route("GET", "trends", get_trends, _hub("trends"), seconds=TRENDS_SECONDS),
@@ -10070,6 +10498,7 @@ def route(root, db, con, path, qs, body, whole=False):
       GET  plan/<code>              ?phase=N: the plan's page with that phase's steps in full
       GET  step/<plan code>/<n>     one step in full, with its commits and the points it closes
       GET  goals                    goals
+      GET  ideas                    goals [{goal, text, domain, proposals}], counts: the feature proposals by goal
       GET  guide                    guide (the How it works text, Markdown)
       GET  run/<id>                 prompt, final_message of one reviewer run
       GET  trends                   metrics, reviews, recurring, hotspots
@@ -10569,8 +10998,8 @@ def _md_cell(v):
 
 def progress_md(con, plan_code):
     """The Markdown progress report of one plan (`ledger.py progress-md P-0001`): the plan's totals, one row per
-    phase from v_plan_progress, then each phase's steps (number, status, title, how many review points and issues it
-    closes, its progress note). The format is fixed so every agent's PROGRESS.md reads the same. None when there is
+    phase from v_plan_progress, then each phase's steps in the order to work them (v_step_order: number, status,
+    title, how many review points and issues it closes, its progress note). The format is fixed so every agent's PROGRESS.md reads the same. None when there is
     no such plan."""
     pl = one(con, "SELECT * FROM plans WHERE code=?", (plan_code,))
     if not pl:
@@ -10580,7 +11009,9 @@ def progress_md(con, plan_code):
             (SELECT count(*) FROM step_findings sf WHERE sf.step_id=s.id) points,
             (SELECT count(DISTINCT f.issue_id) FROM step_findings sf JOIN findings f ON f.id=sf.finding_id
               WHERE sf.step_id=s.id) issues
-            FROM steps s JOIN phases ph ON ph.id=s.phase_id WHERE s.plan_id=? ORDER BY s.number""", (pl["id"],))
+            FROM steps s JOIN phases ph ON ph.id=s.phase_id
+            JOIN v_step_order o ON o.plan = ? AND o.step = s.number
+            WHERE s.plan_id=? ORDER BY o.position""", (pl["code"], pl["id"]))
     keys = ("steps", "done", "doing", "waiting_owner", "not_started", "dropped")
     tot = {k: sum(p[k] or 0 for p in phases) for k in keys}
     out = [f"# Progress of {pl['code']}: {pl['title']}", "",
@@ -10645,7 +11076,7 @@ You can answer every question here, under **Waiting on you**. The agent picks yo
 
 ## Where to look
 
-**Overview** shows the totals and the ledger's own checks. **Reviews** lists every review; open one for its report, the areas reviewed and skipped, the reviewers, and every point with the code it cites. **Design goals** lists what you want the code to be. **Issues** lets you search and filter every issue and see its full history. **Fix plans** shows every step by phase, with what it changes, how it is proven, and which points it closes. **Over time** shows how the numbers move between reviews. **Explore** shows the raw tables behind everything.
+**Overview** shows the totals and the ledger's own checks. **Reviews** lists every review; open one for its report, the areas reviewed and skipped, the reviewers, and every point with the code it cites. **Design goals** lists what you want the code to be. **Ideas** lists additions that would serve those goals, for you to pick from; they are not problems and no count of issues includes them. **Issues** lets you search and filter every issue and see its full history. **Fix plans** shows every step by phase, with what it changes, how it is proven, and which points it closes. **Over time** shows how the numbers move between reviews. **Explore** shows the raw tables behind everything.
 """
 
 # The one change progress-page makes to page.html: the data script (%s is the JSON), put in front of the page's own
@@ -11246,11 +11677,11 @@ class GateRefused(Exception):
         self.status = status
 
 
-CODE_PREFIXES = ("ISS", "R", "P", "D", "GATE", "REQ", "G", "IQ")
+CODE_PREFIXES = ("ISS", "R", "P", "D", "GATE", "REQ", "G", "IQ", "FP")
 
 
 def next_code(con, prefix):
-    """The next code for a prefix (ISS, R, P, D, GATE, REQ, G or IQ), from v_next_codes: the highest number + 1 in the
+    """The next code for a prefix (ISS, R, P, D, GATE, REQ, G, IQ or FP), from v_next_codes: the highest number + 1 in the
     canonical format (ISS-0001, G-01). Codes are never reused, and the code triggers refuse anything else."""
     p = (prefix or "").upper().rstrip("-")
     if p not in CODE_PREFIXES:
@@ -11468,7 +11899,7 @@ def _need(value, what):
 
 # ----- next-code, add-repo, add-actor
 
-@_command("next-code", "print the next code for a prefix (ISS, R, P, D, GATE, REQ, G, IQ)",
+@_command("next-code", "print the next code for a prefix (ISS, R, P, D, GATE, REQ, G, IQ, FP)",
           "ledger.py next-code ISS", read=True)
 def cmd_next_code(con, a):
     return [next_code(con, a.prefix)]
@@ -11842,7 +12273,23 @@ def _finding_ref(ref, by, points):
     return None, f"point {ref} is in {', '.join(revs)}; write it as {revs[0]}:{ref}"
 
 
-@_command("import-steps", "load drafted plan steps (JSON lines) into a plan: phases, steps, closes, depends",
+def _dependency_cycle(waits, start):
+    """The steps of a cycle of dependencies through start ([start, ..., start]), or None. waits maps a step number to
+    the numbers it depends on."""
+    stack, seen = [(start, [start])], set()
+    while stack:
+        at, path = stack.pop()
+        for nxt in sorted(waits.get(at, ())):
+            if nxt == start:
+                return path + [start]
+            if nxt not in seen:
+                seen.add(nxt)
+                stack.append((nxt, path + [nxt]))
+    return None
+
+
+@_command("import-steps", "load drafted plan steps (JSON lines) into a plan: phases, steps, closes, depends, "
+                          "features",
           "ledger.py import-steps P-0001 steps.jsonl [--actor A-0001]   (format: references/formats/plan-steps.md)")
 def cmd_import_steps(ctx):
     con = ctx.con
@@ -11893,8 +12340,19 @@ def cmd_import_steps(ctx):
         if not isinstance(o.get("closes", []), list) or not isinstance(o.get("depends", []), list):
             problems.append(f"line {n} ({k}): closes and depends are lists")
             continue
-        if not o.get("closes") and not str(o.get("no_findings_reason") or "").strip():
-            problems.append(f"line {n} ({k}): closes no point; give closes or no_findings_reason")
+        if not isinstance(o.get("features", []), list):
+            problems.append(f"line {n} ({k}): features is a list of picked proposals (FP-0001)")
+            continue
+        if not o.get("closes") and not o.get("features") and not str(o.get("no_findings_reason") or "").strip():
+            problems.append(f"line {n} ({k}): closes no point; give closes, features or no_findings_reason")
+        for fp in o.get("features") or []:
+            row = one(con, "SELECT status, step_id FROM feature_proposals WHERE code=?", (str(fp),))
+            if not row:
+                problems.append(f"line {n} ({k}): no feature proposal {fp}")
+            elif row["status"] != "picked" or row["step_id"] is not None:
+                problems.append(f"line {n} ({k}): {fp} is {row['status']}"
+                                + (" and has its step" if row["step_id"] is not None else "")
+                                + "; a step builds a picked proposal that has none")
         for ref in o.get("closes") or []:
             if _finding_ref(str(ref), by, points)[1]:
                 problems.append(f"line {n} ({k}): {_finding_ref(str(ref), by, points)[1]}")
@@ -11909,6 +12367,10 @@ def cmd_import_steps(ctx):
     start = (con.execute("SELECT max(number) FROM steps WHERE plan_id=?", (pl["id"],)).fetchone()[0] or 0) + 1
     ordered = sorted(steps, key=lambda s: (s[1]["phase"], s[1].get("order", 0), s[0]))
     number = {str(o["key"]).strip(): start + i for i, (_, o) in enumerate(ordered)}
+    waits = {}   # step number -> the numbers it depends on, the plan's and the file's
+    for a_, b_ in con.execute("""SELECT a.number, b.number FROM step_dependencies d JOIN steps a ON a.id = d.step_id
+                                 JOIN steps b ON b.id = d.depends_on_step_id WHERE a.plan_id=?""", (pl["id"],)):
+        waits.setdefault(a_, set()).add(b_)
     for n, o in ordered:
         k = str(o["key"]).strip()
         for d in o.get("depends") or []:
@@ -11918,8 +12380,13 @@ def cmd_import_steps(ctx):
                     else None
             if dn is None:
                 problems.append(f"line {n} ({k}): depends on unknown step {d!r}")
-            elif dn >= number[k]:
-                problems.append(f"line {n} ({k}): depends on {d} (step {dn}), which is not earlier (step {number[k]})")
+            else:
+                waits.setdefault(number[k], set()).add(dn)
+    for n, o in ordered:
+        k = str(o["key"]).strip()
+        loop = _dependency_cycle(waits, number[k])
+        if loop:
+            problems.append(f"line {n} ({k}): its dependencies make a cycle (steps {' -> '.join(map(str, loop))})")
     closers = {}
     for r in con.execute("""SELECT sf.finding_id, sf.multi_reason FROM step_findings sf JOIN steps s ON s.id = sf.step_id
                             WHERE s.plan_id=? AND s.status <> 'dropped'""", (pl["id"],)):
@@ -11959,6 +12426,8 @@ def cmd_import_steps(ctx):
                                                   (pl["id"], d)).fetchone()[0])
             ctx.x("INSERT OR IGNORE INTO step_dependencies(step_id, depends_on_step_id) VALUES (?,?)", (ids[k], dep))
         record_touches(ctx, ids[k], o.get("touches"))
+        for fp in o.get("features") or []:
+            ctx.x("UPDATE feature_proposals SET step_id=? WHERE code=?", (ids[k], str(fp)))
     out = [f"{pl['code']}: imported {len(new_phases)} phases and {len(ordered)} steps "
            f"({start}-{start + len(ordered) - 1})" if ordered else f"{pl['code']}: imported {len(new_phases)} phases"]
     uncovered = con.execute("SELECT count(*) FROM v_uncovered_findings WHERE plan=?", (pl["code"],)).fetchone()[0]
@@ -11967,10 +12436,188 @@ def cmd_import_steps(ctx):
     return out
 
 
+# ----- feature proposals (plan step 145): what the codebase could add to meet the owner's goals
+
+FEATURE_VALUES = ("high", "medium", "low")
+FEATURE_EFFORTS = ("small", "medium", "large")
+FEATURE_MOVES = {"pick": "picked", "decline": "declined", "built": "built"}
+FP_CODE = re.compile(r"FP-[0-9]{4,}")
+
+
+def feature_row(con, code):
+    """The feature_proposals row of a code like FP-0001; WriteError for a malformed or unknown code."""
+    if not FP_CODE.fullmatch(code or ""):
+        raise WriteError(f"{code!r} is not a feature proposal code like FP-0001")
+    r = one(con, "SELECT * FROM feature_proposals WHERE code=?", (code,))
+    if not r:
+        raise WriteError(f"no feature proposal {code}")
+    return r
+
+
+def _feature_serves(con, goal, requirement):
+    """(goal_id, requirement_id) of what a proposal serves: an approved goal or an active requirement, exactly one."""
+    if bool(goal) == bool(requirement):
+        raise WriteError("give --goal or --requirement: the one approved goal (G-01) or active requirement "
+                         "(REQ-0001) the addition serves")
+    if goal:
+        g = goal_row(con, goal.strip())
+        if g["status"] not in _served(con):
+            raise WriteError(f"{g['code']} is {g['status']}; a proposal serves an approved goal")
+        return g["id"], None
+    r = one(con, "SELECT id, status FROM requirements WHERE code=?", (requirement.strip(),))
+    if not r:
+        raise WriteError(f"no requirement {requirement.strip()}")
+    if r["status"] != "active":
+        raise WriteError(f"{requirement.strip()} is {r['status']}; a proposal serves an active requirement")
+    return None, r["id"]
+
+
+@_command("propose-feature", "record one addition the codebase could make to serve an approved goal or a stated "
+                             "requirement; not a defect: it has a value and an effort, no severity (prints its code)",
+          "ledger.py propose-feature --review R-0001 --goal G-01|--requirement REQ-0001 --title T --today TEXT "
+          "--evidence 'path:line'|absent --proposal TEXT --value high|medium|low --effort small|medium|large "
+          "--done-test 'test_name: what it asserts' [--risks TEXT] [--depends TEXT] [--actor A-0002]")
+def cmd_propose_feature(ctx):
+    a, con = ctx.a, ctx.con
+    rv = review_row(con, _need(a.review, "--review"))
+    goal_id, req_id = _feature_serves(con, a.goal, a.requirement)
+    title = " ".join(_need(_text_arg(a.title, "--title"), "--title (the addition, in a few words)").split())
+    fields = {k: _need(_text_arg(getattr(a, k), f"--{k.replace('_', '-')}"), f"--{k.replace('_', '-')} ({why})")
+              for k, why in (("today", "what the code does toward the goal now"),
+                             ("evidence", "path:line of what serves the goal today, or absent"),
+                             ("proposal", "the addition"),
+                             ("done_test", "the test that would show it is built: 'test_name: what it asserts'"))}
+    if (a.value or "") not in FEATURE_VALUES:
+        raise WriteError(f"--value {a.value!r} is not one of {', '.join(FEATURE_VALUES)} (how far it advances the goal)")
+    if (a.effort or "") not in FEATURE_EFFORTS:
+        raise WriteError(f"--effort {a.effort!r} is not one of {', '.join(FEATURE_EFFORTS)}")
+    for f in rows(con, """SELECT code, status FROM feature_proposals WHERE goal_id IS ? AND requirement_id IS ?
+                          AND lower(trim(title)) = lower(?)""", (goal_id, req_id, title)):
+        if f["status"] == "declined":
+            raise WriteError(f"the owner declined this idea for the same goal as {f['code']}; propose it again only "
+                             f"for a changed goal")
+        raise WriteError(f"{f['code']} already proposes it ({f['status']})")
+    code = next_code(con, "FP")
+    ctx.x("""INSERT INTO feature_proposals(code, review_id, goal_id, requirement_id, title, today, evidence, proposal,
+             value, effort, risks, depends, done_test, proposed_by_actor_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+          (code, rv["id"], goal_id, req_id, title, fields["today"], fields["evidence"], fields["proposal"], a.value,
+           a.effort, _text_arg(a.risks, "--risks"), _text_arg(a.depends, "--depends"), fields["done_test"],
+           ctx.actor_id))
+    return [code]
+
+
+@_command("feature-status", "record the owner's pick or decline of a feature proposal, or that a picked one is built",
+          "ledger.py feature-status FP-0001 pick|decline|built --note TEXT [--gate GATE-0001] "
+          "[--step 12|P-0001#12] [--plan P-0001] [--actor A-0001]")
+def cmd_feature_status(ctx):
+    a, con = ctx.a, ctx.con
+    f = feature_row(con, a.proposal)
+    if a.move not in FEATURE_MOVES:
+        raise WriteError(f"{a.move!r} is not one of {', '.join(FEATURE_MOVES)}")
+    to = FEATURE_MOVES[a.move]
+    note = _need(_text_arg(a.note, "--note"), "--note (why, in the owner's words where they gave them)")
+    gate = None
+    if a.gate:
+        gate = one(con, "SELECT * FROM gates WHERE code=?", (a.gate,))
+        if not gate or gate["kind"] != "feature-pick" or gate["review_id"] != f["review_id"]:
+            raise WriteError(f"{a.gate} is not the feature-pick gate of {f['code']}'s review")
+        if gate["status"] not in ("answered", "applied"):
+            raise WriteError(f"{a.gate} is not answered yet; the owner picks there first")
+    if to == "built":
+        who = ctx.actor_id
+        if who is None:
+            raise WriteError("give --actor: who built it")
+    elif gate is not None:
+        who = owner_actor(con)
+    else:
+        who = _owner_decides(ctx, f"{'picked' if to == 'picked' else 'declined'} it")
+    if f["status"] == to:
+        raise WriteError(f"{f['code']} is already {to}")
+    allowed = {"proposed": ("picked", "declined"), "picked": ("built", "declined"), "declined": ("picked",)}
+    if to not in allowed.get(f["status"], ()):
+        raise WriteError(f"{f['code']} is {f['status']}; " + (
+            "only a picked proposal is built" if to == "built" else f"a {f['status']} proposal cannot be {to}"))
+    step = step_row(con, a.step, a.plan) if a.step else None
+    if step is not None and to == "declined":
+        raise WriteError("--step goes with pick or built")
+    ctx.x("""UPDATE feature_proposals SET status=?, status_note=?, decided_by_actor_id=?, decided_at=?,
+             gate_id=COALESCE(?, gate_id), step_id=CASE WHEN ? = 'declined' THEN NULL ELSE COALESCE(?, step_id) END
+             WHERE id=?""",
+          (to, note, who, now(), gate["id"] if gate else None, to, step["id"] if step else None, f["id"]))
+    where = f" (step {step['number']})" if step else ""
+    return [f"{f['code']}: {f['status']} -> {to}{where}"]
+
+
+def _feature_lines(con, gate_review=None):
+    """The open proposals of a review as the feature-pick gate's context: one line each, best first."""
+    out = []
+    for p in rows(con, "SELECT * FROM v_feature_proposals WHERE review=? AND status='proposed' ORDER BY rank, code",
+                  (gate_review,)):
+        out.append(f"- {p['code']} {p['title']} (serves {p['serves']}; value {p['value']}, effort {p['effort']}). "
+                   f"{' '.join(p['proposal'].split())} Done when: {' '.join(p['done_test'].split())}")
+    return out
+
+
+@_command("feature-gate", "ask the owner, in one non-blocking gate per review, which feature proposals to build "
+                          "(prints the gate's code)",
+          "ledger.py feature-gate --review R-0001 [--actor A-0002]")
+def cmd_feature_gate(ctx):
+    a, con = ctx.a, ctx.con
+    rv = review_row(con, _need(a.review, "--review"))
+    have = one(con, "SELECT code FROM gates WHERE review_id=? AND kind='feature-pick' AND status <> 'withdrawn'",
+               (rv["id"],))
+    if have:
+        raise WriteError(f"{rv['code']} already has its feature-pick gate, {have['code']}")
+    lines = _feature_lines(con, rv["code"])
+    if not lines:
+        raise WriteError(f"{rv['code']} has no proposed feature proposals (ledger.py features --review {rv['code']})")
+    code = next_code(con, "GATE")
+    opts = [{"value": "all", "label": "Build them all"}, {"value": "none", "label": "None for now"}]
+    ctx.x("""INSERT INTO gates(code, kind, title, question, context, options, allow_text, blocking, review_id,
+             opened_by_actor_id) VALUES (?, 'feature-pick', ?, ?, ?, ?, 1, 0, ?, ?)""",
+          (code, f"Ideas from {rv['code']}", "Which of these should become plan steps? Name the codes, or choose "
+                                            "one answer.", "\n".join(lines), json.dumps(opts), rv["id"], ctx.actor_id))
+    return [code]
+
+
+def features_list(con, review=None, status=None):
+    """The feature proposals, best first (v_feature_proposals), of one review and one status when given."""
+    where, args = [], []
+    if review:
+        review_row(con, review)
+        where.append("review=?"); args.append(review)
+    if status:
+        if status not in FEATURE_MOVES.values() and status != "proposed":
+            raise WriteError(f"--status {status!r} is not one of proposed, {', '.join(FEATURE_MOVES.values())}")
+        where.append("status=?"); args.append(status)
+    return rows(con, f"SELECT * FROM v_feature_proposals WHERE {' AND '.join(where) or '1'} ORDER BY rank, code", args)
+
+
+@_command("features", "list the feature proposals, best first, with the goal each serves, value, effort and status "
+                      "(read-only)",
+          "ledger.py features [--review R-0001] [--status proposed|picked|declined|built] [--json]", read=True)
+def cmd_features(con, a):
+    found = features_list(con, a.review, a.status)
+    if a.json:
+        return [json.dumps({"proposals": found}, ensure_ascii=False, indent=1)]
+    if not found:
+        return ["no feature proposals" + (f" in {a.review}" if a.review else "")]
+    words = {r["value"]: r["label"] for r in con.execute(
+        "SELECT value, label FROM enum_labels WHERE enum='feature_status'")}
+    out, last = [], object()
+    for p in sorted(found, key=lambda p: (p["serves"], p["rank"], p["code"])):
+        if p["serves"] != last:
+            last = p["serves"]
+            out.append(("" if not out else "\n") + f"{p['serves']}  {' '.join(p['serves_text'].split())}")
+        out.append(f"  {p['code']}  {p['title']}  [{words.get(p['status'], p['status'])}; value {p['value']}, "
+                   f"effort {p['effort']}" + (f"; {p['step']}" if p["step"] else "") + "]")
+    return out
+
+
 # ----- gates: open-gate, answer-gate (shared with the viewer), apply-gate
 
 GATE_KINDS_HELP = ("decision|confirm|domain-approval|plan-approval|step-input|confirm-false-finding|accept-risk|"
-                   "production-action|review-handoff|other")
+                   "production-action|review-handoff|feature-pick|other")
 
 
 def _gate_options(specs, raw_json):
@@ -12006,6 +12653,7 @@ def _gate_options(specs, raw_json):
 @_command("open-gate", "ask the owner something (prints the gate's code)",
           f"ledger.py open-gate {GATE_KINDS_HELP} --title T --question Q [--context TEXT|@file] "
           "[--option value=label[:description]]... [--options-json JSON|@file] [--no-text] [--non-blocking] "
+          "[--multi [--preselect value,...]] "
           "[--review R-0001] [--plan P-0001] [--step 12] [--issue ISS-0001] [--decision D-0001] [--actor A-0001]")
 def cmd_open_gate(ctx):
     a, con = ctx.a, ctx.con
@@ -12015,18 +12663,28 @@ def cmd_open_gate(ctx):
     opts = _gate_options(a.option, a.options_json)
     if a.no_text and not opts:
         raise WriteError("a gate without free text needs at least one --option")
+    if a.multi and not opts:
+        raise WriteError("a multi-select gate (--multi) needs its --option list")
+    pre = [v.strip() for v in (a.preselect or "").split(",") if v.strip()]
+    if pre and not a.multi:
+        raise WriteError("--preselect goes with --multi")
+    unknown = [v for v in pre if v not in [o["value"] for o in opts]]
+    if unknown:
+        raise WriteError(f"--preselect {', '.join(unknown)} is not one of the options")
     code = next_code(con, "GATE")
     plan = plan_row(con, a.plan) if a.plan or a.step else None
     dec = one(con, "SELECT id FROM decisions WHERE code=?", (a.decision,)) if a.decision else None
     if a.decision and not dec:
         raise WriteError(f"no decision {a.decision}")
     ctx.x("""INSERT INTO gates(code, kind, title, question, context, options, allow_text, blocking, review_id, plan_id,
-             step_id, issue_id, decision_id, opened_by_actor_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+             step_id, issue_id, decision_id, opened_by_actor_id, multi, preselect)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
           (code, a.kind, _need(a.title, "--title"), _need(a.question, "--question"), _text_arg(a.context, "--context"),
            json.dumps(opts) if opts else None, 0 if a.no_text else 1, 0 if a.non_blocking else 1,
            review_row(con, a.review)["id"] if a.review else None, plan["id"] if plan else None,
            step_row(con, a.step, plan["code"])["id"] if a.step else None,
-           issue_row(con, a.issue)["id"] if a.issue else None, dec["id"] if dec else None, ctx.actor_id))
+           issue_row(con, a.issue)["id"] if a.issue else None, dec["id"] if dec else None, ctx.actor_id,
+           1 if a.multi else 0, json.dumps(list(dict.fromkeys(pre))) if pre else None))
     return [code]
 
 
@@ -12048,7 +12706,8 @@ def answer_gate(con, code, value=None, text=None, via="chat", actor_id=None):
     ANSWER_MAX_TEXT); returns {"ok": True}. tr_gate_answer_rules holds the same rules for answers written as SQL."""
     if not isinstance(con, sqlite3.Connection):  # answer_gate(db, code, body): the viewer's request form
         return gate_answer_request(con, code, value if isinstance(value, dict) else {})
-    if (value is not None and not isinstance(value, str)) or (text is not None and not isinstance(text, str)):
+    if (value is not None and not isinstance(value, (str, list))) or (text is not None and not isinstance(text, str)) \
+            or (isinstance(value, list) and not all(isinstance(v, str) for v in value)):
         raise GateRefused(400, "An answer is text.")
     own = not con.in_transaction
     if own:
@@ -12059,11 +12718,23 @@ def answer_gate(con, code, value=None, text=None, via="chat", actor_id=None):
             raise GateRefused(404, "no such gate")
         if g["status"] != "open":
             raise GateRefused(409, GATE_CLOSED.get(g["status"], GATE_CLOSED["answered"]))
-        val = (value or "").strip() or None
         txt = (text or "").strip() or None
         opts = [o.get("value") for o in json.loads(g["options"] or "[]")]
-        if val is not None and val not in opts:
-            raise GateRefused(400, "That choice is not one of the options.")
+        if g["multi"]:
+            picked = None if value is None else list(dict.fromkeys(
+                v.strip() for v in ([value] if isinstance(value, str) else value) if v.strip()))
+            if picked is not None and any(v not in opts for v in picked):
+                raise GateRefused(400, "That choice is not one of the options.")
+            # stored in the options' order, so the same choice is always the same text
+            val = None if picked is None else json.dumps([v for v in opts if v in picked])
+        else:
+            if isinstance(value, list):
+                if len(value) > 1:
+                    raise GateRefused(400, "This question takes one option.")
+                value = value[0] if value else None
+            val = (value or "").strip() or None
+            if val is not None and val not in opts:
+                raise GateRefused(400, "That choice is not one of the options.")
         if val is None and not txt:
             raise GateRefused(400, "Choose an option or write an answer.")
         if txt and not g["allow_text"]:
@@ -12089,14 +12760,20 @@ def answer_gate(con, code, value=None, text=None, via="chat", actor_id=None):
 
 
 @_command("answer-gate", "record the owner's answer given in chat (the viewer's rules)",
-          "ledger.py answer-gate GATE-0001 [--value OPTION] [--text 'their words'] [--via chat|other] "
+          "ledger.py answer-gate GATE-0001 [--value OPTION]... [--text 'their words'] [--via chat|other] "
           "[--by A-0001 (default: the owner)]")
 def cmd_answer_gate(ctx):
     a = ctx.a
     who = resolve_actor(ctx.con, a.by, "--by") if a.by else None
-    answer_gate(ctx.con, a.gate, a.value, _text_arg(a.text, "--text"), a.via, who)
-    g = one(ctx.con, "SELECT answer_value, answer_text FROM gates WHERE code=?", (a.gate,))
-    return [f"{a.gate}: answered ({', '.join(x for x in (g['answer_value'], g['answer_text']) if x)})"]
+    g = one(ctx.con, "SELECT multi FROM gates WHERE code=?", (a.gate,))
+    values = a.value or []
+    value = values if (g and g["multi"] and values) else (values[0] if len(values) == 1 else (values or None))
+    answer_gate(ctx.con, a.gate, value, _text_arg(a.text, "--text"), a.via, who)
+    g = one(ctx.con, "SELECT answer_value, answer_text, options FROM gates WHERE code=?", (a.gate,))
+    shown = g["answer_value"]
+    if g["answer_value"] is not None and g["answer_value"].startswith("["):
+        shown = ", ".join(json.loads(g["answer_value"])) or "none"
+    return [f"{a.gate}: answered ({', '.join(x for x in (shown, g['answer_text']) if x)})"]
 
 
 @_command("apply-gate", "record what was done with a gate's answer (a decision gate also records the decision)",
@@ -13869,7 +14546,7 @@ def add_write_commands(sub):
             s.add_argument("--actor", help="who makes this change (A-0001, an actor id, or a unique actor name)")
         return s
 
-    s = p("next-code"); s.add_argument("prefix", help="ISS, R, P, D, GATE, REQ, G or IQ")
+    s = p("next-code"); s.add_argument("prefix", help="ISS, R, P, D, GATE, REQ, G, IQ or FP")
     s = p("add-repo"); s.add_argument("name"); s.add_argument("path", help="relative to the project root ('.')")
     s.add_argument("--remote"); s.add_argument("--default-branch"); s.add_argument("--permalink-template")
     s.add_argument("--outside-root", action="store_true", help="the owner listed it as living outside the root")
@@ -13903,7 +14580,12 @@ def add_write_commands(sub):
     s.add_argument("--option", action="append", help="value=label or value=label:description")
     s.add_argument("--no-text", action="store_true", help="the owner must choose an option")
     s.add_argument("--non-blocking", action="store_true")
-    s = p("answer-gate"); s.add_argument("gate"); s.add_argument("--value"); s.add_argument("--text")
+    s.add_argument("--multi", action="store_true", help="the owner may choose any number of the options")
+    s.add_argument("--preselect", help="with --multi: the recommended option values, ticked first (a,b)")
+    s = p("answer-gate"); s.add_argument("gate")
+    s.add_argument("--value", action="append", help="the chosen option's value (again for each one of a multi-select "
+                                                    "gate)")
+    s.add_argument("--text")
     s.add_argument("--via", default="chat", choices=("chat", "other")); s.add_argument("--by")
     s = p("apply-gate"); s.add_argument("gate"); s.add_argument("--note"); s.add_argument("--revisit-when")
     s = p("interview-ask"); s.add_argument("question", nargs="?"); s.add_argument("--review"); s.add_argument("--domain")
@@ -13951,6 +14633,24 @@ def add_write_commands_131(p):
     s.add_argument("step_a", help="one step's number"); s.add_argument("step_b", help="the other step's number")
     s.add_argument("--resolution", help=", ".join(CONFLICT_RESOLUTIONS)); s.add_argument("--note")
     s.add_argument("--gate", help="with owner: the applied gate where the owner decided")
+    s.add_argument("--first", help="with order: the step that runs first (default: the lower number)")
+    s = p("propose-feature"); s.add_argument("--review", help="the review whose features reviewer proposed it")
+    s.add_argument("--goal", help="the approved goal (G-01)")
+    s.add_argument("--requirement", help="or the active requirement (REQ-0001)")
+    for o, h in (("--title", "the addition, in a few words"), ("--today", "what the code does toward the goal now"),
+                 ("--evidence", "path:line of what serves the goal today, or absent"),
+                 ("--proposal", "the addition"), ("--value", "high, medium or low: how far it advances the goal"),
+                 ("--effort", "small, medium or large"), ("--risks", "what could go wrong"),
+                 ("--depends", "what it needs first"), ("--done-test", "the test that shows it is built")):
+        s.add_argument(o, help=h)
+    s = p("feature-status"); s.add_argument("proposal", help="the proposal (FP-0001)")
+    s.add_argument("move", help="pick, decline or built"); s.add_argument("--note")
+    s.add_argument("--gate", help="the answered feature-pick gate where the owner chose")
+    s.add_argument("--step", help="the plan step that builds it"); s.add_argument("--plan")
+    s = p("feature-gate"); s.add_argument("--review", help="the review whose proposals the owner picks from")
+    s = p("features"); s.add_argument("--review", help="only this review's proposals")
+    s.add_argument("--status", help="only proposed, picked, declined or built ones")
+    s.add_argument("--json", action="store_true", help="print JSON")
     s = p("new-plan"); s.add_argument("--title"); s.add_argument("--review", action="append")
     s = p("plan-status"); s.add_argument("plan"); s.add_argument("status"); s.add_argument("--note")
     s.add_argument("--approved-by"); s.add_argument("--superseded-by")
@@ -14842,7 +15542,8 @@ def parse_rule(domain, rule):
 
 def scan_review(con, root, rv):
     """The scan of a review: each repository's inventory at its reviewed commit, the facts (summed over the
-    repositories, with the ledger's own: requirements recorded), and each catalog domain's proposal by its rule."""
+    repositories, with the ledger's own: requirements recorded and goals approved), and each catalog domain's proposal
+    by its rule."""
     repos = rows(con, """SELECT r.name, r.path, r.allow_outside_root, rr.commit_sha FROM review_repositories rr
                          JOIN repositories r ON r.id = rr.repository_id WHERE rr.review_id=? ORDER BY r.name""",
                  (rv["id"],))
@@ -14859,6 +15560,8 @@ def scan_review(con, root, rv):
         for k, v in f.items():
             facts[k] = max(facts.get(k, 0), v) if k in ("history_months", "authors") else facts.get(k, 0) + v
     facts["requirements"] = con.execute("SELECT count(*) FROM requirements WHERE status='active'").fetchone()[0]
+    facts["goals"] = con.execute("""SELECT count(*) FROM design_goals WHERE retired_at IS NULL AND status IN
+                                    (SELECT value FROM goal_statuses WHERE served = 1)""").fetchone()[0]
     open_issues = {}
     for r in rows(con, """SELECT domain_code, code FROM issues WHERE status IN
                           (SELECT value FROM issue_statuses WHERE active = 1) ORDER BY id"""):
@@ -15149,6 +15852,44 @@ def catalog_entry(domain_row, catalog=None):
     return None
 
 
+def features_prompt(con, d, folder, scope, report, tool, catalog):
+    """The features reviewer's prompt: every approved goal (each domain's and the whole project's), the active
+    requirements, the proposals already on record, the checklist, the catalog's entry and the proposals report
+    format."""
+    out = [f"First read {folder}/BRIEF.md and follow it exactly.", "",
+           f"You review one domain: {d['name']} (`{d['code']}`). You are read-only: the one file you write is your "
+           f"report.", f"Scope: {' '.join(scope.split()) if scope and scope.strip() else 'the whole system'}",
+           f"Report file: {folder}/{report or d['report_file']}", "",
+           "You look ahead: for each goal and requirement below, say what the code does toward it today and what is "
+           "missing, then propose the additions (features, components, abilities, services, capabilities, "
+           "integrations, tooling) that would advance it most. Proposals are not defects: missing them breaks "
+           "nothing, so they have no severity and are not findings.", "",
+           f"The approved goals, every domain's and the whole project's (read them again with `{tool} goals`; this "
+           f"domain's own with `{tool} goals --domain {d['code']}`):", ""]
+    goals = rows(con, "SELECT domain_code, code, text FROM v_goals_for_brief")
+    out += [f"- {g['code']} {' '.join(g['text'].split())}" + (f" ({g['domain_code']})" if g["domain_code"] else "")
+            for g in goals] or ["- none approved"]
+    out += ["", "The active requirements:", ""]
+    out += [f"- {r['code']} {' '.join(r['text'].split())}" for r in rows(
+        con, "SELECT code, text FROM requirements WHERE status='active' ORDER BY id")] or ["- none recorded"]
+    out += ["", f"Proposals already on record (`{tool} features`). Check each again against its goal and the code; "
+                "never propose again what the owner declined for the same goal.", ""]
+    out += [f"- {p['code']} [{p['status']}] {p['title']} (serves {p['serves']})" for p in rows(
+        con, "SELECT code, status, title, serves FROM v_feature_proposals ORDER BY rank, code")] or ["- none"]
+    out += ["", "Checklist. Answer every item in your \"Checklist\" table: yes, no, partly or not applicable, with the "
+                "evidence or the reason.", ""]
+    out += [f"- {c['code']} {c['question']} Evidence: {c['evidence']}" for c in rows(
+        con, "SELECT code, question, evidence FROM domain_checks WHERE domain_code=? ORDER BY position", (d["code"],))]
+    entry = catalog_entry(d, catalog)
+    out += ["", "How to review this domain (the catalog's entry):", "",
+            entry or "The catalog is not beside this ledger.py: read the domain's entry in the skill's "
+                     "references/domains.md.", "", "## Report format", "",
+            FEATURES_REPORT_FORMAT.replace("`ledger.py ", f"`{tool} ").rstrip("\n"), "",
+            "Final message back: at most 15 lines, with counts (goals read, proposals by value) and the 5 proposals "
+            "that advance the goals most."]
+    return "\n".join(out) + "\n"
+
+
 def prompt_text(con, root, db, rv, domain, scope=None, report=None, tool="ledger.py", catalog=None):
     """One reviewer's prompt, from the fixed template and the ledger: the brief to read first, the domain, scope and
     report file, the domain's approved goals and where to read them again, its known issues, its checklist and its
@@ -15158,6 +15899,8 @@ def prompt_text(con, root, db, rv, domain, scope=None, report=None, tool="ledger
     if not d:
         raise WriteError(f"{rv['code']} did not include domain {domain!r} (review_domains)")
     folder = _review_folder(root, db, rv)
+    if d["code"] == FEATURES_DOMAIN:
+        return features_prompt(con, d, folder, scope, report, tool, catalog)
     out = [f"First read {folder}/BRIEF.md and follow it exactly.", "",
            f"You review one domain of review {rv['code']}: {d['name']} (`{d['code']}`). You are read-only: the one "
            f"file you write is your report.",
@@ -15275,21 +16018,14 @@ def parse_report(text):
     return sections, findings
 
 
-def lint_report(con, root, text, domain, rv=None):
-    """(problems, notes, counts, answers) for a report of a domain: the required sections, every checklist item
-    answered with evidence (or 'not applicable' and the reason), every known issue reported, and every finding with
-    an id used once, a severity, a location and a fix. With a review, each location must exist at its reviewed
-    commit. Problems are (line or 0, message), in the order of the report."""
-    problems, notes = [], []
-    sections, findings = parse_report(text)
-    section = lambda title: next((v for k, v in sections.items() if k.startswith(title)), None)
-    for title in REPORT_SECTIONS:
-        if section(title) is None:
-            problems.append((0, f"no section '## {title}'"))
+def _lint_checklist(con, domain, lines, problems):
+    """(checks by code, answers) of a report's Checklist section lines (None: no section); appends to problems
+    each item not of the domain, answered twice, with an unknown answer or without evidence, and each item left
+    unanswered."""
     checks = {c["code"]: c for c in rows(con, "SELECT * FROM domain_checks WHERE domain_code=? ORDER BY position",
                                          (domain,))}
     answers = {}
-    for no, cells in _table_rows(section("Checklist") or []):
+    for no, cells in _table_rows(lines or []):
         code = cells[0]
         answer = CHECK_ANSWERS.get(cells[1].lower()) if len(cells) > 1 else None
         evidence = cells[2] if len(cells) > 2 else ""
@@ -15307,9 +16043,130 @@ def lint_report(con, root, text, domain, rv=None):
             answers[code] = None
         else:
             answers[code] = (answer, evidence)
-    if section("Checklist") is not None:
+    if lines is not None:
         problems += [(0, f"checklist item {code} is not answered ({checks[code]['question']})")
                      for code in checks if code not in answers]
+    return checks, answers
+
+
+FEATURES_DOMAIN = "features"
+FEATURES_REPORT_FORMAT = """\
+The manager checks the report with `ledger.py lint-report <file> --domain features --review <review>`. Sections, in
+this order; the five marked required must be there:
+
+    # features: <what was reviewed>
+
+    ## Scope and method        (required) what was read, and what was not
+    ## Checklist               (required) one row per checklist item of the domain
+    | check | answer | evidence |
+    |-------|--------|----------|
+    | features.1 | yes | the goals table lists 4 goals and 1 requirement |
+    ## Goals                   (required) one row per approved goal and active requirement
+    | goal | what the code does toward it | evidence |
+    |------|------------------------------|----------|
+    | G-01 | keeps open items only | `repo:src/items.py:12-40#Store` |
+    ## Proposals               (required) every addition worth considering, best first
+    ### FEAT-1 One line that names the addition.
+    - Goal: G-01
+    - Today: what the code does toward the goal now, with `repo:path:line`, or absent
+    - Proposal: the feature, component, service, capability or integration to add
+    - Value: high, medium or low (how far it advances the goal)
+    - Effort: small, medium or large
+    - Risks: what could go wrong
+    - Depends: what it needs first, or none
+    - Done-test: test_name: what it asserts once it is built
+    ## Totals                  (required) goals read and proposals made
+
+- Proposals are not defects: no severity, no issue. Each names one approved goal (`G-01`) or active requirement
+  (`REQ-0001`) and a done-test.
+- Do not propose again what the owner declined for the same goal (`ledger.py features --status declined`); say in
+  the checklist what changed about each proposal already on record.
+"""
+FEATURES_SECTIONS = ("Scope and method", "Checklist", "Goals", "Proposals", "Totals")
+PROPOSAL_FIELDS = ("goal", "today", "proposal", "value", "effort", "risks", "depends", "done-test")
+
+
+def parse_proposals(sections):
+    """The proposals of a features report's Proposals section: {id, title, line, fields, severity}."""
+    out, cur, field = [], None, None
+    body = next((v for k, v in sections.items() if k.startswith("Proposals")), [])
+    for no, line in body:
+        head = re.match(r"### +(.+?)\s*$", line)
+        bullet = re.match(r"\s*[-*] +\**(Goal|Today|Proposal|Value|Effort|Risks|Depends|Done-test)\**:\**\s*(.*)$",
+                          line, re.I)
+        if head:
+            m = FINDING_HEAD.match(head.group(1))
+            cur = {"id": m.group(1) if m else head.group(1), "severity": m.group(2) if m else None,
+                   "title": m.group(3) if m else "", "line": no, "fields": {}}
+            out.append(cur)
+            field = None
+        elif cur is not None and bullet:
+            field = bullet.group(1).lower()
+            cur["fields"][field] = bullet.group(2).strip()
+        elif cur is not None and field and line.strip() and line.startswith(" "):
+            cur["fields"][field] += " " + line.strip()
+        else:
+            field = None
+    return out
+
+
+def lint_features_report(con, text):
+    """lint_report() for the features domain: its own sections, the checklist, and each proposal with an id used
+    once, no severity, a goal that is approved (or a requirement that is active), today's state, the addition, a
+    value, an effort and a done-test."""
+    problems, notes = [], []
+    sections, _ = parse_report(text)
+    section = lambda title: next((v for k, v in sections.items() if k.startswith(title)), None)
+    for title in FEATURES_SECTIONS:
+        if section(title) is None:
+            problems.append((0, f"no section '## {title}'"))
+    checks, answers = _lint_checklist(con, FEATURES_DOMAIN, section("Checklist"), problems)
+    served = {r[0] for r in con.execute("""SELECT code FROM design_goals WHERE retired_at IS NULL AND status IN
+                                           (SELECT value FROM goal_statuses WHERE served = 1)""")}
+    served |= {r[0] for r in con.execute("SELECT code FROM requirements WHERE status='active'")}
+    seen = set()
+    for p in parse_proposals(sections):
+        pid, f = p["id"], p["fields"]
+        if pid in seen:
+            problems.append((p["line"], f"{pid}: the id is used twice"))
+        seen.add(pid)
+        if p["severity"]:
+            problems.append((p["line"], f"{pid}: a proposal has no severity (### {pid} <the addition>)"))
+        goal = (re.findall(r"\b(?:G-[0-9]{2,}|REQ-[0-9]{4,})\b", f.get("goal", "")) or [None])[0]
+        if goal is None:
+            problems.append((p["line"], f"{pid}: names no goal (- Goal: G-01, or a requirement REQ-0001)"))
+        elif goal not in served:
+            problems.append((p["line"], f"{pid}: {goal} is not an approved goal or an active requirement"))
+        if len(f.get("done-test", "")) < 3:
+            problems.append((p["line"], f"{pid}: no done-test (- Done-test: test_name: what it asserts)"))
+        for k in ("today", "proposal"):
+            if len(f.get(k, "")) < 3:
+                problems.append((p["line"], f"{pid}: no {k} (- {k.capitalize()}: ...)"))
+        if f.get("value", "").lower().strip(". ") not in FEATURE_VALUES:
+            problems.append((p["line"], f"{pid}: value {f.get('value', '')!r} is not one of "
+                                        f"{', '.join(FEATURE_VALUES)}"))
+        if f.get("effort", "").lower().strip(". ") not in FEATURE_EFFORTS:
+            problems.append((p["line"], f"{pid}: effort {f.get('effort', '')!r} is not one of "
+                                        f"{', '.join(FEATURE_EFFORTS)}"))
+    summary = {"checks": len([a for a in answers.values() if a]), "proposals": len(seen)}
+    return sorted(problems, key=lambda p: (p[0] == 0, p[0])), notes, summary, {k: v for k, v in answers.items() if v}
+
+
+def lint_report(con, root, text, domain, rv=None):
+    """(problems, notes, counts, answers) for a report of a domain: the required sections, every checklist item
+    answered with evidence (or 'not applicable' and the reason), every known issue reported, and every finding with
+    an id used once, a severity, a location and a fix. With a review, each location must exist at its reviewed
+    commit. Problems are (line or 0, message), in the order of the report. A features report is checked by
+    lint_features_report()."""
+    if domain == FEATURES_DOMAIN:
+        return lint_features_report(con, text)
+    problems, notes = [], []
+    sections, findings = parse_report(text)
+    section = lambda title: next((v for k, v in sections.items() if k.startswith(title)), None)
+    for title in REPORT_SECTIONS:
+        if section(title) is None:
+            problems.append((0, f"no section '## {title}'"))
+    checks, answers = _lint_checklist(con, domain, section("Checklist"), problems)
     reported = {}
     for no, cells in _table_rows(section("Known issues") or []):
         outcome = cells[1].lower() if len(cells) > 1 else ""
@@ -15403,10 +16260,14 @@ def lint_report_command(a, root, db):
         print("\n".join(lines))
         return 1
     plural = lambda n, word: f"{n} {word}{'' if n == 1 else 's'}"
-    by = ", ".join(f"{s} {n}" for s, n in summary["by_severity"].items())
-    lines.append(f"{name}: ok: {plural(summary['checks'], 'check')} answered, "
-                 f"{plural(summary['known'], 'known issue')} reported, {plural(summary['findings'], 'finding')}"
-                 + (f" ({by})" if by else ""))
+    by = ", ".join(f"{s} {n}" for s, n in summary.get("by_severity", {}).items())
+    if "proposals" in summary:
+        lines.append(f"{name}: ok: {plural(summary['checks'], 'check')} answered, "
+                     f"{plural(summary['proposals'], 'proposal')}")
+    else:
+        lines.append(f"{name}: ok: {plural(summary['checks'], 'check')} answered, "
+                     f"{plural(summary['known'], 'known issue')} reported, "
+                     f"{plural(summary['findings'], 'finding')}" + (f" ({by})" if by else ""))
     if not a.record:
         print("\n".join(lines))
         return 0
@@ -15692,7 +16553,7 @@ def conflicts_command(a, root, db):
 
 @_command("resolve-conflict", "record how two plan steps that touch the same thing are judged",
           "ledger.py resolve-conflict P-0001 STEP STEP --resolution no-conflict|order|merge|owner --note TEXT "
-          "[--gate GATE-0001] [--actor A-0001]")
+          "[--first STEP] [--gate GATE-0001] [--actor A-0001]")
 def cmd_resolve_conflict(ctx):
     a, con = ctx.a, ctx.con
     plan = plan_row(con, a.plan)
@@ -15715,7 +16576,15 @@ def cmd_resolve_conflict(ctx):
              WHERE step_a_id=? AND step_b_id=? AND resolution='none'""",
           (a.resolution, note, gate["id"] if gate else None, ctx.actor_id, now(), s1["id"], s2["id"]))
     if a.resolution == "order":
-        ctx.x("INSERT OR IGNORE INTO step_dependencies(step_id, depends_on_step_id) VALUES (?,?)", (s2["id"], s1["id"]))
+        first, then = (s1, s2)
+        if a.first is not None:
+            if str(a.first) not in (str(s1["number"]), str(s2["number"])):
+                raise WriteError(f"--first {a.first} is neither step {s1['number']} nor step {s2['number']}")
+            first, then = (s1, s2) if str(a.first) == str(s1["number"]) else (s2, s1)
+        ctx.x("INSERT OR IGNORE INTO step_dependencies(step_id, depends_on_step_id) VALUES (?,?)",
+              (then["id"], first["id"]))
+    elif a.first is not None:
+        raise WriteError("--first goes with --resolution order")
     return [f"{plan['code']} steps {s1['number']} and {s2['number']}: {n} conflict{'' if n == 1 else 's'} resolved "
             f"({a.resolution})"]
 

@@ -85,7 +85,7 @@ what is committed: nothing, only `ledger.sql`, or only `ledger.sqlite` (about 9 
 Each project keeps a copy of the tool at `.code-review/ledger.py`. Review a pull request that changes that copy or the
 ledger's schema like any other code change. `ledger.py check` fails when the ledger's tables, views or triggers differ
 from the shipped schema. Agents run the skill's own `scripts/ledger.py`, and the project copy only right after `init`
-refreshed it.
+refreshed it; `init` prints the sha256 of the copy it wrote, to compare with the skill's.
 
 The ledger runs in SQLite's WAL mode (`init` sets it; `migrate` switches an existing ledger once), so the viewer's
 reads never block the agent's writes. While it is open, `ledger.sqlite-wal` and `ledger.sqlite-shm` sit beside it
@@ -113,9 +113,11 @@ codes both sides made are renumbered (the mapping is printed), and the ledger be
 ## Use the viewer
 
 After every review step and fix batch the agent writes the hub: the viewer as one file (`.code-review/hub.html`,
-`ledger.py progress-page`). Answers given in the hub file download as `answers.json` (a published copy
-with an answer store exports the same file); `ledger.py import-answers` records them. Publishing it elsewhere is optional. The live viewer, from the project root, with the skill's copy (or the project copy right
-after `init`):
+`ledger.py progress-page`). Answers given in the hub file download as `answers.json` (a published copy with an answer
+store exports the same file); `ledger.py import-answers` records them. Publishing it elsewhere is optional.
+
+The live viewer, from the project root, runs the skill's copy of ledger.py, not the project's `.code-review/ledger.py`
+(run that one only right after `init` refreshed it):
 
     python3 <skill folder>/scripts/ledger.py --root . serve
 
@@ -155,9 +157,10 @@ every `ledger.py` command SKILL.md names.
 `release.py` writes `dist/codebase-system-review-<version>.zip` (`dist/` is ignored by git): one folder named as
 SKILL.md's `name:`, with exactly SKILL.md, README.md, LICENSE, `scripts/ledger.py` and `references/`, dated so the
 same sources give the same bytes. It refuses, writing nothing, when `name:` is not `codebase-system-review`, the
-description is empty or over 1,024 characters, or `version:` is not X.Y.Z. To release: bump `version:` in SKILL.md,
-add the version to CHANGELOG.md, run the tests and `release.py`, commit, tag `v<version>` and attach the zip to a
-GitHub release.
+description is empty or over 1,024 characters, `version:` under `metadata:` is not X.Y.Z, or the frontmatter has a
+top-level key other than `name`, `description`, `license`, `compatibility`, `metadata` and `allowed-tools` (some skill
+loaders refuse any other). To release: bump `metadata:` `version:` in SKILL.md, add the version to CHANGELOG.md, run the
+tests and `release.py`, commit, tag `v<version>` and attach the zip to a GitHub release.
 
 Write SKILL.md, this file and `references/` to `references/writing.md`; `dev/tests/test_writing_lint.py` refuses its
 banned phrases (CHANGELOG.md is exempt). `SKILL.md` and `references/*.md` never put an exclamation mark right before a
@@ -206,7 +209,7 @@ since 1 (frozen in `dev/tests/data/schema-v1.sql`):
    refuses if any of these disagrees with the highest migration (`SCHEMA_VERSION` in ledger.py is that number).
 3. Add a test that restores the frozen v1 ledger (`dev/tests/_migrate_helpers.py`), runs `migrate`, and checks the
    result against a fresh `init` (`dev/tests/test_migrate.py` shows how); then rebuild with `python3 dev/build.py`.
-4. Bump `version:` in SKILL.md's frontmatter and add a line to CHANGELOG.md.
+4. Bump `metadata:` `version:` in SKILL.md's frontmatter and add a line to CHANGELOG.md.
 
 A migration file stays as it is once any ledger has run it. `migrate` refuses a ledger newer than the
 tool, backs the ledger up with SQLite's backup API to `ledger.sqlite.bak-v<old version>` (never overwriting an earlier

@@ -45,7 +45,7 @@ At full-review scale (about 2,000 points) one pass is too large:
 - Merge: read every step title phase by phase; fold steps that are the same fix into one (union of points, both texts
   kept); move steps whose dependency sits in a later phase; put verification and pinning tests first inside a phase.
   Then load: `ledger.py import-steps P-0001 steps.jsonl --actor A-0002` (the whole file is checked first; a dependency
-  must point at an earlier step). It prints the points still uncovered and the coverage problems.
+  may point at any step of the plan, never in a cycle). It prints the points still uncovered and the coverage problems.
 - Count the steps that need the owner by kind and the steps that change behavior on purpose, for the narrative.
 
 ## Ordering rules
@@ -57,7 +57,8 @@ At full-review scale (about 2,000 points) one pass is too large:
 3. Foundations before the things built on them: validation and the shared contract before tests that rely on them;
    one source of truth (access, approvals, decisions in their owning layer) before the UI that shows it;
    characterization tests before any structural move.
-4. A step depends only on earlier steps. Steps that change behavior on purpose are marked for the owner's eye.
+4. A step that must wait for another names it in `depends`, whatever the numbers; work goes in `v_step_order`'s order.
+   Steps that change behavior on purpose are marked for the owner's eye.
 5. Not-verified items become explicit verification steps, placed before the work that depends on the answer.
 6. Tests for untested units go group by group, the owner's most important or most used areas first.
 7. Recurring issues and regressions get a guard test in the same step as their fix.

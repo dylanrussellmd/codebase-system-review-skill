@@ -91,7 +91,7 @@ class Migrate(unittest.TestCase):
         after = M.counts(db)
         for table, n in before_counts.items():
             if table not in ("meta", "schema_migrations"):  # meta gains written_by_tool etc.; one row per migration
-                self.assertEqual(after[table], n, f"rows of {table} changed")
+                self.assertEqual(after[table], n + M.SEEDED_LATER.get(table, 0), f"rows of {table} changed")
         con = sqlite3.connect(str(db))
         try:
             self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], mod.SCHEMA_VERSION)

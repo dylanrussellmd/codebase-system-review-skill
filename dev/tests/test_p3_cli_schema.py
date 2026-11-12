@@ -151,7 +151,7 @@ class Migration0002(unittest.TestCase):
         after = M.counts(db)
         for t, n in before.items():
             if t not in ("meta", "schema_migrations"):
-                self.assertEqual(after[t], n, t)
+                self.assertEqual(after[t], n + M.SEEDED_LATER.get(t, 0), t)
         con = sqlite3.connect(str(db))
         try:
             self.assertEqual(con.execute("SELECT count(*) FROM finding_locations WHERE permalink GLOB 'http*'")

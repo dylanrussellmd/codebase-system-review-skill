@@ -14,7 +14,7 @@ SKILL_MD = fixtures.REPO_ROOT / "SKILL.md"
 
 def skill_version():
     front = SKILL_MD.read_text(encoding="utf-8").split("---\n")[1]
-    return re.search(r"(?m)^version: (\S+)$", front).group(1)
+    return re.search(r"(?m)^metadata:\n(?:[ \t]+.*\n)*?[ \t]+version: (\S+)$", front).group(1)
 
 
 def new_project():
@@ -91,14 +91,19 @@ class Stamp(unittest.TestCase):
 
     def test_build_requires_a_skill_version(self):
         build = fixtures.load_build_module()
-        for bad in ("version: banana\n", ""):
+        cases = {"  version: banana\n": "version", "": "metadata", "version: 1.9.2\n": "metadata"}
+        for bad, word in cases.items():
             with self.subTest(bad=bad):
                 root = M.copy_sources()
                 p = root / "SKILL.md"
-                p.write_text(re.sub(r"(?m)^version: .*\n", bad, p.read_text(encoding="utf-8"), count=1))
+                pattern = r"(?m)^metadata:\n  version: .*\n" if bad.startswith("version") else r"(?m)^  version: .*\n"
+                text, n = re.subn(pattern, bad, p.read_text(encoding="utf-8"), count=1)
+                self.assertEqual(n, 1, "SKILL.md has metadata: then '  version:'")
+                p.write_text(text)
                 with self.assertRaises(build.BuildError) as cm:
                     build.build(root)
                 self.assertIn("version", str(cm.exception))
+                self.assertIn(word, str(cm.exception))
 
 
 class InitToolCopy(unittest.TestCase):

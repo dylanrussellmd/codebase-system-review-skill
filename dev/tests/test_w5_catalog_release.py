@@ -4,7 +4,10 @@ test_bundle_contents_and_frontmatter  the zip's top folder equals SKILL.md's nam
                                       README.md, LICENSE, scripts/ledger.py and references/, and scripts/ledger.py
                                       inside equals a fresh build
 test_bundle_is_reproducible           two bundles of the same sources are byte-identical
-test_frontmatter_rules_refuse         a wrong name, a missing or overlong description, no version: exit 2, no zip
+test_frontmatter_rules_refuse         a wrong name, a missing or overlong description, no metadata version, a top-level
+                                      version or another unknown top-level key: exit 2, no zip
+test_frontmatter_keys_portable        SKILL.md's top-level keys are name, description, license and metadata, and the
+                                      build stamps metadata's version
 test_license_is_mit                   LICENSE is the MIT licence
 test_readme_names_the_canonical_copy  README names the GitHub repository and the release command
 """
@@ -68,7 +71,16 @@ class Bundle(unittest.TestCase):
         self.assertRegex(front, rf"(?m)^name: {NAME}$")
         desc = re.search(r"(?m)^description: (.+)$", front).group(1)
         self.assertLessEqual(len(desc), 1024)
-        self.assertRegex(front, r"(?m)^version: \d+\.\d+\.\d+")
+        self.assertRegex(front, r"(?m)^metadata:\n  version: \d+\.\d+\.\d+$")
+        self.assertNotRegex(front, r"(?m)^version:")
+
+    def test_frontmatter_keys_portable(self):
+        front = (REPO / "SKILL.md").read_text(encoding="utf-8").split("---\n", 2)[1]
+        keys = re.findall(r"(?m)^([^\s:#][^:]*):", front)
+        self.assertEqual(keys, ["name", "description", "license", "metadata"])
+        self.assertRegex(front, r"(?m)^license: MIT$")
+        version = load(REPO / "dev" / "build.py", "build_k").skill_version(REPO)
+        self.assertIn(f'TOOL_VERSION = "{version}"', (REPO / "scripts" / "ledger.py").read_text(encoding="utf-8"))
 
     def test_bundle_is_reproducible(self):
         first, _ = self.bundle()
@@ -77,18 +89,20 @@ class Bundle(unittest.TestCase):
         self.assertEqual(a, second.read_bytes())
 
     def test_frontmatter_rules_refuse(self):
-        cases = {
-            "name: other-name\n": "name",
-            "description: \n": "description",
-            "description: " + "x" * 1100 + "\n": "description",
-            "": "version",
-        }
-        for repl, word in cases.items():
+        cases = [   # (what is replaced, by what, a word the refusal names)
+            (r"^name:.*\n", "name: other-name\n", "name"),
+            (r"^description:.*\n", "description: \n", "description"),
+            (r"^description:.*\n", "description: " + "x" * 1100 + "\n", "description"),
+            (r"^  version:.*\n", "", "version"),
+            (r"^metadata:\n  version: (.*)\n", r"version: \1\n", "version"),
+            (r"^license:.*\n", r"\g<0>author: someone\n", "author"),
+        ]
+        for pattern, repl, word in cases:
             with self.subTest(change=repl[:30] or "no version"):
                 root = copy_repo(fixtures.temp_dir("release-bad-") / NAME)
                 skill = (root / "SKILL.md").read_text(encoding="utf-8")
-                key = repl.split(":", 1)[0] if repl else "version"
-                skill = re.sub(rf"(?m)^{key}:.*\n", repl, skill, count=1)
+                skill, n = re.subn("(?m)" + pattern, repl, skill, count=1)
+                self.assertEqual(n, 1, pattern)
                 (root / "SKILL.md").write_text(skill, encoding="utf-8")
                 p = release(root)
                 self.assertEqual(p.returncode, 2, p.stdout + p.stderr)

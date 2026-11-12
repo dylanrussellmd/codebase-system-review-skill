@@ -111,6 +111,23 @@ files that always change together but live apart (hidden coupling); code with a 
 with many changes and few tests. Combine with the ledger's `v_file_hotspots` (files that keep producing issues across
 reviews). Run early if possible and share the ranked list with the other reviewers as where to dig deepest.
 
+**Features toward the goals, `features.md`.** *Applies when the review has approved goals or stated requirements.*
+Look ahead instead of for faults. Read every approved goal (`ledger.py goals`, all domains), the active
+requirements, the scan's inventory and the proposals already on record (`ledger.py features`). For each goal and
+requirement: what the code does toward it today (`path:line`, or absent) and what is missing. Then propose the
+additions that would advance it most: features, components, abilities, services, capabilities, integrations,
+tooling. For a to-do app that might be calendar integration, or a history of completed items. A proposal is not a
+defect: missing it breaks nothing, so it has no severity, opens no issue and is counted in no total of issues,
+regressions or coverage. Each names the goal or requirement it serves, today's state with its evidence, the
+addition, its value (how far it advances the goal) and effort, risks, what it depends on, and a deterministic test
+that would show it is built. Never propose again what the owner declined for the same goal; check each earlier
+proposal against its goal and the code. The report format is the one `ledger.py prompt --domain features` gives
+(Goals and Proposals sections in place of Known issues and Findings). The manager records each with
+`ledger.py propose-feature`, opens the review's one non-blocking `feature-pick` gate (`ledger.py feature-gate`),
+and records the owner's choices with `ledger.py feature-status FP-0001 pick|decline --note '...'`; a picked one
+becomes a plan step (`features` in `steps.jsonl`) and is marked `built` when its done-test passes. Its checklist's
+severities are unused.
+
 #### User-facing
 
 **Front end / UI (one to three reviewers, split by area), `ui-<area>.md`.** *Applies when there are screens.* Judge
@@ -318,6 +335,7 @@ the result in Step 2b.
 | `docs-developer` | `code_files >= 1` |
 | `docs-user` | `user_doc_files >= 1 or page_files >= 1` |
 | `handover` | `authors >= 2 or deploy_files >= 1 or history_months >= 6` |
+| `features` | `goals >= 1 or requirements >= 1` |
 
 The facts, counted over the files tracked at the commit (vendored and build folders left out):
 
@@ -334,7 +352,7 @@ The facts, counted over the files tracked at the commit (vendored and build fold
   `personal_data_files` (names, e-mail, passwords, phone, birth dates), `paid_service_files` (payment, cloud and
   hosted-service SDKs).
 - From git: `history_commits`, `history_months` (first to last commit), `authors`. From the ledger: `requirements`
-  (recorded with `add-requirement`).
+  (recorded with `add-requirement`) and `goals` (approved and not retired).
 
 ## Checklists
 
@@ -460,6 +478,10 @@ Project-specific questions come from the owner's approved goals, not from new ro
 | `handover.2` | H | Who owns each account, domain, key and secret, and is any tied to one person? | The list with the owner and how access transfers. |
 | `handover.3` | M | Are there runbooks for the common incidents and the periodic chores? | Each one, present or missing. |
 | `handover.4` | M | Where is knowledge held by one person? | From the history or the hotspots report. |
+| `features.1` | L | Is every approved goal and active requirement listed with what the code does toward it today? | A row per goal and requirement: path:line of what serves it, or absent. |
+| `features.2` | L | Does each proposal name the goal or requirement it serves, its value, effort, risks and dependencies? | Each proposal with its goal code and the four answers. |
+| `features.3` | L | Does each proposal have a test that would show it is built? | The done-test per proposal: its name and what it asserts. |
+| `features.4` | L | Were the proposals already on record checked again against the goals and the code? | Per earlier proposal: still wanted, built, or serving no current goal. |
 
 ## Interview questions
 
@@ -471,3 +493,5 @@ Step 2c asks these for each approved domain named here, besides the questions th
   goals (`propose-goal --domain ui`), one each for type scale, palette and density, and one per "never"; the owner
   approves them like any goal, and reviewers judge against them.
 - `walkthroughs`: Who uses it for the first time, and what is the one task they must finish unaided?
+- `features`: Which capabilities do you already plan? Record each plan as said; the reviewer proposes nothing
+  the owner already plans, and builds on it.

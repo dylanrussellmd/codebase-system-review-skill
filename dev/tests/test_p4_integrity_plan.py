@@ -112,31 +112,32 @@ class PlanGuards(IntegrityCase):
         self.s3 = self.L.step(self.p, self.ph, 3)
 
     def test_dep_order_insert(self):
+        # Step 216 (schema 17): any step of the same plan, earlier or later; never itself or another plan's step.
         self.x("INSERT INTO step_dependencies VALUES (?, ?)", (self.s2, self.s1))
-        self.raises("INSERT INTO step_dependencies VALUES (?, ?)", (self.s1, self.s3), "earlier step")
-        self.raises("INSERT INTO step_dependencies VALUES (?, ?)", (self.s1, self.s1), "earlier step")
+        self.x("INSERT INTO step_dependencies VALUES (?, ?)", (self.s1, self.s3))
+        self.raises("INSERT INTO step_dependencies VALUES (?, ?)", (self.s1, self.s1), "same plan")
+        self.raises("INSERT INTO step_dependencies VALUES (?, ?)", (self.s3, self.s2), "cycle")
         other = self.L.plan()
         o1 = self.L.step(other, self.L.phase(other, 1), 1)
-        self.raises("INSERT INTO step_dependencies VALUES (?, ?)", (self.s3, o1), "earlier step")
+        self.raises("INSERT INTO step_dependencies VALUES (?, ?)", (self.s3, o1), "same plan")
 
     def test_dep_order_update_refused(self):
         self.x("INSERT INTO step_dependencies VALUES (?, ?)", (self.s2, self.s1))
-        self.raises("UPDATE step_dependencies SET depends_on_step_id=? WHERE step_id=?", (self.s3, self.s2),
-                    "earlier step")
-        self.raises("UPDATE step_dependencies SET step_id=? WHERE step_id=?", (self.s1, self.s2), "earlier step")
+        self.x("INSERT INTO step_dependencies VALUES (?, ?)", (self.s3, self.s2))
+        self.raises("UPDATE step_dependencies SET depends_on_step_id=? WHERE step_id=?", (self.s3, self.s2), "cycle")
+        self.raises("UPDATE step_dependencies SET step_id=? WHERE step_id=?", (self.s1, self.s2), "same plan")
 
     def test_step_renumber_keeps_dep_order(self):
         self.x("INSERT INTO step_dependencies VALUES (?, ?)", (self.s3, self.s1))
-        self.x("UPDATE steps SET number=5 WHERE id=?", (self.s3,))   # still after step 1
+        self.x("UPDATE steps SET number=5 WHERE id=?", (self.s3,))
         self.assertEqual(self.scalar("SELECT number FROM steps WHERE id=?", (self.s3,)), 5)
 
-    def test_renumber_cannot_create_backward_dependency(self):
+    def test_renumber_may_put_a_dependency_later(self):
+        # Step 216: the numbers no longer carry the order; v_step_order does.
         self.x("INSERT INTO step_dependencies VALUES (?, ?)", (self.s3, self.s1))
-        self.raises("UPDATE steps SET number=10 WHERE id=?", (self.s1,), "earlier step")
-
-    def test_renumber_cannot_create_forward_dependency(self):
-        self.x("INSERT INTO step_dependencies VALUES (?, ?)", (self.s2, self.s1))
-        self.raises("UPDATE steps SET number=0 WHERE id=?", (self.s2,), "earlier step")
+        self.x("UPDATE steps SET number=10 WHERE id=?", (self.s1,))
+        self.x("UPDATE steps SET number=0 WHERE id=?", (self.s2,))
+        self.assertEqual(self.scalar("SELECT count(*) FROM step_dependencies"), 1)
 
     def test_step_phase_plan_insert(self):
         other = self.L.plan()
@@ -148,7 +149,7 @@ class PlanGuards(IntegrityCase):
         other = self.L.plan()
         oph = self.L.phase(other, 1)
         self.raises("UPDATE steps SET phase_id=? WHERE id=?", (oph, self.s1), "another plan")
-        self.raises("UPDATE steps SET plan_id=? WHERE id=?", (other, self.s3), ("another plan", "earlier step"))
+        self.raises("UPDATE steps SET plan_id=? WHERE id=?", (other, self.s3), ("another plan", "same plan"))
         self.raises("UPDATE phases SET plan_id=? WHERE id=?", (other, self.ph), "another plan")
 
     def test_dependency_rules_hold_on_update(self):

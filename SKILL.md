@@ -1,7 +1,9 @@
 ---
 name: codebase-system-review
 description: Run a managed, read-only, multi-reviewer audit of any codebase (tests, security, performance, architecture, UI, API, DB, docs, logging), verify findings, record every point in a per-project SQLite ledger tracked across reviews, then turn every point into a tracked fix plan.
-version: 1.9.1
+license: MIT
+metadata:
+  version: 1.9.2
 ---
 
 # Comprehensive review of a software system
@@ -37,9 +39,8 @@ skill at `scripts/ledger.py`. `<skill folder>` is the folder the harness gives w
 | Claude Code | "Base directory for this skill: <dir>" before SKILL.md |
 | others | the path it reports for the loaded skill (else ask the owner) |
 
-In this file `ledger.py X` stands for this, run from anywhere:
-`python3 <skill folder>/scripts/ledger.py --root <project root> X`. Every command has `--help`; `ledger.py schema`
-prints every table and column with comments.
+In this file `ledger.py X` means, from anywhere, `python3 <skill folder>/scripts/ledger.py --root <project root> X`.
+Every command has `--help`; `ledger.py schema` prints every table and column with comments.
 
 - **Trust.** Run the skill's own copy. `init` copies it to `.code-review/ledger.py` for the owner's viewer; run that
   copy only right after `init` refreshed it, never from a branch or pull request nobody reviewed. A change to
@@ -111,7 +112,7 @@ Redaction, the one exception to append-only history: `ledger.py redact`, then `d
 - `plans.status`: `drafting`, `awaiting-approval`, `approved`, `in-progress`, `complete`, `superseded`, `abandoned`.
 - `steps.status`: `not-started`, `doing`, `waiting-owner`, `done`, `dropped`.
 - `gates.kind`: `domain-approval`, `plan-approval`, `decision`, `step-input`, `confirm-false-finding`, `accept-risk`,
-  `production-action`, `review-handoff`, `confirm`, `other`.
+  `production-action`, `review-handoff`, `confirm`, `feature-pick`, `other`.
 - `steps.owner_need`: `none`, `decision`, `confirm`, `review`, `production` (gates `decision`, `confirm`, `other`, `production-action`).
 - `findings.verification`: `unverified`, `confirmed`, `partly`, `false`, `not-checkable`.
 - `findings.match_type`: `new`, `still-present`, `changed`, `regression`, `recurrence`, `continuation`.
@@ -146,7 +147,7 @@ separate review or plan documents: the report and the narrative live in the ledg
   takes answers; from another machine `ssh -L 8765:127.0.0.1:8765 host`, same port both ends). Publishing it elsewhere
   is optional, always to the same address (`ledger.py add-artifact progress-page --url`).
 - **Ask** with `ledger.py open-gate <kind> --title '...' --question '...' --context @file`, one `--option value=label`
-  per choice, linked by `--review`, `--plan`, `--step` or `--issue`; say in chat what you asked (with the harness's
+  per choice (`--multi --preselect a,b`: any number, the recommended ones ticked), linked by `--review`, `--plan`, `--step` or `--issue`; say in chat what you asked (with the harness's
   question tool, when it has one) and that the owner can answer in the hub or in chat.
 - **Collect answers** before resuming paused work and at every session start: `ledger.py gates` (the viewer writes
   answers directly). The owner downloads `answers.json` from the hub file (a published page exports its answer
@@ -304,8 +305,8 @@ Every point of every report goes into the ledger, not only the summary's: `ledge
 
 ## Step 6: Consolidate
 
-`ledger.py review-status R-0001 consolidating --note '...'`. Write the review report (sections:
-`references/brief.md#the-review-report`; style: `references/writing.md`) and check every number against the ledger.
+`ledger.py review-status R-0001 consolidating --note '...'`. Write the review report (sections: `references/brief.md#the-review-report`; style: `references/writing.md`) and check every number against the ledger.
+Ideas (`features` domain): `propose-feature` each, `feature-gate --review R-0001` for the owner's pick; never issues (`references/domains.md`).
 Store it with `ledger.py set-report R-0001 .code-review/reviews/R-0001/review.md`, record the verdict
 (`ledger.py set-verdict R-0001 --verdict '<one line>' --summary '<a short paragraph>'`) and publish the hub. A rerun
 of a commit: `ledger.py compare-runs R-0001 R-0002 --record`; rerun each domain below the owner's agreement threshold.
@@ -354,10 +355,9 @@ Brief every implementer with `references/implementer-brief.md` (it runs `ledger.
   what is refused, what turned out different and why, what to do on deploy) and its guard tests (`--guard`, or
   `add-guard` for one issue), and each issue `issue-status ISS-0001 fixed` (below).
 - **Blocked on the owner:** `step-status 12 waiting-owner --question '...'` and a gate of its `owner_need`'s kind.
-- **After each step or small batch:** `ledger.py check`, `ledger.py dump`, `ledger.py progress-md P-0001` (to a file
-  only where the ledger-location decision commits review data), publish the hub, import answers, and tell the owner how
-  many steps are done. `v_stale_steps` (printed by `gates`) lists steps whose issues are closed: mark each done or
-  dropped with a note.
+- **After each step or batch:** `ledger.py check`, `ledger.py dump`, `ledger.py progress-md P-0001` (to a file only if
+  the ledger-location decision commits review data), publish the hub, import answers, tell the owner how many steps are
+  done. `v_stale_steps` (in `gates`) lists steps whose issues are closed: mark each done or dropped with a note.
 
 ```
 ledger.py report-finding --step 12 --severity M --domain <code> --where 'path:10-20#symbol' --summary '...' --before '...' --fix '...' --test 'test_name: what it asserts' --actor A-0002

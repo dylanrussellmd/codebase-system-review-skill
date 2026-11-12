@@ -92,7 +92,7 @@ class Scan(unittest.TestCase):
         self.assertIn("ui_files = 3", a["ui"]["reason"])
         self.assertIn("not met", b["ui"]["reason"])
         self.assertIn("ui_files = 0", b["ui"]["reason"])
-        self.assertEqual(len(a), 27)
+        self.assertEqual(len(a), 28)
         text = plain.run_ok("scan", "--review", "R-0001").stdout
         self.assertRegex(text, r"(?m)^  ui +skipped +ui_files >= 1 not met: ui_files = 0$")
 
@@ -100,7 +100,7 @@ class Scan(unittest.TestCase):
         L, _ = scanned(self, PAGES)
         out = L.run_ok("scan", "--review", "R-0001", "--actor", "A-0001").stdout
         got = domains(L)
-        self.assertEqual(len(got), 27)
+        self.assertEqual(len(got), 28)
         self.assertEqual((got["ui"]["decision"], got["ui"]["proposed_by_rule"]), ("included", "ui_files >= 1"))
         self.assertIn("ui_files = 3", got["ui"]["reason"])
         self.assertEqual((got["localization"]["decision"], got["localization"]["proposed_by_rule"]), ("skipped", None))

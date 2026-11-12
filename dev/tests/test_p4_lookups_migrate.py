@@ -70,7 +70,7 @@ class Upgrade(unittest.TestCase):
             if table in ("meta", "schema_migrations"):
                 continue
             with self.subTest(table=table):
-                self.assertEqual(after[table], n)
+                self.assertEqual(after[table], n + M.SEEDED_LATER.get(table, 0))
         for table in ("issue_statuses", "severities", "match_types", "relation_types", "gate_kinds", "enum_labels"):
             self.assertGreater(after[table], 0)
         p = fixtures.run_ledger("--root", project, "check")

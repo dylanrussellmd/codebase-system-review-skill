@@ -617,6 +617,7 @@ CONTRACT = {
              {"plan", "reviews", "artifacts", "last_updated", "gates", "discoveries", "events", "phases", "phase_rows", "steps", "unguarded"}),
     "trends": ("GET", "/api/trends", None, 200, dict, {"metrics", "reviews", "recurring", "hotspots"}),
     "goals": ("GET", "/api/goals", None, 200, dict, {"goals"}),  # schema 9 (step 129)
+    "ideas": ("GET", "/api/ideas", None, 200, dict, {"goals", "counts"}),  # schema 19 (step 145)
     "tables": ("GET", "/api/tables", None, 200, list, {"name", "type", "label", "description", "for_agent", "count"}),
     "table": ("GET", "/api/table/issues", None, 200, dict,
               {"columns", "rows", "count", "more", "truncated", "offset", "limit"}),
@@ -723,6 +724,14 @@ def full_ledger(L):
     L.update("design_goals", goal, review_id=r1)
     L.insert("goal_sources", goal_id=goal, question_id=q)
     L.dependency(ids["steps"][3], ids["steps"][2])
+    L.gate(kind="decision", title="Which tools?", question="Pick.", options='[{"value":"a","label":"A"}]', multi=1,
+           preselect='["a"]', blocking=0)                                  # schema 18 (step 217)
+    served = L.design_goal(None, "Every answer is kept.", status="approved",             # schema 19 (step 145)
+                           approved_by_actor_id=L.actor("owner"), approved_at="2026-11-01T09:00:00.000Z")
+    if served:
+        L.insert("feature_proposals", code="FP-0001", review_id=r1, goal_id=served, title="Keep a history",
+                 today="Nothing is kept.", evidence="absent", proposal="A history table.", value="high",
+                 effort="small", risks="It grows.", depends="none", done_test="test_history: lists two")
     L.update("issues", L.id_of("issues", ids["found_issue"]), status="fixed",
              after_state="The retry stops after five tries.")   # fixed, with no test guarding it
     L.commit()
@@ -787,9 +796,9 @@ ROUTE_KEYS = {
     "decisions":
         "decisions[code question answer rationale status revisit_when decided_at review issues]",
     "gates?status=pending":
-        "gates[code kind title question context options[value label description] allow_text blocking status "
-        "answer_value answer_text answered_at created_at review_code plan_code step_number issue_code "
-        "decision_code] other[kind ref need title question context]",
+        "gates[code kind title question context options[value label description] allow_text multi preselect "
+        "blocking status answer_value answer_text answered_at created_at review_code plan_code step_number "
+        "issue_code decision_code answer_label] other[kind ref need title question context]",
     "gates?status=all":
         "gates[code kind title status blocking created_at answered_at answer_value answer_text applied_note "
         "review_code plan_code step_number issue_code decision_code answer_label] total limit offset",
@@ -846,12 +855,15 @@ ROUTE_KEYS = {
         "unguarded[code title problem step] phases[phase steps done] phase_rows[number title goal why "
         "first_step last_step] steps[number section title status owner_need behavior_change phase change "
         "proof owner_question behavior_note progress_note no_findings_reason started_at done_at depends "
-        "closes search commits[commit_sha branch pr_url summary]]",
+        "position closes search commits[commit_sha branch pr_url summary]]",
     "step/*/*":
         "number change proof owner_question behavior_note progress_note no_findings_reason started_at done_at "
         "commits[commit_sha branch pr_url summary] closes[point_id severity summary review issue]",
     "goals":
         "goals[code domain text status approved_at note adopted_at retired_at used_by sources[code question]]",
+    "ideas":
+        "goals[goal text domain proposals[code review title today evidence proposal value effort risks depends "
+        "done_test status status_note decided_at gate step]] counts",
     "guide":
         "guide",
     "run/*":
@@ -870,7 +882,7 @@ ROUTE_KEYS = {
 # Keys only the shared copy reads (dev/core.py hub_snapshot, the page's staticApi).
 HUB_KEYS = {"search", "total", "findings"}
 # Row keys that are data the page walks rather than names it reads: a label map's values, a table's cells.
-DATA_KEYS = {"overview": ("labels",), "table/*?limit=500&offset=0": ("columns", "rows")}
+DATA_KEYS = {"overview": ("labels",), "table/*?limit=500&offset=0": ("columns", "rows"), "ideas": ("counts",)}
 
 
 class RouteKeys(RouteCase):

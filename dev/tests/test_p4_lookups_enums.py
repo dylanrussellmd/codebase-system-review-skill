@@ -58,6 +58,9 @@ COLUMN_ENUMS = {
     ("step_touches", "source"): "touch_source",
     ("step_conflicts", "resolution"): "conflict_resolution",
     ("events", "entity_type"): "entity_type",
+    ("feature_proposals", "value"): "feature_value",        # schema 19 (step 145)
+    ("feature_proposals", "effort"): "feature_effort",
+    ("feature_proposals", "status"): "feature_status",
 }
 # Enums whose words no CHECK lists: events.event is free text, and its labels cover the names the triggers write.
 FREE_TEXT_ENUMS = {"event"}

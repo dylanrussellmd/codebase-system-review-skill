@@ -20,6 +20,7 @@ Reviews:      new-review, review-status, add-repo, add-actor, add-domain, review
 Points:       import-findings, import-checks, load-index, match, verify, report-finding, issue-status
 Owner:        open-gate, answer-gate, apply-gate, interview-ask, interview-answer, propose-goal, approve-goals,
               reject-goal, link-step-goals
+Ideas:        propose-feature, feature-gate, feature-status, features
 Plans:        new-plan, plan-status, plan-add-review, import-steps, step-status, add-commit, add-guard, confirm-guard,
               conflicts, resolve-conflict
 Review tools: env, scan, brief, prompt, ui-capture, ui-audit, lint-report, compare-runs
@@ -34,7 +35,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote
 
-TOOL_VERSION = "@@TOOL_VERSION@@"  # stamped by dev/build.py from `version:` in SKILL.md's frontmatter
+TOOL_VERSION = "@@TOOL_VERSION@@"  # stamped by dev/build.py from `metadata: version:` in SKILL.md's frontmatter
 TOOL_HASH = "@@TOOL_HASH@@"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
 # Placeholders: dev/build.py puts references/schema.sql, dev/page.html and references/migrations/*.sql in their
 # place when it writes scripts/ledger.py. dev/core.py itself is never run as the tool.
@@ -2018,14 +2019,23 @@ GATE_LINKS = """LEFT JOIN reviews r ON r.id=g.review_id LEFT JOIN plans pl ON pl
 
 
 def answer_label(options, value):
-    """The label of the option a gate was answered with (the stored value when its options do not have it)."""
+    """The label of the option a gate was answered with (the stored value when its options do not have it); for a
+    multi-select answer (a JSON list), the labels of its choices."""
     if value is None:
         return None
     try:
         opts = json.loads(options) if isinstance(options, str) else (options or [])
     except ValueError:
         opts = []
-    return next((o.get("label") for o in opts if isinstance(o, dict) and o.get("value") == value), None) or value
+    label = lambda v: next((o.get("label") for o in opts if isinstance(o, dict) and o.get("value") == v), None) or v
+    if isinstance(value, str) and value.startswith("["):
+        try:
+            chosen = json.loads(value)
+        except ValueError:
+            chosen = None
+        if isinstance(chosen, list):   # a multi-select answer: each choice's label
+            return ", ".join(label(v) for v in chosen) or "None of them"
+    return label(value)
 
 
 def get_gates(rq):
@@ -2035,13 +2045,15 @@ def get_gates(rq):
     con, st = rq.con, rq.arg("status", "pending")
     if st == "pending":
         gates = rows(con, f"""SELECT g.code, g.kind, g.title, g.question, g.context, g.options, g.allow_text,
-                g.blocking, g.status, g.answer_value, g.answer_text, g.answered_at, g.created_at,
+                g.multi, g.preselect, g.blocking, g.status, g.answer_value, g.answer_text, g.answered_at, g.created_at,
                 r.code review_code, pl.code plan_code, s.number step_number,
                 i.code issue_code, d.code decision_code FROM gates g {GATE_LINKS}
                 WHERE g.id IN (SELECT id FROM v_pending_gates)
                 ORDER BY g.status='answered', g.blocking DESC, g.created_at""")
         for g in gates:
+            g["answer_label"] = answer_label(g["options"], g["answer_value"])
             g["options"] = json.loads(g["options"]) if g["options"] else []
+            g["preselect"] = json.loads(g["preselect"]) if g["preselect"] else []
         return {"gates": gates, "other": rows(con, """SELECT kind, ref, need, title, question, context
                                                       FROM v_owner_queue WHERE kind <> 'gate'""")}
     where, args = ("1", ()) if st == "all" else ("g.status = ?", (st,))
@@ -2444,6 +2456,8 @@ def get_plan(rq):
                           WHERE s.plan_id=? ORDER BY s.number""", (pid,))
     phase = int_arg(rq.qs, "phase", min([s["phase"] for s in steps] or [1]), 0)
     deps, ids, words = {}, {}, {}
+    position = {r["step"]: r["position"] for r in rows(con, "SELECT step, position FROM v_step_order WHERE plan=?",
+                                                       (code,))}
     for d in rows(con, """SELECT sd.step_id, s.number FROM step_dependencies sd JOIN steps s ON s.id=sd.depends_on_step_id
                           WHERE s.plan_id=?""", (pid,)):
         deps.setdefault(d["step_id"], []).append(d["number"])
@@ -2458,6 +2472,7 @@ def get_plan(rq):
     for s in steps:
         sid = s.pop("id")
         s["depends"] = sorted(deps.get(sid, []))
+        s["position"] = position.get(s["number"])
         s["closes"] = ids.get(sid, [])
         s["search"] = " ".join([str(s["number"]), s["title"] or ""] + words.get(sid, [])
                                + [s["proof"] or "", s["change"] or ""]).lower()[:STEP_SEARCH]
@@ -2521,6 +2536,22 @@ def get_guide(rq):
 def get_goals(rq):
     """Every design goal by domain, with its status and sources (schema 9)."""
     return {"goals": shown_goals(rq.con)}
+
+
+def get_ideas(rq):
+    """The feature proposals by the goal or requirement each serves (goals first, by code), best first within each,
+    with the count per status. Not issues: no severity, and no other page counts them."""
+    found = rows(rq.con, """SELECT code, review, serves, serves_text, domain, title, today, evidence, proposal, value,
+                                   effort, risks, depends, done_test, status, status_note, decided_at, gate, step
+                            FROM v_feature_proposals ORDER BY rank, code""")
+    groups, counts = {}, {}
+    for p in found:
+        g = groups.setdefault(p["serves"], {"goal": p["serves"], "text": p["serves_text"], "domain": p["domain"],
+                                            "proposals": []})
+        g["proposals"].append({k: v for k, v in p.items() if k not in ("serves", "serves_text", "domain")})
+        counts[p["status"]] = counts.get(p["status"], 0) + 1
+    order = sorted(groups, key=lambda c: (not c.startswith("G-"), c))
+    return {"goals": [groups[c] for c in order], "counts": counts}
 
 
 TRENDS_RECURRING = 50  # issues that keep coming back, most often seen first: past this the list stops helping
@@ -2714,6 +2745,7 @@ ROUTES = (
     Route("GET", "plan/*", get_plan, _hub_each("plan", "SELECT code FROM plans ORDER BY code")),
     Route("GET", "step/*/*", get_step, lambda con: []),  # none in the hub: its plans carry every step in full
     Route("GET", "goals", get_goals, _hub("goals")),
+    Route("GET", "ideas", get_ideas, _hub("ideas")),
     Route("GET", "guide", get_guide, _hub("guide")),
     Route("GET", "run/*", get_run, _hub_each("run", "SELECT id FROM reviewer_runs ORDER BY id")),
     Route("GET", "trends", get_trends, _hub("trends"), seconds=TRENDS_SECONDS),
@@ -2786,6 +2818,7 @@ def route(root, db, con, path, qs, body, whole=False):
       GET  plan/<code>              ?phase=N: the plan's page with that phase's steps in full
       GET  step/<plan code>/<n>     one step in full, with its commits and the points it closes
       GET  goals                    goals
+      GET  ideas                    goals [{goal, text, domain, proposals}], counts: the feature proposals by goal
       GET  guide                    guide (the How it works text, Markdown)
       GET  run/<id>                 prompt, final_message of one reviewer run
       GET  trends                   metrics, reviews, recurring, hotspots
@@ -3285,8 +3318,8 @@ def _md_cell(v):
 
 def progress_md(con, plan_code):
     """The Markdown progress report of one plan (`ledger.py progress-md P-0001`): the plan's totals, one row per
-    phase from v_plan_progress, then each phase's steps (number, status, title, how many review points and issues it
-    closes, its progress note). The format is fixed so every agent's PROGRESS.md reads the same. None when there is
+    phase from v_plan_progress, then each phase's steps in the order to work them (v_step_order: number, status,
+    title, how many review points and issues it closes, its progress note). The format is fixed so every agent's PROGRESS.md reads the same. None when there is
     no such plan."""
     pl = one(con, "SELECT * FROM plans WHERE code=?", (plan_code,))
     if not pl:
@@ -3296,7 +3329,9 @@ def progress_md(con, plan_code):
             (SELECT count(*) FROM step_findings sf WHERE sf.step_id=s.id) points,
             (SELECT count(DISTINCT f.issue_id) FROM step_findings sf JOIN findings f ON f.id=sf.finding_id
               WHERE sf.step_id=s.id) issues
-            FROM steps s JOIN phases ph ON ph.id=s.phase_id WHERE s.plan_id=? ORDER BY s.number""", (pl["id"],))
+            FROM steps s JOIN phases ph ON ph.id=s.phase_id
+            JOIN v_step_order o ON o.plan = ? AND o.step = s.number
+            WHERE s.plan_id=? ORDER BY o.position""", (pl["code"], pl["id"]))
     keys = ("steps", "done", "doing", "waiting_owner", "not_started", "dropped")
     tot = {k: sum(p[k] or 0 for p in phases) for k in keys}
     out = [f"# Progress of {pl['code']}: {pl['title']}", "",
@@ -3361,7 +3396,7 @@ You can answer every question here, under **Waiting on you**. The agent picks yo
 
 ## Where to look
 
-**Overview** shows the totals and the ledger's own checks. **Reviews** lists every review; open one for its report, the areas reviewed and skipped, the reviewers, and every point with the code it cites. **Design goals** lists what you want the code to be. **Issues** lets you search and filter every issue and see its full history. **Fix plans** shows every step by phase, with what it changes, how it is proven, and which points it closes. **Over time** shows how the numbers move between reviews. **Explore** shows the raw tables behind everything.
+**Overview** shows the totals and the ledger's own checks. **Reviews** lists every review; open one for its report, the areas reviewed and skipped, the reviewers, and every point with the code it cites. **Design goals** lists what you want the code to be. **Ideas** lists additions that would serve those goals, for you to pick from; they are not problems and no count of issues includes them. **Issues** lets you search and filter every issue and see its full history. **Fix plans** shows every step by phase, with what it changes, how it is proven, and which points it closes. **Over time** shows how the numbers move between reviews. **Explore** shows the raw tables behind everything.
 """
 
 # The one change progress-page makes to page.html: the data script (%s is the JSON), put in front of the page's own
@@ -3962,11 +3997,11 @@ class GateRefused(Exception):
         self.status = status
 
 
-CODE_PREFIXES = ("ISS", "R", "P", "D", "GATE", "REQ", "G", "IQ")
+CODE_PREFIXES = ("ISS", "R", "P", "D", "GATE", "REQ", "G", "IQ", "FP")
 
 
 def next_code(con, prefix):
-    """The next code for a prefix (ISS, R, P, D, GATE, REQ, G or IQ), from v_next_codes: the highest number + 1 in the
+    """The next code for a prefix (ISS, R, P, D, GATE, REQ, G, IQ or FP), from v_next_codes: the highest number + 1 in the
     canonical format (ISS-0001, G-01). Codes are never reused, and the code triggers refuse anything else."""
     p = (prefix or "").upper().rstrip("-")
     if p not in CODE_PREFIXES:
@@ -4184,7 +4219,7 @@ def _need(value, what):
 
 # ----- next-code, add-repo, add-actor
 
-@_command("next-code", "print the next code for a prefix (ISS, R, P, D, GATE, REQ, G, IQ)",
+@_command("next-code", "print the next code for a prefix (ISS, R, P, D, GATE, REQ, G, IQ, FP)",
           "ledger.py next-code ISS", read=True)
 def cmd_next_code(con, a):
     return [next_code(con, a.prefix)]
@@ -4558,7 +4593,23 @@ def _finding_ref(ref, by, points):
     return None, f"point {ref} is in {', '.join(revs)}; write it as {revs[0]}:{ref}"
 
 
-@_command("import-steps", "load drafted plan steps (JSON lines) into a plan: phases, steps, closes, depends",
+def _dependency_cycle(waits, start):
+    """The steps of a cycle of dependencies through start ([start, ..., start]), or None. waits maps a step number to
+    the numbers it depends on."""
+    stack, seen = [(start, [start])], set()
+    while stack:
+        at, path = stack.pop()
+        for nxt in sorted(waits.get(at, ())):
+            if nxt == start:
+                return path + [start]
+            if nxt not in seen:
+                seen.add(nxt)
+                stack.append((nxt, path + [nxt]))
+    return None
+
+
+@_command("import-steps", "load drafted plan steps (JSON lines) into a plan: phases, steps, closes, depends, "
+                          "features",
           "ledger.py import-steps P-0001 steps.jsonl [--actor A-0001]   (format: references/formats/plan-steps.md)")
 def cmd_import_steps(ctx):
     con = ctx.con
@@ -4609,8 +4660,19 @@ def cmd_import_steps(ctx):
         if not isinstance(o.get("closes", []), list) or not isinstance(o.get("depends", []), list):
             problems.append(f"line {n} ({k}): closes and depends are lists")
             continue
-        if not o.get("closes") and not str(o.get("no_findings_reason") or "").strip():
-            problems.append(f"line {n} ({k}): closes no point; give closes or no_findings_reason")
+        if not isinstance(o.get("features", []), list):
+            problems.append(f"line {n} ({k}): features is a list of picked proposals (FP-0001)")
+            continue
+        if not o.get("closes") and not o.get("features") and not str(o.get("no_findings_reason") or "").strip():
+            problems.append(f"line {n} ({k}): closes no point; give closes, features or no_findings_reason")
+        for fp in o.get("features") or []:
+            row = one(con, "SELECT status, step_id FROM feature_proposals WHERE code=?", (str(fp),))
+            if not row:
+                problems.append(f"line {n} ({k}): no feature proposal {fp}")
+            elif row["status"] != "picked" or row["step_id"] is not None:
+                problems.append(f"line {n} ({k}): {fp} is {row['status']}"
+                                + (" and has its step" if row["step_id"] is not None else "")
+                                + "; a step builds a picked proposal that has none")
         for ref in o.get("closes") or []:
             if _finding_ref(str(ref), by, points)[1]:
                 problems.append(f"line {n} ({k}): {_finding_ref(str(ref), by, points)[1]}")
@@ -4625,6 +4687,10 @@ def cmd_import_steps(ctx):
     start = (con.execute("SELECT max(number) FROM steps WHERE plan_id=?", (pl["id"],)).fetchone()[0] or 0) + 1
     ordered = sorted(steps, key=lambda s: (s[1]["phase"], s[1].get("order", 0), s[0]))
     number = {str(o["key"]).strip(): start + i for i, (_, o) in enumerate(ordered)}
+    waits = {}   # step number -> the numbers it depends on, the plan's and the file's
+    for a_, b_ in con.execute("""SELECT a.number, b.number FROM step_dependencies d JOIN steps a ON a.id = d.step_id
+                                 JOIN steps b ON b.id = d.depends_on_step_id WHERE a.plan_id=?""", (pl["id"],)):
+        waits.setdefault(a_, set()).add(b_)
     for n, o in ordered:
         k = str(o["key"]).strip()
         for d in o.get("depends") or []:
@@ -4634,8 +4700,13 @@ def cmd_import_steps(ctx):
                     else None
             if dn is None:
                 problems.append(f"line {n} ({k}): depends on unknown step {d!r}")
-            elif dn >= number[k]:
-                problems.append(f"line {n} ({k}): depends on {d} (step {dn}), which is not earlier (step {number[k]})")
+            else:
+                waits.setdefault(number[k], set()).add(dn)
+    for n, o in ordered:
+        k = str(o["key"]).strip()
+        loop = _dependency_cycle(waits, number[k])
+        if loop:
+            problems.append(f"line {n} ({k}): its dependencies make a cycle (steps {' -> '.join(map(str, loop))})")
     closers = {}
     for r in con.execute("""SELECT sf.finding_id, sf.multi_reason FROM step_findings sf JOIN steps s ON s.id = sf.step_id
                             WHERE s.plan_id=? AND s.status <> 'dropped'""", (pl["id"],)):
@@ -4675,6 +4746,8 @@ def cmd_import_steps(ctx):
                                                   (pl["id"], d)).fetchone()[0])
             ctx.x("INSERT OR IGNORE INTO step_dependencies(step_id, depends_on_step_id) VALUES (?,?)", (ids[k], dep))
         record_touches(ctx, ids[k], o.get("touches"))
+        for fp in o.get("features") or []:
+            ctx.x("UPDATE feature_proposals SET step_id=? WHERE code=?", (ids[k], str(fp)))
     out = [f"{pl['code']}: imported {len(new_phases)} phases and {len(ordered)} steps "
            f"({start}-{start + len(ordered) - 1})" if ordered else f"{pl['code']}: imported {len(new_phases)} phases"]
     uncovered = con.execute("SELECT count(*) FROM v_uncovered_findings WHERE plan=?", (pl["code"],)).fetchone()[0]
@@ -4683,10 +4756,188 @@ def cmd_import_steps(ctx):
     return out
 
 
+# ----- feature proposals (plan step 145): what the codebase could add to meet the owner's goals
+
+FEATURE_VALUES = ("high", "medium", "low")
+FEATURE_EFFORTS = ("small", "medium", "large")
+FEATURE_MOVES = {"pick": "picked", "decline": "declined", "built": "built"}
+FP_CODE = re.compile(r"FP-[0-9]{4,}")
+
+
+def feature_row(con, code):
+    """The feature_proposals row of a code like FP-0001; WriteError for a malformed or unknown code."""
+    if not FP_CODE.fullmatch(code or ""):
+        raise WriteError(f"{code!r} is not a feature proposal code like FP-0001")
+    r = one(con, "SELECT * FROM feature_proposals WHERE code=?", (code,))
+    if not r:
+        raise WriteError(f"no feature proposal {code}")
+    return r
+
+
+def _feature_serves(con, goal, requirement):
+    """(goal_id, requirement_id) of what a proposal serves: an approved goal or an active requirement, exactly one."""
+    if bool(goal) == bool(requirement):
+        raise WriteError("give --goal or --requirement: the one approved goal (G-01) or active requirement "
+                         "(REQ-0001) the addition serves")
+    if goal:
+        g = goal_row(con, goal.strip())
+        if g["status"] not in _served(con):
+            raise WriteError(f"{g['code']} is {g['status']}; a proposal serves an approved goal")
+        return g["id"], None
+    r = one(con, "SELECT id, status FROM requirements WHERE code=?", (requirement.strip(),))
+    if not r:
+        raise WriteError(f"no requirement {requirement.strip()}")
+    if r["status"] != "active":
+        raise WriteError(f"{requirement.strip()} is {r['status']}; a proposal serves an active requirement")
+    return None, r["id"]
+
+
+@_command("propose-feature", "record one addition the codebase could make to serve an approved goal or a stated "
+                             "requirement; not a defect: it has a value and an effort, no severity (prints its code)",
+          "ledger.py propose-feature --review R-0001 --goal G-01|--requirement REQ-0001 --title T --today TEXT "
+          "--evidence 'path:line'|absent --proposal TEXT --value high|medium|low --effort small|medium|large "
+          "--done-test 'test_name: what it asserts' [--risks TEXT] [--depends TEXT] [--actor A-0002]")
+def cmd_propose_feature(ctx):
+    a, con = ctx.a, ctx.con
+    rv = review_row(con, _need(a.review, "--review"))
+    goal_id, req_id = _feature_serves(con, a.goal, a.requirement)
+    title = " ".join(_need(_text_arg(a.title, "--title"), "--title (the addition, in a few words)").split())
+    fields = {k: _need(_text_arg(getattr(a, k), f"--{k.replace('_', '-')}"), f"--{k.replace('_', '-')} ({why})")
+              for k, why in (("today", "what the code does toward the goal now"),
+                             ("evidence", "path:line of what serves the goal today, or absent"),
+                             ("proposal", "the addition"),
+                             ("done_test", "the test that would show it is built: 'test_name: what it asserts'"))}
+    if (a.value or "") not in FEATURE_VALUES:
+        raise WriteError(f"--value {a.value!r} is not one of {', '.join(FEATURE_VALUES)} (how far it advances the goal)")
+    if (a.effort or "") not in FEATURE_EFFORTS:
+        raise WriteError(f"--effort {a.effort!r} is not one of {', '.join(FEATURE_EFFORTS)}")
+    for f in rows(con, """SELECT code, status FROM feature_proposals WHERE goal_id IS ? AND requirement_id IS ?
+                          AND lower(trim(title)) = lower(?)""", (goal_id, req_id, title)):
+        if f["status"] == "declined":
+            raise WriteError(f"the owner declined this idea for the same goal as {f['code']}; propose it again only "
+                             f"for a changed goal")
+        raise WriteError(f"{f['code']} already proposes it ({f['status']})")
+    code = next_code(con, "FP")
+    ctx.x("""INSERT INTO feature_proposals(code, review_id, goal_id, requirement_id, title, today, evidence, proposal,
+             value, effort, risks, depends, done_test, proposed_by_actor_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+          (code, rv["id"], goal_id, req_id, title, fields["today"], fields["evidence"], fields["proposal"], a.value,
+           a.effort, _text_arg(a.risks, "--risks"), _text_arg(a.depends, "--depends"), fields["done_test"],
+           ctx.actor_id))
+    return [code]
+
+
+@_command("feature-status", "record the owner's pick or decline of a feature proposal, or that a picked one is built",
+          "ledger.py feature-status FP-0001 pick|decline|built --note TEXT [--gate GATE-0001] "
+          "[--step 12|P-0001#12] [--plan P-0001] [--actor A-0001]")
+def cmd_feature_status(ctx):
+    a, con = ctx.a, ctx.con
+    f = feature_row(con, a.proposal)
+    if a.move not in FEATURE_MOVES:
+        raise WriteError(f"{a.move!r} is not one of {', '.join(FEATURE_MOVES)}")
+    to = FEATURE_MOVES[a.move]
+    note = _need(_text_arg(a.note, "--note"), "--note (why, in the owner's words where they gave them)")
+    gate = None
+    if a.gate:
+        gate = one(con, "SELECT * FROM gates WHERE code=?", (a.gate,))
+        if not gate or gate["kind"] != "feature-pick" or gate["review_id"] != f["review_id"]:
+            raise WriteError(f"{a.gate} is not the feature-pick gate of {f['code']}'s review")
+        if gate["status"] not in ("answered", "applied"):
+            raise WriteError(f"{a.gate} is not answered yet; the owner picks there first")
+    if to == "built":
+        who = ctx.actor_id
+        if who is None:
+            raise WriteError("give --actor: who built it")
+    elif gate is not None:
+        who = owner_actor(con)
+    else:
+        who = _owner_decides(ctx, f"{'picked' if to == 'picked' else 'declined'} it")
+    if f["status"] == to:
+        raise WriteError(f"{f['code']} is already {to}")
+    allowed = {"proposed": ("picked", "declined"), "picked": ("built", "declined"), "declined": ("picked",)}
+    if to not in allowed.get(f["status"], ()):
+        raise WriteError(f"{f['code']} is {f['status']}; " + (
+            "only a picked proposal is built" if to == "built" else f"a {f['status']} proposal cannot be {to}"))
+    step = step_row(con, a.step, a.plan) if a.step else None
+    if step is not None and to == "declined":
+        raise WriteError("--step goes with pick or built")
+    ctx.x("""UPDATE feature_proposals SET status=?, status_note=?, decided_by_actor_id=?, decided_at=?,
+             gate_id=COALESCE(?, gate_id), step_id=CASE WHEN ? = 'declined' THEN NULL ELSE COALESCE(?, step_id) END
+             WHERE id=?""",
+          (to, note, who, now(), gate["id"] if gate else None, to, step["id"] if step else None, f["id"]))
+    where = f" (step {step['number']})" if step else ""
+    return [f"{f['code']}: {f['status']} -> {to}{where}"]
+
+
+def _feature_lines(con, gate_review=None):
+    """The open proposals of a review as the feature-pick gate's context: one line each, best first."""
+    out = []
+    for p in rows(con, "SELECT * FROM v_feature_proposals WHERE review=? AND status='proposed' ORDER BY rank, code",
+                  (gate_review,)):
+        out.append(f"- {p['code']} {p['title']} (serves {p['serves']}; value {p['value']}, effort {p['effort']}). "
+                   f"{' '.join(p['proposal'].split())} Done when: {' '.join(p['done_test'].split())}")
+    return out
+
+
+@_command("feature-gate", "ask the owner, in one non-blocking gate per review, which feature proposals to build "
+                          "(prints the gate's code)",
+          "ledger.py feature-gate --review R-0001 [--actor A-0002]")
+def cmd_feature_gate(ctx):
+    a, con = ctx.a, ctx.con
+    rv = review_row(con, _need(a.review, "--review"))
+    have = one(con, "SELECT code FROM gates WHERE review_id=? AND kind='feature-pick' AND status <> 'withdrawn'",
+               (rv["id"],))
+    if have:
+        raise WriteError(f"{rv['code']} already has its feature-pick gate, {have['code']}")
+    lines = _feature_lines(con, rv["code"])
+    if not lines:
+        raise WriteError(f"{rv['code']} has no proposed feature proposals (ledger.py features --review {rv['code']})")
+    code = next_code(con, "GATE")
+    opts = [{"value": "all", "label": "Build them all"}, {"value": "none", "label": "None for now"}]
+    ctx.x("""INSERT INTO gates(code, kind, title, question, context, options, allow_text, blocking, review_id,
+             opened_by_actor_id) VALUES (?, 'feature-pick', ?, ?, ?, ?, 1, 0, ?, ?)""",
+          (code, f"Ideas from {rv['code']}", "Which of these should become plan steps? Name the codes, or choose "
+                                            "one answer.", "\n".join(lines), json.dumps(opts), rv["id"], ctx.actor_id))
+    return [code]
+
+
+def features_list(con, review=None, status=None):
+    """The feature proposals, best first (v_feature_proposals), of one review and one status when given."""
+    where, args = [], []
+    if review:
+        review_row(con, review)
+        where.append("review=?"); args.append(review)
+    if status:
+        if status not in FEATURE_MOVES.values() and status != "proposed":
+            raise WriteError(f"--status {status!r} is not one of proposed, {', '.join(FEATURE_MOVES.values())}")
+        where.append("status=?"); args.append(status)
+    return rows(con, f"SELECT * FROM v_feature_proposals WHERE {' AND '.join(where) or '1'} ORDER BY rank, code", args)
+
+
+@_command("features", "list the feature proposals, best first, with the goal each serves, value, effort and status "
+                      "(read-only)",
+          "ledger.py features [--review R-0001] [--status proposed|picked|declined|built] [--json]", read=True)
+def cmd_features(con, a):
+    found = features_list(con, a.review, a.status)
+    if a.json:
+        return [json.dumps({"proposals": found}, ensure_ascii=False, indent=1)]
+    if not found:
+        return ["no feature proposals" + (f" in {a.review}" if a.review else "")]
+    words = {r["value"]: r["label"] for r in con.execute(
+        "SELECT value, label FROM enum_labels WHERE enum='feature_status'")}
+    out, last = [], object()
+    for p in sorted(found, key=lambda p: (p["serves"], p["rank"], p["code"])):
+        if p["serves"] != last:
+            last = p["serves"]
+            out.append(("" if not out else "\n") + f"{p['serves']}  {' '.join(p['serves_text'].split())}")
+        out.append(f"  {p['code']}  {p['title']}  [{words.get(p['status'], p['status'])}; value {p['value']}, "
+                   f"effort {p['effort']}" + (f"; {p['step']}" if p["step"] else "") + "]")
+    return out
+
+
 # ----- gates: open-gate, answer-gate (shared with the viewer), apply-gate
 
 GATE_KINDS_HELP = ("decision|confirm|domain-approval|plan-approval|step-input|confirm-false-finding|accept-risk|"
-                   "production-action|review-handoff|other")
+                   "production-action|review-handoff|feature-pick|other")
 
 
 def _gate_options(specs, raw_json):
@@ -4722,6 +4973,7 @@ def _gate_options(specs, raw_json):
 @_command("open-gate", "ask the owner something (prints the gate's code)",
           f"ledger.py open-gate {GATE_KINDS_HELP} --title T --question Q [--context TEXT|@file] "
           "[--option value=label[:description]]... [--options-json JSON|@file] [--no-text] [--non-blocking] "
+          "[--multi [--preselect value,...]] "
           "[--review R-0001] [--plan P-0001] [--step 12] [--issue ISS-0001] [--decision D-0001] [--actor A-0001]")
 def cmd_open_gate(ctx):
     a, con = ctx.a, ctx.con
@@ -4731,18 +4983,28 @@ def cmd_open_gate(ctx):
     opts = _gate_options(a.option, a.options_json)
     if a.no_text and not opts:
         raise WriteError("a gate without free text needs at least one --option")
+    if a.multi and not opts:
+        raise WriteError("a multi-select gate (--multi) needs its --option list")
+    pre = [v.strip() for v in (a.preselect or "").split(",") if v.strip()]
+    if pre and not a.multi:
+        raise WriteError("--preselect goes with --multi")
+    unknown = [v for v in pre if v not in [o["value"] for o in opts]]
+    if unknown:
+        raise WriteError(f"--preselect {', '.join(unknown)} is not one of the options")
     code = next_code(con, "GATE")
     plan = plan_row(con, a.plan) if a.plan or a.step else None
     dec = one(con, "SELECT id FROM decisions WHERE code=?", (a.decision,)) if a.decision else None
     if a.decision and not dec:
         raise WriteError(f"no decision {a.decision}")
     ctx.x("""INSERT INTO gates(code, kind, title, question, context, options, allow_text, blocking, review_id, plan_id,
-             step_id, issue_id, decision_id, opened_by_actor_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+             step_id, issue_id, decision_id, opened_by_actor_id, multi, preselect)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
           (code, a.kind, _need(a.title, "--title"), _need(a.question, "--question"), _text_arg(a.context, "--context"),
            json.dumps(opts) if opts else None, 0 if a.no_text else 1, 0 if a.non_blocking else 1,
            review_row(con, a.review)["id"] if a.review else None, plan["id"] if plan else None,
            step_row(con, a.step, plan["code"])["id"] if a.step else None,
-           issue_row(con, a.issue)["id"] if a.issue else None, dec["id"] if dec else None, ctx.actor_id))
+           issue_row(con, a.issue)["id"] if a.issue else None, dec["id"] if dec else None, ctx.actor_id,
+           1 if a.multi else 0, json.dumps(list(dict.fromkeys(pre))) if pre else None))
     return [code]
 
 
@@ -4764,7 +5026,8 @@ def answer_gate(con, code, value=None, text=None, via="chat", actor_id=None):
     ANSWER_MAX_TEXT); returns {"ok": True}. tr_gate_answer_rules holds the same rules for answers written as SQL."""
     if not isinstance(con, sqlite3.Connection):  # answer_gate(db, code, body): the viewer's request form
         return gate_answer_request(con, code, value if isinstance(value, dict) else {})
-    if (value is not None and not isinstance(value, str)) or (text is not None and not isinstance(text, str)):
+    if (value is not None and not isinstance(value, (str, list))) or (text is not None and not isinstance(text, str)) \
+            or (isinstance(value, list) and not all(isinstance(v, str) for v in value)):
         raise GateRefused(400, "An answer is text.")
     own = not con.in_transaction
     if own:
@@ -4775,11 +5038,23 @@ def answer_gate(con, code, value=None, text=None, via="chat", actor_id=None):
             raise GateRefused(404, "no such gate")
         if g["status"] != "open":
             raise GateRefused(409, GATE_CLOSED.get(g["status"], GATE_CLOSED["answered"]))
-        val = (value or "").strip() or None
         txt = (text or "").strip() or None
         opts = [o.get("value") for o in json.loads(g["options"] or "[]")]
-        if val is not None and val not in opts:
-            raise GateRefused(400, "That choice is not one of the options.")
+        if g["multi"]:
+            picked = None if value is None else list(dict.fromkeys(
+                v.strip() for v in ([value] if isinstance(value, str) else value) if v.strip()))
+            if picked is not None and any(v not in opts for v in picked):
+                raise GateRefused(400, "That choice is not one of the options.")
+            # stored in the options' order, so the same choice is always the same text
+            val = None if picked is None else json.dumps([v for v in opts if v in picked])
+        else:
+            if isinstance(value, list):
+                if len(value) > 1:
+                    raise GateRefused(400, "This question takes one option.")
+                value = value[0] if value else None
+            val = (value or "").strip() or None
+            if val is not None and val not in opts:
+                raise GateRefused(400, "That choice is not one of the options.")
         if val is None and not txt:
             raise GateRefused(400, "Choose an option or write an answer.")
         if txt and not g["allow_text"]:
@@ -4805,14 +5080,20 @@ def answer_gate(con, code, value=None, text=None, via="chat", actor_id=None):
 
 
 @_command("answer-gate", "record the owner's answer given in chat (the viewer's rules)",
-          "ledger.py answer-gate GATE-0001 [--value OPTION] [--text 'their words'] [--via chat|other] "
+          "ledger.py answer-gate GATE-0001 [--value OPTION]... [--text 'their words'] [--via chat|other] "
           "[--by A-0001 (default: the owner)]")
 def cmd_answer_gate(ctx):
     a = ctx.a
     who = resolve_actor(ctx.con, a.by, "--by") if a.by else None
-    answer_gate(ctx.con, a.gate, a.value, _text_arg(a.text, "--text"), a.via, who)
-    g = one(ctx.con, "SELECT answer_value, answer_text FROM gates WHERE code=?", (a.gate,))
-    return [f"{a.gate}: answered ({', '.join(x for x in (g['answer_value'], g['answer_text']) if x)})"]
+    g = one(ctx.con, "SELECT multi FROM gates WHERE code=?", (a.gate,))
+    values = a.value or []
+    value = values if (g and g["multi"] and values) else (values[0] if len(values) == 1 else (values or None))
+    answer_gate(ctx.con, a.gate, value, _text_arg(a.text, "--text"), a.via, who)
+    g = one(ctx.con, "SELECT answer_value, answer_text, options FROM gates WHERE code=?", (a.gate,))
+    shown = g["answer_value"]
+    if g["answer_value"] is not None and g["answer_value"].startswith("["):
+        shown = ", ".join(json.loads(g["answer_value"])) or "none"
+    return [f"{a.gate}: answered ({', '.join(x for x in (shown, g['answer_text']) if x)})"]
 
 
 @_command("apply-gate", "record what was done with a gate's answer (a decision gate also records the decision)",
@@ -6585,7 +6866,7 @@ def add_write_commands(sub):
             s.add_argument("--actor", help="who makes this change (A-0001, an actor id, or a unique actor name)")
         return s
 
-    s = p("next-code"); s.add_argument("prefix", help="ISS, R, P, D, GATE, REQ, G or IQ")
+    s = p("next-code"); s.add_argument("prefix", help="ISS, R, P, D, GATE, REQ, G, IQ or FP")
     s = p("add-repo"); s.add_argument("name"); s.add_argument("path", help="relative to the project root ('.')")
     s.add_argument("--remote"); s.add_argument("--default-branch"); s.add_argument("--permalink-template")
     s.add_argument("--outside-root", action="store_true", help="the owner listed it as living outside the root")
@@ -6619,7 +6900,12 @@ def add_write_commands(sub):
     s.add_argument("--option", action="append", help="value=label or value=label:description")
     s.add_argument("--no-text", action="store_true", help="the owner must choose an option")
     s.add_argument("--non-blocking", action="store_true")
-    s = p("answer-gate"); s.add_argument("gate"); s.add_argument("--value"); s.add_argument("--text")
+    s.add_argument("--multi", action="store_true", help="the owner may choose any number of the options")
+    s.add_argument("--preselect", help="with --multi: the recommended option values, ticked first (a,b)")
+    s = p("answer-gate"); s.add_argument("gate")
+    s.add_argument("--value", action="append", help="the chosen option's value (again for each one of a multi-select "
+                                                    "gate)")
+    s.add_argument("--text")
     s.add_argument("--via", default="chat", choices=("chat", "other")); s.add_argument("--by")
     s = p("apply-gate"); s.add_argument("gate"); s.add_argument("--note"); s.add_argument("--revisit-when")
     s = p("interview-ask"); s.add_argument("question", nargs="?"); s.add_argument("--review"); s.add_argument("--domain")
@@ -6667,6 +6953,24 @@ def add_write_commands_131(p):
     s.add_argument("step_a", help="one step's number"); s.add_argument("step_b", help="the other step's number")
     s.add_argument("--resolution", help=", ".join(CONFLICT_RESOLUTIONS)); s.add_argument("--note")
     s.add_argument("--gate", help="with owner: the applied gate where the owner decided")
+    s.add_argument("--first", help="with order: the step that runs first (default: the lower number)")
+    s = p("propose-feature"); s.add_argument("--review", help="the review whose features reviewer proposed it")
+    s.add_argument("--goal", help="the approved goal (G-01)")
+    s.add_argument("--requirement", help="or the active requirement (REQ-0001)")
+    for o, h in (("--title", "the addition, in a few words"), ("--today", "what the code does toward the goal now"),
+                 ("--evidence", "path:line of what serves the goal today, or absent"),
+                 ("--proposal", "the addition"), ("--value", "high, medium or low: how far it advances the goal"),
+                 ("--effort", "small, medium or large"), ("--risks", "what could go wrong"),
+                 ("--depends", "what it needs first"), ("--done-test", "the test that shows it is built")):
+        s.add_argument(o, help=h)
+    s = p("feature-status"); s.add_argument("proposal", help="the proposal (FP-0001)")
+    s.add_argument("move", help="pick, decline or built"); s.add_argument("--note")
+    s.add_argument("--gate", help="the answered feature-pick gate where the owner chose")
+    s.add_argument("--step", help="the plan step that builds it"); s.add_argument("--plan")
+    s = p("feature-gate"); s.add_argument("--review", help="the review whose proposals the owner picks from")
+    s = p("features"); s.add_argument("--review", help="only this review's proposals")
+    s.add_argument("--status", help="only proposed, picked, declined or built ones")
+    s.add_argument("--json", action="store_true", help="print JSON")
     s = p("new-plan"); s.add_argument("--title"); s.add_argument("--review", action="append")
     s = p("plan-status"); s.add_argument("plan"); s.add_argument("status"); s.add_argument("--note")
     s.add_argument("--approved-by"); s.add_argument("--superseded-by")
@@ -7558,7 +7862,8 @@ def parse_rule(domain, rule):
 
 def scan_review(con, root, rv):
     """The scan of a review: each repository's inventory at its reviewed commit, the facts (summed over the
-    repositories, with the ledger's own: requirements recorded), and each catalog domain's proposal by its rule."""
+    repositories, with the ledger's own: requirements recorded and goals approved), and each catalog domain's proposal
+    by its rule."""
     repos = rows(con, """SELECT r.name, r.path, r.allow_outside_root, rr.commit_sha FROM review_repositories rr
                          JOIN repositories r ON r.id = rr.repository_id WHERE rr.review_id=? ORDER BY r.name""",
                  (rv["id"],))
@@ -7575,6 +7880,8 @@ def scan_review(con, root, rv):
         for k, v in f.items():
             facts[k] = max(facts.get(k, 0), v) if k in ("history_months", "authors") else facts.get(k, 0) + v
     facts["requirements"] = con.execute("SELECT count(*) FROM requirements WHERE status='active'").fetchone()[0]
+    facts["goals"] = con.execute("""SELECT count(*) FROM design_goals WHERE retired_at IS NULL AND status IN
+                                    (SELECT value FROM goal_statuses WHERE served = 1)""").fetchone()[0]
     open_issues = {}
     for r in rows(con, """SELECT domain_code, code FROM issues WHERE status IN
                           (SELECT value FROM issue_statuses WHERE active = 1) ORDER BY id"""):
@@ -7865,6 +8172,44 @@ def catalog_entry(domain_row, catalog=None):
     return None
 
 
+def features_prompt(con, d, folder, scope, report, tool, catalog):
+    """The features reviewer's prompt: every approved goal (each domain's and the whole project's), the active
+    requirements, the proposals already on record, the checklist, the catalog's entry and the proposals report
+    format."""
+    out = [f"First read {folder}/BRIEF.md and follow it exactly.", "",
+           f"You review one domain: {d['name']} (`{d['code']}`). You are read-only: the one file you write is your "
+           f"report.", f"Scope: {' '.join(scope.split()) if scope and scope.strip() else 'the whole system'}",
+           f"Report file: {folder}/{report or d['report_file']}", "",
+           "You look ahead: for each goal and requirement below, say what the code does toward it today and what is "
+           "missing, then propose the additions (features, components, abilities, services, capabilities, "
+           "integrations, tooling) that would advance it most. Proposals are not defects: missing them breaks "
+           "nothing, so they have no severity and are not findings.", "",
+           f"The approved goals, every domain's and the whole project's (read them again with `{tool} goals`; this "
+           f"domain's own with `{tool} goals --domain {d['code']}`):", ""]
+    goals = rows(con, "SELECT domain_code, code, text FROM v_goals_for_brief")
+    out += [f"- {g['code']} {' '.join(g['text'].split())}" + (f" ({g['domain_code']})" if g["domain_code"] else "")
+            for g in goals] or ["- none approved"]
+    out += ["", "The active requirements:", ""]
+    out += [f"- {r['code']} {' '.join(r['text'].split())}" for r in rows(
+        con, "SELECT code, text FROM requirements WHERE status='active' ORDER BY id")] or ["- none recorded"]
+    out += ["", f"Proposals already on record (`{tool} features`). Check each again against its goal and the code; "
+                "never propose again what the owner declined for the same goal.", ""]
+    out += [f"- {p['code']} [{p['status']}] {p['title']} (serves {p['serves']})" for p in rows(
+        con, "SELECT code, status, title, serves FROM v_feature_proposals ORDER BY rank, code")] or ["- none"]
+    out += ["", "Checklist. Answer every item in your \"Checklist\" table: yes, no, partly or not applicable, with the "
+                "evidence or the reason.", ""]
+    out += [f"- {c['code']} {c['question']} Evidence: {c['evidence']}" for c in rows(
+        con, "SELECT code, question, evidence FROM domain_checks WHERE domain_code=? ORDER BY position", (d["code"],))]
+    entry = catalog_entry(d, catalog)
+    out += ["", "How to review this domain (the catalog's entry):", "",
+            entry or "The catalog is not beside this ledger.py: read the domain's entry in the skill's "
+                     "references/domains.md.", "", "## Report format", "",
+            FEATURES_REPORT_FORMAT.replace("`ledger.py ", f"`{tool} ").rstrip("\n"), "",
+            "Final message back: at most 15 lines, with counts (goals read, proposals by value) and the 5 proposals "
+            "that advance the goals most."]
+    return "\n".join(out) + "\n"
+
+
 def prompt_text(con, root, db, rv, domain, scope=None, report=None, tool="ledger.py", catalog=None):
     """One reviewer's prompt, from the fixed template and the ledger: the brief to read first, the domain, scope and
     report file, the domain's approved goals and where to read them again, its known issues, its checklist and its
@@ -7874,6 +8219,8 @@ def prompt_text(con, root, db, rv, domain, scope=None, report=None, tool="ledger
     if not d:
         raise WriteError(f"{rv['code']} did not include domain {domain!r} (review_domains)")
     folder = _review_folder(root, db, rv)
+    if d["code"] == FEATURES_DOMAIN:
+        return features_prompt(con, d, folder, scope, report, tool, catalog)
     out = [f"First read {folder}/BRIEF.md and follow it exactly.", "",
            f"You review one domain of review {rv['code']}: {d['name']} (`{d['code']}`). You are read-only: the one "
            f"file you write is your report.",
@@ -7991,21 +8338,14 @@ def parse_report(text):
     return sections, findings
 
 
-def lint_report(con, root, text, domain, rv=None):
-    """(problems, notes, counts, answers) for a report of a domain: the required sections, every checklist item
-    answered with evidence (or 'not applicable' and the reason), every known issue reported, and every finding with
-    an id used once, a severity, a location and a fix. With a review, each location must exist at its reviewed
-    commit. Problems are (line or 0, message), in the order of the report."""
-    problems, notes = [], []
-    sections, findings = parse_report(text)
-    section = lambda title: next((v for k, v in sections.items() if k.startswith(title)), None)
-    for title in REPORT_SECTIONS:
-        if section(title) is None:
-            problems.append((0, f"no section '## {title}'"))
+def _lint_checklist(con, domain, lines, problems):
+    """(checks by code, answers) of a report's Checklist section lines (None: no section); appends to problems
+    each item not of the domain, answered twice, with an unknown answer or without evidence, and each item left
+    unanswered."""
     checks = {c["code"]: c for c in rows(con, "SELECT * FROM domain_checks WHERE domain_code=? ORDER BY position",
                                          (domain,))}
     answers = {}
-    for no, cells in _table_rows(section("Checklist") or []):
+    for no, cells in _table_rows(lines or []):
         code = cells[0]
         answer = CHECK_ANSWERS.get(cells[1].lower()) if len(cells) > 1 else None
         evidence = cells[2] if len(cells) > 2 else ""
@@ -8023,9 +8363,130 @@ def lint_report(con, root, text, domain, rv=None):
             answers[code] = None
         else:
             answers[code] = (answer, evidence)
-    if section("Checklist") is not None:
+    if lines is not None:
         problems += [(0, f"checklist item {code} is not answered ({checks[code]['question']})")
                      for code in checks if code not in answers]
+    return checks, answers
+
+
+FEATURES_DOMAIN = "features"
+FEATURES_REPORT_FORMAT = """\
+The manager checks the report with `ledger.py lint-report <file> --domain features --review <review>`. Sections, in
+this order; the five marked required must be there:
+
+    # features: <what was reviewed>
+
+    ## Scope and method        (required) what was read, and what was not
+    ## Checklist               (required) one row per checklist item of the domain
+    | check | answer | evidence |
+    |-------|--------|----------|
+    | features.1 | yes | the goals table lists 4 goals and 1 requirement |
+    ## Goals                   (required) one row per approved goal and active requirement
+    | goal | what the code does toward it | evidence |
+    |------|------------------------------|----------|
+    | G-01 | keeps open items only | `repo:src/items.py:12-40#Store` |
+    ## Proposals               (required) every addition worth considering, best first
+    ### FEAT-1 One line that names the addition.
+    - Goal: G-01
+    - Today: what the code does toward the goal now, with `repo:path:line`, or absent
+    - Proposal: the feature, component, service, capability or integration to add
+    - Value: high, medium or low (how far it advances the goal)
+    - Effort: small, medium or large
+    - Risks: what could go wrong
+    - Depends: what it needs first, or none
+    - Done-test: test_name: what it asserts once it is built
+    ## Totals                  (required) goals read and proposals made
+
+- Proposals are not defects: no severity, no issue. Each names one approved goal (`G-01`) or active requirement
+  (`REQ-0001`) and a done-test.
+- Do not propose again what the owner declined for the same goal (`ledger.py features --status declined`); say in
+  the checklist what changed about each proposal already on record.
+"""
+FEATURES_SECTIONS = ("Scope and method", "Checklist", "Goals", "Proposals", "Totals")
+PROPOSAL_FIELDS = ("goal", "today", "proposal", "value", "effort", "risks", "depends", "done-test")
+
+
+def parse_proposals(sections):
+    """The proposals of a features report's Proposals section: {id, title, line, fields, severity}."""
+    out, cur, field = [], None, None
+    body = next((v for k, v in sections.items() if k.startswith("Proposals")), [])
+    for no, line in body:
+        head = re.match(r"### +(.+?)\s*$", line)
+        bullet = re.match(r"\s*[-*] +\**(Goal|Today|Proposal|Value|Effort|Risks|Depends|Done-test)\**:\**\s*(.*)$",
+                          line, re.I)
+        if head:
+            m = FINDING_HEAD.match(head.group(1))
+            cur = {"id": m.group(1) if m else head.group(1), "severity": m.group(2) if m else None,
+                   "title": m.group(3) if m else "", "line": no, "fields": {}}
+            out.append(cur)
+            field = None
+        elif cur is not None and bullet:
+            field = bullet.group(1).lower()
+            cur["fields"][field] = bullet.group(2).strip()
+        elif cur is not None and field and line.strip() and line.startswith(" "):
+            cur["fields"][field] += " " + line.strip()
+        else:
+            field = None
+    return out
+
+
+def lint_features_report(con, text):
+    """lint_report() for the features domain: its own sections, the checklist, and each proposal with an id used
+    once, no severity, a goal that is approved (or a requirement that is active), today's state, the addition, a
+    value, an effort and a done-test."""
+    problems, notes = [], []
+    sections, _ = parse_report(text)
+    section = lambda title: next((v for k, v in sections.items() if k.startswith(title)), None)
+    for title in FEATURES_SECTIONS:
+        if section(title) is None:
+            problems.append((0, f"no section '## {title}'"))
+    checks, answers = _lint_checklist(con, FEATURES_DOMAIN, section("Checklist"), problems)
+    served = {r[0] for r in con.execute("""SELECT code FROM design_goals WHERE retired_at IS NULL AND status IN
+                                           (SELECT value FROM goal_statuses WHERE served = 1)""")}
+    served |= {r[0] for r in con.execute("SELECT code FROM requirements WHERE status='active'")}
+    seen = set()
+    for p in parse_proposals(sections):
+        pid, f = p["id"], p["fields"]
+        if pid in seen:
+            problems.append((p["line"], f"{pid}: the id is used twice"))
+        seen.add(pid)
+        if p["severity"]:
+            problems.append((p["line"], f"{pid}: a proposal has no severity (### {pid} <the addition>)"))
+        goal = (re.findall(r"\b(?:G-[0-9]{2,}|REQ-[0-9]{4,})\b", f.get("goal", "")) or [None])[0]
+        if goal is None:
+            problems.append((p["line"], f"{pid}: names no goal (- Goal: G-01, or a requirement REQ-0001)"))
+        elif goal not in served:
+            problems.append((p["line"], f"{pid}: {goal} is not an approved goal or an active requirement"))
+        if len(f.get("done-test", "")) < 3:
+            problems.append((p["line"], f"{pid}: no done-test (- Done-test: test_name: what it asserts)"))
+        for k in ("today", "proposal"):
+            if len(f.get(k, "")) < 3:
+                problems.append((p["line"], f"{pid}: no {k} (- {k.capitalize()}: ...)"))
+        if f.get("value", "").lower().strip(". ") not in FEATURE_VALUES:
+            problems.append((p["line"], f"{pid}: value {f.get('value', '')!r} is not one of "
+                                        f"{', '.join(FEATURE_VALUES)}"))
+        if f.get("effort", "").lower().strip(". ") not in FEATURE_EFFORTS:
+            problems.append((p["line"], f"{pid}: effort {f.get('effort', '')!r} is not one of "
+                                        f"{', '.join(FEATURE_EFFORTS)}"))
+    summary = {"checks": len([a for a in answers.values() if a]), "proposals": len(seen)}
+    return sorted(problems, key=lambda p: (p[0] == 0, p[0])), notes, summary, {k: v for k, v in answers.items() if v}
+
+
+def lint_report(con, root, text, domain, rv=None):
+    """(problems, notes, counts, answers) for a report of a domain: the required sections, every checklist item
+    answered with evidence (or 'not applicable' and the reason), every known issue reported, and every finding with
+    an id used once, a severity, a location and a fix. With a review, each location must exist at its reviewed
+    commit. Problems are (line or 0, message), in the order of the report. A features report is checked by
+    lint_features_report()."""
+    if domain == FEATURES_DOMAIN:
+        return lint_features_report(con, text)
+    problems, notes = [], []
+    sections, findings = parse_report(text)
+    section = lambda title: next((v for k, v in sections.items() if k.startswith(title)), None)
+    for title in REPORT_SECTIONS:
+        if section(title) is None:
+            problems.append((0, f"no section '## {title}'"))
+    checks, answers = _lint_checklist(con, domain, section("Checklist"), problems)
     reported = {}
     for no, cells in _table_rows(section("Known issues") or []):
         outcome = cells[1].lower() if len(cells) > 1 else ""
@@ -8119,10 +8580,14 @@ def lint_report_command(a, root, db):
         print("\n".join(lines))
         return 1
     plural = lambda n, word: f"{n} {word}{'' if n == 1 else 's'}"
-    by = ", ".join(f"{s} {n}" for s, n in summary["by_severity"].items())
-    lines.append(f"{name}: ok: {plural(summary['checks'], 'check')} answered, "
-                 f"{plural(summary['known'], 'known issue')} reported, {plural(summary['findings'], 'finding')}"
-                 + (f" ({by})" if by else ""))
+    by = ", ".join(f"{s} {n}" for s, n in summary.get("by_severity", {}).items())
+    if "proposals" in summary:
+        lines.append(f"{name}: ok: {plural(summary['checks'], 'check')} answered, "
+                     f"{plural(summary['proposals'], 'proposal')}")
+    else:
+        lines.append(f"{name}: ok: {plural(summary['checks'], 'check')} answered, "
+                     f"{plural(summary['known'], 'known issue')} reported, "
+                     f"{plural(summary['findings'], 'finding')}" + (f" ({by})" if by else ""))
     if not a.record:
         print("\n".join(lines))
         return 0
@@ -8408,7 +8873,7 @@ def conflicts_command(a, root, db):
 
 @_command("resolve-conflict", "record how two plan steps that touch the same thing are judged",
           "ledger.py resolve-conflict P-0001 STEP STEP --resolution no-conflict|order|merge|owner --note TEXT "
-          "[--gate GATE-0001] [--actor A-0001]")
+          "[--first STEP] [--gate GATE-0001] [--actor A-0001]")
 def cmd_resolve_conflict(ctx):
     a, con = ctx.a, ctx.con
     plan = plan_row(con, a.plan)
@@ -8431,7 +8896,15 @@ def cmd_resolve_conflict(ctx):
              WHERE step_a_id=? AND step_b_id=? AND resolution='none'""",
           (a.resolution, note, gate["id"] if gate else None, ctx.actor_id, now(), s1["id"], s2["id"]))
     if a.resolution == "order":
-        ctx.x("INSERT OR IGNORE INTO step_dependencies(step_id, depends_on_step_id) VALUES (?,?)", (s2["id"], s1["id"]))
+        first, then = (s1, s2)
+        if a.first is not None:
+            if str(a.first) not in (str(s1["number"]), str(s2["number"])):
+                raise WriteError(f"--first {a.first} is neither step {s1['number']} nor step {s2['number']}")
+            first, then = (s1, s2) if str(a.first) == str(s1["number"]) else (s2, s1)
+        ctx.x("INSERT OR IGNORE INTO step_dependencies(step_id, depends_on_step_id) VALUES (?,?)",
+              (then["id"], first["id"]))
+    elif a.first is not None:
+        raise WriteError("--first goes with --resolution order")
     return [f"{plan['code']} steps {s1['number']} and {s2['number']}: {n} conflict{'' if n == 1 else 's'} resolved "
             f"({a.resolution})"]
 

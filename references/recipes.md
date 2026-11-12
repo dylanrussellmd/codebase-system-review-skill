@@ -246,6 +246,16 @@ UPDATE design_goals SET retired_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE
 COMMIT;
 ```
 
+### Ask a question with several answers
+
+`--multi` lets the owner choose any number of the options; `--preselect` ticks the recommended ones. The answer is a
+JSON list of the chosen values, in the options' order (`[]` when they choose none).
+
+```sh
+ledger.py open-gate decision --review R-0001 --title 'Which tools may run?' --question 'Pick the tools for this review.' --option ruff=Ruff --option mypy=mypy --option vale=Vale --multi --preselect ruff,vale --non-blocking
+ledger.py answer-gate GATE-0004 --value ruff --value mypy --text 'not Vale yet'
+```
+
 ### Withdraw or change a gate
 
 A gate nobody needs is withdrawn (only an open or answered one). To ask again, open a new gate; or reopen
@@ -353,7 +363,7 @@ A warning: copy the brief, report or index into `.code-review/reviews/R-0002/` a
 
 Two steps of a plan touch the same thing and nobody has judged the pair. Read both steps and judge each pair with
 `ledger.py resolve-conflict P-0001 12 14 --resolution no-conflict|order|merge|owner --note '<why>'` (`order` also
-makes the later step depend on the earlier; `owner` needs `--gate`, the applied `decision` gate). The plan cannot be
+makes one step depend on the other: the higher number waits, or the one `--first` does not name; `owner` needs `--gate`, the applied `decision` gate). The plan cannot be
 approved until it is empty (`references/fix-plan.md#deconflict-the-steps-8c`).
 
 #### `v_late_step_conflicts`

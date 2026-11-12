@@ -8,8 +8,9 @@ every file under references/. Entries are sorted and dated 1980-01-01, so the sa
 
 Frontmatter rules: `name:` is codebase-system-review (1-64 lowercase letters, digits and single hyphens), the
 folder name in the zip and in every skills folder;
-`description:` is 1-1024 characters on one line; `version:` is X.Y.Z (dev/build.py reads it). A broken rule exits 2
-and writes nothing.
+`description:` is 1-1024 characters on one line; `version:` is X.Y.Z, indented under `metadata:` (dev/build.py reads
+it). The top-level keys are only those every skill loader accepts (KEYS); some loaders refuse any other, so a
+top-level `version:` is refused too. A broken rule exits 2 and writes nothing.
 """
 import argparse
 import importlib.util
@@ -24,6 +25,7 @@ FILES = ("SKILL.md", "README.md", "LICENSE", "scripts/ledger.py")
 NAME = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 DESCRIPTION_MAX = 1024  # characters; the skill format's limit
 NAME_MAX = 64
+KEYS = ("name", "description", "license", "compatibility", "metadata", "allowed-tools")  # portable top-level keys
 EPOCH = (1980, 1, 1, 0, 0, 0)  # the earliest date a zip entry can carry
 
 
@@ -44,7 +46,11 @@ def frontmatter(root):
     parts = text.split("---\n", 2)
     if not text.startswith("---\n") or len(parts) < 3:
         raise ReleaseError("SKILL.md must start with a frontmatter block between two '---' lines")
-    keys = dict(re.findall(r"(?m)^([a-z][a-z-]*):[ \t]*(.*?)[ \t]*$", parts[1]))
+    keys = dict(re.findall(r"(?m)^([^\s:#][^:]*):[ \t]*(.*?)[ \t]*$", parts[1]))
+    other = [k for k in keys if k not in KEYS]
+    if other:
+        raise ReleaseError(f"SKILL.md frontmatter key {other[0]!r} is not one of {', '.join(KEYS)}"
+                           + (" (version goes under metadata:)" if other[0] == "version" else ""))
     name = keys.get("name", "")
     if not NAME.match(name) or len(name) > NAME_MAX:
         raise ReleaseError(f"SKILL.md name {name!r} must be 1-{NAME_MAX} lowercase letters, digits and single hyphens")

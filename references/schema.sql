@@ -1,5 +1,5 @@
 -- =====================================================================
--- Code review ledger — schema version 16
+-- Code review ledger — schema version 19
 -- One SQLite file per project: <project root>/.code-review/ledger.sqlite
 -- Every connection must run:  PRAGMA foreign_keys = ON;
 -- Times are UTC ISO-8601 text with milliseconds (strftime('%Y-%m-%dT%H:%M:%fZ','now')); the tr_time_*
@@ -669,7 +669,7 @@ CREATE TABLE gates (
   status          TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','answered','applied','withdrawn'))
                     CHECK (status <> 'answered' OR answer_value IS NOT NULL OR answer_text IS NOT NULL)
                     CHECK (status <> 'applied' OR applied_note IS NOT NULL),
-  answer_value    TEXT,                     -- the option chosen
+  answer_value    TEXT,                     -- the option chosen; a multi-select gate's: a JSON list of them
   answer_text     TEXT,                     -- the owner's own words
   answered_by     TEXT,
   answered_via    TEXT CHECK (answered_via IS NULL OR answered_via IN ('chat','viewer','other')),
@@ -685,8 +685,11 @@ CREATE TABLE gates (
   created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   answered_by_actor_id INTEGER REFERENCES actors(id),  -- who answered (the viewer: the owner's actors row);
                                             -- answered_by keeps the text for older rows
-  change_actor_id INTEGER REFERENCES actors(id)        -- who made the next status change (applied, withdrawn);
+  change_actor_id INTEGER REFERENCES actors(id),       -- who made the next status change (applied, withdrawn);
                                             -- copied into its event, then cleared
+  multi INTEGER NOT NULL DEFAULT 0 CHECK (multi IN (0,1)),   -- takes any number of its options (schema 18)
+  preselect TEXT CHECK (preselect IS NULL OR (json_valid(preselect) AND json_type(preselect) = 'array'))
+                                            -- the option values a multi-select gate shows ticked first
 );
 
 -- ---------- The owner interview (schema 9, plan step 129) --------------
@@ -817,8 +820,9 @@ CREATE TABLE steps (
   UNIQUE (plan_id, number)
 );
 
--- The earlier steps each step has to wait for.
--- A step depends only on earlier steps of its own plan (tr_dep_order).
+-- The steps each step has to wait for.
+-- Any other step of its own plan, earlier or later, as long as no cycle forms (tr_dep_order); v_step_order is the
+-- order to work in.
 CREATE TABLE step_dependencies (
   step_id            INTEGER NOT NULL REFERENCES steps(id) ON DELETE CASCADE,
   depends_on_step_id INTEGER NOT NULL REFERENCES steps(id),
@@ -914,6 +918,60 @@ CREATE TABLE guard_tests (
   last_confirmed_review_id INTEGER REFERENCES reviews(id),
   created_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   UNIQUE (issue_id, test_path, test_name)
+);
+
+-- ---------- Feature proposals (schema 19, plan step 145) ---------------
+-- What the features domain proposes the codebase could add to meet the owner's goals. A proposal is not a defect: no
+-- severity, no issue, never counted in open issues, defect totals, regressions, coverage or the must-be-empty
+-- checks. The owner picks or declines each (`feature-status`, or the review's one non-blocking feature-pick gate);
+-- a picked one is built by a plan step (step_id), and a declined one is not proposed again for the same goal or
+-- requirement (tr_feature_not_again). A goal changes by being replaced (a new code), so a replaced goal takes the
+-- idea again.
+
+-- One addition the codebase could make to serve a goal.
+-- It names the goal or requirement it serves, what the code does toward it today and the evidence
+-- (path:line, or 'absent'), the addition, its value and effort, risks, what it needs first, and the test that shows
+-- it is built. decided_by_actor_id and decided_at are the last status change; feature_status_changes keeps them all.
+CREATE TABLE feature_proposals (
+  id                   INTEGER PRIMARY KEY,
+  code                 TEXT NOT NULL UNIQUE      -- FP-0001
+                         CHECK (code GLOB 'FP-[0-9][0-9][0-9][0-9]*' AND code NOT GLOB 'FP-*[^0-9]*'),
+  review_id            INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
+  goal_id              INTEGER REFERENCES design_goals(id),     -- the approved goal it serves, or
+  requirement_id       INTEGER REFERENCES requirements(id),     -- the active requirement it serves
+  title                TEXT NOT NULL CHECK (length(trim(title)) > 0),
+  today                TEXT NOT NULL CHECK (length(trim(today)) > 0),      -- what the code does toward it now
+  evidence             TEXT NOT NULL CHECK (length(trim(evidence)) > 0),   -- path:line, or 'absent'
+  proposal             TEXT NOT NULL CHECK (length(trim(proposal)) > 0),   -- the addition
+  value                TEXT NOT NULL CHECK (value IN ('high','medium','low')),     -- how far it advances the goal
+  effort               TEXT NOT NULL CHECK (effort IN ('small','medium','large')),
+  risks                TEXT,
+  depends              TEXT,                     -- what it needs first
+  done_test            TEXT NOT NULL CHECK (length(trim(done_test)) > 0),  -- the test that shows it is built
+  status               TEXT NOT NULL DEFAULT 'proposed' CHECK (status IN ('proposed','picked','declined','built')),
+  status_note          TEXT,                     -- why it was picked, declined or called built
+  decided_by_actor_id  INTEGER REFERENCES actors(id),   -- who made the last status change
+  decided_at           TEXT,
+  gate_id              INTEGER REFERENCES gates(id),    -- the feature-pick gate the owner answered
+  step_id              INTEGER REFERENCES steps(id),    -- the plan step that builds it
+  proposed_by_actor_id INTEGER REFERENCES actors(id),
+  created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  CHECK ((goal_id IS NULL) <> (requirement_id IS NULL)),
+  CHECK (status = 'proposed' OR (decided_by_actor_id IS NOT NULL AND decided_at IS NOT NULL
+                                 AND length(trim(COALESCE(status_note, ''))) > 0)),
+  CHECK (step_id IS NULL OR status IN ('picked','built'))
+);
+
+-- Each status a feature proposal has had, with who set it, when and why.
+-- Written by the feature triggers, never by hand.
+CREATE TABLE feature_status_changes (
+  id          INTEGER PRIMARY KEY,
+  proposal_id INTEGER NOT NULL REFERENCES feature_proposals(id) ON DELETE RESTRICT,
+  from_status TEXT,                      -- NULL when it was proposed
+  to_status   TEXT NOT NULL,
+  note        TEXT,
+  actor_id    INTEGER REFERENCES actors(id),
+  at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
 -- ---------- Measurements over time ------------------------------------
@@ -1015,11 +1073,12 @@ CREATE TABLE artifacts (
 -- Not logged: finding_locations, finding_goals, finding_requirements, review_requirement_checks, test_runs,
 -- artifacts, step_commits, guard_tests, decision_issues, plan_reviews, phases, review_repositories, review_goals,
 -- review_domains, review_environment, review_actors, actors, repositories, domains, domain_rules,
--- domain_checks, checklist_answers, step_touches, step_conflicts, themes,
--- requirements, metric_defs,
+-- domain_checks, checklist_answers, step_touches, step_conflicts, themes, feature_proposals,
+-- feature_status_changes, requirements, metric_defs,
 -- meta, schema_migrations, ledger_checks, issue_statuses, severities, match_types, relation_types, gate_kinds,
 -- goal_statuses, enum_labels.
--- Why not: finding_locations, finding_goals and finding_requirements belong to their finding (logged when it is
+-- Why not: feature_proposals keep their own history in feature_status_changes; finding_locations, finding_goals and
+-- finding_requirements belong to their finding (logged when it is
 -- created) and cannot change but for fill-refs; review_requirement_checks, test_runs and artifacts are themselves
 -- timestamped records written once; step_commits, guard_tests, decision_issues, plan_reviews and phases are plan
 -- and evidence links whose rows are their own record; the rest are setup and configuration (who, which
@@ -1168,6 +1227,16 @@ CREATE INDEX ix_fk_issue_relations_relation          ON issue_relations(relation
 CREATE INDEX ix_fk_findings_severity                 ON findings(severity);
 CREATE INDEX ix_fk_findings_match_type               ON findings(match_type);
 CREATE INDEX ix_fk_gates_kind                        ON gates(kind);
+CREATE INDEX ix_fk_feature_proposals_review_id            ON feature_proposals(review_id);
+CREATE INDEX ix_fk_feature_proposals_goal_id              ON feature_proposals(goal_id);
+CREATE INDEX ix_fk_feature_proposals_requirement_id       ON feature_proposals(requirement_id);
+CREATE INDEX ix_fk_feature_proposals_decided_by_actor_id  ON feature_proposals(decided_by_actor_id);
+CREATE INDEX ix_fk_feature_proposals_gate_id              ON feature_proposals(gate_id);
+CREATE INDEX ix_fk_feature_proposals_step_id              ON feature_proposals(step_id);
+CREATE INDEX ix_fk_feature_proposals_proposed_by_actor_id ON feature_proposals(proposed_by_actor_id);
+CREATE INDEX ix_fk_feature_status_changes_proposal_id ON feature_status_changes(proposal_id);
+CREATE INDEX ix_fk_feature_status_changes_actor_id    ON feature_status_changes(actor_id);
+CREATE UNIQUE INDEX ux_gates_one_feature_pick ON gates(review_id) WHERE kind = 'feature-pick' AND status <> 'withdrawn';
 
 -- ---------- Triggers ----------------------------------------------------
 -- (schema 3, plan steps 54-83) History is append-only, every tracked change writes an event, status and
@@ -1973,10 +2042,12 @@ CREATE TRIGGER tr_goal_no_delete BEFORE DELETE ON design_goals BEGIN
   SELECT RAISE(ABORT, 'history is append-only: design goals cannot be deleted; retire it instead');
 END;
 
--- The owner's answer to a goal-approval gate: 'approve' approves every goal still proposed on it, by whoever answered
--- (the viewer and import-answers: the owner). Any other answer leaves them proposed for the manager to reword.
+-- The owner's answer to a goal-approval gate: 'approve' (alone, or among the choices of a multi-select gate)
+-- approves every goal still proposed on it, by whoever answered (the viewer and import-answers: the owner). Any other answer leaves them proposed for the manager to reword.
 CREATE TRIGGER tr_gate_approves_goals AFTER UPDATE OF status ON gates
-WHEN OLD.status = 'open' AND NEW.status = 'answered' AND NEW.answer_value = 'approve' BEGIN
+WHEN OLD.status = 'open' AND NEW.status = 'answered'
+ AND (NEW.answer_value = 'approve' OR (NEW.multi = 1 AND json_valid(NEW.answer_value) AND EXISTS (
+        SELECT 1 FROM json_each(NEW.answer_value) WHERE value = 'approve'))) BEGIN
   UPDATE design_goals SET status = 'approved',
     approved_by_actor_id = COALESCE(NEW.answered_by_actor_id, (SELECT min(id) FROM actors WHERE kind = 'owner')),
     approved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
@@ -2197,21 +2268,51 @@ WHEN NEW.options IS NOT NULL AND json_valid(NEW.options) AND json_type(NEW.optio
 END;
 
 -- The answer rules of answer_gate() (the viewer, answer-gate, import-answers), for answers written as SQL:
--- answer_value is one of the option values; a gate without free text needs an option chosen and takes no note;
--- a note is at most 10,000 characters.
+-- answer_value is one of the option values, or on a multi-select gate a JSON list of them ('[]': none); a gate
+-- without free text needs an option chosen and takes no note; a note is at most 10,000 characters.
 CREATE TRIGGER tr_gate_answer_rules BEFORE UPDATE OF status, answer_value, answer_text ON gates
 WHEN NEW.status = 'answered' AND (OLD.status IS NOT 'answered' OR OLD.answer_value IS NOT NEW.answer_value
                                   OR OLD.answer_text IS NOT NEW.answer_text) BEGIN
   SELECT RAISE(ABORT, 'answer_value must be one of the gate''s option values')
-  WHERE NEW.answer_value IS NOT NULL
+  WHERE NEW.multi = 0 AND NEW.answer_value IS NOT NULL
     AND NOT EXISTS (SELECT 1 FROM json_each(COALESCE(NEW.options, '[]')) j
                     WHERE json_extract(j.value, '$.value') = NEW.answer_value);
+  SELECT RAISE(ABORT, 'a multi-select answer is a JSON list of the gate''s option values')
+  WHERE NEW.multi = 1 AND NEW.answer_value IS NOT NULL
+    AND (CASE WHEN json_valid(NEW.answer_value) THEN json_type(NEW.answer_value) IS NOT 'array' ELSE 1 END
+         OR EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(NEW.answer_value) AND json_type(NEW.answer_value) = 'array'
+                                                 THEN NEW.answer_value ELSE '[]' END) a
+                    WHERE a.type <> 'text' OR NOT EXISTS (
+                      SELECT 1 FROM json_each(COALESCE(NEW.options, '[]')) j
+                      WHERE json_extract(j.value, '$.value') = a.value)));
   SELECT RAISE(ABORT, 'this gate takes no free text: choose one of the options')
   WHERE NEW.allow_text = 0 AND NEW.answer_value IS NULL;
   SELECT RAISE(ABORT, 'this gate takes no free text: answer with the option alone')
   WHERE NEW.allow_text = 0 AND NEW.answer_text IS NOT NULL;
   SELECT RAISE(ABORT, 'answer_text is too long (over 10,000 characters)')
   WHERE length(NEW.answer_text) > 10000;
+END;
+
+-- A multi-select gate has options, and its preselected values are among them; only a multi-select gate preselects.
+CREATE TRIGGER tr_gate_multi_shape BEFORE INSERT ON gates
+WHEN NEW.multi = 1 OR NEW.preselect IS NOT NULL BEGIN
+  SELECT RAISE(ABORT, 'a multi-select gate needs options')
+  WHERE NEW.multi = 1 AND (NEW.options IS NULL OR json_array_length(NEW.options) = 0);
+  SELECT RAISE(ABORT, 'preselect goes with a multi-select gate, and names only its option values')
+  WHERE NEW.preselect IS NOT NULL AND (NEW.multi = 0 OR EXISTS (
+    SELECT 1 FROM json_each(NEW.preselect) p WHERE p.type <> 'text' OR NOT EXISTS (
+      SELECT 1 FROM json_each(COALESCE(NEW.options, '[]')) j WHERE json_extract(j.value, '$.value') = p.value)));
+END;
+
+-- The same when the options, the shape or the preselection change.
+CREATE TRIGGER tr_gate_multi_shape_upd BEFORE UPDATE OF multi, preselect, options ON gates
+WHEN NEW.multi = 1 OR NEW.preselect IS NOT NULL BEGIN
+  SELECT RAISE(ABORT, 'a multi-select gate needs options')
+  WHERE NEW.multi = 1 AND (NEW.options IS NULL OR json_array_length(NEW.options) = 0);
+  SELECT RAISE(ABORT, 'preselect goes with a multi-select gate, and names only its option values')
+  WHERE NEW.preselect IS NOT NULL AND (NEW.multi = 0 OR EXISTS (
+    SELECT 1 FROM json_each(NEW.preselect) p WHERE p.type <> 'text' OR NOT EXISTS (
+      SELECT 1 FROM json_each(COALESCE(NEW.options, '[]')) j WHERE json_extract(j.value, '$.value') = p.value)));
 END;
 
 -- A gate moves open -> answered -> applied (or withdrawn); it cannot be applied before it is answered. Any
@@ -2238,7 +2339,9 @@ WHEN OLD.status IS NOT NEW.status BEGIN
                ELSE NEW.change_actor_id END,
           NEW.review_id, NEW.step_id,
           CASE WHEN NEW.status = 'applied' THEN NEW.applied_note
-               ELSE COALESCE(NEW.answer_value || ': ', '') || COALESCE(NEW.answer_text, '') END);
+               ELSE COALESCE(CASE WHEN NEW.multi = 1 AND json_valid(NEW.answer_value)
+                                   THEN (SELECT COALESCE(group_concat(value, ', '), 'none') FROM json_each(NEW.answer_value))
+                                   ELSE NEW.answer_value END || ': ', '') || COALESCE(NEW.answer_text, '') END);
   UPDATE gates SET
     answered_at = CASE WHEN NEW.status = 'answered' AND answered_at IS NULL
                        THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE answered_at END,
@@ -2379,20 +2482,34 @@ END;
 
 -- ----- Plan structure: phases, steps, dependencies, coverage links
 
--- Plan rules enforced by the database, on INSERT and on UPDATE.
+-- Plan rules enforced by the database, on INSERT and on UPDATE: a step depends on another step of its own plan,
+-- of any number, and no chain of dependencies leads back to the step.
 CREATE TRIGGER tr_dep_order BEFORE INSERT ON step_dependencies BEGIN
-  SELECT RAISE(ABORT, 'a step may only depend on an earlier step of the same plan')
-  WHERE NOT EXISTS (
+  SELECT RAISE(ABORT, 'a step may only depend on another step of the same plan')
+  WHERE NEW.step_id = NEW.depends_on_step_id OR NOT EXISTS (
     SELECT 1 FROM steps a JOIN steps b ON a.plan_id = b.plan_id
-    WHERE a.id = NEW.step_id AND b.id = NEW.depends_on_step_id AND b.number < a.number);
+    WHERE a.id = NEW.step_id AND b.id = NEW.depends_on_step_id);
+  SELECT RAISE(ABORT, 'that dependency would make a cycle: the step it depends on already waits for it')
+  WHERE EXISTS (
+    WITH RECURSIVE up(id) AS (
+      SELECT NEW.depends_on_step_id
+      UNION SELECT d.depends_on_step_id FROM step_dependencies d JOIN up ON d.step_id = up.id)
+    SELECT 1 FROM up WHERE up.id = NEW.step_id);
 END;
 
 -- The same when a dependency is edited.
 CREATE TRIGGER tr_dep_order_upd BEFORE UPDATE ON step_dependencies BEGIN
-  SELECT RAISE(ABORT, 'a step may only depend on an earlier step of the same plan')
-  WHERE NOT EXISTS (
+  SELECT RAISE(ABORT, 'a step may only depend on another step of the same plan')
+  WHERE NEW.step_id = NEW.depends_on_step_id OR NOT EXISTS (
     SELECT 1 FROM steps a JOIN steps b ON a.plan_id = b.plan_id
-    WHERE a.id = NEW.step_id AND b.id = NEW.depends_on_step_id AND b.number < a.number);
+    WHERE a.id = NEW.step_id AND b.id = NEW.depends_on_step_id);
+  SELECT RAISE(ABORT, 'that dependency would make a cycle: the step it depends on already waits for it')
+  WHERE EXISTS (
+    WITH RECURSIVE up(id) AS (
+      SELECT NEW.depends_on_step_id
+      UNION SELECT d.depends_on_step_id FROM step_dependencies d JOIN up ON d.step_id = up.id
+            WHERE NOT (d.step_id = OLD.step_id AND d.depends_on_step_id = OLD.depends_on_step_id))
+    SELECT 1 FROM up WHERE up.id = NEW.step_id);
 END;
 
 -- Logs 'dependency-added' on the step, with the number of the step it depends on.
@@ -2423,15 +2540,14 @@ WHEN OLD.plan_id IS NOT NEW.plan_id BEGIN
   WHERE EXISTS (SELECT 1 FROM steps WHERE phase_id = NEW.id AND plan_id IS NOT NEW.plan_id);
 END;
 
--- Renumbering or moving a step keeps every dependency of it and on it pointing at an earlier step of the same
--- plan (renumber before loading dependencies, or renumber in an order that keeps them valid).
-CREATE TRIGGER tr_step_renumber BEFORE UPDATE OF number, plan_id ON steps
-WHEN OLD.number IS NOT NEW.number OR OLD.plan_id IS NOT NEW.plan_id BEGIN
-  SELECT RAISE(ABORT, 'a step may only depend on an earlier step of the same plan')
+-- Moving a step to another plan keeps every dependency of it and on it inside one plan; renumbering is free.
+CREATE TRIGGER tr_step_renumber BEFORE UPDATE OF plan_id ON steps
+WHEN OLD.plan_id IS NOT NEW.plan_id BEGIN
+  SELECT RAISE(ABORT, 'a step may only depend on another step of the same plan')
   WHERE EXISTS (SELECT 1 FROM step_dependencies d JOIN steps b ON b.id = d.depends_on_step_id
-                WHERE d.step_id = NEW.id AND (b.plan_id IS NOT NEW.plan_id OR b.number >= NEW.number))
+                WHERE d.step_id = NEW.id AND b.plan_id IS NOT NEW.plan_id)
      OR EXISTS (SELECT 1 FROM step_dependencies d JOIN steps a ON a.id = d.step_id
-                WHERE d.depends_on_step_id = NEW.id AND (a.plan_id IS NOT NEW.plan_id OR a.number <= NEW.number));
+                WHERE d.depends_on_step_id = NEW.id AND a.plan_id IS NOT NEW.plan_id);
 END;
 
 -- A status change needs change_note (moving to waiting-owner, owner_question will do); a step cannot start or
@@ -2869,6 +2985,100 @@ WHEN NEW.status = 'doing' AND OLD.status <> 'doing' AND EXISTS (
 END;
 
 
+-- ----- Feature proposals (schema 19, plan step 145)
+
+-- A proposal starts as proposed, serving an approved design goal or an active requirement.
+CREATE TRIGGER tr_feature_serves BEFORE INSERT ON feature_proposals BEGIN
+  SELECT RAISE(ABORT, 'a feature proposal starts as proposed')
+  WHERE NEW.status IS NOT 'proposed' OR NEW.step_id IS NOT NULL OR NEW.decided_at IS NOT NULL;
+  SELECT RAISE(ABORT, 'a feature proposal serves an approved design goal or an active requirement')
+  WHERE (NEW.goal_id IS NOT NULL AND NOT EXISTS (
+           SELECT 1 FROM design_goals g JOIN goal_statuses s ON s.value = g.status
+           WHERE g.id = NEW.goal_id AND s.served = 1))
+     OR (NEW.requirement_id IS NOT NULL AND NOT EXISTS (
+           SELECT 1 FROM requirements WHERE id = NEW.requirement_id AND status = 'active'));
+END;
+
+-- An idea the owner declined is not proposed again for the same goal or requirement.
+CREATE TRIGGER tr_feature_not_again BEFORE INSERT ON feature_proposals BEGIN
+  SELECT RAISE(ABORT, 'the owner declined this idea for the same goal; propose it again only for a changed goal')
+  WHERE EXISTS (SELECT 1 FROM feature_proposals f
+                WHERE f.status = 'declined' AND f.goal_id IS NEW.goal_id AND f.requirement_id IS NEW.requirement_id
+                  AND lower(trim(f.title)) = lower(trim(NEW.title)));
+END;
+
+-- Logs the proposal as the first row of its history.
+CREATE TRIGGER tr_feature_proposed AFTER INSERT ON feature_proposals BEGIN
+  INSERT INTO feature_status_changes(proposal_id, from_status, to_status, note, actor_id, at)
+  VALUES (NEW.id, NULL, NEW.status, NULL, NEW.proposed_by_actor_id, NEW.created_at);
+END;
+
+-- The moves: proposed to picked or declined, picked to built or declined, declined to picked; the gate, when
+-- given, is a feature-pick gate of the proposal's review.
+CREATE TRIGGER tr_feature_transition BEFORE UPDATE OF status, gate_id ON feature_proposals BEGIN
+  SELECT RAISE(ABORT, 'a feature proposal moves proposed -> picked or declined, picked -> built or declined, declined -> picked')
+  WHERE OLD.status IS NOT NEW.status
+    AND NOT ((OLD.status = 'proposed' AND NEW.status IN ('picked','declined'))
+          OR (OLD.status = 'picked' AND NEW.status IN ('built','declined'))
+          OR (OLD.status = 'declined' AND NEW.status = 'picked'));
+  SELECT RAISE(ABORT, 'the gate is not the feature-pick gate of the proposal''s review')
+  WHERE NEW.gate_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM gates g WHERE g.id = NEW.gate_id AND g.kind = 'feature-pick' AND g.review_id = NEW.review_id);
+END;
+
+-- Logs each status change with its note, who made it and when.
+CREATE TRIGGER tr_feature_status_logged AFTER UPDATE OF status ON feature_proposals
+WHEN OLD.status IS NOT NEW.status BEGIN
+  INSERT INTO feature_status_changes(proposal_id, from_status, to_status, note, actor_id, at)
+  VALUES (NEW.id, OLD.status, NEW.status, NEW.status_note, NEW.decided_by_actor_id, NEW.decided_at);
+END;
+
+-- What a proposal says stays as written: a changed idea is a new proposal.
+CREATE TRIGGER tr_feature_fixed BEFORE UPDATE ON feature_proposals
+WHEN NEW.code IS NOT OLD.code OR NEW.review_id IS NOT OLD.review_id OR NEW.goal_id IS NOT OLD.goal_id
+  OR NEW.requirement_id IS NOT OLD.requirement_id OR NEW.title IS NOT OLD.title OR NEW.today IS NOT OLD.today
+  OR NEW.evidence IS NOT OLD.evidence OR NEW.proposal IS NOT OLD.proposal OR NEW.value IS NOT OLD.value
+  OR NEW.effort IS NOT OLD.effort OR NEW.risks IS NOT OLD.risks OR NEW.depends IS NOT OLD.depends
+  OR NEW.done_test IS NOT OLD.done_test OR NEW.proposed_by_actor_id IS NOT OLD.proposed_by_actor_id
+  OR NEW.created_at IS NOT OLD.created_at BEGIN
+  SELECT RAISE(ABORT, 'a feature proposal is not edited; propose the changed idea as a new one');
+END;
+
+-- History is append-only.
+CREATE TRIGGER tr_feature_no_delete BEFORE DELETE ON feature_proposals BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: feature proposals cannot be deleted; decline one instead');
+END;
+
+-- A feature proposal's history is not changed.
+CREATE TRIGGER tr_feature_history_no_update BEFORE UPDATE ON feature_status_changes BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: feature_status_changes cannot be changed');
+END;
+
+-- Nor deleted.
+CREATE TRIGGER tr_feature_history_no_delete BEFORE DELETE ON feature_status_changes BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: feature_status_changes cannot be deleted');
+END;
+
+CREATE TRIGGER tr_time_feature_proposals_ins BEFORE INSERT ON feature_proposals
+WHEN (NEW.created_at IS NOT NULL AND (NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at) IS NOT NEW.created_at)) OR (NEW.decided_at IS NOT NULL AND (NEW.decided_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.decided_at) IS NOT NEW.decided_at)) BEGIN
+  SELECT RAISE(ABORT, 'feature_proposals: created_at and decided_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_feature_proposals_upd BEFORE UPDATE OF created_at, decided_at ON feature_proposals
+WHEN (NEW.created_at IS NOT NULL AND (NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at) IS NOT NEW.created_at)) OR (NEW.decided_at IS NOT NULL AND (NEW.decided_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.decided_at) IS NOT NEW.decided_at)) BEGIN
+  SELECT RAISE(ABORT, 'feature_proposals: created_at and decided_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_feature_status_changes_ins BEFORE INSERT ON feature_status_changes
+WHEN (NEW.at IS NOT NULL AND (NEW.at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.at) IS NOT NEW.at)) BEGIN
+  SELECT RAISE(ABORT, 'feature_status_changes: at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_feature_status_changes_upd BEFORE UPDATE OF at ON feature_status_changes
+WHEN (NEW.at IS NOT NULL AND (NEW.at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.at) IS NOT NEW.at)) BEGIN
+  SELECT RAISE(ABORT, 'feature_status_changes: at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
 -- ---------- Views ---------------------------------------------------------
 
 -- Issues still to fix, most severe first, then oldest.
@@ -3041,15 +3251,16 @@ WHERE p.status NOT IN ('superseded','abandoned') AND r.status <> 'abandoned'
                          OR EXISTS (SELECT 1 FROM decisions d WHERE d.step_id = s.id AND d.status = 'decided')));
 
 -- Plan steps that close nothing, and points closed by several steps without a reason.
--- Must be empty. A dropped step, or one whose no_findings_reason says why it closes nothing by design (the
--- follow-up review that verifies the plan), is not a problem; dropped steps do not count towards closing a finding
--- twice. Superseded and abandoned plans are not checked.
+-- Must be empty. A dropped step, one that builds a picked feature proposal, or one whose no_findings_reason says
+-- why it closes nothing by design (the follow-up review that verifies the plan), is not a problem; dropped steps do
+-- not count towards closing a finding twice. Superseded and abandoned plans are not checked.
 CREATE VIEW v_coverage_problems AS
 SELECT p.code AS plan, 'step closes nothing' AS problem, CAST(s.number AS TEXT) AS item
 FROM steps s JOIN plans p ON p.id = s.plan_id
 WHERE p.status NOT IN ('superseded','abandoned') AND s.status <> 'dropped'
   AND NULLIF(trim(s.no_findings_reason), '') IS NULL
   AND NOT EXISTS (SELECT 1 FROM step_findings sf WHERE sf.step_id = s.id)
+  AND NOT EXISTS (SELECT 1 FROM feature_proposals fp WHERE fp.step_id = s.id)
 UNION ALL
 SELECT p.code, 'finding closed by several steps without a reason', f.point_id
 FROM step_findings sf JOIN steps s ON s.id = sf.step_id JOIN plans p ON p.id = s.plan_id
@@ -3290,7 +3501,9 @@ UNION ALL SELECT 'REQ', 'REQ-' || printf('%04d', COALESCE(max(CAST(substr(code, 
 FROM requirements
 UNION ALL SELECT 'G', 'G-' || printf('%02d', COALESCE(max(CAST(substr(code, 3) AS INTEGER)), 0) + 1) FROM design_goals
 UNION ALL SELECT 'IQ', 'IQ-' || printf('%04d', COALESCE(max(CAST(substr(code, 4) AS INTEGER)), 0) + 1)
-FROM interview_questions;
+FROM interview_questions
+UNION ALL SELECT 'FP', 'FP-' || printf('%04d', COALESCE(max(CAST(substr(code, 4) AS INTEGER)), 0) + 1)
+FROM feature_proposals;
 
 -- Plan steps still to do whose issues are already closed.
 -- Closed for example by a review's check of 'fixed': mark the step done or dropped. Superseded and abandoned plans
@@ -3501,6 +3714,45 @@ JOIN steps l ON l.id = c.late_step_id JOIN plans p ON p.id = a.plan_id
 WHERE c.resolution = 'none'
 ORDER BY p.code, l.number, other_step, c.kind, c.target;
 
+-- The order to work each plan's steps in.
+-- Each step comes after every step it depends on, directly or not, and otherwise keeps its number's place. position counts from 1 per plan; depth is the longest chain of steps it waits
+-- for; depends_on lists the steps it depends on directly. A step whose dependencies all have lower numbers keeps its
+-- place; one that waits for a later-numbered step moves to just after it.
+CREATE VIEW v_step_order AS
+WITH RECURSIVE n(c) AS (SELECT count(*) FROM steps),
+walk(step_id, ancestor_id, depth) AS (
+  SELECT id, id, 0 FROM steps
+  UNION
+  SELECT w.step_id, d.depends_on_step_id, w.depth + 1
+  FROM walk w JOIN step_dependencies d ON d.step_id = w.ancestor_id JOIN n ON w.depth < n.c),
+reach(step_id, plan_id, number, after_number, depth) AS (
+  SELECT w.step_id, s.plan_id, s.number, max(a.number), max(w.depth)
+  FROM walk w JOIN steps a ON a.id = w.ancestor_id JOIN steps s ON s.id = w.step_id GROUP BY w.step_id)
+SELECT p.code AS plan, s.number AS step, s.title, s.status,
+       (SELECT count(*) FROM reach o WHERE o.plan_id = r.plan_id
+          AND (o.after_number < r.after_number OR (o.after_number = r.after_number AND (o.depth < r.depth
+               OR (o.depth = r.depth AND o.number <= r.number))))) AS position,
+       r.depth,
+       (SELECT group_concat(x.number, ',') FROM (SELECT b.number FROM step_dependencies d
+          JOIN steps b ON b.id = d.depends_on_step_id WHERE d.step_id = s.id ORDER BY b.number) x) AS depends_on
+FROM reach r JOIN steps s ON s.id = r.step_id JOIN plans p ON p.id = s.plan_id;
+
+-- Every feature proposal with what it serves and where it stands, ranked.
+-- rank orders them best first: by how far each advances its goal (value), then by how little it costs (effort); ties
+-- go by code. serves is the goal or requirement code, step the plan step that builds it (P-0001#12).
+CREATE VIEW v_feature_proposals AS
+SELECT f.code, r.code AS review, COALESCE(g.code, q.code) AS serves, COALESCE(g.text, q.text) AS serves_text,
+       g.domain_code AS domain, f.title, f.today, f.evidence, f.proposal, f.value, f.effort, f.risks, f.depends,
+       f.done_test, f.status, f.status_note, 'A-' || printf('%04d', a.id) AS decided_by, f.decided_at, gt.code AS gate,
+       CASE WHEN s.id IS NULL THEN NULL ELSE p.code || '#' || s.number END AS step,
+       vl.position * 10 + el.position AS rank, f.created_at
+FROM feature_proposals f JOIN reviews r ON r.id = f.review_id
+LEFT JOIN design_goals g ON g.id = f.goal_id LEFT JOIN requirements q ON q.id = f.requirement_id
+LEFT JOIN actors a ON a.id = f.decided_by_actor_id LEFT JOIN gates gt ON gt.id = f.gate_id
+LEFT JOIN steps s ON s.id = f.step_id LEFT JOIN plans p ON p.id = s.plan_id
+LEFT JOIN enum_labels vl ON vl.enum = 'feature_value' AND vl.value = f.value
+LEFT JOIN enum_labels el ON el.enum = 'feature_effort' AND el.value = f.effort;
+
 -- ---------- Catalog seed (extend with custom domains/themes as needed) ---
 
 INSERT INTO domains(code, name, category, report_file) VALUES
@@ -3530,7 +3782,8 @@ INSERT INTO domains(code, name, category, report_file) VALUES
  ('cost','Cost','security-operations','cost.md'),
  ('docs-developer','Developer documentation','documentation','docs-developer.md'),
  ('docs-user','End-user documentation','documentation','docs-user.md'),
- ('handover','Maintainability and handover','documentation','handover.md');
+ ('handover','Maintainability and handover','documentation','handover.md'),
+ ('features','Features toward the goals','architecture','features.md');
 
 INSERT INTO themes(code, name) VALUES
  ('spec-mismatch','Spec mismatch'),('sign-in','Sign-in and sessions'),('authorization','Authorization'),
@@ -3578,7 +3831,8 @@ WITH applies(code, text) AS (VALUES
  ('cost','Applies when the system runs on paid infrastructure or services.'),
  ('docs-developer','Almost always applies.'),
  ('docs-user','Applies when the system has users other than its developers.'),
- ('handover','Applies whenever someone other than the current author may need to run or change the system.'))
+ ('handover','Applies whenever someone other than the current author may need to run or change the system.'),
+ ('features','Applies when the review has approved goals or stated requirements.'))
 UPDATE domains SET description = (SELECT text FROM applies WHERE applies.code = domains.code)
  WHERE description IS NULL AND code IN (SELECT code FROM applies);
 
@@ -3610,7 +3864,8 @@ INSERT INTO domain_rules(domain_code, rule) VALUES
  ('cost','paid_service_files >= 1 or deploy_files >= 1'),
  ('docs-developer','code_files >= 1'),
  ('docs-user','user_doc_files >= 1 or page_files >= 1'),
- ('handover','authors >= 2 or deploy_files >= 1 or history_months >= 6');
+ ('handover','authors >= 2 or deploy_files >= 1 or history_months >= 6'),
+ ('features','goals >= 1 or requirements >= 1');
 
 
 -- The metric names the domains ask for (keep names stable between reviews so they trend).
@@ -3677,7 +3932,8 @@ INSERT INTO gate_kinds(value, label, position) VALUES
  ('production-action','Production action',7),
  ('review-handoff','Review hand-off',8),
  ('confirm','Confirm',9),
- ('other','Question',10);
+ ('other','Question',10),
+ ('feature-pick','Pick ideas to build',11);
 INSERT INTO goal_statuses(value, label, position, served) VALUES
  ('proposed','Waiting for your approval',1,0),
  ('approved','Approved',2,1),
@@ -3925,6 +4181,11 @@ INSERT INTO domain_checks(code, domain_code, position, severity, question, evide
  ('handover.2','handover',2,'H','Who owns each account, domain, key and secret, and is any tied to one person?','The list with the owner and how access transfers.'),
  ('handover.3','handover',3,'M','Are there runbooks for the common incidents and the periodic chores?','Each one, present or missing.'),
  ('handover.4','handover',4,'M','Where is knowledge held by one person?','From the history or the hotspots report.');
+INSERT INTO domain_checks(code, domain_code, position, severity, question, evidence) VALUES
+ ('features.1','features',1,'L','Is every approved goal and active requirement listed with what the code does toward it today?','A row per goal and requirement: path:line of what serves it, or absent.'),
+ ('features.2','features',2,'L','Does each proposal name the goal or requirement it serves, its value, effort, risks and dependencies?','Each proposal with its goal code and the four answers.'),
+ ('features.3','features',3,'L','Does each proposal have a test that would show it is built?','The done-test per proposal: its name and what it asserts.'),
+ ('features.4','features',4,'L','Were the proposals already on record checked again against the goals and the code?','Per earlier proposal: still wanted, built, or serving no current goal.');
 
 INSERT INTO enum_labels(enum, value, label, position) VALUES
  ('checklist_answer','yes','Yes',1), ('checklist_answer','no','No',2), ('checklist_answer','partly','Partly',3),
@@ -3943,7 +4204,12 @@ INSERT INTO enum_labels(enum, value, label, position) VALUES
 INSERT INTO ledger_checks(view, label, tier, position) VALUES
  ('v_unresolved_conflicts','Plan steps that touch the same thing, not judged yet','error',120),
  ('v_late_step_conflicts','Steps added after approval that touch what other steps touch','warning',130);
-INSERT INTO meta(key, value) VALUES ('schema_version','16');
+INSERT INTO enum_labels(enum, value, label, position) VALUES
+ ('feature_status','proposed','Proposed',1), ('feature_status','picked','Picked',2),
+ ('feature_status','declined','Declined',3), ('feature_status','built','Built',4),
+ ('feature_value','high','High',1), ('feature_value','medium','Medium',2), ('feature_value','low','Low',3),
+ ('feature_effort','small','Small',1), ('feature_effort','medium','Medium',2), ('feature_effort','large','Large',3);
+INSERT INTO meta(key, value) VALUES ('schema_version','19');
 INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger schema'),
   (2, 'url, path, hash and code checks; repositories.allow_outside_root; finding_locations.excerpt_redacted'),
   (3, 'integrity rules: codes, hashes, checks, append-only history, owner actor on gate answers'),
@@ -3959,4 +4225,7 @@ INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger s
   (13, 'domain_rules: the rule by which scan proposes each domain; review_domains.proposed_by_rule'),
   (14, 'domain_checks and checklist_answers: each domain''s checklist, and the answers each report gave'),
   (15, 'the agreement metrics compare-runs records: domain_agreement, finding_agreement, severity_agreement'),
-  (16, 'step_touches and step_conflicts: what each plan step touches, and the pairs of steps that touch the same thing');
+  (16, 'step_touches and step_conflicts: what each plan step touches, and the pairs of steps that touch the same thing'),
+  (17, 'a step may depend on any step of its plan, cycles refused; v_step_order: the order to work in'),
+  (18, 'multi-select gates: gates.multi and gates.preselect; a multi-select answer is a JSON list of option values'),
+  (19, 'the features domain and feature_proposals: additions to the reviewed codebase that would serve the owner''s goals');

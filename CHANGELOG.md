@@ -1,6 +1,22 @@
 # Changelog
 
-The tool version is `version:` in SKILL.md's frontmatter; `ledger.py --version` prints it with the schema version.
+The tool version is `metadata:` `version:` in SKILL.md's frontmatter; `ledger.py --version` prints it with the schema
+version.
+
+## 1.9.2 (schema 19)
+
+- A plan step may depend on any step of its plan, a later-numbered one too; only a cycle is refused.
+  `v_step_order` is the order to work in, and `progress-md` lists steps in it; `resolve-conflict --resolution order`
+  takes `--first`. Migration 0017.
+- Multi-select questions: `open-gate --multi [--preselect a,b]`; the answer is a JSON list of option values, checked
+  against the options. `answer-gate` takes `--value` more than once; the viewer and the hub draw checkboxes with
+  Select all and Select none. Migration 0018.
+- The `features` domain proposes additions that would serve the owner's goals (`propose-feature`, `feature-gate`,
+  `feature-status`, `features`, the Ideas page). Proposals are not issues: no severity, never counted with issues,
+  regressions or coverage. A picked one becomes a plan step (`features` in `steps.jsonl`). Migration 0019.
+- SKILL.md's frontmatter holds only keys every skill loader accepts: `name`, `description`, `license: MIT` and
+  `metadata:` with `version:` under it. `dev/release.py` refuses any other top-level key, a top-level `version:`
+  included.
 
 ## 1.9.1 (schema 16)
 

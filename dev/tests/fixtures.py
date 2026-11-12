@@ -842,9 +842,9 @@ def seed_demo(ledger):
         L.con.execute("SAVEPOINT backward")
         L.dependency(s1, s3)
     except sqlite3.IntegrityError as e:
-        _expect("earlier step" in str(e), f"backward dependency refused with an unexpected message: {e}")
+        _expect("cycle" in str(e), f"a dependency cycle refused with an unexpected message: {e}")
     else:
-        raise DemoExpectationError("a step was allowed to depend on a later step (tr_dep_order)")
+        raise DemoExpectationError("a dependency cycle was allowed (tr_dep_order)")
     finally:
         L.con.execute("ROLLBACK TO backward")
         L.con.execute("RELEASE backward")

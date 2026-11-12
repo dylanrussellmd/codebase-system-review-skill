@@ -73,7 +73,7 @@ class ImportStepsTest(unittest.TestCase):
                 ({"key": "A-1", "phase": 1, "order": 1, "title": "T", "change": "C", "proof": "P",
                   "closes": ["SPEC-H9"]}, "no point SPEC-H9"),
                 ({"key": "A-1", "phase": 1, "order": 1, "title": "T", "change": "C", "proof": "P",
-                  "closes": ["SPEC-M1"], "depends": ["A-2"]}, "not earlier"),
+                  "closes": ["SPEC-M1"], "depends": ["A-1"]}, "make a cycle"),
                 ({"key": "A-1", "phase": 1, "order": 1, "title": "T", "change": "C", "proof": "P",
                   "closes": ["SPEC-M1"], "depends": ["Z-9"]}, "unknown step"),
                 ({"key": "A-1", "phase": 7, "order": 1, "title": "T", "change": "C", "proof": "P",

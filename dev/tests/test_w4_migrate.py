@@ -41,7 +41,7 @@ class MigrateReviewTools(unittest.TestCase):
         self.addCleanup(fresh.close)
         want = [(r["domain_code"], r["rule"]) for r in fresh.all("SELECT * FROM domain_rules ORDER BY 1")]
         self.assertEqual(self.con.execute("SELECT domain_code, rule FROM domain_rules ORDER BY 1").fetchall(), want)
-        self.assertEqual(len(want), 27)
+        self.assertEqual(len(want), 28)   # 27, and features (schema 19)
         self.assertEqual(self.con.execute("SELECT count(*) FROM review_domains WHERE proposed_by_rule IS NOT NULL")
                          .fetchone()[0], 0)   # earlier proposals were made by a person
 

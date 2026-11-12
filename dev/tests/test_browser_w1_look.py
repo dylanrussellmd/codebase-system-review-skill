@@ -454,7 +454,7 @@ class Stress(browser.ViewerTestCase):
         page = self.open("#/trends", viewport=browser.PHONE)
         boxes = page.js("[...document.querySelectorAll('#tabs a')].map(a => { const r = a.getBoundingClientRect();"
                         " return [a.textContent, r.left, r.right, r.top, r.bottom]; })")
-        self.assertEqual(len(boxes), 9)   # How it works is a tab of the viewer too (step 197)
+        self.assertEqual(len(boxes), 10)   # How it works (step 197) and Ideas (step 145) are tabs too
         for text, left, right, top, bottom in boxes:
             self.assertTrue(0 <= left and right <= 390 and 0 <= top and bottom <= 844, (text, left, right, top, bottom))
         # between phone and desktop width the tabs scroll sideways, and the current one is brought into view

@@ -38,7 +38,7 @@ input,select,textarea,button{font:inherit;color:var(--fg)}
 .field{background:var(--surface);border:1px solid var(--field);border-radius:6px;padding:8px 10px;min-width:0}
 .tools input{flex:1 1 240px}
 textarea{width:100%;min-height:72px;resize:vertical}
-input[type=radio]{accent-color:var(--accent)}
+input[type=radio],input[type=checkbox]{accent-color:var(--accent)}
 button.btn{cursor:pointer;background:var(--accent);color:var(--bg);border:0;border-radius:6px;padding:8px 14px;font-weight:600}
 button.btn.ghost{background:transparent;color:var(--accent);border:1px solid var(--line)}
 button.btn:disabled{opacity:.5;cursor:default}
@@ -142,6 +142,7 @@ nav.rail small{display:block;font-size:12px;opacity:.75}
 //   #/reviews                            reviews   reviews
 //   #/review/R-0001?match=none           review    review/<code>; finding/<id> as a point opens; run/<id>
 //   #/goals, #/goals/G-01                goals     goals
+//   #/ideas, #/ideas/FP-0001             ideas     ideas
 //   #/issues?status=&severity=&domain_code=&q=&offset=   issues   issues?...
 //   #/issue/ISS-0001                     issue     issue/<code>
 //   #/plans                              plans     plans
@@ -300,11 +301,11 @@ function hubGateBody(card, g, hid){
     return card;
   }
   if (!HUB.store) { add(card, h("p", {class: "note"}, "Answer in the chat with the agent.")); return card; }
-  const {name: nm, opts, ta} = gateInputs(g, hid);
+  const {opts, ta, picked} = gateInputs(g, hid);
   const msg = h("div"), form = h("div", {class: "gate"});
   const send = h("button", {class: "btn", type: "button", id: hid + "-send", "aria-labelledby": `${hid}-send ${hid}`, onclick: async () => {
-    const picked = card.querySelector(`input[name="${nm}"]:checked`), val = picked ? picked.value : null, txt = ta ? ta.value.trim() : "";
-    if (!val && !txt) { put(msg, errorBox("Choose an option or write an answer.")); return; }
+    const val = picked(), txt = ta ? ta.value.trim() : "";
+    if (!g.multi && !val && !txt) { put(msg, errorBox("Choose an option or write an answer.")); return; }
     send.disabled = true;
     try {
       const a = {gate: g.code, answer_value: val, answer_text: txt || null, answered_at: new Date().toISOString()};
@@ -380,7 +381,8 @@ const ENUM_OF = {sev:"severity", issue:"issue_status", match:"match_type", verif
   relIn:"relation_type_inverse", check:"check_outcome", kind:"issue_kind", run:"run_status", plan:"plan_status",
   decision:"decision_status", goal:"goal_status", via:"answered_via", role:"location_role", ownerChange:"owner_change",
   conf:"confidence", method:"metric_method", verdict:"verdict", tested:"tested", actorKind:"actor_kind",
-  artifact:"artifact_kind", purpose:"test_purpose", event:"event"};
+  artifact:"artifact_kind", purpose:"test_purpose", event:"event", idea:"feature_status", value:"feature_value",
+  effort:"feature_effort"};
 const FALLBACK = {sev:{H:"High",M:"Medium",L:"Low",T:"Missing test"}, need:{none:""}};
 let L = {};
 const setLabels = enums => { L = Object.fromEntries(Object.entries(ENUM_OF).map(([k, e]) =>
@@ -398,6 +400,7 @@ const TONE = {
   verif:{confirmed:"ok"},
   gate:{"production-action":"crit"}, gstat:{open:"you"},
   goal:{approved:"ok", proposed:"you"},
+  idea:{proposed:"you", picked:"info", built:"solid", declined:""},
   step:{"not-started":"", doing:"ok", "waiting-owner":"you", done:"solid", dropped:""},
   need:{none:"", decision:"warn", confirm:"info", review:"info", production:"crit"},
   area:{included:"ok"},
@@ -482,7 +485,7 @@ function filterBar(controls, onChange, wait=0){
 }
 // A gate's answer as the owner gave it: the chosen option's label, then the note.
 function answerText(g, strong){
-  const label = g.answer_value ? optLabel(g) : "", note = g.answer_text || "";
+  const label = g.answer_value != null && g.answer_value !== "" ? optLabel(g) : "", note = g.answer_text || "";
   if (!strong) return [label, note].filter(Boolean).join(" — ");
   return [label ? h("b", null, label) : null, note ? (label ? " — " : "") + note : null];
 }
@@ -752,21 +755,31 @@ VIEWS.history = async ([code], params) => {
   await load(code ? "at=" + encodeURIComponent(code) : "offset=" + (Number(params.get("offset")) || 0));
   if (code) jumpTo(document.getElementById("gate-row-" + code));
 };
-const optLabel = g => g.answer_label || ((g.options || []).find(o => o.value === g.answer_value) || {}).label || words(g.answer_value);
+const optOf = (g, v) => ((g.options || []).find(o => o.value === v) || {}).label || words(v);
+const optLabel = g => g.answer_label || (Array.isArray(g.answer_value) ? g.answer_value.map(v => optOf(g, v)).join(", ") || "None of them" : optOf(g, g.answer_value));
 
 // level: "h3" for a gate listed under a section heading. moved(card, gate, note): called once the gate is answered.
 const FINAL = "You can't change an answer once it is sent.";
 const IN_CHAT = "Answer this one in the chat with the agent.";
-// What an open gate is answered with: its options as one radio group and, where the gate takes text, a text box.
-// hid: the id of the gate's title, which names both for a screen reader.
+// What an open gate is answered with: its options as one radio group (checkboxes, the recommended ones ticked, with
+// Select all and Select none, when it takes several) and, where the gate takes text, a text box. hid: the id of the
+// gate's title, which names them for a screen reader. picked() is the answer the choices give: a value, a list of
+// values for a multi-select gate, or null.
 function gateInputs(g, hid){
-  const name = "opt-" + g.code;
-  const option = o => h("label", null, h("input", {type:"radio", name, value:o.value}),
+  const name = "opt-" + g.code, multi = !!g.multi, pre = new Set(g.preselect || []);
+  const option = o => h("label", null, h("input", multi ? {type:"checkbox", name, value:o.value, checked: pre.has(o.value) ? "" : null} : {type:"radio", name, value:o.value}),
     h("span", null, o.label, o.description ? h("small", null, o.description) : null));
-  const opts = (g.options || []).length ? h("div", {class:"opts", role:"radiogroup", "aria-labelledby":hid}, g.options.map(option)) : null;
+  let opts = (g.options || []).length ? h("div", {class:"opts", role: multi ? "group" : "radiogroup", "aria-labelledby":hid}, g.options.map(option)) : null;
+  if (opts && multi) {
+    const all = on => () => opts.querySelectorAll("input").forEach(i => { i.checked = on; });
+    opts = h("div", null, h("div", {class:"tools"}, h("button", {type:"button", class:"btn ghost", onclick: all(true)}, "Select all"),
+      h("button", {type:"button", class:"btn ghost", onclick: all(false)}, "Select none")), opts);
+  }
   const ta = g.allow_text ? h("textarea", {class:"field", placeholder: opts ? "Add a note or a different answer (optional)" : "Your answer",
     id:hid + "-text", "aria-label":"Your answer", "aria-labelledby":`${hid}-text ${hid}`}) : null;
-  return {name, opts, ta};
+  const picked = () => { const on = [...(opts ? opts.querySelectorAll(`input[name="${name}"]:checked`) : [])].map(i => i.value);
+    return multi ? on : (on[0] || null); };
+  return {name, opts, ta, picked};
 }
 function gateCard(g, level, moved){
   const hid = "gate-" + g.code;   // the title's id: it names this gate's choices, text box and button
@@ -782,18 +795,17 @@ function gateCard(g, level, moved){
     g.context ? h("div", {class:"ctx"}, g.context) : null,
     refs.length ? h("div", {class:"refline"}, refs) : null);
   if (g.status !== "open") {
-    add(card, h("p", {class:"callout answer"}, g.answer_value || g.answer_text ? ["You answered: ", answerText(g, true), g.answered_at ? ` (${when(g.answered_at)})` : ""] : lab("gstat", g.status)));
+    add(card, h("p", {class:"callout answer"}, g.answer_value != null || g.answer_text ? ["You answered: ", answerText(g, true), g.answered_at ? ` (${when(g.answered_at)})` : ""] : lab("gstat", g.status)));
     return card;
   }
   if (!(g.options || []).length && !g.allow_text) { add(card, h("p", {class:"note"}, IN_CHAT)); return card; }
   if (STATIC) return hubGateBody(card, g, hid);
-  const {name, opts, ta} = gateInputs(g, hid);
+  const {opts, ta, picked} = gateInputs(g, hid);
   const msg = h("div");
   const send = h("button", {class:"btn", type:"button", id:hid + "-send", "aria-labelledby":`${hid}-send ${hid}`, onclick:async () => {
-    const picked = card.querySelector(`input[name="${name}"]:checked`);
     send.disabled = true;
     try {
-      await api(`gates/${encodeURIComponent(g.code)}/answer`, {answer_value: picked ? picked.value : null, answer_text: ta ? ta.value : null});
+      await api(`gates/${encodeURIComponent(g.code)}/answer`, {answer_value: picked(), answer_text: ta ? ta.value : null});
       say("Answer saved.");
       if (moved) await moved(card, g, "Answer saved. The agent will act on it the next time it checks."); else put(msg, h("p", {class:"status"}, "Answer saved."));
     } catch (e) {
@@ -1012,6 +1024,25 @@ VIEWS.goals = async ([code]) => {
       : empty("No design goals yet."),
     d.goals.some(g => g.status === "proposed") ? h("p", {class:"callout you"}, h("a", {href:"#/inbox"}, "Goals are waiting for your approval →")) : null);
   if (code) jumpTo(document.getElementById("goal-" + code));
+};
+
+// ---------- ideas: what the codebase could add to meet the goals (schema 19)
+// Not issues: no severity, and no other page counts them. Grouped by the goal each serves, best first.
+VIEWS.ideas = async ([code]) => {
+  const d = await api("ideas");
+  const cols = [{label:"Idea", key:"code"}, {label:"Addition", get:p => h("span", null, h("b", null, p.title), h("small", {class:"note"}, " " + p.proposal))},
+    {label:"Value", get:p => lab("value", p.value)}, {label:"Effort", get:p => lab("effort", p.effort)},
+    {label:"Today", get:p => [p.today, " ", h("span", {class:"mono"}, p.evidence)]},
+    {label:"Risks", get:p => [p.risks || "", p.depends ? h("small", {class:"note"}, " Needs first: " + p.depends) : null]},
+    {label:"Done when", key:"done_test"}, {label:"Status", get:p => labTag("idea", p.status)},
+    {label:"Step", get:p => p.step ? h("a", {href:"#/plan/" + p.step.split("#")[0]}, p.step) : (p.status_note || "")}];
+  const n = d.counts.proposed || 0;
+  setView(h("h1", null, "Ideas"),
+    h("p", {class:"lede"}, "Additions that would serve your goals. Missing them breaks nothing."),
+    n ? h("p", {class:"callout you"}, h("a", {href:"#/inbox"}, `${plural(n, "idea")} to pick from →`)) : null,
+    d.goals.length ? d.goals.map(g => [sect(g.goal + " · " + g.text), table(cols, g.proposals, null, "", p => ({id:"idea-" + p.code}))])
+      : empty("No ideas yet."));
+  if (code) jumpTo(document.getElementById("idea-" + code));
 };
 
 // The filters live in the address (#/issues?status=all&severity=H&domain_code=spec&q=text&offset=200), so a reload, a
@@ -1328,7 +1359,7 @@ VIEWS.guide = async () => {
 // ---------- routing
 // The tabs: [key, address, name]. drawTabs(active) draws them with the Waiting on you badge.
 const TABS = [["home","#/","Overview"], ["guide","#/guide","How it works"], ["inbox","#/inbox","Waiting on you"],
-  ["reviews","#/reviews","Reviews"], ["goals","#/goals","Design goals"], ["issues","#/issues","Issues"],
+  ["reviews","#/reviews","Reviews"], ["goals","#/goals","Design goals"], ["ideas","#/ideas","Ideas"], ["issues","#/issues","Issues"],
   ["plans","#/plans","Fix plans"], ["trends","#/trends","Over time"], ["explore","#/explore","Explore"]];
 // What the badge counts: everything in the owner's queue still to act on. In the shared copy, less the open gates
 // answered there since the copy was made.
