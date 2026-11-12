@@ -3,6 +3,15 @@
 The tool version is `metadata:` `version:` in SKILL.md's frontmatter; `ledger.py --version` prints it with the schema
 version.
 
+## 1.10.0 (schema 20)
+
+- `tool-run` runs a picked tool on an export of the reviewed commit, or imports its output (SARIF, JUnit, LCOV,
+  Cobertura), with versions pinned in `references/tools.lock`. Results are leads; `check` fails while one is
+  neither cited by a finding nor dismissed with a reason (`dismiss-lead`, `cite-lead`).
+- Wired in: ast-grep rule packs (`references/rules/ast-grep/`), scc, jscpd, git-history analysis, Semgrep CE,
+  gitleaks, OSV-Scanner, actionlint, zizmor, coverage import, and `test-runs` (repeat, random order, network off,
+  clock and time-zone shifts).
+
 ## 1.9.2 (schema 19)
 
 - A plan step may depend on any step of its plan, a later-numbered one too; only a cycle is refused.

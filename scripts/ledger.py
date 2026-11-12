@@ -36,8 +36,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote
 
-TOOL_VERSION = "1.9.2"  # stamped by dev/build.py from `metadata: version:` in SKILL.md's frontmatter
-TOOL_HASH = "ef2ae119c76a652811d6f3940efe3fccf4f3d3216c232755bb843cf4e31dcd0d"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
+TOOL_VERSION = "1.10.0"  # stamped by dev/build.py from `metadata: version:` in SKILL.md's frontmatter
+TOOL_HASH = "d42bdd8aa6706bf411a1790572db0229b8dd4f0df5521ab8f3003ad890bb8834"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
 # Placeholders: dev/build.py puts references/schema.sql, dev/page.html and references/migrations/*.sql in their
 # place when it writes scripts/ledger.py. dev/core.py itself is never run as the tool.
 SCHEMA = r"""-- =====================================================================
