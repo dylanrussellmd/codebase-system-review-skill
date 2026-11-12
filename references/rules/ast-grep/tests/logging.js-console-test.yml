@@ -1,0 +1,7 @@
+id: logging.js-console
+valid:
+  - logger.info("started")
+  - console.table(rows)
+invalid:
+  - console.log("started")
+  - console.error(err)

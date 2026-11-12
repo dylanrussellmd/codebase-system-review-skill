@@ -1,0 +1,8 @@
+id: client-api.js-fetch
+valid:
+  - cache.fetch(key)
+  - prefetch(url)
+invalid:
+  - fetch("/api/users")
+  - axios.post("/api/items", body)
+  - axios({ url })

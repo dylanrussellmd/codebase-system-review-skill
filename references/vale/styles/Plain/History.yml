@@ -1,0 +1,23 @@
+# Current state, not history. dev/tests/test_writing_lint.py reads these tokens.
+extends: existence
+message: "Describe what is true now; drop the history ('%s')."
+level: error
+ignorecase: true
+tokens:
+  - previously
+  - formerly
+  - originally
+  - used to
+  - no longer
+  - not anymore
+  - any ?more
+  - (?:was|were|got|has been|have been) (?:changed|renamed|moved|replaced|removed|added|updated|migrated|refactored|rewritten|deprecated|introduced|fixed)
+  - (?:now|newly) (?:uses?|supports?|returns?|handles?|accepts?|requires?|lives?|works?)
+  - we (?:changed|moved|renamed|replaced|removed|added|switched|migrated|refactored|fixed|introduced)
+  - (?:switched|migrated|moved) (?:from|over|away)
+  - instead of the (?:old|previous|former)
+  - the (?:old|previous|former|new|updated|legacy) (?:way|behaviou?r|version|implementation|approach|logic|code)
+  - in (?:an? )?(?:earlier|older|previous|prior) (?:versions?|releases?)
+  - as of (?:v|version )\d
+  - (?:before|after) (?:this|the) (?:change|fix|refactor|commit|PR)
+  - this (?:change|fix|commit|PR) (?:adds|removes|makes|changes|fixes)

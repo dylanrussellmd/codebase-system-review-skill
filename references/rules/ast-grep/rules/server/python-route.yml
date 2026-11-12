@@ -1,0 +1,10 @@
+id: server.python-route
+language: python
+severity: hint
+message: A server entry point; list it with who may call it and its tests.
+rule:
+  kind: decorator
+  has:
+    stopBy: end
+    kind: attribute
+    regex: ^\w+\.(route|get|post|put|patch|delete|websocket)$

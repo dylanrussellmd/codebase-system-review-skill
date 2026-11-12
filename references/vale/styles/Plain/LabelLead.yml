@@ -1,0 +1,8 @@
+# Labels on the self-evident, in prose. `[ \t]`, not `\s`: a match must not start on the line before.
+extends: existence
+message: "Drop the label '%s' and state the content."
+level: warning
+scope: raw
+nonword: true
+tokens:
+  - '(?m)^[ \t]*(?:[-*][ \t]+)?\*{0,2}(?:Note|Please note|Important|Tip|Hint|Info|Description|Summary|Overview|Purpose|Details|Explanation)\*{0,2}:'

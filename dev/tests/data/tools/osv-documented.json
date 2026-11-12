@@ -1,0 +1,54 @@
+{
+  "results": [
+    {
+      "source": {
+        "path": "requirements.txt",
+        "type": "lockfile"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "requests",
+            "version": "2.19.0",
+            "ecosystem": "PyPI"
+          },
+          "vulnerabilities": [
+            {
+              "id": "GHSA-x84v-xcm2-53pg",
+              "aliases": ["CVE-2018-18074"],
+              "summary": "Insufficiently protected credentials in Requests"
+            },
+            {
+              "id": "PYSEC-2018-28",
+              "aliases": ["CVE-2018-18074"],
+              "summary": "Requests sends an Authorization header after an https to http redirect"
+            },
+            {
+              "id": "GHSA-j8r2-6x86-q33q",
+              "aliases": ["CVE-2023-32681"],
+              "summary": "Unintended leak of Proxy-Authorization header in requests"
+            }
+          ],
+          "groups": [
+            {
+              "ids": ["GHSA-x84v-xcm2-53pg", "PYSEC-2018-28"],
+              "aliases": ["CVE-2018-18074", "GHSA-x84v-xcm2-53pg", "PYSEC-2018-28"],
+              "max_severity": "7.5"
+            },
+            {
+              "ids": ["GHSA-j8r2-6x86-q33q"],
+              "aliases": ["CVE-2023-32681", "GHSA-j8r2-6x86-q33q"],
+              "max_severity": "6.1"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": null
+    }
+  }
+}

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites>
+<testsuite tests="3" errors="0" failures="1">
+<testcase id="/project/hurl/0001-GET-%2Fapi%2Fusers--admin.hurl" name="/project/hurl/0001-GET-%2Fapi%2Fusers--admin.hurl" time="0.011" />
+<testcase id="/project/hurl/0002-GET-%2Fapi%2Fusers--anonymous.hurl" name="/project/hurl/0002-GET-%2Fapi%2Fusers--anonymous.hurl" time="0.009"><failure>Assert status code
+  --&gt; /project/hurl/0002-GET-%2Fapi%2Fusers--anonymous.hurl:4:0
+   |
+ 4 | status &gt;= 401
+   |   actual:   integer &lt;200&gt;
+   |   expected: greater than or equals to integer &lt;401&gt;
+   |</failure></testcase>
+<testcase id="/project/hurl/0003-GET-%2Fapi%2Fusers%2F%7Bid%7D--admin.hurl" name="/project/hurl/0003-GET-%2Fapi%2Fusers%2F%7Bid%7D--admin.hurl" time="0.007" />
+</testsuite>
+</testsuites>

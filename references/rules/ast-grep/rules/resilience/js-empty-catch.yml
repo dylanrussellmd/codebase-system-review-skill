@@ -1,0 +1,11 @@
+id: resilience.js-empty-catch
+language: javascript
+severity: warning
+message: An error is caught and dropped; the failure leaves no trace.
+note: Handle it, log it with context, or let it propagate.
+rule:
+  kind: catch_clause
+  has:
+    field: body
+    kind: statement_block
+    regex: ^\{\s*\}$

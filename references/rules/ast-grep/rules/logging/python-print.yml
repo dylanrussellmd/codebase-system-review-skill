@@ -1,0 +1,6 @@
+id: logging.python-print
+language: python
+severity: hint
+message: Output written with print, outside the logger (no level, no request id, no time).
+rule:
+  pattern: print($$$)

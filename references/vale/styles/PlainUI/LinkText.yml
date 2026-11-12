@@ -1,0 +1,9 @@
+extends: existence
+message: "Name the destination, not '%s'."
+level: error
+ignorecase: true
+tokens:
+  - click here
+  - this link
+  - read more
+  - learn more

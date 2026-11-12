@@ -1,0 +1,7 @@
+extends: existence
+message: "Say 'Saved', not 'Saved successfully' ('%s')."
+level: error
+ignorecase: true
+tokens:
+  - successfully
+  - has been (?:saved|updated|deleted|created|sent)

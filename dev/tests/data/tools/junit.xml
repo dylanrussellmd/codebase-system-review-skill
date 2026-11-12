@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="1" skipped="0" tests="3" time="0.200" timestamp="2026-11-11T23:48:14.091904-08:00" hostname="vm"><testcase classname="tests.test_app.AreaTest" name="test_area" time="0.002" /><testcase classname="tests.test_app.AreaTest" name="test_fails" time="0.001"><failure message="AssertionError: 1 != 2">self = &lt;test_app.AreaTest testMethod=test_fails&gt;
+
+    def test_fails(self):
+&gt;       self.assertEqual(area(1, 1), 2)
+E       AssertionError: 1 != 2
+
+tests/test_app.py:15: AssertionError</failure></testcase><testcase classname="tests.test_app.AreaTest" name="test_negative" time="0.001" /></testsuite></testsuites>

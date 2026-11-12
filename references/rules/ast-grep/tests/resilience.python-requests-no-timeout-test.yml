@@ -1,0 +1,8 @@
+id: resilience.python-requests-no-timeout
+valid:
+  - requests.get(url, timeout=5)
+  - requests.post(url, json=body, timeout=(3, 10))
+  - requests.Session()
+invalid:
+  - requests.get(url)
+  - requests.post(url, json=body)

@@ -1,0 +1,15 @@
+id: resilience.python-swallowed-exception
+language: python
+severity: warning
+message: An exception is caught and dropped; the failure leaves no trace.
+note: Handle it, log it with context, or let it propagate.
+rule:
+  kind: except_clause
+  has:
+    kind: block
+    all:
+      - has:
+          kind: pass_statement
+      - not:
+          has:
+            nthChild: 2

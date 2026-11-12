@@ -1,0 +1,7 @@
+id: decision-placement.python-role-check
+valid:
+  - if can(user, "edit"):\n    pass
+  - x = user.name == "admin"
+invalid:
+  - x = user.role == "admin"
+  - y = "admin" in user.roles

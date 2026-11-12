@@ -1,0 +1,6 @@
+id: resilience.js-empty-catch
+valid:
+  - "try { run(); } catch (e) { log(e); }"
+invalid:
+  - "try { run(); } catch (e) {}"
+  - "try { run(); } catch {}"

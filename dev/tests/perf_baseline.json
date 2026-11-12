@@ -1,0 +1,370 @@
+{
+ "_about": [
+  "Baseline measurements for plan step 29, made with `python3 dev/tests/scale.py baseline` on a 2-CPU Linux machine while the test suite was also running, so timings are upper bounds.",
+  "x1 = 10,000 findings and 600 plan steps; x10 = 100,000 and 6,000. Text is generated from a 46-word vocabulary unless the name says _prose (sentences taken from real review reports).",
+  "git growth: 5 consecutive commits of ledger.sqlite and its SQL dump at x1, each after 30 steps were marked done and 20 check evidences rewritten.",
+  "fill_refs.* (plan step 102, PERF-V3, measured 2026-11-11 with `python3 dev/tests/scale.py fill-refs --refs 1000,10000`): wall time of the whole `ledger.py fill-refs` command (start-up and schema verification included) on fresh references over 50 files of 400 lines in one commit, through one `git cat-file --batch`. marginal_ms_per_1000 = (x10 - x1) / 9, the cost per 1,000 references once the command is running; the review estimated < 300 ms per 1,000 (before: about 3,700 ms per 1,000, two git processes per reference).",
+  "review_search.* (plan step 163, UI-X3, measured 2026-11-11 in headless Chrome on the x1 ledger's R-0005, 2,000 points, before the search was changed): time of one input event on the review page's search box (the list of the first 100 points is rebuilt in the handler), whether an open point stays open, and the page's cold load and element count.",
+  "review_page.x10.* and check.x10.* (plan steps 149 and 92, measured 2026-11-11 on a 2-CPU Linux machine with `python3 dev/tests/scale.py build --scale 10`, a 0.94 GB ledger): cold load of the largest review's page (R-0001, 20,000 points) in headless Chrome until its first points are drawn, three runs; and the whole `ledger.py check --quiet` command, with its slowest statements.",
+  "check.x10.* after plan step 92 (decision D-0016, measured 2026-11-12 on the same 2-CPU machine, the 10x ledger migrated to schema 21): the whole `ledger.py check --quiet` command, four runs; check --full adds integrity_check's index comparison and foreign_key_check. The views are read from migration 0021's indexes. Before: 7.07 s (quick_check 2.54, foreign_key_check 1.26, views 3.0, schema verification 0.36).",
+  "insert_budget.* (plan step 92, measured 2026-11-12, best of three `scale.build(reviews=1, files=50)`): the timed sections hold only the ledger's writes; the generator makes its rows first (before, about 0.2 s of the 0.45 s load was generating text and hashes). A GitHub ubuntu-latest runner measured 0.756 s for the load before that change, about 1.7 times this machine. Triggers timed one at a time with the rest in place (a scratch copy, best of three): on loading none costs more than about 0.03 s (the time-format checks 0.02 s, all finding_locations triggers 0.045 s); on matching tr_finding_matched costs 0.17 s of 0.32 s, about 0.10 s of it the issue triggers its UPDATE sets off. Each enforces a rule, so none was removed; the time-format checks were already one trigger per table.",
+  "x1.bytes_per_finding and the x1 ledger and dump sizes (plan step 214, decision D-0017, measured 2026-11-12 with scale.build(scale=1) at schema 21 and `ledger.py dump`): the owner accepted about 10 KB per finding as the budget. The other x1.* and x10.* sizes are from the schema-2 baseline of 2026-11-10."
+ ],
+ "measured": "2026-11-10",
+ "measurements": {
+  "x1.build_seconds": {
+   "value": 6.7,
+   "unit": "s"
+  },
+  "x1.check_exit": {
+   "value": 0,
+   "unit": "exit code"
+  },
+  "x1.findings": {
+   "value": 10000,
+   "unit": "rows"
+  },
+  "x1.issues": {
+   "value": 4000,
+   "unit": "rows"
+  },
+  "x1.steps": {
+   "value": 600,
+   "unit": "rows"
+  },
+  "x1.insert_findings_us_per_row": {
+   "value": 284.9,
+   "unit": "us/row"
+  },
+  "x1.match_new_issue_us_per_row": {
+   "value": 165.3,
+   "unit": "us/row"
+  },
+  "x1.match_existing_issue_us_per_row": {
+   "value": 77.9,
+   "unit": "us/row"
+  },
+  "x1.insert_checks_us_per_row": {
+   "value": 48.9,
+   "unit": "us/row"
+  },
+  "x1.ledger_bytes": {
+   "value": 72089600,
+   "unit": "bytes"
+  },
+  "x1.ledger_gzip_ratio": {
+   "value": 4.7,
+   "unit": "raw/gzip"
+  },
+  "x1.dump_bytes": {
+   "value": 49650272,
+   "unit": "bytes"
+  },
+  "x1.dump_gzip_ratio": {
+   "value": 5.46,
+   "unit": "raw/gzip"
+  },
+  "x1.api_review_bytes": {
+   "value": 6596814,
+   "unit": "bytes"
+  },
+  "x1.api_review_gzip_ratio": {
+   "value": 5.76,
+   "unit": "raw/gzip"
+  },
+  "x1.api_review_ms": {
+   "value": 111.9,
+   "unit": "ms"
+  },
+  "x1.api_plan_bytes": {
+   "value": 3503604,
+   "unit": "bytes"
+  },
+  "x1.api_plan_gzip_ratio": {
+   "value": 5.54,
+   "unit": "raw/gzip"
+  },
+  "x1.api_plan_ms": {
+   "value": 126.3,
+   "unit": "ms"
+  },
+  "x1.git_loose_growth_per_ledger_commit_mean": {
+   "value": 29316.8,
+   "unit": "KiB"
+  },
+  "x1.git_loose_growth_per_ledger_commit": {
+   "value": [
+    29308,
+    29316,
+    29320,
+    29320,
+    29320
+   ],
+   "unit": "KiB"
+  },
+  "x1.git_pack_growth_per_ledger_commit_after_gc": {
+   "value": 3445.4,
+   "unit": "KiB"
+  },
+  "x1_prose.build_seconds": {
+   "value": 18.4,
+   "unit": "s"
+  },
+  "x1_prose.check_exit": {
+   "value": 0,
+   "unit": "exit code"
+  },
+  "x1_prose.findings": {
+   "value": 10000,
+   "unit": "rows"
+  },
+  "x1_prose.issues": {
+   "value": 4000,
+   "unit": "rows"
+  },
+  "x1_prose.steps": {
+   "value": 600,
+   "unit": "rows"
+  },
+  "x1_prose.insert_findings_us_per_row": {
+   "value": 649.4,
+   "unit": "us/row"
+  },
+  "x1_prose.match_new_issue_us_per_row": {
+   "value": 344.5,
+   "unit": "us/row"
+  },
+  "x1_prose.match_existing_issue_us_per_row": {
+   "value": 226.3,
+   "unit": "us/row"
+  },
+  "x1_prose.insert_checks_us_per_row": {
+   "value": 152.2,
+   "unit": "us/row"
+  },
+  "x1_prose.ledger_bytes": {
+   "value": 88084480,
+   "unit": "bytes"
+  },
+  "x1_prose.ledger_gzip_ratio": {
+   "value": 3.13,
+   "unit": "raw/gzip"
+  },
+  "x1_prose.dump_bytes": {
+   "value": 71400625,
+   "unit": "bytes"
+  },
+  "x1_prose.dump_gzip_ratio": {
+   "value": 3.31,
+   "unit": "raw/gzip"
+  },
+  "x1_prose.api_review_bytes": {
+   "value": 9535861,
+   "unit": "bytes"
+  },
+  "x1_prose.api_review_gzip_ratio": {
+   "value": 3.22,
+   "unit": "raw/gzip"
+  },
+  "x1_prose.api_review_ms": {
+   "value": 332.4,
+   "unit": "ms"
+  },
+  "x1_prose.api_plan_bytes": {
+   "value": 5680691,
+   "unit": "bytes"
+  },
+  "x1_prose.api_plan_gzip_ratio": {
+   "value": 3.12,
+   "unit": "raw/gzip"
+  },
+  "x1_prose.api_plan_ms": {
+   "value": 154.9,
+   "unit": "ms"
+  },
+  "x10.build_seconds": {
+   "value": 71.8,
+   "unit": "s"
+  },
+  "x10.check_exit": {
+   "value": 0,
+   "unit": "exit code"
+  },
+  "x10.findings": {
+   "value": 100000,
+   "unit": "rows"
+  },
+  "x10.issues": {
+   "value": 40000,
+   "unit": "rows"
+  },
+  "x10.steps": {
+   "value": 6000,
+   "unit": "rows"
+  },
+  "x10.insert_findings_us_per_row": {
+   "value": 337.5,
+   "unit": "us/row"
+  },
+  "x10.match_new_issue_us_per_row": {
+   "value": 256.3,
+   "unit": "us/row"
+  },
+  "x10.match_existing_issue_us_per_row": {
+   "value": 132.0,
+   "unit": "us/row"
+  },
+  "x10.insert_checks_us_per_row": {
+   "value": 67.1,
+   "unit": "us/row"
+  },
+  "x10.ledger_bytes": {
+   "value": 720822272,
+   "unit": "bytes"
+  },
+  "x10.ledger_gzip_ratio": {
+   "value": 4.67,
+   "unit": "raw/gzip"
+  },
+  "x10.dump_bytes": {
+   "value": 498062576,
+   "unit": "bytes"
+  },
+  "x10.dump_gzip_ratio": {
+   "value": 5.47,
+   "unit": "raw/gzip"
+  },
+  "x10.api_review_bytes": {
+   "value": 65675093,
+   "unit": "bytes"
+  },
+  "x10.api_review_gzip_ratio": {
+   "value": 5.77,
+   "unit": "raw/gzip"
+  },
+  "x10.api_review_ms": {
+   "value": 1205.5,
+   "unit": "ms"
+  },
+  "x10.api_plan_bytes": {
+   "value": 35287692,
+   "unit": "bytes"
+  },
+  "x10.api_plan_gzip_ratio": {
+   "value": 5.44,
+   "unit": "raw/gzip"
+  },
+  "x10.api_plan_ms": {
+   "value": 995.3,
+   "unit": "ms"
+  },
+  "fill_refs.x1.refs": {
+   "value": 1000,
+   "unit": "rows"
+  },
+  "fill_refs.x1.seconds": {
+   "value": 0.46,
+   "unit": "s"
+  },
+  "fill_refs.x1.git_processes": {
+   "value": 1,
+   "unit": "processes"
+  },
+  "fill_refs.x10.refs": {
+   "value": 10000,
+   "unit": "rows"
+  },
+  "fill_refs.x10.seconds": {
+   "value": 1.63,
+   "unit": "s"
+  },
+  "fill_refs.x10.ms_per_1000": {
+   "value": 163,
+   "unit": "ms per 1,000 refs"
+  },
+  "fill_refs.x10.git_processes": {
+   "value": 1,
+   "unit": "processes"
+  },
+  "fill_refs.marginal_ms_per_1000": {
+   "value": 131,
+   "unit": "ms per 1,000 refs"
+  },
+  "review_search.x1.keystroke_ms": {
+   "value": 21.1,
+   "unit": "ms per key (mean of 5: 20.6, 25.7, 20.3, 18.6, 20.2)"
+  },
+  "review_search.x1.open_items_kept": {
+   "value": 0,
+   "unit": "of 1 open point (a keystroke closes it)"
+  },
+  "review_page.x1.cold_load_s": {
+   "value": 1.51,
+   "unit": "s"
+  },
+  "review_page.x1.dom_nodes": {
+   "value": 34119,
+   "unit": "elements"
+  },
+  "review_page.x10.cold_load_s": {
+   "value": 3.75,
+   "unit": "s (mean of 3: 3.82, 3.92, 3.51); estimate was 1.5 s"
+  },
+  "review_page.x10.dom_nodes": {
+   "value": 148692,
+   "unit": "elements (144,010 of them the review's 16,000 links between issues)"
+  },
+  "check.x10.seconds": {
+   "value": 2.95,
+   "unit": "s (four runs: 3.01, 2.97, 3.04, 2.91); budget 2 s, not reached: quick_check reads every page"
+  },
+  "check.x10.quick_check_s": {
+   "value": 2.05,
+   "unit": "s"
+  },
+  "check.x10.foreign_key_check_s": {
+   "value": 0.0,
+   "unit": "s (runs only with check --full: 1.3 s there)"
+  },
+  "check.x10.views_s": {
+   "value": 0.5,
+   "unit": "s for the 18 ledger_checks views (v_untraceable_refs 0.15 the slowest)"
+  },
+  "check.x10.schema_verify_s": {
+   "value": 0.07,
+   "unit": "s (normalizing the shipped schema's statements)"
+  },
+  "check.x10.startup_s": {
+   "value": 0.19,
+   "unit": "s (loading ledger.py)"
+  },
+  "check.x10.full_seconds": {
+   "value": 6.66,
+   "unit": "s (check --full --quiet, one run)"
+  },
+  "insert_budget.local.insert_s": {
+   "value": 0.21,
+   "unit": "s to load 2,000 findings (three builds: 0.219, 0.214, 0.203); budget 0.5 s"
+  },
+  "insert_budget.local.match_s": {
+   "value": 0.32,
+   "unit": "s to match them (0.354, 0.326, 0.315); budget 0.8 s"
+  },
+  "insert_budget.ci.insert_s": {
+   "value": 0.756,
+   "unit": "s on a GitHub ubuntu-latest runner, before the generator's work left the timed section"
+  },
+  "x1.bytes_per_finding": {
+   "value": 9535,
+   "unit": "bytes of ledger.sqlite per finding; budget 10,000 (D-0017)"
+  },
+  "x1.schema21.ledger_bytes": {
+   "value": 95346688,
+   "unit": "bytes (findings 41.0 MB, events 15.4 MB, finding_locations 14.5 MB, issues 6.0 MB, ix_events_entity 3.5 MB)"
+  },
+  "x1.schema21.dump_bytes": {
+   "value": 65548106,
+   "unit": "bytes"
+  }
+ }
+}

@@ -1,0 +1,9 @@
+id: logging.js-console
+language: javascript
+severity: hint
+message: Output written to the console, outside the logger (no level, no request id, no time).
+rule:
+  pattern: console.$M($$$)
+constraints:
+  M:
+    regex: ^(log|info|warn|error|debug|trace)$

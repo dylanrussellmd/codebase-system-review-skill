@@ -1,0 +1,7 @@
+extends: existence
+message: "Give the instruction without '%s'."
+level: error
+ignorecase: true
+tokens:
+  - please
+  - kindly

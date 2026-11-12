@@ -1,0 +1,64 @@
+# Checks every push and pull request: the shipped scripts/ledger.py matches its sources, and the test suite passes.
+# The main jobs use the standard library only. Browser tests (Playwright) and slow scale tests run in their own jobs.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: scripts/ledger.py is a fresh build of the sources
+        run: python3 dev/build.py --check
+
+  tests:
+    # Pinned: setup-python has no Python 3.9 build for newer Ubuntu images, and 3.9 is the oldest supported version.
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Test suite
+        run: python3 -m unittest discover -s dev/tests -t . -v
+
+  browser-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Playwright and Chromium (test-only; the tool itself needs nothing)
+        run: |
+          python3 -m pip install playwright
+          python3 -m playwright install --with-deps chromium
+      - name: Browser tests
+        env:
+          LEDGER_BROWSER_TESTS: "1"
+        run: python3 -m unittest discover -s dev/tests -t . -p "test_browser_*.py" -v
+
+  slow-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Scale and performance tests
+        env:
+          LEDGER_SLOW_TESTS: "1"
+        run: python3 -m unittest dev.tests.test_perf -v

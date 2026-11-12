@@ -1,0 +1,13 @@
+id: time-concurrency.python-naive-now
+language: python
+severity: warning
+message: Reads the clock without a time zone; whose today is this?
+note: Pass a zone (datetime.now(timezone.utc)) or take the time from one injected clock.
+rule:
+  any:
+    - pattern: datetime.now()
+    - pattern: datetime.datetime.now()
+    - pattern: datetime.utcnow()
+    - pattern: datetime.datetime.utcnow()
+    - pattern: date.today()
+    - pattern: datetime.date.today()

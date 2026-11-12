@@ -1,0 +1,18 @@
+id: resilience.python-requests-no-timeout
+language: python
+severity: warning
+message: An HTTP call with no timeout waits forever when the other side hangs.
+note: Pass timeout= (seconds) on every call.
+rule:
+  all:
+    - pattern: requests.$M($$$ARGS)
+    - not:
+        has:
+          stopBy: end
+          kind: keyword_argument
+          has:
+            field: name
+            regex: ^timeout$
+constraints:
+  M:
+    regex: ^(get|post|put|patch|delete|head|options|request)$

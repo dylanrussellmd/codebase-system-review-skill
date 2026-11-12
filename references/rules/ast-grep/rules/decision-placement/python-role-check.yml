@@ -1,0 +1,9 @@
+id: decision-placement.python-role-check
+language: python
+severity: warning
+message: A permission decided inline by comparing a role; is this the one place that decides it?
+rule:
+  kind: comparison_operator
+  has:
+    kind: attribute
+    regex: \.(role|roles|is_admin|is_staff|permission|permissions)$

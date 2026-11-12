@@ -1,0 +1,26 @@
+# A shorter form exists. dev/tests/test_writing_lint.py reads the left-hand sides.
+extends: substitution
+message: "Use '%s', not '%s'."
+level: error
+ignorecase: true
+swap:
+  in order to: to
+  so as to: to
+  due to the fact that: because
+  in the event that: if
+  in case of: if
+  for the purpose of: to
+  with regard to: about
+  with respect to: about
+  a number of: several
+  the majority of: most
+  at this (?:point|moment) in time: now
+  prior to: before
+  subsequent to: after
+  is able to: can
+  has the ability to: can
+  allows you to: lets you
+  utili[sz]e: use
+  leverage: use
+  in the process of: (omit)
+  whether or not: whether

@@ -1,0 +1,7 @@
+id: decision-placement.js-role-check
+valid:
+  - if (can(user, "edit")) {}
+  - const same = user.name === "admin";
+invalid:
+  - const admin = user.role === "admin";
+  - if (session.isAdmin != true) {}
