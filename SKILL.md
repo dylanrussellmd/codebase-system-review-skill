@@ -3,7 +3,7 @@ name: codebase-system-review
 description: Run a managed, read-only, multi-reviewer audit of any codebase (tests, security, performance, architecture, UI, API, DB, docs, logging), verify findings, record every point in a per-project SQLite ledger tracked across reviews, then turn every point into a tracked fix plan.
 license: MIT
 metadata:
-  version: 1.11.0
+  version: 1.12.0
 ---
 
 # Comprehensive review of a software system
@@ -72,7 +72,7 @@ Everything sits in `.code-review/` at the project root: `ledger.sqlite`, the cop
 At the first review open a `decision` gate "Where does the review ledger live?" with options `outside` (nothing in
 the repository: `CODE_REVIEW_DIR`, or `.code-review/` in `.gitignore`), `commit-dump` (commit `ledger.sql` only; the
 binary is ignored and rebuilt with `ledger.py restore .code-review/ledger.sql --to <new file>`) and `commit-binary`
-(commit `ledger.sqlite` only); each costs about 9 MB of ledger and 7 MB of dump per 1,000 findings. Until it is
+(commit `ledger.sqlite` only); each costs about 10 MB of ledger and 7 MB of dump per 1,000 findings. Until it is
 decided, list `.code-review/` in `.git/info/exclude` (local, never committed) and commit nothing. Later reviews read
 the answer in `v_standing_decisions`. Only as it says, commit the chosen file after `dump`, in its own commit, and
 push tags (`git push origin review/R-0001`, then `ledger.py tag-review R-0001 --pushed`); otherwise tags stay local.
@@ -149,10 +149,10 @@ separate review or plan documents: the report and the narrative live in the ledg
 - **Ask** with `ledger.py open-gate <kind> --title '...' --question '...' --context @file`, one `--option value=label`
   per choice (`--multi --preselect a,b`: any number, the recommended ones ticked), linked by `--review`, `--plan`, `--step` or `--issue`; say in chat what you asked (with the harness's
   question tool, when it has one) and that the owner can answer in the hub or in chat.
-- **Collect answers** before resuming paused work and at every session start: `ledger.py gates` (the viewer writes
-  answers directly). The owner downloads `answers.json` from the hub file (a published page exports its answer
-  store, when it has one, to the same file); run `ledger.py import-answers answers.json` first. A chat answer:
-  `ledger.py answer-gate GATE-0001 --value approve --text '<their words>'` (refused once the gate is not open).
+- **Collect answers** at the start of every session, before every batch and before telling the owner what is waiting:
+  `ledger.py import-answers answers.json` (the hub's download, or a published page's answer store when it has one),
+  then `ledger.py gates`; `gates`, `check` and `progress-page` say when a published page's answers were last imported.
+  In chat: `ledger.py answer-gate GATE-0001 --value approve --text '<their words>'` (refused once the gate is not open).
 - **Act, then close**: `ledger.py apply-gate GATE-0001 --note '<what you did>'` (a `decision` gate also records the
   decision; to withdraw or re-ask: `references/recipes.md#withdraw-or-change-a-gate`).
 
@@ -356,8 +356,8 @@ Brief every implementer with `references/implementer-brief.md` (it runs `ledger.
   `add-guard` for one issue), and each issue `issue-status ISS-0001 fixed` (below).
 - **Blocked on the owner:** `step-status 12 waiting-owner --question '...'` and a gate of its `owner_need`'s kind.
 - **After each step or batch:** `ledger.py check`, `ledger.py dump`, `ledger.py progress-md P-0001` (to a file only if
-  the ledger-location decision commits review data), publish the hub, import answers, tell the owner how many steps are
-  done. `v_stale_steps` (in `gates`) lists steps whose issues are closed: mark each done or dropped with a note.
+  the ledger-location decision commits review data), publish the hub, tell the owner how many steps are done.
+  `v_stale_steps` (in `gates`) lists steps whose issues are closed: mark each done or dropped with a note.
 
 ```
 ledger.py report-finding --step 12 --severity M --domain <code> --where 'path:10-20#symbol' --summary '...' --before '...' --fix '...' --test 'test_name: what it asserts' --actor A-0002

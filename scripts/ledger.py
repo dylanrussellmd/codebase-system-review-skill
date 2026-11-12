@@ -36,12 +36,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote
 
-TOOL_VERSION = "1.11.0"  # stamped by dev/build.py from `metadata: version:` in SKILL.md's frontmatter
-TOOL_HASH = "703dceadc22f229f2b3d2a05f1513ac89839f07b6c7b5a4745e642007cd8bf77"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
+TOOL_VERSION = "1.12.0"  # stamped by dev/build.py from `metadata: version:` in SKILL.md's frontmatter
+TOOL_HASH = "e2910db189f57726a5e0aec8c474df5d1870734304e11b9e2941489032736ef3"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
 # Placeholders: dev/build.py puts references/schema.sql, dev/page.html and references/migrations/*.sql in their
 # place when it writes scripts/ledger.py. dev/core.py itself is never run as the tool.
 SCHEMA = r"""-- =====================================================================
--- Code review ledger — schema version 20
+-- Code review ledger — schema version 21
 -- One SQLite file per project: <project root>/.code-review/ledger.sqlite
 -- Every connection must run:  PRAGMA foreign_keys = ON;
 -- Times are UTC ISO-8601 text with milliseconds (strftime('%Y-%m-%dT%H:%M:%fZ','now')); the tr_time_*
@@ -1221,8 +1221,9 @@ CREATE TABLE events (
 -- ---------- Indexes -----------------------------------------------------
 
 CREATE INDEX ix_findings_review      ON findings(review_id);
--- The columns the per-review counts read (v_review_totals), so a list of reviews never reads the findings themselves.
-CREATE INDEX ix_findings_review_counts ON findings(review_id, verification, severity, match_type);
+-- The columns the per-review counts read (v_review_totals), so a list of reviews never reads the findings themselves;
+-- issue_id too, so v_match_problems is counted from the index (schema 21).
+CREATE INDEX ix_findings_review_counts ON findings(review_id, verification, severity, match_type, issue_id);
 CREATE INDEX ix_findings_issue       ON findings(issue_id);
 CREATE INDEX ix_findings_fingerprint ON findings(fingerprint);
 CREATE INDEX ix_findings_slug        ON findings(domain_code, theme_code, sub);
@@ -1235,13 +1236,32 @@ CREATE INDEX ix_relations_to         ON issue_relations(to_issue_id);
 CREATE INDEX ix_checks_issue         ON review_issue_checks(issue_id);
 CREATE INDEX ix_steps_phase          ON steps(phase_id);
 CREATE INDEX ix_steps_status         ON steps(plan_id, status);
-CREATE INDEX ix_step_findings_find   ON step_findings(finding_id);
+CREATE INDEX ix_step_findings_find   ON step_findings(finding_id, step_id);
 CREATE INDEX ix_deps_on              ON step_dependencies(depends_on_step_id);
 CREATE INDEX ix_guard_issue          ON guard_tests(issue_id);
 CREATE INDEX ix_events_entity        ON events(entity_type, entity_id, at);
 CREATE INDEX ix_metrics_name         ON metrics(name, scope);
 CREATE INDEX ix_runs_review          ON reviewer_runs(review_id);
 CREATE INDEX ix_gates_status         ON gates(status);
+-- For check's views (schema 21, plan step 92): each lets a view read an index instead of every row.
+-- The status events of each issue and gate in order (v_history_gaps, v_match_problems).
+CREATE INDEX ix_events_history       ON events(entity_type, entity_id, id, event, to_value)
+  WHERE event IN ('opened','status-changed');
+-- The issues of a domain by status (v_unchecked_known_issues).
+CREATE INDEX ix_issues_domain_known  ON issues(domain_code, status, first_seen_review_id, opened_at);
+-- The few points found during fix work (v_unplanned_discoveries).
+CREATE INDEX ix_findings_discovered  ON findings(discovered_in_step_id) WHERE discovered_in_step_id IS NOT NULL;
+-- Locations with a problem of their own (v_untraceable_refs repeats this WHERE word for word, so the planner uses
+-- the index; edit both together).
+CREATE INDEX ix_locations_untraceable ON finding_locations(finding_id)
+  WHERE commit_sha IS NULL OR (line_start IS NULL AND whole_file = 0)
+     OR ((excerpt IS NULL OR excerpt = '') AND excerpt_status IS NOT 'not-text')
+     OR (excerpt_status IS NULL AND line_start IS NOT NULL
+         AND length(excerpt) - length(replace(excerpt, char(10), '')) + 1
+             <> COALESCE(line_end, line_start) - line_start + 1
+         AND NOT (substr(excerpt, -1) = char(10)
+                  AND length(excerpt) - length(replace(excerpt, char(10), ''))
+                      = COALESCE(line_end, line_start) - line_start + 1));
 -- Uniqueness the table constraints cannot express (schema 3): one metric per review, name, scope and repository
 -- even when repository_id is NULL; at most one primary location per finding; one repository per path.
 CREATE UNIQUE INDEX ux_metrics_key            ON metrics(review_id, name, scope, COALESCE(repository_id, 0));
@@ -3443,6 +3463,8 @@ SELECT p.code, 'finding closed by several steps without a reason', f.point_id
 FROM step_findings sf JOIN steps s ON s.id = sf.step_id JOIN plans p ON p.id = s.plan_id
 JOIN findings f ON f.id = sf.finding_id
 WHERE p.status NOT IN ('superseded','abandoned') AND s.status <> 'dropped'
+  -- only points linked to more than one step can be closed twice (read from ix_step_findings_find alone)
+  AND sf.finding_id IN (SELECT finding_id FROM step_findings GROUP BY finding_id HAVING count(*) > 1)
 GROUP BY p.id, sf.finding_id
 HAVING count(*) > 1 AND sum(sf.multi_reason IS NULL) > 0;
 
@@ -3574,6 +3596,19 @@ SELECT review, point_id, path, problem FROM (
   JOIN reviews r ON r.id = f.review_id
   LEFT JOIN review_repositories rr ON rr.review_id = f.review_id AND rr.repository_id = fl.repository_id
   WHERE r.status <> 'abandoned'
+    -- the rows the CASE can name: the review's own terms here, the location's own from ix_locations_untraceable
+    -- (its WHERE, repeated word for word, so the excerpts are read only when a location is written)
+    AND (rr.tag_name IS NULL
+         OR (rr.commit_sha IS NOT NULL AND fl.commit_sha <> rr.commit_sha AND f.discovered_in_step_id IS NULL)
+         OR fl.id IN (SELECT id FROM finding_locations
+                      WHERE commit_sha IS NULL OR (line_start IS NULL AND whole_file = 0)
+                         OR ((excerpt IS NULL OR excerpt = '') AND excerpt_status IS NOT 'not-text')
+                         OR (excerpt_status IS NULL AND line_start IS NOT NULL
+                             AND length(excerpt) - length(replace(excerpt, char(10), '')) + 1
+                                 <> COALESCE(line_end, line_start) - line_start + 1
+                             AND NOT (substr(excerpt, -1) = char(10)
+                                      AND length(excerpt) - length(replace(excerpt, char(10), ''))
+                                          = COALESCE(line_end, line_start) - line_start + 1))))
   UNION ALL
   SELECT r.code, f.point_id, NULL, 'no location'
   FROM findings f JOIN reviews r ON r.id = f.review_id
@@ -3804,26 +3839,29 @@ SELECT review, point_id, issue, match_type, problem FROM (
 -- refuses such a link when it is made; this lists links made before it, or left behind when a plan_reviews row was
 -- removed.
 CREATE VIEW v_off_plan_coverage AS
+-- Read from the plans and the reviews they do not cover (CROSS JOIN keeps that order), so a plan that covers every
+-- review reads no point at all.
 SELECT p.code AS plan, s.number AS step, r.code AS review, f.point_id
-FROM step_findings sf
-JOIN steps s ON s.id = sf.step_id
-JOIN plans p ON p.id = s.plan_id
-JOIN findings f ON f.id = sf.finding_id
-JOIN reviews r ON r.id = f.review_id
-WHERE p.status NOT IN ('superseded','abandoned')
-  AND NOT EXISTS (SELECT 1 FROM plan_reviews pr WHERE pr.plan_id = p.id AND pr.review_id = f.review_id);
+FROM plans p
+CROSS JOIN reviews r
+CROSS JOIN findings f ON f.review_id = r.id
+CROSS JOIN step_findings sf ON sf.finding_id = f.id
+CROSS JOIN steps s ON s.id = sf.step_id
+WHERE p.status NOT IN ('superseded','abandoned') AND s.plan_id = p.id
+  AND NOT EXISTS (SELECT 1 FROM plan_reviews pr WHERE pr.plan_id = p.id AND pr.review_id = r.id);
 
 -- Finished plan steps whose issues are still to fix.
 -- Must be empty: when a step is done, its issues move on (fixed with after_state, or another closing status),
 -- unless another unfinished step still works on them. Regressed issues are left to the next plan. Superseded and
 -- abandoned plans are not checked.
 CREATE VIEW v_done_steps_open_issues AS
+-- Read from the issues still to fix (ix_issues_status; CROSS JOIN keeps that order), fewer than the done steps' points.
 SELECT DISTINCT p.code AS plan, s.number AS step, i.code AS issue, i.status AS issue_status
-FROM steps s
+FROM issues i
+CROSS JOIN findings f ON f.issue_id = i.id
+CROSS JOIN step_findings sf ON sf.finding_id = f.id
+CROSS JOIN steps s ON s.id = sf.step_id
 JOIN plans p ON p.id = s.plan_id
-JOIN step_findings sf ON sf.step_id = s.id
-JOIN findings f ON f.id = sf.finding_id
-JOIN issues i ON i.id = f.issue_id
 WHERE s.status = 'done' AND p.status NOT IN ('superseded','abandoned') AND f.verification <> 'false'
   AND i.status IN ('open','needs-decision','planned','in-progress')
   AND NOT EXISTS (SELECT 1 FROM findings f2 JOIN step_findings sf2 ON sf2.finding_id = f2.id
@@ -4287,6 +4325,8 @@ INSERT INTO enum_labels(enum, value, label, position) VALUES
  ('event','metric-recorded','A measurement was recorded',28),
  ('event','tag-pushed','The tag of the reviewed commit was pushed',29),
  ('event','redacted','A secret was removed from the text',30);
+INSERT INTO enum_labels(enum, value, label, position) VALUES
+ ('event','answers-imported','Answers brought in from the published page',31);
 
 INSERT INTO ledger_checks(view, label, tier, position) VALUES
  ('v_artifacts_outside_ledger','Review files recorded outside the ledger''s folder','warning',110);
@@ -4447,7 +4487,7 @@ INSERT INTO enum_labels(enum, value, label, position) VALUES
  ('tool_output_format','json','JSON',5), ('tool_output_format','jsonl','JSON lines',6),
  ('tool_result_level','error','Error',1), ('tool_result_level','warning','Warning',2),
  ('tool_result_level','note','Note',3), ('tool_result_level','none','No level',4);
-INSERT INTO meta(key, value) VALUES ('schema_version','20');
+INSERT INTO meta(key, value) VALUES ('schema_version','21');
 INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger schema'),
   (2, 'url, path, hash and code checks; repositories.allow_outside_root; finding_locations.excerpt_redacted'),
   (3, 'integrity rules: codes, hashes, checks, append-only history, owner actor on gate answers'),
@@ -4467,7 +4507,8 @@ INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger s
   (17, 'a step may depend on any step of its plan, cycles refused; v_step_order: the order to work in'),
   (18, 'multi-select gates: gates.multi and gates.preselect; a multi-select answer is a JSON list of option values'),
   (19, 'the features domain and feature_proposals: additions to the reviewed codebase that would serve the owner''s goals'),
-  (20, 'tool_runs and tool_results: the picked tools'' runs at the reviewed commit, and their results as leads');
+  (20, 'tool_runs and tool_results: the picked tools'' runs at the reviewed commit, and their results as leads'),
+  (21, 'indexes for check''s views, which read them instead of every row; the answers-imported event');
 """
 PAGE = r"""<!doctype html>
 <html lang="en">
@@ -4477,7 +4518,7 @@ PAGE = r"""<!doctype html>
 <title>Review ledger</title>
 <style>
 :root{--bg:#f7f8f6;--surface:#fff;--fg:#1b2420;--muted:#5d6b64;--line:#dfe4e0;--field:#828f88;--accent:#0f6b57;--accent-soft:#e2f1ec;--warn:#9a5b00;--warn-soft:#fbefd9;--crit:#a3271f;--crit-soft:#fae6e3;--info:#2b5c99;--info-soft:#e5eefa;
- --display:ui-rounded,"SF Pro Rounded","Segoe UI Variable Display","Segoe UI",system-ui,sans-serif;--body:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;color-scheme:light}
+ --display:"Helvetica Neue",Helvetica,"Nimbus Sans","Arial Nova",Arial,system-ui,sans-serif;--body:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;color-scheme:light}
 :root[data-theme="dark"]{--bg:#121715;--surface:#1a211e;--fg:#e6ece8;--muted:#9aa8a1;--line:#2c3632;--field:#6b7a73;--accent:#5fc9ae;--accent-soft:#17352d;--warn:#e7b25a;--warn-soft:#3a2c12;--crit:#f08d84;--crit-soft:#3d1c19;--info:#8db6ee;--info-soft:#1a2a40;color-scheme:dark}
 *{box-sizing:border-box}
 html{scroll-padding-top:var(--top,110px)}
@@ -5126,6 +5167,8 @@ VIEWS.home = async () => {
     !o.reviews.length ? h("p", {class:"callout"}, "No reviews yet. Ask your agent to run the system review.") : null,
     waiting ? h("p", {class:"callout you"}, h("a", {href:"#/inbox"}, plural(waiting, "thing needs", "things need") + " your input or approval →")) : null,
     o.answered_count ? h("p", {class:"note"}, h("a", {href:"#/inbox"}, plural(o.answered_count, "answer")), " of yours waiting for the agent to act on.") : null,
+    o.published_page ? h("p", {class:"note", id:"answers-imported"}, "Answers you gave on the ", extLink(o.published_page, "published page"),
+      o.answers_imported_at ? [" were last brought in ", whenCell(o.answers_imported_at), "."] : " have not been brought in yet.") : null,
     h("div", {class:"grid2"},
       h("div", {class:"card"}, h("h2", null, "Latest reviews"),
         table([{label:"Review", get:r => r.code}, {label:"Title", key:"title"}, {label:"Status", get:r => lab("review", r.status)},
@@ -5146,12 +5189,15 @@ VIEWS.home = async () => {
   } catch (e) { back.textContent = "—"; put(checks, errorBox(e, true)); }
 };
 
-function progressBar(done, doing, waiting, total){
+// full: the plan page's line, every state and when the plan last changed (updated: a stored time, or null).
+function progressBar(done, doing, waiting, total, full){
   const pct = n => total ? (100 * n / total).toFixed(2) + "%" : "0";
+  const rest = total - done - doing - waiting;
   return h("div", {class:"progress"},
     h("div", {class:"bar", role:"img", "aria-label":`${done} of ${total} done`},
       h("i", {class:"d", style:`width:${pct(done)}`}), h("i", {class:"g", style:`width:${pct(doing)}`}), h("i", {class:"y", style:`width:${pct(waiting)}`})),
-    h("span", {class:"note"}, `${done} of ${total} done` + (doing ? ` · ${doing} in progress` : "") + (waiting ? ` · ${waiting} waiting on you` : "")));
+    h("span", {class:"note"}, full ? `${done} done, ${doing} in progress, ${waiting} waiting on you, ${rest} not started.` + (full.updated ? ` Updated ${when(full.updated)}.` : "")
+      : `${done} of ${total} done` + (doing ? ` · ${doing} in progress` : "") + (waiting ? ` · ${waiting} waiting on you` : "")));
 }
 
 // Waiting on you. Each gate is a card; answering one moves that card alone under Answered, so what is typed into the
@@ -5625,20 +5671,20 @@ VIEWS.plan = async ([code, , phaseArg]) => {
   };
   const commitLine = c => h("div", null, h("code", null, short(c.commit_sha)), c.branch ? ` on ${c.branch}` : "",
     c.summary ? " " + c.summary : "", c.pr_url ? [" ", extLink(c.pr_url, "pull request")] : "");
-  const closeLine = c => h("div", {class:"refline"}, h("code", null, `${c.review} · ${c.point_id}`), sevTag(c.severity),
+  const closeLine = c => h("div", {class:"refline", title:c.report ? "Report: " + c.report.split("/").pop() : null}, h("code", null, `${c.review} · ${c.point_id}`), sevTag(c.severity),
     c.issue ? h("a", {href:"#/issue/" + c.issue}, c.issue) : null, h("span", null, c.summary));
   const stepBody = (s, closes) => [
-    kv([["Change", s.change], ["Proof", s.proof],
+    kv([["Progress", s.progress_note], [(s.commits || []).length > 1 ? "Commits" : "Commit", (s.commits || []).length ? s.commits.map(commitLine) : null],
+      ["Change", s.change], ["Proof", s.proof],
       ["Depends on", s.depends.length ? `${noun(s.depends.length, "Step")} ${s.depends.join(", ")}` : null],
-      ["Behaviour change", s.behavior_note],
-      ["Needs from you", s.owner_question], ["Progress", s.progress_note], ["Started", whenCell(s.started_at)], ["Done", whenCell(s.done_at)],
-      ["Closes no point because", s.no_findings_reason],
-      ["Commits", (s.commits || []).length ? s.commits.map(commitLine) : null]]),
+      ["Changes behaviour", s.behavior_note], ["Needs you", s.owner_question],
+      ["Started", whenCell(s.started_at)], ["Done", whenCell(s.done_at)],
+      ["Closes no point because", s.no_findings_reason]]),
     closes.length ? h("div", {class:"ref"}, h("span", {class:"note"}, "Closes " + plural(closes.length, "point")), closes.map(closeLine)) : null];
   const stepItem = s => item(s.number, s.title,
     [s.status !== "not-started" ? labTag("step", s.status) : null,
      s.owner_need !== "none" ? tag(lab("need", s.owner_need), tone("need", s.owner_need) || "info") : null,
-     s.behavior_change ? tag("Changes behaviour") : null],
+     s.behavior_change ? tag("Changes behaviour") : null, s.closes.length ? tag(plural(s.closes.length, "point")) : null],
     async () => {
       if (d.findings) return stepBody(s, s.closes.map(id => d.findings[id]).filter(Boolean));
       if (s.change !== undefined && !s.closes.length) return stepBody(s, []);
@@ -5660,25 +5706,28 @@ VIEWS.plan = async ([code, , phaseArg]) => {
       const more = () => { const first = shown; shown += PLAN_PAGE; draw(); main.querySelectorAll("details.item > summary")[first].focus(); };
       put(main, h("h2", null, count), hit.length > shown ? h("p", {class:"note"}, `Showing the first ${shown}.`) : null,
         hit.length ? hit.slice(0, shown).map(stepItem) : empty("No step matches."),
-        hit.length > shown ? h("button", {class:"btn ghost", type:"button", onclick:more}, `Show more (${hit.length - shown} left)`) : null);
+        hit.length > shown ? h("button", {class:"btn ghost", type:"button", onclick:more}, `Show ${Math.min(PLAN_PAGE, hit.length - shown)} more`) : null);
       return count;
     } else {
       const p = phases.find(x => x.number === phase) || phases[0];
       const ps = steps.filter(s => s.phase === p.number);
       const sections = [...new Set(ps.map(s => s.section || ""))];
-      put(main, h("h2", null, `Phase ${p.number} · ${p.title}`), h("p", {class:"lede"}, p.goal), p.why ? h("p", {class:"note"}, p.why) : null,
+      const points = new Set(ps.flatMap(s => s.closes)).size;
+      const span = p.first_step == null ? null : (p.first_step === p.last_step ? `Step ${p.first_step}` : `Steps ${p.first_step} to ${p.last_step}`) + `, closing ${plural(points, "review point")}.`;
+      put(main, h("h2", null, `Phase ${p.number}: ${p.title}`), h("p", {class:"lede"}, p.goal), span ? h("p", {class:"note phase-span"}, span) : null, p.why ? h("p", {class:"note"}, p.why) : null,
         sections.map(sec => [sec ? h("h3", null, sec) : null, ps.filter(s => (s.section || "") === sec).map(stepItem)]));
     }
   };
   const filters = filterBar([q, f], () => { shown = PLAN_PAGE; say(draw()); }, 150);
   const pl = d.plan, closed = new Set(steps.flatMap(s => s.closes)).size;
+  const needYou = steps.filter(s => s.owner_need !== "none" && s.status !== "done" && s.status !== "dropped").length;
   const head =[h("h1", null, `${pl.code} · ${pl.title}`),
-    h("p", {class:"lede"}, lab("plan", pl.status) + (pl.approved_at ? ` · approved ${when(pl.approved_at)}` : "") + (d.last_updated ? ` · last updated ${when(d.last_updated)}` : "")),
+    h("p", {class:"lede"}, lab("plan", pl.status) + (pl.approved_at ? ` · approved ${when(pl.approved_at)}` : "")),
     kv([["From", d.reviews.length ? d.reviews.map((r, i) => [i ? ", " : "", h("a", {href:"#/review/" + r.code}, r.code)]) : null],
         ["Plan document", pl.doc_url ? extLink(pl.doc_url, "Open the plan document") : null], ["Shared page", pl.page_url ? extLink(pl.page_url, "Open the shared page") : null]]),
     h("div", {class:"facts"}, fact(steps.length, noun(steps.length, "step")), fact(phases.length, noun(phases.length, "phase")),
-      fact(closed, noun(closed, "point") + " closed")),
-    progressBar(count("done"), count("doing"), count("waiting-owner"), steps.length),
+      fact(closed, noun(closed, "point") + " closed"), fact(needYou, noun(needYou, "step needs you", "steps need you"))),
+    progressBar(count("done"), count("doing"), count("waiting-owner"), steps.length, {updated:d.last_updated}),
     pl.narrative_md ? h("div", {class:"card"}, h("h2", null, "About this plan"), md(pl.narrative_md)) : null,
     d.gates.length ? h("div", {class:"card"}, h("h2", null, "Questions about this plan"),
       table([{label:"Question", key:"title", link:true}, {label:"Step", key:"step", num:1}, {label:"Status", get:g => lab("gstat", g.status)}], d.gates, g => "#/inbox/" + g.code)) : null,
@@ -8002,6 +8051,34 @@ INSERT INTO enum_labels(enum, value, label, position) VALUES
  ('tool_output_format','json','JSON',5), ('tool_output_format','jsonl','JSON lines',6),
  ('tool_result_level','error','Error',1), ('tool_result_level','warning','Warning',2),
  ('tool_result_level','note','Note',3), ('tool_result_level','none','No level',4);
+-- migration: 0021-check-speed.sql
+-- indexes for check's views, which read them instead of every row; the answers-imported event
+-- Plan P-0001 step 92 (decision D-0016). ix_events_history, ix_issues_domain_known, ix_findings_discovered and
+-- ix_locations_untraceable are new; ix_findings_review_counts gains issue_id and ix_step_findings_find gains
+-- step_id, so v_match_problems and v_uncovered_findings are read from them. migrate re-creates the views (four of
+-- them rewritten to read in a cheaper order, with the same rows) with the shipped schema. Plan step 225 (FIX-32):
+-- import-answers records each run as an answers-imported event on the plan; its label is the one row added.
+
+DROP INDEX ix_findings_review_counts;
+CREATE INDEX ix_findings_review_counts ON findings(review_id, verification, severity, match_type, issue_id);
+DROP INDEX ix_step_findings_find;
+CREATE INDEX ix_step_findings_find   ON step_findings(finding_id, step_id);
+CREATE INDEX ix_events_history       ON events(entity_type, entity_id, id, event, to_value)
+  WHERE event IN ('opened','status-changed');
+CREATE INDEX ix_issues_domain_known  ON issues(domain_code, status, first_seen_review_id, opened_at);
+CREATE INDEX ix_findings_discovered  ON findings(discovered_in_step_id) WHERE discovered_in_step_id IS NOT NULL;
+CREATE INDEX ix_locations_untraceable ON finding_locations(finding_id)
+  WHERE commit_sha IS NULL OR (line_start IS NULL AND whole_file = 0)
+     OR ((excerpt IS NULL OR excerpt = '') AND excerpt_status IS NOT 'not-text')
+     OR (excerpt_status IS NULL AND line_start IS NOT NULL
+         AND length(excerpt) - length(replace(excerpt, char(10), '')) + 1
+             <> COALESCE(line_end, line_start) - line_start + 1
+         AND NOT (substr(excerpt, -1) = char(10)
+                  AND length(excerpt) - length(replace(excerpt, char(10), ''))
+                      = COALESCE(line_end, line_start) - line_start + 1));
+
+INSERT INTO enum_labels(enum, value, label, position) VALUES
+ ('event','answers-imported','Answers brought in from the published page',31);
 """
 
 
@@ -8174,9 +8251,14 @@ def _sql_segments(sql):
             k = sql.find("*/", i + 2)
             code.append(" "); i = n if k < 0 else k + 2
         else:
-            code.append(c); i += 1
+            m = _SQL_SPECIAL.search(sql, i + 1)   # plain code up to the next quote or comment, in one piece
+            k = m.start() if m else n
+            code.append(sql[i:k]); i = k
     out.append(("code", "".join(code)))
     return out
+
+
+_SQL_SPECIAL = re.compile(r"['\"`]|--|/\*")
 
 
 def normalize_sql(sql):
@@ -8961,7 +9043,8 @@ def check(con, quiet=False, full=False):
     """Print what check finds; return the number of failed checks (integrity, foreign keys, schema, each non-empty
     error-tier view). A non-empty warning-tier view is printed with 'warning' and does not count. The integrity
     pass is PRAGMA quick_check (no index-content comparison, so fast on a large ledger) unless full, which runs the
-    full PRAGMA integrity_check (`check --full`); the line printed names the one that ran. Under a non-empty
+    full PRAGMA integrity_check and PRAGMA foreign_key_check (`check --full`; every write runs with foreign keys on,
+    so a broken reference needs a write made without them); the lines printed name what ran. Under a non-empty
     view come its first CHECK_SAMPLE_ROWS rows as JSON, each cut to CHECK_SAMPLE_CHARS characters. quiet: only
     what is wrong is printed."""
     bad = 0
@@ -8974,10 +9057,13 @@ def check(con, quiet=False, full=False):
     if ic != "ok":
         print(f"{pragma}:", "\n  ".join(found)); bad += 1
     elif not quiet:
-        print(f"{pragma}: ok" + ("" if full else " (check --full runs the full integrity_check)"))
-    fk = con.execute("PRAGMA foreign_key_check").fetchall()
-    if fk:
-        print(f"foreign_key_check: {len(fk)} broken references"); bad += 1
+        print(f"{pragma}: ok" + ("" if full else " (check --full runs integrity_check and foreign_key_check)"))
+    if full:
+        fk = con.execute("PRAGMA foreign_key_check").fetchall()
+        if fk:
+            print(f"foreign_key_check: {len(fk)} broken references"); bad += 1
+        elif not quiet:
+            print("foreign_key_check: ok")
     bad += check_schema(con)
     checks = ledger_checks(con)
     if checks is None:
@@ -9911,6 +9997,8 @@ def get_home(rq):
             FROM v_plan_totals ORDER BY created_at DESC"""),
         "discoveries": one(con, """SELECT count(*) n FROM findings WHERE discovered_in_step_id IS NOT NULL
                                    AND verification <> 'false'""")["n"],
+        "published_page": (published_page(con) or {}).get("url"),
+        "answers_imported_at": last_answers_import(con),
     }
 
 
@@ -10383,9 +10471,11 @@ STEP_FULL = ("s.change, s.proof, s.owner_question, s.behavior_note, s.progress_n
 def _plan_closes(con, where, args):
     """{step id: [the points it closes]} for the steps a WHERE on steps s picks."""
     out = {}
-    for c in rows(con, f"""SELECT sf.step_id, f.id, f.point_id, f.severity, f.summary, r.code review, i.code issue
+    for c in rows(con, f"""SELECT sf.step_id, f.id, f.point_id, f.severity, f.summary, r.code review, i.code issue,
+                                  COALESCE(ru.report_path, ru.label) report
                            FROM step_findings sf JOIN steps s ON s.id=sf.step_id JOIN findings f ON f.id=sf.finding_id
                            JOIN reviews r ON r.id=f.review_id LEFT JOIN issues i ON i.id=f.issue_id
+                           LEFT JOIN reviewer_runs ru ON ru.id=f.reviewer_run_id
                            WHERE {where} ORDER BY sf.step_id, f.id""", args):
         out.setdefault(c.pop("step_id"), []).append(c)
     return out
@@ -10762,7 +10852,8 @@ def route(root, db, con, path, qs, body, whole=False):
     dev/tests/test_routes.py ROUTE_KEYS pins every key of every answer.
 
       GET  overview                 project, queue_count, answered_count, labels {domains, themes, enums}
-      GET  home                     open_by_severity, reviews (latest 5), plans, discoveries
+      GET  home                     open_by_severity, reviews (latest 5), plans, discoveries, published_page,
+                                    answers_imported_at
       GET  checks                   checks [label, n, action, recipe, link], recurring
       GET  decisions                decisions, open ones first
       GET  gates                    ?status=pending (default): gates, other; ?status=all or one status with
@@ -11474,6 +11565,49 @@ def _answer_items(doc):
     return out
 
 
+def published_page(con):
+    """The latest published copy of the hub this ledger records (an add-artifact progress-page with a URL), as
+    {"url", "plan_id"}, or None."""
+    try:
+        return one(con, """SELECT url, plan_id FROM artifacts WHERE kind = 'progress-page' AND url IS NOT NULL
+                           ORDER BY created_at DESC, id DESC LIMIT 1""")
+    except sqlite3.Error:
+        return None
+
+
+def last_answers_import(con):
+    """When import-answers last ran on this ledger (its answers-imported event), or None."""
+    try:
+        return con.execute("SELECT max(at) FROM events WHERE event = 'answers-imported'").fetchone()[0]
+    except sqlite3.Error:
+        return None
+
+
+def import_reminder(con):
+    """The line gates, check and progress-page print while a published page may hold answers not yet imported, or
+    None when the review records no published page."""
+    page = published_page(con)
+    if not page:
+        return None
+    last = last_answers_import(con)
+    return (f"note: the owner may have answered on the published page {page['url']} (answers last imported: "
+            f"{last or 'never'}). Export its answer store and run: python3 .code-review/ledger.py import-answers FILE")
+
+
+def record_answers_import(con, source, recorded, skipped, refused):
+    """One answers-imported event per import-answers run, on the plan of the published page (else the latest
+    plan); a ledger with no plan keeps no record of it."""
+    page = published_page(con)
+    plan = (page or {}).get("plan_id") or (con.execute("SELECT max(id) FROM plans").fetchone() or [None])[0]
+    if plan is None:
+        return
+    name = "standard input" if source == "-" else Path(source).name
+    con.execute("""INSERT INTO events(entity_type, entity_id, event, to_value, note)
+                   VALUES ('plan', ?, 'answers-imported', ?, ?)""",
+                (plan, f"{recorded} recorded, {skipped} already answered, {refused} refused", f"from {name}"))
+    con.commit()
+
+
 def import_answers(db, source):
     """`ledger.py import-answers FILE`: record the owner's answers given in the hub (the answers.json it downloads,
     or the documents of a published page's answer store) into the ledger. Each goes through answer_gate(), the one set
@@ -11503,6 +11637,7 @@ def import_answers(db, source):
                 continue
             print(f"{code}: recorded")
             recorded += 1
+        record_answers_import(con, source, recorded, skipped, refused)
     finally:
         con.close()
     print(f"import-answers: {recorded} recorded, {skipped} already answered, {refused} refused")
@@ -11925,6 +12060,7 @@ def tool_command(a, root, db):
         if a.plan and not one(con, "SELECT 1 x FROM plans WHERE code=?", (a.plan,)):
             print(f"progress-page: no plan {a.plan}", file=sys.stderr)
             return 1
+        reminder = import_reminder(con)
     finally:
         con.close()
     try:
@@ -11935,6 +12071,8 @@ def tool_command(a, root, db):
     out = Path(a.out) if a.out else db.parent / "hub.html"
     write_atomic(out, page.encode("utf-8"))
     print(f"wrote {out} ({len(page.encode('utf-8')) / 1e6:.2f} MB, {n} views, no outside requests)")
+    if reminder:
+        print(reminder)
     return 0
 
 
@@ -20435,7 +20573,7 @@ def _main():
     s.add_argument("--no-open", action="store_true", help="print the address without opening a browser")
     s = sub.add_parser("check", help="the ledger's integrity and must-be-empty checks; exit 1 when one fails")
     s.add_argument("--full", action="store_true",
-                   help="run the full PRAGMA integrity_check instead of quick_check")
+                   help="run the full PRAGMA integrity_check instead of quick_check, and foreign_key_check")
     s.add_argument("--quiet", action="store_true", help="print only failures and warnings (no 'ok' or zero lines)")
     s = sub.add_parser("fill-refs", help="save each cited line range's excerpt, blob id and permalink from git")
     s.add_argument("review", nargs="?", help="only this review's references (R-0001; default: every review)")
@@ -20511,6 +20649,8 @@ def _main():
         try:
             bad = check(con, quiet=a.quiet, full=a.full)
             bad += check_git_refs(root, con, quiet=a.quiet)
+            if import_reminder(con):
+                print(import_reminder(con))
         except sqlite3.DatabaseError as e:  # a damaged file stops a later read: what was found is printed already
             print(f"check: stopped, the ledger file is damaged ({_one_line(e)})")
             sys.exit(1)
@@ -20539,6 +20679,8 @@ def _main():
                      f"excerpt)")
     elif a.cmd == "gates":
         print_gates(con)
+        if import_reminder(con):
+            print(import_reminder(con))
     elif a.cmd == "dump":
         dump(con, db)
 

@@ -192,7 +192,7 @@ class CheckFunction(unittest.TestCase):
             n, out = self.run_check(L)
         self.assertEqual(n, 0)
         # step 92: the first line names the integrity pass that ran (quick_check unless check --full)
-        self.assertEqual(out.splitlines(), ["quick_check: ok (check --full runs the full integrity_check)"]
+        self.assertEqual(out.splitlines(), ["quick_check: ok (check --full runs integrity_check and foreign_key_check)"]
                          + [f"    0  {label}" for _, label, _ in self.checks])
 
     def test_check_quiet(self):
@@ -223,7 +223,9 @@ class CheckFunction(unittest.TestCase):
                 L.close()
                 break_foreign_key(L.db)
                 L.con = L.connect()
-                n, out = self.run_check(L)
+                quick = self.run_check(L)
+                n, out = self.run_check(L, full=True)
+            self.assertEqual(quick[0], 0, "foreign_key_check runs only with --full (decision D-0016)")
             self.assertEqual(n, 1)
             self.assertIn("foreign_key_check: 1 broken references", out)
         with self.subTest("both, plus a view: the count is one per failing check"):
@@ -311,7 +313,7 @@ class CheckCommand(unittest.TestCase):
         lines = p.stdout.splitlines()
         for _, label, _ in self.checks:
             self.assertIn(f"    0  {label}", lines)
-        self.assertEqual(lines[0], "quick_check: ok (check --full runs the full integrity_check)")
+        self.assertEqual(lines[0], "quick_check: ok (check --full runs integrity_check and foreign_key_check)")
         self.assertTrue(all(l.startswith("    0  ") for l in lines[1:]), lines)
 
     def test_cli_check_each_view_exit1(self):
@@ -338,7 +340,7 @@ class CheckCommand(unittest.TestCase):
         with new_ledger() as L:
             L.close()
             break_foreign_key(L.db)
-            p = L.run("check")
+            p = L.run("check", "--full")
         self.assertEqual(p.returncode, 1)
         self.assertIn("foreign_key_check: 1 broken references", p.stdout)
 

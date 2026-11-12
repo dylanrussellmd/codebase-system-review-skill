@@ -128,13 +128,13 @@ class IssuesPlansExplore(browser.ViewerTestCase):
     def test_page_plan_phase_routing(self):
         page = self.open("#/plan/P-0001")
         self.assertEqual(self._rail(page), [["1Safety netstep 10/1", "true"], ["2Fix firststeps 2–31/2", "false"]])   # step 191: the steps of each phase
-        self.assertEqual(page.text("#app .steps h2"), "Phase 1 · Safety net")
+        self.assertEqual(page.text("#app .steps h2"), "Phase 1: Safety net")
         self.assertEqual(page.contents("#app .steps h3"), ["CI"])     # steps grouped by section
         self.assertEqual(page.texts(".steps details.item > summary .n"), ["1"])
         facts = dict(zip(page.texts(".facts span"), page.texts(".facts b")))
-        self.assertEqual(facts, {"steps": "3", "phases": "2", "points closed": "3"})
+        self.assertEqual(facts, {"steps": "3", "phases": "2", "points closed": "3", "step needs you": "1"})
         page.hash("#/plan/P-0001/phase/2")
-        self.assertEqual(page.text("#app .steps h2"), "Phase 2 · Fix first")
+        self.assertEqual(page.text("#app .steps h2"), "Phase 2: Fix first")
         self.assertEqual(page.texts(".steps details.item > summary .n"), ["2", "3"])
         # A rail click switches phase in place, rewrites the URL and clears the filters.
         page.page.locator("#app .tools input").fill("secrets")
@@ -142,11 +142,11 @@ class IssuesPlansExplore(browser.ViewerTestCase):
         page.settle()
         self.assertEqual(page.location_hash(), "#/plan/P-0001/phase/1")
         self.assertEqual(page.js("document.querySelector('#app .tools input').value"), "")
-        self.assertEqual(page.text("#app .steps h2"), "Phase 1 · Safety net")
+        self.assertEqual(page.text("#app .steps h2"), "Phase 1: Safety net")
         # Step tags and body.
         page.hash("#/plan/P-0001/phase/2")
         tags = page.page.locator(".steps details.item", has_text="Make the notice period").locator(".tags .tag")
-        self.assertEqual(tags.all_inner_texts(), ["Waiting on you", "Your decision", "Changes behaviour"])
+        self.assertEqual(tags.all_inner_texts(), ["Waiting on you", "Your decision", "Changes behaviour", "1 point"])
 
     def test_page_plan_filters(self):
         page = self.open("#/plan/P-0001")
@@ -166,7 +166,7 @@ class IssuesPlansExplore(browser.ViewerTestCase):
                 page.page.select_option("#app select[aria-label='Filter steps']", value)
                 page.settle()
                 if want is None:
-                    self.assertEqual(page.text("#app .steps h2"), "Phase 1 · Safety net")
+                    self.assertEqual(page.text("#app .steps h2"), "Phase 1: Safety net")
                     continue
                 self.assertEqual(page.texts(".steps details.item > summary .n"), want)
                 n = len(want)
@@ -203,7 +203,7 @@ class IssuesPlansExplore(browser.ViewerTestCase):
         self.assertEqual(page.count("nav.rail"), 0)
         self.assertEqual(page.count("#app .tools"), 0)    # nothing to search or filter
         facts = dict(zip(page.texts(".facts span"), page.texts(".facts b")))
-        self.assertEqual(facts, {"steps": "0", "phases": "0", "points closed": "0"})
+        self.assertEqual(facts, {"steps": "0", "phases": "0", "points closed": "0", "steps need you": "0"})
 
     def test_page_rail_and_table_list_focus(self):
         page = self.open("#/plan/P-0001")
@@ -383,7 +383,7 @@ class LargePlan(browser.ViewerTestCase):
         self.assertEqual(page.count(".steps details.item"), 300)
         self.assertEqual(page.text("#app .steps p.note"), "Showing the first 300.")
         more = page.page.locator("#app .steps button")
-        self.assertEqual(more.inner_text(), "Show more (20 left)")
+        self.assertEqual(more.inner_text(), "Show 20 more")
         more.focus()
         page.page.keyboard.press("Enter")
         page.settle()

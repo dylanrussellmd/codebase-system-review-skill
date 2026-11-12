@@ -3,6 +3,15 @@
 The tool version is `metadata:` `version:` in SKILL.md's frontmatter; `ledger.py --version` prints it with the schema
 version.
 
+## 1.12.0 (schema 21)
+
+- `check` runs quick_check, the schema check and the views (2.9 s at 10x, was 7.1 s); `check --full` adds
+  integrity_check and foreign_key_check. Migration 0021 adds four indexes and rewrites four slow views; every view
+  returns the same rows.
+- While a published page is recorded, `gates`, `check` and `progress-page` remind the agent to import its answers,
+  with the time of the last import; each import is an event; the home page shows when answers were last imported.
+- The plan page matches the original fix-plan page's layout where it should. Ledger size budget: 10 KB per finding.
+
 ## 1.11.0 (schema 20)
 
 - Wired in: Vale (the writing-standard rules, now run and fixed), lychee, built-in `doc-references` and

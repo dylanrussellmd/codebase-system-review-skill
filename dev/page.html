@@ -6,7 +6,7 @@
 <title>Review ledger</title>
 <style>
 :root{--bg:#f7f8f6;--surface:#fff;--fg:#1b2420;--muted:#5d6b64;--line:#dfe4e0;--field:#828f88;--accent:#0f6b57;--accent-soft:#e2f1ec;--warn:#9a5b00;--warn-soft:#fbefd9;--crit:#a3271f;--crit-soft:#fae6e3;--info:#2b5c99;--info-soft:#e5eefa;
- --display:ui-rounded,"SF Pro Rounded","Segoe UI Variable Display","Segoe UI",system-ui,sans-serif;--body:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;color-scheme:light}
+ --display:"Helvetica Neue",Helvetica,"Nimbus Sans","Arial Nova",Arial,system-ui,sans-serif;--body:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;color-scheme:light}
 :root[data-theme="dark"]{--bg:#121715;--surface:#1a211e;--fg:#e6ece8;--muted:#9aa8a1;--line:#2c3632;--field:#6b7a73;--accent:#5fc9ae;--accent-soft:#17352d;--warn:#e7b25a;--warn-soft:#3a2c12;--crit:#f08d84;--crit-soft:#3d1c19;--info:#8db6ee;--info-soft:#1a2a40;color-scheme:dark}
 *{box-sizing:border-box}
 html{scroll-padding-top:var(--top,110px)}
@@ -655,6 +655,8 @@ VIEWS.home = async () => {
     !o.reviews.length ? h("p", {class:"callout"}, "No reviews yet. Ask your agent to run the system review.") : null,
     waiting ? h("p", {class:"callout you"}, h("a", {href:"#/inbox"}, plural(waiting, "thing needs", "things need") + " your input or approval →")) : null,
     o.answered_count ? h("p", {class:"note"}, h("a", {href:"#/inbox"}, plural(o.answered_count, "answer")), " of yours waiting for the agent to act on.") : null,
+    o.published_page ? h("p", {class:"note", id:"answers-imported"}, "Answers you gave on the ", extLink(o.published_page, "published page"),
+      o.answers_imported_at ? [" were last brought in ", whenCell(o.answers_imported_at), "."] : " have not been brought in yet.") : null,
     h("div", {class:"grid2"},
       h("div", {class:"card"}, h("h2", null, "Latest reviews"),
         table([{label:"Review", get:r => r.code}, {label:"Title", key:"title"}, {label:"Status", get:r => lab("review", r.status)},
@@ -675,12 +677,15 @@ VIEWS.home = async () => {
   } catch (e) { back.textContent = "—"; put(checks, errorBox(e, true)); }
 };
 
-function progressBar(done, doing, waiting, total){
+// full: the plan page's line, every state and when the plan last changed (updated: a stored time, or null).
+function progressBar(done, doing, waiting, total, full){
   const pct = n => total ? (100 * n / total).toFixed(2) + "%" : "0";
+  const rest = total - done - doing - waiting;
   return h("div", {class:"progress"},
     h("div", {class:"bar", role:"img", "aria-label":`${done} of ${total} done`},
       h("i", {class:"d", style:`width:${pct(done)}`}), h("i", {class:"g", style:`width:${pct(doing)}`}), h("i", {class:"y", style:`width:${pct(waiting)}`})),
-    h("span", {class:"note"}, `${done} of ${total} done` + (doing ? ` · ${doing} in progress` : "") + (waiting ? ` · ${waiting} waiting on you` : "")));
+    h("span", {class:"note"}, full ? `${done} done, ${doing} in progress, ${waiting} waiting on you, ${rest} not started.` + (full.updated ? ` Updated ${when(full.updated)}.` : "")
+      : `${done} of ${total} done` + (doing ? ` · ${doing} in progress` : "") + (waiting ? ` · ${waiting} waiting on you` : "")));
 }
 
 // Waiting on you. Each gate is a card; answering one moves that card alone under Answered, so what is typed into the
@@ -1154,20 +1159,20 @@ VIEWS.plan = async ([code, , phaseArg]) => {
   };
   const commitLine = c => h("div", null, h("code", null, short(c.commit_sha)), c.branch ? ` on ${c.branch}` : "",
     c.summary ? " " + c.summary : "", c.pr_url ? [" ", extLink(c.pr_url, "pull request")] : "");
-  const closeLine = c => h("div", {class:"refline"}, h("code", null, `${c.review} · ${c.point_id}`), sevTag(c.severity),
+  const closeLine = c => h("div", {class:"refline", title:c.report ? "Report: " + c.report.split("/").pop() : null}, h("code", null, `${c.review} · ${c.point_id}`), sevTag(c.severity),
     c.issue ? h("a", {href:"#/issue/" + c.issue}, c.issue) : null, h("span", null, c.summary));
   const stepBody = (s, closes) => [
-    kv([["Change", s.change], ["Proof", s.proof],
+    kv([["Progress", s.progress_note], [(s.commits || []).length > 1 ? "Commits" : "Commit", (s.commits || []).length ? s.commits.map(commitLine) : null],
+      ["Change", s.change], ["Proof", s.proof],
       ["Depends on", s.depends.length ? `${noun(s.depends.length, "Step")} ${s.depends.join(", ")}` : null],
-      ["Behaviour change", s.behavior_note],
-      ["Needs from you", s.owner_question], ["Progress", s.progress_note], ["Started", whenCell(s.started_at)], ["Done", whenCell(s.done_at)],
-      ["Closes no point because", s.no_findings_reason],
-      ["Commits", (s.commits || []).length ? s.commits.map(commitLine) : null]]),
+      ["Changes behaviour", s.behavior_note], ["Needs you", s.owner_question],
+      ["Started", whenCell(s.started_at)], ["Done", whenCell(s.done_at)],
+      ["Closes no point because", s.no_findings_reason]]),
     closes.length ? h("div", {class:"ref"}, h("span", {class:"note"}, "Closes " + plural(closes.length, "point")), closes.map(closeLine)) : null];
   const stepItem = s => item(s.number, s.title,
     [s.status !== "not-started" ? labTag("step", s.status) : null,
      s.owner_need !== "none" ? tag(lab("need", s.owner_need), tone("need", s.owner_need) || "info") : null,
-     s.behavior_change ? tag("Changes behaviour") : null],
+     s.behavior_change ? tag("Changes behaviour") : null, s.closes.length ? tag(plural(s.closes.length, "point")) : null],
     async () => {
       if (d.findings) return stepBody(s, s.closes.map(id => d.findings[id]).filter(Boolean));
       if (s.change !== undefined && !s.closes.length) return stepBody(s, []);
@@ -1189,25 +1194,28 @@ VIEWS.plan = async ([code, , phaseArg]) => {
       const more = () => { const first = shown; shown += PLAN_PAGE; draw(); main.querySelectorAll("details.item > summary")[first].focus(); };
       put(main, h("h2", null, count), hit.length > shown ? h("p", {class:"note"}, `Showing the first ${shown}.`) : null,
         hit.length ? hit.slice(0, shown).map(stepItem) : empty("No step matches."),
-        hit.length > shown ? h("button", {class:"btn ghost", type:"button", onclick:more}, `Show more (${hit.length - shown} left)`) : null);
+        hit.length > shown ? h("button", {class:"btn ghost", type:"button", onclick:more}, `Show ${Math.min(PLAN_PAGE, hit.length - shown)} more`) : null);
       return count;
     } else {
       const p = phases.find(x => x.number === phase) || phases[0];
       const ps = steps.filter(s => s.phase === p.number);
       const sections = [...new Set(ps.map(s => s.section || ""))];
-      put(main, h("h2", null, `Phase ${p.number} · ${p.title}`), h("p", {class:"lede"}, p.goal), p.why ? h("p", {class:"note"}, p.why) : null,
+      const points = new Set(ps.flatMap(s => s.closes)).size;
+      const span = p.first_step == null ? null : (p.first_step === p.last_step ? `Step ${p.first_step}` : `Steps ${p.first_step} to ${p.last_step}`) + `, closing ${plural(points, "review point")}.`;
+      put(main, h("h2", null, `Phase ${p.number}: ${p.title}`), h("p", {class:"lede"}, p.goal), span ? h("p", {class:"note phase-span"}, span) : null, p.why ? h("p", {class:"note"}, p.why) : null,
         sections.map(sec => [sec ? h("h3", null, sec) : null, ps.filter(s => (s.section || "") === sec).map(stepItem)]));
     }
   };
   const filters = filterBar([q, f], () => { shown = PLAN_PAGE; say(draw()); }, 150);
   const pl = d.plan, closed = new Set(steps.flatMap(s => s.closes)).size;
+  const needYou = steps.filter(s => s.owner_need !== "none" && s.status !== "done" && s.status !== "dropped").length;
   const head =[h("h1", null, `${pl.code} · ${pl.title}`),
-    h("p", {class:"lede"}, lab("plan", pl.status) + (pl.approved_at ? ` · approved ${when(pl.approved_at)}` : "") + (d.last_updated ? ` · last updated ${when(d.last_updated)}` : "")),
+    h("p", {class:"lede"}, lab("plan", pl.status) + (pl.approved_at ? ` · approved ${when(pl.approved_at)}` : "")),
     kv([["From", d.reviews.length ? d.reviews.map((r, i) => [i ? ", " : "", h("a", {href:"#/review/" + r.code}, r.code)]) : null],
         ["Plan document", pl.doc_url ? extLink(pl.doc_url, "Open the plan document") : null], ["Shared page", pl.page_url ? extLink(pl.page_url, "Open the shared page") : null]]),
     h("div", {class:"facts"}, fact(steps.length, noun(steps.length, "step")), fact(phases.length, noun(phases.length, "phase")),
-      fact(closed, noun(closed, "point") + " closed")),
-    progressBar(count("done"), count("doing"), count("waiting-owner"), steps.length),
+      fact(closed, noun(closed, "point") + " closed"), fact(needYou, noun(needYou, "step needs you", "steps need you"))),
+    progressBar(count("done"), count("doing"), count("waiting-owner"), steps.length, {updated:d.last_updated}),
     pl.narrative_md ? h("div", {class:"card"}, h("h2", null, "About this plan"), md(pl.narrative_md)) : null,
     d.gates.length ? h("div", {class:"card"}, h("h2", null, "Questions about this plan"),
       table([{label:"Question", key:"title", link:true}, {label:"Step", key:"step", num:1}, {label:"Status", get:g => lab("gstat", g.status)}], d.gates, g => "#/inbox/" + g.code)) : null,

@@ -585,7 +585,7 @@ CONTRACT = {
     "overview": ("GET", "/api/overview", None, 200, dict,
                  {"project", "queue_count", "answered_count", "labels"}),
     "home": ("GET", "/api/home", None, 200, dict,
-             {"open_by_severity", "reviews", "plans", "discoveries"}),
+             {"open_by_severity", "reviews", "plans", "discoveries", "published_page", "answers_imported_at"}),
     "guide": ("GET", "/api/guide", None, 200, dict, {"guide"}),
     "run": ("GET", "/api/run/{run}", None, 200, dict, {"prompt", "final_message"}),
     "checks": ("GET", "/api/checks", None, 200, dict, {"checks", "recurring"}),
@@ -790,7 +790,7 @@ ROUTE_KEYS = {
         "project queue_count answered_count labels",
     "home":
         "open_by_severity[severity n] reviews[code title status started_at points high] plans[code title "
-        "status steps done doing waiting] discoveries",
+        "status steps done doing waiting] discoveries published_page answers_imported_at",
     "checks":
         "checks[label n action recipe link] recurring",
     "decisions":
@@ -858,7 +858,7 @@ ROUTE_KEYS = {
         "position closes search commits[commit_sha branch pr_url summary]]",
     "step/*/*":
         "number change proof owner_question behavior_note progress_note no_findings_reason started_at done_at "
-        "commits[commit_sha branch pr_url summary] closes[point_id severity summary review issue]",
+        "commits[commit_sha branch pr_url summary] closes[point_id severity summary review issue report]",
     "goals":
         "goals[code domain text status approved_at note adopted_at retired_at used_by sources[code question]]",
     "ideas":

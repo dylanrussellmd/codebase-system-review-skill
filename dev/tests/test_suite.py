@@ -59,8 +59,10 @@ class ScratchRepoFixture(unittest.TestCase):
 
     def test_identity_and_config_are_isolated(self):
         r, _, c2 = self.make()
-        self.assertEqual(r.git("log", "-1", "--format=%an <%ae> %ad", "--date=iso-strict", c2),
-                         "Test Author <test@example.invalid> 2026-01-01T00:02:00+00:00")
+        # git 2.56 and later print UTC as "Z" in iso-strict dates; earlier versions print "+00:00".
+        self.assertIn(r.git("log", "-1", "--format=%an <%ae> %ad", "--date=iso-strict", c2),
+                      ("Test Author <test@example.invalid> 2026-01-01T00:02:00+00:00",
+                       "Test Author <test@example.invalid> 2026-01-01T00:02:00Z"))
         self.assertEqual(r.git("config", "--global", "--list", check=False), "")
         self.assertEqual(r.git("rev-parse", "--abbrev-ref", "HEAD"), "main")
 

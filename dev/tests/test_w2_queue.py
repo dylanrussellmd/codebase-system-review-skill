@@ -66,7 +66,7 @@ class Header(Case):
         self.L.commit()
         try:
             d = self.ok("/api/home")
-            self.assertEqual(set(d), {"open_by_severity", "reviews", "plans", "discoveries"})
+            self.assertEqual(set(d), {"open_by_severity", "reviews", "plans", "discoveries", "published_page", "answers_imported_at"})
             plan = d["plans"][0]
             self.assertEqual(set(plan), {"code", "title", "status", "steps", "done", "doing", "waiting"})
             listed = self.ok("/api/plans")[0]

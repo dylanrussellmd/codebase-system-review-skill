@@ -64,7 +64,7 @@ class CheckQuiet(unittest.TestCase):
         L.x("PRAGMA foreign_keys = OFF")
         L.x("INSERT INTO review_goals(review_id, goal_id) VALUES (999, 999)")
         L.commit()
-        bad, out = self.check(quiet=True)
+        bad, out = self.check(quiet=True, full=True)   # foreign_key_check runs only with --full (D-0016)
         self.assertGreaterEqual(bad, 1)
         self.assertIn("foreign_key_check: 2 broken references", out)
         L.x("DELETE FROM review_goals WHERE review_id=999")

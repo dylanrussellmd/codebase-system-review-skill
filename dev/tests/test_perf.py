@@ -8,7 +8,9 @@ fast. Run them with:
 test_scale_generator_small         (fast) a small generated ledger passes check: the generator matches the schema
 test_large_ledger_checks_clean     the 1x ledger (10,000 findings, 600-step plan) passes check, all five views at 0
 test_insert_throughput_budget      2,000 findings with 1-3 locations, one transaction per report: < 0.5 s to load and
-                                   < 0.4 s to match (best of three runs, so a busy machine does not fail it)
+                                   < 0.8 s to match (best of three runs, so a busy machine does not fail it); the
+                                   generator makes its rows before the clock starts. Measured (perf_baseline.json
+                                   insert_budget.*): 0.21 s and 0.32 s here, about 1.7 times that on a CI runner
 test_perf_ledger_builds            the 10x ledger builds and passes check
 test_baseline_measurements         the baseline measures gzip ratios on real prose and git growth per ledger commit
 """
@@ -19,7 +21,7 @@ from dev.tests import fixtures, scale
 from dev.tests.fixtures import slow
 
 INSERT_BUDGET_S = 0.5
-MATCH_BUDGET_S = 0.4
+MATCH_BUDGET_S = 0.8
 
 
 def must_be_empty_counts(db):

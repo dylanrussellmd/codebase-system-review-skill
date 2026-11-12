@@ -595,9 +595,10 @@ class QuickCheck(Base):
 
     @fixtures.slow
     def test_check_budget_10x(self):
-        """At 10x (a ~0.9 GB ledger) check with quick_check takes well under the time with --full. Measured on the
-        reviewer's machine (2026-11-11): quick_check 2.1 s, integrity_check 5.1 s, foreign_key_check 1.1 s, all
-        views 3.0 s, so the plan's 2 s budget for the whole check is not met by quick_check alone."""
+        """At 10x (a ~0.9 GB ledger) check with quick_check takes well under the time with --full, and its views
+        (read from migration 0021's indexes) take under a second. Measured on the reviewer's machine (2026-11-12,
+        perf_baseline.json check.x10.*): check 2.9 s, of which quick_check 2.0 s and the views 0.5 s; --full 6.7 s.
+        The plan's 2 s for the whole check is not reached: quick_check alone reads every page of the file."""
         from dev.tests import scale
         info = scale.build(fixtures.temp_dir("budget10-") / "proj", scale=10)
 
@@ -612,6 +613,15 @@ class QuickCheck(Base):
                 con.close()
         quick, full = timed(False), timed(True)
         self.assertLess(quick, 0.8 * full, (quick, full))
+        con = self.mod.connect(info["db"])
+        try:
+            t = time.perf_counter()
+            for view, _, _ in self.mod.ledger_checks(con):
+                self.mod.count_view(con, view)
+            views = time.perf_counter() - t
+        finally:
+            con.close()
+        self.assertLess(views, 1.0, f"the check views took {views:.2f} s at 10x")
 
 if __name__ == "__main__":
     unittest.main()

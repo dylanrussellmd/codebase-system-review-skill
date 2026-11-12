@@ -1,5 +1,5 @@
 -- =====================================================================
--- Code review ledger — schema version 20
+-- Code review ledger — schema version 21
 -- One SQLite file per project: <project root>/.code-review/ledger.sqlite
 -- Every connection must run:  PRAGMA foreign_keys = ON;
 -- Times are UTC ISO-8601 text with milliseconds (strftime('%Y-%m-%dT%H:%M:%fZ','now')); the tr_time_*
@@ -1179,8 +1179,9 @@ CREATE TABLE events (
 -- ---------- Indexes -----------------------------------------------------
 
 CREATE INDEX ix_findings_review      ON findings(review_id);
--- The columns the per-review counts read (v_review_totals), so a list of reviews never reads the findings themselves.
-CREATE INDEX ix_findings_review_counts ON findings(review_id, verification, severity, match_type);
+-- The columns the per-review counts read (v_review_totals), so a list of reviews never reads the findings themselves;
+-- issue_id too, so v_match_problems is counted from the index (schema 21).
+CREATE INDEX ix_findings_review_counts ON findings(review_id, verification, severity, match_type, issue_id);
 CREATE INDEX ix_findings_issue       ON findings(issue_id);
 CREATE INDEX ix_findings_fingerprint ON findings(fingerprint);
 CREATE INDEX ix_findings_slug        ON findings(domain_code, theme_code, sub);
@@ -1193,13 +1194,32 @@ CREATE INDEX ix_relations_to         ON issue_relations(to_issue_id);
 CREATE INDEX ix_checks_issue         ON review_issue_checks(issue_id);
 CREATE INDEX ix_steps_phase          ON steps(phase_id);
 CREATE INDEX ix_steps_status         ON steps(plan_id, status);
-CREATE INDEX ix_step_findings_find   ON step_findings(finding_id);
+CREATE INDEX ix_step_findings_find   ON step_findings(finding_id, step_id);
 CREATE INDEX ix_deps_on              ON step_dependencies(depends_on_step_id);
 CREATE INDEX ix_guard_issue          ON guard_tests(issue_id);
 CREATE INDEX ix_events_entity        ON events(entity_type, entity_id, at);
 CREATE INDEX ix_metrics_name         ON metrics(name, scope);
 CREATE INDEX ix_runs_review          ON reviewer_runs(review_id);
 CREATE INDEX ix_gates_status         ON gates(status);
+-- For check's views (schema 21, plan step 92): each lets a view read an index instead of every row.
+-- The status events of each issue and gate in order (v_history_gaps, v_match_problems).
+CREATE INDEX ix_events_history       ON events(entity_type, entity_id, id, event, to_value)
+  WHERE event IN ('opened','status-changed');
+-- The issues of a domain by status (v_unchecked_known_issues).
+CREATE INDEX ix_issues_domain_known  ON issues(domain_code, status, first_seen_review_id, opened_at);
+-- The few points found during fix work (v_unplanned_discoveries).
+CREATE INDEX ix_findings_discovered  ON findings(discovered_in_step_id) WHERE discovered_in_step_id IS NOT NULL;
+-- Locations with a problem of their own (v_untraceable_refs repeats this WHERE word for word, so the planner uses
+-- the index; edit both together).
+CREATE INDEX ix_locations_untraceable ON finding_locations(finding_id)
+  WHERE commit_sha IS NULL OR (line_start IS NULL AND whole_file = 0)
+     OR ((excerpt IS NULL OR excerpt = '') AND excerpt_status IS NOT 'not-text')
+     OR (excerpt_status IS NULL AND line_start IS NOT NULL
+         AND length(excerpt) - length(replace(excerpt, char(10), '')) + 1
+             <> COALESCE(line_end, line_start) - line_start + 1
+         AND NOT (substr(excerpt, -1) = char(10)
+                  AND length(excerpt) - length(replace(excerpt, char(10), ''))
+                      = COALESCE(line_end, line_start) - line_start + 1));
 -- Uniqueness the table constraints cannot express (schema 3): one metric per review, name, scope and repository
 -- even when repository_id is NULL; at most one primary location per finding; one repository per path.
 CREATE UNIQUE INDEX ux_metrics_key            ON metrics(review_id, name, scope, COALESCE(repository_id, 0));
@@ -3401,6 +3421,8 @@ SELECT p.code, 'finding closed by several steps without a reason', f.point_id
 FROM step_findings sf JOIN steps s ON s.id = sf.step_id JOIN plans p ON p.id = s.plan_id
 JOIN findings f ON f.id = sf.finding_id
 WHERE p.status NOT IN ('superseded','abandoned') AND s.status <> 'dropped'
+  -- only points linked to more than one step can be closed twice (read from ix_step_findings_find alone)
+  AND sf.finding_id IN (SELECT finding_id FROM step_findings GROUP BY finding_id HAVING count(*) > 1)
 GROUP BY p.id, sf.finding_id
 HAVING count(*) > 1 AND sum(sf.multi_reason IS NULL) > 0;
 
@@ -3532,6 +3554,19 @@ SELECT review, point_id, path, problem FROM (
   JOIN reviews r ON r.id = f.review_id
   LEFT JOIN review_repositories rr ON rr.review_id = f.review_id AND rr.repository_id = fl.repository_id
   WHERE r.status <> 'abandoned'
+    -- the rows the CASE can name: the review's own terms here, the location's own from ix_locations_untraceable
+    -- (its WHERE, repeated word for word, so the excerpts are read only when a location is written)
+    AND (rr.tag_name IS NULL
+         OR (rr.commit_sha IS NOT NULL AND fl.commit_sha <> rr.commit_sha AND f.discovered_in_step_id IS NULL)
+         OR fl.id IN (SELECT id FROM finding_locations
+                      WHERE commit_sha IS NULL OR (line_start IS NULL AND whole_file = 0)
+                         OR ((excerpt IS NULL OR excerpt = '') AND excerpt_status IS NOT 'not-text')
+                         OR (excerpt_status IS NULL AND line_start IS NOT NULL
+                             AND length(excerpt) - length(replace(excerpt, char(10), '')) + 1
+                                 <> COALESCE(line_end, line_start) - line_start + 1
+                             AND NOT (substr(excerpt, -1) = char(10)
+                                      AND length(excerpt) - length(replace(excerpt, char(10), ''))
+                                          = COALESCE(line_end, line_start) - line_start + 1))))
   UNION ALL
   SELECT r.code, f.point_id, NULL, 'no location'
   FROM findings f JOIN reviews r ON r.id = f.review_id
@@ -3762,26 +3797,29 @@ SELECT review, point_id, issue, match_type, problem FROM (
 -- refuses such a link when it is made; this lists links made before it, or left behind when a plan_reviews row was
 -- removed.
 CREATE VIEW v_off_plan_coverage AS
+-- Read from the plans and the reviews they do not cover (CROSS JOIN keeps that order), so a plan that covers every
+-- review reads no point at all.
 SELECT p.code AS plan, s.number AS step, r.code AS review, f.point_id
-FROM step_findings sf
-JOIN steps s ON s.id = sf.step_id
-JOIN plans p ON p.id = s.plan_id
-JOIN findings f ON f.id = sf.finding_id
-JOIN reviews r ON r.id = f.review_id
-WHERE p.status NOT IN ('superseded','abandoned')
-  AND NOT EXISTS (SELECT 1 FROM plan_reviews pr WHERE pr.plan_id = p.id AND pr.review_id = f.review_id);
+FROM plans p
+CROSS JOIN reviews r
+CROSS JOIN findings f ON f.review_id = r.id
+CROSS JOIN step_findings sf ON sf.finding_id = f.id
+CROSS JOIN steps s ON s.id = sf.step_id
+WHERE p.status NOT IN ('superseded','abandoned') AND s.plan_id = p.id
+  AND NOT EXISTS (SELECT 1 FROM plan_reviews pr WHERE pr.plan_id = p.id AND pr.review_id = r.id);
 
 -- Finished plan steps whose issues are still to fix.
 -- Must be empty: when a step is done, its issues move on (fixed with after_state, or another closing status),
 -- unless another unfinished step still works on them. Regressed issues are left to the next plan. Superseded and
 -- abandoned plans are not checked.
 CREATE VIEW v_done_steps_open_issues AS
+-- Read from the issues still to fix (ix_issues_status; CROSS JOIN keeps that order), fewer than the done steps' points.
 SELECT DISTINCT p.code AS plan, s.number AS step, i.code AS issue, i.status AS issue_status
-FROM steps s
+FROM issues i
+CROSS JOIN findings f ON f.issue_id = i.id
+CROSS JOIN step_findings sf ON sf.finding_id = f.id
+CROSS JOIN steps s ON s.id = sf.step_id
 JOIN plans p ON p.id = s.plan_id
-JOIN step_findings sf ON sf.step_id = s.id
-JOIN findings f ON f.id = sf.finding_id
-JOIN issues i ON i.id = f.issue_id
 WHERE s.status = 'done' AND p.status NOT IN ('superseded','abandoned') AND f.verification <> 'false'
   AND i.status IN ('open','needs-decision','planned','in-progress')
   AND NOT EXISTS (SELECT 1 FROM findings f2 JOIN step_findings sf2 ON sf2.finding_id = f2.id
@@ -4245,6 +4283,8 @@ INSERT INTO enum_labels(enum, value, label, position) VALUES
  ('event','metric-recorded','A measurement was recorded',28),
  ('event','tag-pushed','The tag of the reviewed commit was pushed',29),
  ('event','redacted','A secret was removed from the text',30);
+INSERT INTO enum_labels(enum, value, label, position) VALUES
+ ('event','answers-imported','Answers brought in from the published page',31);
 
 INSERT INTO ledger_checks(view, label, tier, position) VALUES
  ('v_artifacts_outside_ledger','Review files recorded outside the ledger''s folder','warning',110);
@@ -4405,7 +4445,7 @@ INSERT INTO enum_labels(enum, value, label, position) VALUES
  ('tool_output_format','json','JSON',5), ('tool_output_format','jsonl','JSON lines',6),
  ('tool_result_level','error','Error',1), ('tool_result_level','warning','Warning',2),
  ('tool_result_level','note','Note',3), ('tool_result_level','none','No level',4);
-INSERT INTO meta(key, value) VALUES ('schema_version','20');
+INSERT INTO meta(key, value) VALUES ('schema_version','21');
 INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger schema'),
   (2, 'url, path, hash and code checks; repositories.allow_outside_root; finding_locations.excerpt_redacted'),
   (3, 'integrity rules: codes, hashes, checks, append-only history, owner actor on gate answers'),
@@ -4425,4 +4465,5 @@ INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger s
   (17, 'a step may depend on any step of its plan, cycles refused; v_step_order: the order to work in'),
   (18, 'multi-select gates: gates.multi and gates.preselect; a multi-select answer is a JSON list of option values'),
   (19, 'the features domain and feature_proposals: additions to the reviewed codebase that would serve the owner''s goals'),
-  (20, 'tool_runs and tool_results: the picked tools'' runs at the reviewed commit, and their results as leads');
+  (20, 'tool_runs and tool_results: the picked tools'' runs at the reviewed commit, and their results as leads'),
+  (21, 'indexes for check''s views, which read them instead of every row; the answers-imported event');

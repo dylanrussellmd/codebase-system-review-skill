@@ -133,10 +133,10 @@ class SkillMdCommands(unittest.TestCase):
 class LedgerSize(unittest.TestCase):
     """PERF-M6 (plan step 120): the docs state what a ledger costs in git, from a measurement."""
 
-    # Measured with scale.build(scale=1) at schema 9: 10,000 findings, ledger.sqlite and ledger.sql in MB.
-    MEASURED = {"ledger": 94.0, "dump": 65.5}
-    # characterization: the plan's budget is 8,000 bytes of ledger.sqlite per finding (PERF-M6); schema 9 takes about
-    # 9,400. The fix lowers this bound to 8000 and the figures above and in the docs with it.
+    # Measured with scale.build(scale=1) at schema 21 (2026-11-12): 10,000 findings, ledger.sqlite and ledger.sql in MB.
+    MEASURED = {"ledger": 95.3, "dump": 65.5}
+    # The owner accepted this size (decision D-0017): the budget is 10 KB of ledger.sqlite per finding; it takes about
+    # 9,500 bytes (the findings' own text about 4,100, the events 1,500 and their indexes 600).
     BUDGET = 10000
 
     def test_documented_size_is_the_measured_one(self):

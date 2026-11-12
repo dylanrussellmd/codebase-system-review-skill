@@ -214,9 +214,14 @@ def _sql_segments(sql):
             k = sql.find("*/", i + 2)
             code.append(" "); i = n if k < 0 else k + 2
         else:
-            code.append(c); i += 1
+            m = _SQL_SPECIAL.search(sql, i + 1)   # plain code up to the next quote or comment, in one piece
+            k = m.start() if m else n
+            code.append(sql[i:k]); i = k
     out.append(("code", "".join(code)))
     return out
+
+
+_SQL_SPECIAL = re.compile(r"['\"`]|--|/\*")
 
 
 def normalize_sql(sql):
@@ -1001,7 +1006,8 @@ def check(con, quiet=False, full=False):
     """Print what check finds; return the number of failed checks (integrity, foreign keys, schema, each non-empty
     error-tier view). A non-empty warning-tier view is printed with 'warning' and does not count. The integrity
     pass is PRAGMA quick_check (no index-content comparison, so fast on a large ledger) unless full, which runs the
-    full PRAGMA integrity_check (`check --full`); the line printed names the one that ran. Under a non-empty
+    full PRAGMA integrity_check and PRAGMA foreign_key_check (`check --full`; every write runs with foreign keys on,
+    so a broken reference needs a write made without them); the lines printed name what ran. Under a non-empty
     view come its first CHECK_SAMPLE_ROWS rows as JSON, each cut to CHECK_SAMPLE_CHARS characters. quiet: only
     what is wrong is printed."""
     bad = 0
@@ -1014,10 +1020,13 @@ def check(con, quiet=False, full=False):
     if ic != "ok":
         print(f"{pragma}:", "\n  ".join(found)); bad += 1
     elif not quiet:
-        print(f"{pragma}: ok" + ("" if full else " (check --full runs the full integrity_check)"))
-    fk = con.execute("PRAGMA foreign_key_check").fetchall()
-    if fk:
-        print(f"foreign_key_check: {len(fk)} broken references"); bad += 1
+        print(f"{pragma}: ok" + ("" if full else " (check --full runs integrity_check and foreign_key_check)"))
+    if full:
+        fk = con.execute("PRAGMA foreign_key_check").fetchall()
+        if fk:
+            print(f"foreign_key_check: {len(fk)} broken references"); bad += 1
+        elif not quiet:
+            print("foreign_key_check: ok")
     bad += check_schema(con)
     checks = ledger_checks(con)
     if checks is None:
@@ -1951,6 +1960,8 @@ def get_home(rq):
             FROM v_plan_totals ORDER BY created_at DESC"""),
         "discoveries": one(con, """SELECT count(*) n FROM findings WHERE discovered_in_step_id IS NOT NULL
                                    AND verification <> 'false'""")["n"],
+        "published_page": (published_page(con) or {}).get("url"),
+        "answers_imported_at": last_answers_import(con),
     }
 
 
@@ -2423,9 +2434,11 @@ STEP_FULL = ("s.change, s.proof, s.owner_question, s.behavior_note, s.progress_n
 def _plan_closes(con, where, args):
     """{step id: [the points it closes]} for the steps a WHERE on steps s picks."""
     out = {}
-    for c in rows(con, f"""SELECT sf.step_id, f.id, f.point_id, f.severity, f.summary, r.code review, i.code issue
+    for c in rows(con, f"""SELECT sf.step_id, f.id, f.point_id, f.severity, f.summary, r.code review, i.code issue,
+                                  COALESCE(ru.report_path, ru.label) report
                            FROM step_findings sf JOIN steps s ON s.id=sf.step_id JOIN findings f ON f.id=sf.finding_id
                            JOIN reviews r ON r.id=f.review_id LEFT JOIN issues i ON i.id=f.issue_id
+                           LEFT JOIN reviewer_runs ru ON ru.id=f.reviewer_run_id
                            WHERE {where} ORDER BY sf.step_id, f.id""", args):
         out.setdefault(c.pop("step_id"), []).append(c)
     return out
@@ -2802,7 +2815,8 @@ def route(root, db, con, path, qs, body, whole=False):
     dev/tests/test_routes.py ROUTE_KEYS pins every key of every answer.
 
       GET  overview                 project, queue_count, answered_count, labels {domains, themes, enums}
-      GET  home                     open_by_severity, reviews (latest 5), plans, discoveries
+      GET  home                     open_by_severity, reviews (latest 5), plans, discoveries, published_page,
+                                    answers_imported_at
       GET  checks                   checks [label, n, action, recipe, link], recurring
       GET  decisions                decisions, open ones first
       GET  gates                    ?status=pending (default): gates, other; ?status=all or one status with
@@ -3514,6 +3528,49 @@ def _answer_items(doc):
     return out
 
 
+def published_page(con):
+    """The latest published copy of the hub this ledger records (an add-artifact progress-page with a URL), as
+    {"url", "plan_id"}, or None."""
+    try:
+        return one(con, """SELECT url, plan_id FROM artifacts WHERE kind = 'progress-page' AND url IS NOT NULL
+                           ORDER BY created_at DESC, id DESC LIMIT 1""")
+    except sqlite3.Error:
+        return None
+
+
+def last_answers_import(con):
+    """When import-answers last ran on this ledger (its answers-imported event), or None."""
+    try:
+        return con.execute("SELECT max(at) FROM events WHERE event = 'answers-imported'").fetchone()[0]
+    except sqlite3.Error:
+        return None
+
+
+def import_reminder(con):
+    """The line gates, check and progress-page print while a published page may hold answers not yet imported, or
+    None when the review records no published page."""
+    page = published_page(con)
+    if not page:
+        return None
+    last = last_answers_import(con)
+    return (f"note: the owner may have answered on the published page {page['url']} (answers last imported: "
+            f"{last or 'never'}). Export its answer store and run: python3 .code-review/ledger.py import-answers FILE")
+
+
+def record_answers_import(con, source, recorded, skipped, refused):
+    """One answers-imported event per import-answers run, on the plan of the published page (else the latest
+    plan); a ledger with no plan keeps no record of it."""
+    page = published_page(con)
+    plan = (page or {}).get("plan_id") or (con.execute("SELECT max(id) FROM plans").fetchone() or [None])[0]
+    if plan is None:
+        return
+    name = "standard input" if source == "-" else Path(source).name
+    con.execute("""INSERT INTO events(entity_type, entity_id, event, to_value, note)
+                   VALUES ('plan', ?, 'answers-imported', ?, ?)""",
+                (plan, f"{recorded} recorded, {skipped} already answered, {refused} refused", f"from {name}"))
+    con.commit()
+
+
 def import_answers(db, source):
     """`ledger.py import-answers FILE`: record the owner's answers given in the hub (the answers.json it downloads,
     or the documents of a published page's answer store) into the ledger. Each goes through answer_gate(), the one set
@@ -3543,6 +3600,7 @@ def import_answers(db, source):
                 continue
             print(f"{code}: recorded")
             recorded += 1
+        record_answers_import(con, source, recorded, skipped, refused)
     finally:
         con.close()
     print(f"import-answers: {recorded} recorded, {skipped} already answered, {refused} refused")
@@ -3965,6 +4023,7 @@ def tool_command(a, root, db):
         if a.plan and not one(con, "SELECT 1 x FROM plans WHERE code=?", (a.plan,)):
             print(f"progress-page: no plan {a.plan}", file=sys.stderr)
             return 1
+        reminder = import_reminder(con)
     finally:
         con.close()
     try:
@@ -3975,6 +4034,8 @@ def tool_command(a, root, db):
     out = Path(a.out) if a.out else db.parent / "hub.html"
     write_atomic(out, page.encode("utf-8"))
     print(f"wrote {out} ({len(page.encode('utf-8')) / 1e6:.2f} MB, {n} views, no outside requests)")
+    if reminder:
+        print(reminder)
     return 0
 
 
@@ -12475,7 +12536,7 @@ def _main():
     s.add_argument("--no-open", action="store_true", help="print the address without opening a browser")
     s = sub.add_parser("check", help="the ledger's integrity and must-be-empty checks; exit 1 when one fails")
     s.add_argument("--full", action="store_true",
-                   help="run the full PRAGMA integrity_check instead of quick_check")
+                   help="run the full PRAGMA integrity_check instead of quick_check, and foreign_key_check")
     s.add_argument("--quiet", action="store_true", help="print only failures and warnings (no 'ok' or zero lines)")
     s = sub.add_parser("fill-refs", help="save each cited line range's excerpt, blob id and permalink from git")
     s.add_argument("review", nargs="?", help="only this review's references (R-0001; default: every review)")
@@ -12551,6 +12612,8 @@ def _main():
         try:
             bad = check(con, quiet=a.quiet, full=a.full)
             bad += check_git_refs(root, con, quiet=a.quiet)
+            if import_reminder(con):
+                print(import_reminder(con))
         except sqlite3.DatabaseError as e:  # a damaged file stops a later read: what was found is printed already
             print(f"check: stopped, the ledger file is damaged ({_one_line(e)})")
             sys.exit(1)
@@ -12579,6 +12642,8 @@ def _main():
                      f"excerpt)")
     elif a.cmd == "gates":
         print_gates(con)
+        if import_reminder(con):
+            print(import_reminder(con))
     elif a.cmd == "dump":
         dump(con, db)
 

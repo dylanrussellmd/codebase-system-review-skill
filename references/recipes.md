@@ -388,7 +388,7 @@ dump; compare the two, and ask the owner before replacing the ledger.
 
 #### `foreign_key_check`
 
-A row points at a row that is missing. Act as for `quick_check`.
+`check --full` runs it. A row points at a row that is missing. Act as for `quick_check`.
 
 #### `check_schema`
 
@@ -406,5 +406,5 @@ other and merge it in; then dump.
 
 `merge` prints codes it renumbered; text that mentions them (notes, tags) is not rewritten. Back up by running `dump`
 after each writing session, and copy `ledger.sqlite` before `migrate` or `merge` (both
-also keep their own backups). Expect about 9 MB of ledger and 7 MB of dump per 1,000 findings (measured at 10,000
-findings: 94 MB and 66 MB).
+also keep their own backups). Expect about 10 MB of ledger and 7 MB of dump per 1,000 findings (measured at 10,000
+findings: 95 MB and 66 MB, about 9.5 KB of ledger per finding).

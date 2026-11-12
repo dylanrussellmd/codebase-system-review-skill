@@ -127,7 +127,7 @@ class Shown(browser.ViewerTestCase):
         self.assertEqual(links["Open the plan document"], "https://example.com/plan-doc")
         self.assertEqual(links["Open the shared page"], "https://example.com/plan-page")
         self.assertEqual(links["R-0001"], "#/review/R-0001")
-        self.assertIn("last updated", page.text("#app p.lede"))
+        self.assertIn("Updated ", page.text("#app .progress .note"))   # the line under the bar (step 152)
         gate = page.page.locator(".card:has(h2:text('Questions about this plan')) tbody tr a")
         self.assertEqual(gate.get_attribute("href"), "#/inbox/GATE-0001")
         self.assertGreater(page.count("h2:text('History') + .timeline > div"), 0)

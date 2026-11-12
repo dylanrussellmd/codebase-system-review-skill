@@ -246,22 +246,19 @@ def build(proj, scale=1, reviews=5, files=300, reports=None, ledger_py=None, see
         fids = []
         for ri, (run_id, dom, act) in enumerate(runs):
             n_run = per_review // len(runs) + (1 if ri < per_review % len(runs) else 0)
-            t0 = time.perf_counter()
-            x("BEGIN")
+            # the rows are made first, so the time is the ledger's writes and not the generator's text and hashes
+            batch = []
             for j in range(n_run):
                 sev = rnd.choices("HMLT", (1, 3, 5, 2))[0]
                 th = rnd.choice(themes)
                 sub = f"sub-{rnd.randrange(2000 * S)}"
                 pid = f"{dom[:4].upper()}-{sev}{j + 1}-{run_id}"
-                x("""INSERT INTO findings(review_id,reviewer_run_id,point_id,severity,kind,domain_code,theme_code,sub,
-                     summary,detail,before_state,recommendation,recommended_test,evidence,where_report,fingerprint,
-                     verification,verified_by_actor_id,verification_note,created_at)
-                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                  (rid, run_id, pid, sev, (lambda k: "test" if sev == "T" else k)(rnd.choice(KINDS)), dom, th, sub, text(22), text(100), text(45), text(45),
-                   text(22), text(45), f"{rnd.randrange(900)}-{rnd.randrange(900, 1000)}", f"{dom}:{th}:{sub}",
-                   rnd.choices(["confirmed", "unverified", "partly", "false"], (6, 2, 1, 1))[0], mgr, text(12),
-                   _ts(day, 3600)))
-                fid = lastid()
+                row = (rid, run_id, pid, sev, (lambda k: "test" if sev == "T" else k)(rnd.choice(KINDS)), dom, th, sub,
+                       text(22), text(100), text(45), text(45), text(22), text(45),
+                       f"{rnd.randrange(900)}-{rnd.randrange(900, 1000)}", f"{dom}:{th}:{sub}",
+                       rnd.choices(["confirmed", "unverified", "partly", "false"], (6, 2, 1, 1))[0], mgr, text(12),
+                       _ts(day, 3600))
+                locs = []
                 for li in range(rnd.choice((1, 1, 2, 2, 3))):
                     p = rnd.choice(paths)
                     a_ = rnd.randrange(1, 385)
@@ -271,15 +268,28 @@ def build(proj, scale=1, reviews=5, files=300, reports=None, ledger_py=None, see
                     blob = hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
                     perma = (TEMPLATE.replace("{sha}", sha).replace("{path}", p).replace("{start}", str(a_))
                              .replace("{end}", str(b_)))
+                    locs.append((p, a_, b_, f"func_{paths.index(p)}_{a_ // 25}",
+                                 "primary" if li == 0 else rnd.choice(("also", "test", "doc")), ex,
+                                 hashlib.sha256(ex.encode()).hexdigest(), blob, perma))
+                goal = rnd.randrange(1, 9)
+                req = ((rnd.randrange(1, 13), rnd.choice(("matches", "differs", "partly", "missing")))
+                       if rnd.random() < 0.2 else None)
+                batch.append((row, locs, goal, req))
+            t0 = time.perf_counter()
+            x("BEGIN")
+            for row, locs, goal, req in batch:
+                x("""INSERT INTO findings(review_id,reviewer_run_id,point_id,severity,kind,domain_code,theme_code,sub,
+                     summary,detail,before_state,recommendation,recommended_test,evidence,where_report,fingerprint,
+                     verification,verified_by_actor_id,verification_note,created_at)
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", row)
+                fid = lastid()
+                for loc in locs:
                     x("""INSERT INTO finding_locations(finding_id,repository_id,path,line_start,line_end,symbol,role,
-                         excerpt,excerpt_sha256,blob_sha,permalink) VALUES (?,1,?,?,?,?,?,?,?,?,?)""",
-                      (fid, p, a_, b_, f"func_{paths.index(p)}_{a_ // 25}",
-                       "primary" if li == 0 else rnd.choice(("also", "test", "doc")), ex,
-                       hashlib.sha256(ex.encode()).hexdigest(), blob, perma))
-                x("INSERT INTO finding_goals(finding_id,goal_id) VALUES (?,?)", (fid, rnd.randrange(1, 9)))
-                if rnd.random() < 0.2:
+                         excerpt,excerpt_sha256,blob_sha,permalink) VALUES (?,1,?,?,?,?,?,?,?,?,?)""", (fid,) + loc)
+                x("INSERT INTO finding_goals(finding_id,goal_id) VALUES (?,?)", (fid, goal))
+                if req:
                     x("INSERT INTO finding_requirements(finding_id,requirement_id,verdict) VALUES (?,?,?)",
-                      (fid, rnd.randrange(1, 13), rnd.choice(("matches", "differs", "partly", "missing"))))
+                      (fid,) + req)
                 fids.append((fid, dom))
             x("INSERT INTO metrics(review_id,domain_code,name,scope,value,unit,method) "
               "VALUES (?,?,?,?,?,?,'measured')", (rid, dom, f"items_{dom}", "all", n_run, "count"))
@@ -304,20 +314,21 @@ def build(proj, scale=1, reviews=5, files=300, reports=None, ledger_py=None, see
         # matching: new issues, then matches to existing ones, in one transaction
         nnew = new_first if k == 0 else new_later
         rnd.shuffle(fids)
+        made = [(text(8), rnd.choice(themes), rnd.choice(KINDS), text(45), text(45), text(15)) for _ in fids[:nnew]]
         x("BEGIN")
         t0 = time.perf_counter()
         created = []
-        for (fid, dom) in fids[:nnew]:
+        for (fid, dom), (title, theme, kind, before, rec, why) in zip(fids[:nnew], made):
             code = f"ISS-{next_iss:04d}"   # canonical and sequential (schema 3)
             next_iss += 1
             sev = x("SELECT severity FROM findings WHERE id=?", (fid,)).fetchone()[0]
             x("""INSERT INTO issues(code,title,domain_code,theme_code,sub,kind,severity,fingerprint,before_state,
                  recommendation,first_seen_review_id,change_actor_id,opened_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-              (code, text(8), dom, rnd.choice(themes), f"s{next_iss}", rnd.choice(KINDS), sev, f"{dom}:x:{next_iss}",
-               text(45), text(45), rid, mgr, _ts(day, 7200)))
+              (code, title, dom, theme, f"s{next_iss}", kind, sev, f"{dom}:x:{next_iss}",
+               before, rec, rid, mgr, _ts(day, 7200)))
             iid = lastid()
             x("UPDATE findings SET issue_id=?, match_type='new', match_confidence='certain', match_rationale=? "
-              "WHERE id=?", (iid, text(15), fid))
+              "WHERE id=?", (iid, why, fid))
             created.append((iid, dom, "open"))
         T.add("match_new_issue", time.perf_counter() - t0, nnew)
         # schema 3: a review that recorded an issue fixed cannot also raise it, and 'regression' is only for an
@@ -325,11 +336,11 @@ def build(proj, scale=1, reviews=5, files=300, reports=None, ledger_py=None, see
         fixed_here = {r[0] for r in x("SELECT issue_id FROM review_issue_checks WHERE review_id=? AND outcome='fixed'",
                                       (rid,))}
         pool = [i for i in issues + created if i[0] not in fixed_here]
+        picks = [(rnd.choice(pool)[0],
+                  rnd.choices(["still-present", "changed", "recurrence", "regression", "continuation"],
+                              (6, 2, 1, 1, 1))[0], text(15)) for _ in fids[nnew:]]
         t0 = time.perf_counter()
-        for (fid, dom) in fids[nnew:]:
-            iid = rnd.choice(pool)[0]
-            mt = rnd.choices(["still-present", "changed", "recurrence", "regression", "continuation"],
-                             (6, 2, 1, 1, 1))[0]
+        for (fid, dom), (iid, mt, why) in zip(fids[nnew:], picks):
             st, first = x("SELECT status, first_seen_review_id FROM issues WHERE id=?", (iid,)).fetchone()
             if mt == "regression" and st not in ("fixed", "verified", "regressed"):
                 mt = "recurrence"
@@ -345,7 +356,7 @@ def build(proj, scale=1, reviews=5, files=300, reports=None, ledger_py=None, see
                                             "'accepted-risk','wont-fix','duplicate','obsolete')", (iid,)).fetchone():
                 mt = "still-present"
             x("UPDATE findings SET issue_id=?, match_type=?, match_confidence='likely', match_rationale=? WHERE id=?",
-              (iid, mt, text(15), fid))
+              (iid, mt, why, fid))
         T.add("match_existing_issue", time.perf_counter() - t0, len(fids) - nnew)
         x("COMMIT")
 

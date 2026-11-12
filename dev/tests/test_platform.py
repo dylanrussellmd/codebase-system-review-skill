@@ -237,7 +237,8 @@ class ForeignKeys(unittest.TestCase):
         self.assertIn(True, [s[0] for s in seen])
 
     def test_foreign_keys_on_every_connection(self):
-        """An agent connection that forgets the PRAGMA can insert an orphan; check reports it and exits non-zero."""
+        """An agent connection that forgets the PRAGMA can insert an orphan; check --full reports it and exits
+        non-zero (foreign_key_check runs only with --full, decision D-0016)."""
         L = fixtures.Ledger()
         self.addCleanup(L.close)
         L.commit()
@@ -250,7 +251,7 @@ class ForeignKeys(unittest.TestCase):
             raw.commit()
         finally:
             raw.close()
-        p = L.run("check")
+        p = L.run("check", "--full")
         self.assertNotEqual(p.returncode, 0, p.stdout)
         self.assertRegex(p.stdout, r"foreign_key_check: [12] broken references")
 

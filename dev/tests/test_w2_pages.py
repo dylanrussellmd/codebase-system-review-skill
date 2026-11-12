@@ -180,7 +180,7 @@ class Lists(Case):
         self.assertEqual(got["R-0003"]["came_back"], 1)
         # the counts can come from the index alone: it holds every findings column the view reads
         self.assertEqual([r[2] for r in self.L.con.execute("PRAGMA index_info(ix_findings_review_counts)")],
-                         ["review_id", "verification", "severity", "match_type"])
+                         ["review_id", "verification", "severity", "match_type", "issue_id"])
         if sqlite3.sqlite_version_info >= (3, 39):   # an older planner picks its own way on a ledger this small
             plan = " ".join(r[3] for r in self.L.con.execute("EXPLAIN QUERY PLAN SELECT * FROM v_review_totals"))
             self.assertIn("ix_findings_review_counts", plan)
