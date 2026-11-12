@@ -21,7 +21,8 @@ jobs:
         run: python3 dev/build.py --check
 
   tests:
-    runs-on: ubuntu-latest
+    # Pinned: setup-python has no Python 3.9 build for newer Ubuntu images, and 3.9 is the oldest supported version.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
