@@ -27,7 +27,7 @@ RECIPES = fixtures.REPO_ROOT / "references" / "recipes.md"
 PLACEHOLDERS = {
     "<owner name>": "Pat Owner",
     "<model id>": "model-x",
-    "<Claude Code or OpenCode>": "Claude Code",
+    "<harness name>": "Harness A",
     "<ref>": "session-1",
     "<name>": "app",
     "<path>": ".",

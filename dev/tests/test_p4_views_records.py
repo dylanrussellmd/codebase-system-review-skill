@@ -68,7 +68,7 @@ class ReviewAgents(unittest.TestCase):
             r1 = ids["reviews"]["R-0001"]
             mgr = ids["actors"]["manager"]
             for kind, role in (("indexer", "indexer for security.md"), ("matcher", "matcher")):
-                a = L.actor(kind, f"{kind} 1", model="claude-opus-5-5", harness="Claude Code", parent_actor_id=mgr)
+                a = L.actor(kind, f"{kind} 1", model="model-a", harness="Harness A", parent_actor_id=mgr)
                 L.insert("review_actors", review_id=r1, actor_id=a, role_label=role)
             L.commit()
             d = route(L, "/api/review/R-0001")
@@ -76,7 +76,7 @@ class ReviewAgents(unittest.TestCase):
         self.assertEqual([k for k, _, _ in agents], ["manager", "reviewer", "reviewer", "indexer", "matcher"], agents)
         self.assertTrue(all(m for _, _, m in agents), agents)
         self.assertEqual({a["parent"] for a in d["agents"] if a["kind"] != "manager"}, {"Review manager"})
-        self.assertIn(("indexer", "indexer for security.md", "claude-opus-5-5"), agents)
+        self.assertIn(("indexer", "indexer for security.md", "model-a"), agents)
 
 
 class Catalogs(unittest.TestCase):

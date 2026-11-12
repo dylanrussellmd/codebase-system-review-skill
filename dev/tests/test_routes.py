@@ -257,7 +257,7 @@ class Reviews(RouteCase):
         d = self.ok("/api/review/R-0002")
         self.assertEqual(set(d), {"review", "repos", "goals", "domains", "runs", "checks", "check_counts", "summary",
                                   "metrics", "artifacts", "gates", "findings", "agents", "requirements",
-                                  "interview", "review_goals", "test_runs", "relations", "events"})
+                                  "interview", "review_goals", "test_runs", "relations", "relation_total", "events"})
         r = d["review"]
         self.assertEqual((r["code"], r["previous_code"], r["manager"], r["approved_by"]),
                          ("R-0002", "R-0001", "Review manager", fixtures.DEMO_OWNER))
@@ -598,8 +598,9 @@ CONTRACT = {
     "review": ("GET", "/api/review/R-0001", None, 200, dict,
                {"review", "repos", "goals", "domains", "runs", "checks", "check_counts", "summary", "metrics",
                 "artifacts", "gates", "findings", "agents", "requirements", "interview", "review_goals",
-                "test_runs", "relations", "events"}),
+                "test_runs", "relations", "relation_total", "events"}),
     "review-checks": ("GET", "/api/review/R-0001/checks", None, 200, dict, {"rows", "total", "limit", "offset"}),
+    "review-relations": ("GET", "/api/review/R-0001/relations", None, 200, dict, {"rows", "total", "limit", "offset"}),
     "review-search": ("GET", "/api/review/R-0001?q=auth", None, 200, dict, {"match"}),
     "finding": ("GET", "/api/finding/{finding}", None, 200, dict, None),
     "step": ("GET", "/api/step/P-0001/2", None, 200, dict,
@@ -800,6 +801,7 @@ ROUTE_KEYS = {
         "repos[name remote_url default_branch notes commit_sha branch commit_subject tag_name tag_pushed "
         "is_dirty dirty_note] goals[code text] test_runs[command purpose passed failed skipped errored "
         "duration_ms notes started_at] relations[from_issue relation to_issue to_title confidence rationale] "
+        "relation_total "
         "events[at event from_value to_value note actor] domains[name decision reason owner_change "
         "reviewers_planned] runs[id domain_code label scope report_path status items_reviewed high_count "
         "medium_count low_count test_count started_at finished_at actor model harness session] checks[outcome "
@@ -813,6 +815,8 @@ ROUTE_KEYS = {
         "severity domain_code summary match_type verification issue_code]",
     "review/*/checks":
         "rows[outcome evidence issue_code title status] total limit offset",
+    "review/*/relations":
+        "rows[from_issue relation to_issue to_title confidence rationale] total limit offset",
     "finding/*":
         "id point_id match_type match_confidence match_rationale severity kind domain_code theme_code summary "
         "detail before_state recommendation recommended_test evidence where_report verification "

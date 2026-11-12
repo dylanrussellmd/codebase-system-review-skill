@@ -156,7 +156,7 @@ CREATE TABLE actors (
                      'matcher','drafter','fixer','tool')),
   name            TEXT NOT NULL,         -- person's name, or the agent's role label ("security reviewer")
   model           TEXT,                  -- model id for agents
-  harness         TEXT,                  -- e.g. Claude Code, CI
+  harness         TEXT,                  -- e.g. OpenCode, CI
   session_ref     TEXT,                  -- session id or URL
   parent_actor_id INTEGER REFERENCES actors(id),   -- subagent -> the agent that launched it
   created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))

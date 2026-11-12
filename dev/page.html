@@ -157,7 +157,7 @@ function takeToken(){
   if (m) {
     TOKEN = m[1];
     try { sessionStorage.setItem("ledger-token", TOKEN); } catch {}
-    history.replaceState(null, "", location.pathname + location.search + (m[2] || "#/"));
+    try { history.replaceState(null, "", location.pathname.replace(/^\/+/, "/") + location.search + (m[2] || "#/")); } catch {}
   } else if (!TOKEN) {
     try { TOKEN = sessionStorage.getItem("ledger-token") || ""; } catch {}
   }
@@ -168,8 +168,8 @@ let LABELS = {domains:{}, themes:{}}, OVERVIEW = null;
 // ---------- the shared copy
 // `ledger.py progress-page` writes this page as one file with every API answer embedded (window.LEDGER_SNAPSHOT).
 // STATIC is that data; in the viewer it is null. With it the page answers api() from the data, routes on hash names
-// an artifact allows (#issue-ISS-0019), shows the How it works tab, and saves gate answers in the artifact's
-// database (collection "answers", one document per gate code) for `ledger.py import-answers`.
+// a published page allows (#issue-ISS-0019), shows the How it works tab, and keeps the owner's gate answers for
+// `ledger.py import-answers` (see ANSWER_STORES).
 const STATIC = (s => s && typeof s === "object" && s.responses ? s : null)(window.LEDGER_SNAPSHOT);
 let CUR_PATH = null;
 const ACTIVE = STATIC ? STATIC.active : [];
@@ -213,7 +213,7 @@ function staticApi(path, body){
     if (at > 0) qs.set("offset", at - at % 200);
     return paged(all, "gates");
   }
-  if (/^review\/[^/]+\/checks$/.test(p) && S[p]) return paged(S[p].rows, "rows");
+  if (/^review\/[^/]+\/(checks|relations)$/.test(p) && S[p]) return paged(S[p].rows, "rows");
   if (p.startsWith("review/") && qs.get("q") && S[p]) {   // the search of a review's points, over each point in full
     const t = qs.get("q").toLowerCase();
     return Promise.resolve({match: S[p].findings.filter(f => JSON.stringify(S["finding/" + f.id] || f).toLowerCase().includes(t)).map(f => f.id)});
@@ -227,21 +227,48 @@ function staticApi(path, body){
   return Promise.resolve(copy(S[p]));
 }
 
-const HUB = {db: null, answers: {}, error: null};
+// Where the shared copy keeps the owner's answers. Each entry of ANSWER_STORES is one optional store, offered by the
+// place the page is published; it returns {watch(onChange), save(code, answer)} or null. When none is there the
+// answers stay in this browser (localStore) and download as answers.json. Either way the agent records them with
+// `ledger.py import-answers`, which reads both shapes.
+const ANSWER_STORES = [
+  async () => {   // an artifact page with a database: collection "answers", one document per gate code
+    const host = window.claude; if (!host || typeof host.use !== "function") return null;
+    const db = await host.use("db"); if (!db) return null;
+    return {watch: (ok, bad) => db.collection("answers").onSnapshot(snap => ok(Object.fromEntries(snap.docs.map(d => [d.id, d.data()]))), bad),
+            save: (code, a) => db.doc("answers/" + code).set(a)};
+  },
+];
+const LOCAL_ANSWERS = () => "ledger-answers:" + ((STATIC && STATIC.responses.overview && STATIC.responses.overview.project) || "");
+const localStore = {local: true, kept: {},
+  read(){ try { return JSON.parse(localStorage.getItem(LOCAL_ANSWERS()) || "{}") || {}; } catch { return this.kept; } },
+  watch(ok){ ok(this.read()); },
+  async save(code, a){ const all = {...this.read(), [code]: a}; this.kept = all; try { localStorage.setItem(LOCAL_ANSWERS(), JSON.stringify(all)); } catch {} }};
+const HUB = {store: null, answers: {}, error: null};
 const OPEN_GATES = () => STATIC ? (STATIC.responses["gates?status=pending"].gates || []).filter(g => g.status === "open").map(g => g.code) : [];
 const hubAnsweredOpen = () => OPEN_GATES().filter(c => HUB.answers[c]).length;
 async function hubInit(){
-  if (!STATIC || !window.claude || typeof window.claude.use !== "function") return;
+  if (!STATIC) return;
+  let store = null;
+  for (const make of ANSWER_STORES) { try { store = await make(); } catch (e) { HUB.error = String(e); } if (store) break; }
+  HUB.store = store || localStore;
   try {
-    const db = await window.claude.use("db"); if (!db) return;
-    HUB.db = db;
-    db.collection("answers").onSnapshot(snap => {
-      HUB.answers = Object.fromEntries(snap.docs.map(d => [d.id, d.data()]));
+    HUB.store.watch(got => {
+      HUB.answers = got || {};
       const cur = document.querySelector('#tabs a[aria-current="page"]');
       if (OVERVIEW) drawTabs(cur ? (cur.dataset.k || "") : "");
     }, e => { HUB.error = e && e.code; });
   } catch (e) { HUB.error = String(e); }
 }
+// The answers kept in this browser as a file for the agent (import-answers takes this list as it is).
+function answersFile(){
+  const list = Object.entries(HUB.answers).map(([gate, a]) => ({gate, answer_value: a.answer_value ?? null, answer_text: a.answer_text ?? null, answered_at: a.answered_at || null}));
+  const href = URL.createObjectURL(new Blob([JSON.stringify(list, null, 1)], {type: "application/json"}));
+  return h("a", {href, download: "answers.json"}, "Download your answers");
+}
+const HANDOVER = () => HUB.store && HUB.store.local
+  ? [" ", answersFile(), " and give the file to the agent, or tell it your answer in the chat."]
+  : [" The agent records it the next time it checks (or tell it in the chat to check now)."];
 function md(text){
   const lines = String(text || "").split("\n"), out = []; let i = 0;
   const inline = str => { const parts = []; const re = /(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\(https?:\/\/[^)\s]+\))/g; let last = 0, m;
@@ -269,11 +296,10 @@ function md(text){
 function hubGateBody(card, g, hid){
   const saved = HUB.answers[g.code];
   if (saved) {
-    add(card, h("p", {class: "callout answer"}, "You answered: ", answerText({options: g.options, ...saved}, true),
-      ". The agent records it the next time it checks (or tell it in the chat to check now)."));
+    add(card, h("p", {class: "callout answer"}, "You answered: ", answerText({options: g.options, ...saved}, true), ".", HANDOVER()));
     return card;
   }
-  if (!HUB.db) { add(card, h("p", {class: "note"}, "Answer in the chat with the agent; answering here needs you signed in as this page's owner.")); return card; }
+  if (!HUB.store) { add(card, h("p", {class: "note"}, "Answer in the chat with the agent.")); return card; }
   const {name: nm, opts, ta} = gateInputs(g, hid);
   const msg = h("div"), form = h("div", {class: "gate"});
   const send = h("button", {class: "btn", type: "button", id: hid + "-send", "aria-labelledby": `${hid}-send ${hid}`, onclick: async () => {
@@ -281,9 +307,10 @@ function hubGateBody(card, g, hid){
     if (!val && !txt) { put(msg, errorBox("Choose an option or write an answer.")); return; }
     send.disabled = true;
     try {
-      await HUB.db.doc("answers/" + g.code).set({gate: g.code, answer_value: val, answer_text: txt || null, answered_at: new Date().toISOString()});
-      HUB.answers[g.code] = {answer_value: val, answer_text: txt || null};
-      put(form, h("p", {class: "status"}, "Saved. The agent records it the next time it checks (or tell it in the chat to check now)."));
+      const a = {gate: g.code, answer_value: val, answer_text: txt || null, answered_at: new Date().toISOString()};
+      await HUB.store.save(g.code, a);
+      HUB.answers[g.code] = a;
+      put(form, h("p", {class: "status"}, HUB.store.local ? "Saved in this browser." : "Saved.", HANDOVER()));
       say("Answer saved.");
       drawTabs("inbox");
     } catch (e) { put(msg, errorBox("Your answer could not be saved here" + (e && e.code === "invalid_argument" ? ": only this page's owner can answer." : ". Try again, or answer in the chat."))); send.disabled = false; }
@@ -878,9 +905,7 @@ VIEWS.review = async ([code], params) => {
              {label:"Skipped", key:"skipped", num:1}, {label:"Errors", key:"errored", num:1}, {label:"Took", get:t => t.duration_ms == null ? "" : (t.duration_ms / 1000).toFixed(1) + " s", num:1},
              {label:"When", get:t => whenCell(t.started_at)}, {label:"Note", key:"notes"}], d.test_runs)] : null,
     d.artifacts.length ? [sect("Files and documents"), filesTable(d.artifacts)] : null,
-    d.relations.length ? [sect("Links between issues made in this review"),
-      table([{label:"Issue", key:"from_issue", link:true}, {label:"Link", get:x => lab("rel", x.relation)}, {label:"To", get:x => h("a", {href:"#/issue/" + x.to_issue}, x.to_issue)}, {label:"Title", key:"to_title"},
-             {label:"How sure", get:x => lab("conf", x.confidence)}, {label:"Why", key:"rationale"}], d.relations, x => "#/issue/" + x.from_issue)] : null,
+    d.relations.length ? [sect("Links between issues made in this review"), reviewLinks(code, d)] : null,
     d.agents.length ? [sect("Agents"),
       table([{label:"Agent", key:"name"}, {label:"Did", key:"role"}, {label:"Kind", get:x => lab("actorKind", x.kind)},
              {label:"Model", key:"model"}, {label:"Run in", key:"harness"}, {label:"Started by", key:"parent"}], d.agents)] : null,
@@ -924,6 +949,20 @@ function filesTable(files){
   return table([{label:"What", get:a => lab("artifact", a.kind)}, {label:"For", key:"run"},
     {label:"Where", get:a => [a.url ? extLink(a.url, a.kind === "report" ? "Open report" : "Open") : null, a.url && a.path ? " " : null, a.path ? h("code", null, a.path) : null]},
     {label:"Recorded", get:a => whenCell(a.created_at)}], files);
+}
+// The links between issues a review made: the first rows, and the rest on request.
+function reviewLinks(code, d){
+  const total = d.relation_total == null ? d.relations.length : d.relation_total, have = d.relations.slice(), box = h("div", {class:"stack"});
+  const draw = () => put(box,
+    table([{label:"Issue", key:"from_issue", link:true}, {label:"Link", get:x => lab("rel", x.relation)}, {label:"To", get:x => h("a", {href:"#/issue/" + x.to_issue}, x.to_issue)}, {label:"Title", key:"to_title"},
+           {label:"How sure", get:x => lab("conf", x.confidence)}, {label:"Why", key:"rationale"}], have, x => "#/issue/" + x.from_issue),
+    have.length < total ? h("button", {class:"btn ghost", type:"button", onclick:async e => {
+      e.target.disabled = true;
+      try { const more = await api(`review/${encodeURIComponent(code)}/relations?limit=500&offset=${have.length}`); have.push(...more.rows); draw(); box.querySelector("button, a").focus(); }
+      catch (err) { add(box, errorBox(err)); e.target.disabled = false; }
+    }}, `Show more (${(total - have.length).toLocaleString()} left)`) : null);
+  draw();
+  return box;
 }
 // The earlier issues a review looked for: how many it found in each state, the first rows, and the rest on request.
 function earlierIssues(code, d){

@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 # The review ledger of this repository stays local (decision D-0001).
 .code-review/
+# Release bundles from dev/release.py.
+dist/

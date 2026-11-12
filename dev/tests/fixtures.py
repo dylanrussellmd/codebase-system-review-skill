@@ -756,9 +756,9 @@ def seed_demo(ledger):
     ids["repository"] = L.repository("demo", ".", permalink_template=
                                      "https://github.com/example/demo/blob/{sha}/{path}#L{start}-L{end}")
     owner = L.actor("owner", DEMO_OWNER)
-    manager = L.actor("manager", "Review manager", model="claude-opus-5-5", harness="Claude Code")
-    sec = L.actor("reviewer", "security reviewer", model="claude-opus-5-5", parent_actor_id=manager)
-    spec = L.actor("reviewer", "spec reviewer", model="claude-opus-5-5", parent_actor_id=manager)
+    manager = L.actor("manager", "Review manager", model="model-a", harness="Harness A")
+    sec = L.actor("reviewer", "security reviewer", model="model-a", parent_actor_id=manager)
+    spec = L.actor("reviewer", "spec reviewer", model="model-a", parent_actor_id=manager)
     ids["actors"] = {"owner": owner, "manager": manager, "security": sec, "spec": spec}
     g1 = L.design_goal("G-01", "Every rule and behavior is a setting.", source="owner")
     g2 = L.design_goal("G-02", "No internal names on screen.", source="owner")

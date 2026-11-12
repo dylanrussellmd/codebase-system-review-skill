@@ -152,9 +152,9 @@ class RunWritesTest(unittest.TestCase):
                           "sha256": hashlib.sha256(b"# Spec\n").hexdigest(), "reviewer_run_id": 1, "review_id": 1})
         L.plan("P-0001", reviews=(1,))
         L.commit()
-        ok(L, "add-artifact", "progress-page", "--plan", "P-0001", "--url", "https://claude.ai/artifacts/example",
+        ok(L, "add-artifact", "progress-page", "--plan", "P-0001", "--url", "https://pages.example.com/hub",
            "--path", L.dir / "hub.html")
-        self.assertEqual(L.scalar("SELECT page_url FROM plans"), "https://claude.ai/artifacts/example")
+        self.assertEqual(L.scalar("SELECT page_url FROM plans"), "https://pages.example.com/hub")
 
     def test_set_verdict(self):
         repo, L, sha = project(self)

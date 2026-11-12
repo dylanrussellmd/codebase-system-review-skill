@@ -1751,7 +1751,8 @@ ROUTE_SECONDS = 3  # a viewer page read that runs longer is stopped (the SQL box
 CHECKS_SECONDS = 15  # the ledger's own checks read every table: they get longer
 TRENDS_SECONDS = 10  # so does the page of numbers over time (its answer is then kept until the ledger changes)
 ANSWER_BUSY_MS = 3000  # how long a gate answer waits for another writer before it reports the ledger busy
-TOO_LONG = "The query took too long (over {} s); add a LIMIT or a WHERE."
+TOO_LONG = "The query took too long (over {} s); add a LIMIT or a WHERE."  # the SQL box's own advice
+PAGE_TOO_LONG = "This page took too long to load; try a narrower filter."
 
 
 def with_deadline(con, seconds):
@@ -1832,7 +1833,7 @@ def api(root, db, path, qs, body):
         return route(root, db, con, path, qs, body)
     except sqlite3.OperationalError as e:
         if "interrupted" in str(e) and timed_out():
-            return error(400, TOO_LONG.format(seconds))
+            return error(400, PAGE_TOO_LONG)
         raise
     finally:
         _serving.on = False
@@ -2135,6 +2136,7 @@ def like_arg(text):
 
 LIKE_ESCAPED = "LIKE ? ESCAPE '\\'"
 REVIEW_CHECKS = 50  # earlier issues listed with a review; the rest come from review/<code>/checks
+REVIEW_RELATIONS = 200  # links between issues listed with a review; the rest come from review/<code>/relations
 
 
 def without(found, *keys):
@@ -2160,7 +2162,8 @@ def shown_goals(con, review=None):
 def get_review(rq):
     """A review's page: the review, what it covered, who ran, and its points as list rows (enough for the row, the
     filters and the search of ids and summaries; a point's detail and code references are /api/finding/<id>).
-    The earlier issues it looked for come as counts by outcome and the first REVIEW_CHECKS rows. With ?q=text the
+    The earlier issues it looked for come as counts by outcome and the first REVIEW_CHECKS rows, the links between
+    issues it made as the first REVIEW_RELATIONS rows and their total. With ?q=text the
     answer is only {"match": [finding ids]}: the points whose text or cited paths contain it."""
     con, code = rq.con, rq.args[0]
     r = one(con, """SELECT r.id, r.code, r.title, r.scope, r.status, r.request_text, r.approved_at, r.skill_version,
@@ -2195,10 +2198,9 @@ def get_review(rq):
         "test_runs": rows(con, """SELECT t.command, t.purpose, t.passed, t.failed, t.skipped, t.errored,
                               t.duration_ms, t.notes, t.started_at
                               FROM test_runs t WHERE t.review_id=? ORDER BY t.started_at, t.id""", (rid,)),
-        "relations": rows(con, """SELECT a.code from_issue, x.relation, b.code to_issue, b.title to_title,
-                              x.confidence, x.rationale FROM issue_relations x JOIN issues a ON a.id=x.from_issue_id
-                              JOIN issues b ON b.id=x.to_issue_id WHERE x.established_in_review_id=?
-                              ORDER BY a.code, b.code""", (rid,)),
+        "relations": review_relations(con, rid, REVIEW_RELATIONS, 0),
+        "relation_total": one(con, "SELECT count(*) n FROM issue_relations WHERE established_in_review_id=?",
+                              (rid,))["n"],
         "events": entity_events(con, "review", rid),
         "domains": rows(con, """SELECT d.name, rd.decision, rd.reason, rd.owner_change, rd.reviewers_planned
                                 FROM review_domains rd JOIN domains d ON d.code=rd.domain_code
@@ -2253,6 +2255,25 @@ def review_checks(con, review_id, limit, offset):
     return rows(con, """SELECT c.outcome, c.evidence, i.code issue_code, i.title, i.status
                         FROM review_issue_checks c JOIN issues i ON i.id=c.issue_id WHERE c.review_id=?
                         ORDER BY c.outcome, i.code LIMIT ? OFFSET ?""", (review_id, limit, offset))
+
+
+def review_relations(con, review_id, limit, offset):
+    """One page of the links between issues a review made, ordered by the two issues' codes."""
+    return rows(con, """SELECT a.code from_issue, x.relation, b.code to_issue, b.title to_title,
+                        x.confidence, x.rationale FROM issue_relations x JOIN issues a ON a.id=x.from_issue_id
+                        JOIN issues b ON b.id=x.to_issue_id WHERE x.established_in_review_id=?
+                        ORDER BY a.code, b.code, x.relation LIMIT ? OFFSET ?""", (review_id, limit, offset))
+
+
+def get_review_relations(rq):
+    """Every link between issues a review made, a page at a time (?limit=, ?offset=) with the total."""
+    r = one(rq.con, "SELECT id FROM reviews WHERE code=?", (rq.args[0],))
+    if not r:
+        return error(404, "no such review")
+    limit, offset = rq.page()
+    found = review_relations(rq.con, r["id"], limit, offset)
+    total = one(rq.con, "SELECT count(*) n FROM issue_relations WHERE established_in_review_id=?", (r["id"],))["n"]
+    return {"rows": found, "total": total, "limit": len(found) if rq.whole else limit, "offset": offset}
 
 
 def get_review_checks(rq):
@@ -2684,6 +2705,8 @@ ROUTES = (
     Route("GET", "review/*", get_review, _hub_each("review", "SELECT code FROM reviews ORDER BY code")),
     Route("GET", "review/*/checks", get_review_checks,
           lambda con: [f"review/{r[0]}/checks" for r in con.execute("SELECT code FROM reviews ORDER BY code")]),
+    Route("GET", "review/*/relations", get_review_relations,
+          lambda con: [f"review/{r[0]}/relations" for r in con.execute("SELECT code FROM reviews ORDER BY code")]),
     Route("GET", "finding/*", get_finding, _hub_each("finding", "SELECT id FROM findings ORDER BY id")),
     Route("GET", "issues", get_issues, _hub("issues")),
     Route("GET", "issue/*", get_issue, _hub_each("issue", "SELECT code FROM issues ORDER BY code")),
@@ -2755,6 +2778,7 @@ def route(root, db, con, path, qs, body, whole=False):
       GET  reviews                  a list, newest first
       GET  review/<code>            the review's page; ?q=text gives only {"match": [finding ids]}
       GET  review/<code>/checks     ?limit ?offset: rows, total, limit, offset
+      GET  review/<code>/relations  ?limit ?offset: rows, total, limit, offset
       GET  finding/<id>             one point in full, with its code references
       GET  issues                   ?status ?severity ?domain_code ?q ?limit ?offset: rows, total, limit, offset
       GET  issue/<code>             the issue's page
@@ -2888,10 +2912,16 @@ def log_line(text):
     sys.stderr.flush()
 
 
+def request_url(raw):
+    """A request's address parsed, with any run of slashes at its start taken as one: // is the page and //api/x is
+    /api/x (urlparse would read the first segment as a host name)."""
+    return urlparse("/" + raw.lstrip("/") if raw.startswith("//") else raw)
+
+
 def logged_path(raw):
     """A request's path as the log shows it: the path, then the names of its query parameters without their values
     (a search text or a code stays out of the terminal's scrollback)."""
-    u = urlparse(raw)
+    u = request_url(raw)
     names = sorted(parse_qs(u.query, keep_blank_values=True))
     return u.path[:200] + ("?" + "&".join(names) if names else "")
 
@@ -2976,7 +3006,7 @@ def make_server(root, db, port=0, ipv6=False):
             """Any method but GET and POST: 405 naming the methods the address takes, 404 for an unknown address."""
             if not self.host_ok():
                 return
-            allowed = allowed_methods(urlparse(self.path).path)
+            allowed = allowed_methods(request_url(self.path).path)
             if not allowed:
                 return self.send(404, {"error": "not found"})
             res = wrong_method(self.command, allowed)
@@ -2991,7 +3021,7 @@ def make_server(root, db, port=0, ipv6=False):
             as if it were the viewer."""
             if self.headers.get("Host") in hosts:
                 return True
-            if self.command == "GET" and urlparse(self.path).path == "/":
+            if self.command == "GET" and request_url(self.path).path == "/":
                 self.send(403, (WRONG_HOST_PAGE % " or ".join(f"http://{a}/" for a in addresses)).encode("utf-8"),
                           "text/html; charset=utf-8")
             else:
@@ -3032,7 +3062,7 @@ def make_server(root, db, port=0, ipv6=False):
             anything else is 404."""
             if not self.host_ok():
                 return
-            u = urlparse(self.path)
+            u = request_url(self.path)
             if u.path == "/":
                 self.send(200, page, "text/html; charset=utf-8")
             elif u.path.startswith("/api/"):
@@ -3047,7 +3077,7 @@ def make_server(root, db, port=0, ipv6=False):
             browser asking first), at most MAX_BODY bytes, complete, and a JSON object."""
             if not self.host_ok():
                 return
-            u = urlparse(self.path)  # the guard below and the dispatch use this one parsed path
+            u = request_url(self.path)  # the guard below and the dispatch use this one parsed path
             if u.path == "/":
                 return self.refuse_method()
             if not u.path.startswith("/api/"):
@@ -3296,15 +3326,15 @@ def progress_md(con, plan_code):
 
 # The published hub: the viewer page (PAGE, the same page.html `serve` sends) made into one self-contained file.
 # Every API response the page can ask for is computed with route() and embedded as JSON; the page answers from that
-# data, routes on artifact-safe hash names (#issue-ISS-0019), shows a How it works guide, and, when it is published as
-# a Claude artifact with a db capability, saves the owner's gate answers in that artifact's database (collection
-# "answers", one document per gate code). The agent exports those answers and runs `ledger.py import-answers`.
+# data, routes on hash names a published page allows (#issue-ISS-0019), shows a How it works guide, and takes the
+# owner's gate answers: into an answer store when the place it is published offers one (page.html ANSWER_STORES),
+# else into the browser, downloaded as answers.json. The agent records either with `ledger.py import-answers`.
 # Nothing in the page makes an outside request; publishing it is the agent's job, outside this tool.
 HUB_GUIDE_MD = """## What this site is
 
 This is the review ledger for this project, shown as a website. Every review, every point it raised, the issues those points describe, the fix plan, and every question waiting on you live here. It always shows the ledger as it is now; a shared copy of it shows the date it was made at the top.
 
-You can answer every question here, under **Waiting on you**. The agent picks your answer up the next time it checks, or right away if you tell it in the chat.
+You can answer every question here, under **Waiting on you**. The agent picks your answer up the next time it checks, or right away if you tell it in the chat. Where this copy keeps answers only in your browser, it offers them as a file to download: give that file to the agent.
 
 ## How a review runs
 
@@ -3448,8 +3478,8 @@ def _answer_items(doc):
 
 
 def import_answers(db, source):
-    """`ledger.py import-answers FILE`: record the owner's answers given in the published hub (exported from its
-    artifact database, collection answers/<gate code>) into the ledger. Each goes through answer_gate(), the one set
+    """`ledger.py import-answers FILE`: record the owner's answers given in the hub (the answers.json it downloads,
+    or the documents of a published page's answer store) into the ledger. Each goes through answer_gate(), the one set
     of answer rules the viewer and answer-gate use, so it is checked against the gate's options and recorded
     answered_via='viewer' by the owner. A gate that is no longer open is left as it is and said so. The time the
     owner answered in the hub is not kept: the gate records when it was imported. Returns 1 when any answer was
@@ -3838,16 +3868,18 @@ def add_tool_parsers(sub):
     s = sub.add_parser("progress-page", help="write the hub: the viewer as one self-contained HTML page",
                        description="Write the whole viewer (every review, issue, plan, question and table) as one "
                                    "HTML file that makes no outside request: the page `serve` shows, with the data "
-                                   "embedded. Published as a Claude artifact with a database, it also takes the "
-                                   "owner's answers to open questions (collection answers/<gate code>); export them "
-                                   "and run import-answers. Give a plan to open the page on it. Default file: "
+                                   "embedded. It also takes the owner's answers to open questions: the owner "
+                                   "downloads them as answers.json (or, where the page is published with an answer "
+                                   "store, you export that) and you run import-answers. Give a plan to open the page "
+                                   "on it. Default file: "
                                    "hub.html beside the ledger.")
     s.add_argument("plan", nargs="?"); s.add_argument("-o", "--out", help="file to write (default: hub.html beside "
                                                                          "the ledger)")
-    s = sub.add_parser("import-answers", help="record gate answers exported from the published hub",
-                       description="Read answers given in the published hub (a JSON list of {gate, answer_value, "
-                                   "answer_text, answered_at}, or the hub's database documents) and record each in "
-                                   "its gate as the viewer does (answered_via 'viewer'). A gate no longer open is "
+    s = sub.add_parser("import-answers", help="record gate answers given in the hub",
+                       description="Read answers given in the hub (the answers.json it downloads: a JSON list of "
+                                   "{gate, answer_value, answer_text, answered_at}; or an answer store's documents) "
+                                   "and record each in its gate as the viewer does (answered_via 'viewer'). A gate "
+                                   "no longer open is "
                                    "left as it is. FILE - reads standard input.")
     s.add_argument("file")
     s = sub.add_parser("restore", help="rebuild a ledger from a dump into a new file, then check it",

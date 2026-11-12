@@ -175,7 +175,7 @@ class Commands(unittest.TestCase):
                                         f"{f.name}:{no}: {line}")
 
     def test_no_harness_command_blocks(self):
-        """Claude Code runs !`cmd` spans and ```! fences of SKILL.md when it loads the skill: none may exist."""
+        """Some harnesses run !`cmd` spans and ```! fences of SKILL.md when they load the skill: none may exist."""
         for f in doc_files():
             with self.subTest(file=f.name):
                 self.assertNotRegex(f.read_text(encoding="utf-8"), r"!`|^\s*```!")
@@ -502,7 +502,7 @@ class OwnerRules(unittest.TestCase):
         self.assertNotRegex(text, r"(?i)living document|commentable|google doc|docs/fix-plan/PLAN\.md")
         self.assertIn("No separate review or plan documents", " ".join(text.split()))
         hub = " ".join(section(text, "The hub and gates").split())
-        for need in ("ledger.py progress-page", "ledger.py import-answers", "ledger.py serve", "a page with a database",
+        for need in ("ledger.py progress-page", "ledger.py import-answers", "ledger.py serve", "answers.json",
                      "Publishing it elsewhere is optional"):
             self.assertIn(need, hub)
         for step in ("2b. Ask the owner to approve", "Step 6: Consolidate", "Step 7: Hand off", "Step 9"):

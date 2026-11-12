@@ -32,6 +32,9 @@ from unittest import mock
 from dev.tests import fixtures
 
 LEDGER_PY = os.environ.get("LEDGER_PY_UNDER_TEST") or None
+# Any harness and any model (plan P-0001 step 144): names no command knows, so nothing may depend on them.
+HARNESS = os.environ.get("WALKTHROUGH_HARNESS") or "Quillwork 0.3"
+MODEL, SUBMODEL = "orbit-7", "orbit-7-mini"
 T = "\t"
 
 APP_V1 = 'def parse(text):\n    return text.split(",")\n\n\ndef handler(request):\n    data = parse(request)\n' \
@@ -181,7 +184,7 @@ class Walkthrough(unittest.TestCase):
         self.assertIn("(created)", self.run_cmd("init"))
         self.assertTrue((self.root / ".code-review" / "ledger.py").exists())
         owner = self.code("add-actor", "owner", "Project Owner")
-        mgr = self.code("add-actor", "manager", "review manager", "--model", "m-1", "--harness", "Claude Code",
+        mgr = self.code("add-actor", "manager", "review manager", "--model", MODEL, "--harness", HARNESS,
                         "--session", "s-1")
         self.assertEqual((owner, mgr), ("A-0001", "A-0002"))
         self.run_cmd("add-repo", "demo", ".", "--remote", "https://example.invalid/demo.git", "--permalink-template",
@@ -206,7 +209,9 @@ class Walkthrough(unittest.TestCase):
         self.keep_domains(r1, ("spec", "tests", "ui"), mgr)
         # The environment recorded on the review: no subagent tool, no publishing, no browser. The rest of the
         # walkthrough takes each fallback: the manager records every run itself, the hub is a file.
-        self.run_cmd("env", "--review", r1, "--actor", mgr)
+        self.run_cmd("env", "--review", r1, "--harness", HARNESS, "--actor", mgr)
+        self.assertEqual(self.run_cmd("query", "SELECT detail FROM review_environment WHERE capability='harness'"),
+                         f"detail\n{HARNESS}\n")
         self.assertEqual(self.query("SELECT capability FROM review_environment WHERE available = 0 AND capability "
                                     "IN ('browser','subagents','publishing','questions') ORDER BY 1"),
                          [["browser"], ["publishing"], ["questions"], ["subagents"]])
@@ -272,7 +277,7 @@ class Walkthrough(unittest.TestCase):
             prompt = self.root / ".code-review" / "reviews" / r1 / f"prompt-{label}.txt"
             self.run_cmd("prompt", "--review", r1, "--domain", domain, "--scope", "everything", "--out", prompt)
             self.assertIn(f"goals --domain {domain}", prompt.read_text(encoding="utf-8"))
-            self.run_cmd("add-run", r1, domain, label, "--scope", "everything", "--model", "m-2", "--prompt",
+            self.run_cmd("add-run", r1, domain, label, "--scope", "everything", "--model", SUBMODEL, "--prompt",
                          f"@{prompt}", "--status", "running", "--actor", mgr)
         self.run_cmd("review-status", r1, "running", "--note", "reviewers started", "--actor", mgr)
         # --- Step 4: verifying; each report checked by lint-report (a first draft without a location is sent
@@ -294,7 +299,7 @@ class Walkthrough(unittest.TestCase):
                                                       "--high", high, "--actor", mgr))
         self.assertEqual(self.query("SELECT count(DISTINCT check_code) FROM checklist_answers")[0][0],
                          len(self.query("SELECT code FROM domain_checks WHERE domain_code IN ('spec','tests')")))
-        self.code("add-actor", "verifier", "verifier 1", "--model", "m-2", "--parent", mgr, "--review", r1,
+        self.code("add-actor", "verifier", "verifier 1", "--model", SUBMODEL, "--parent", mgr, "--review", r1,
                   "--role", "verifier for spec.md", "--actor", mgr)
         # --- Step 5: indexing; 5a indexers; 5c load-index per report, tag-review, fill-refs; 5d match; check.
         self.run_cmd("review-status", r1, "indexing", "--note", "indexing the reports", "--actor", mgr)
@@ -475,9 +480,9 @@ class Walkthrough(unittest.TestCase):
         self.approve_domains(r2, owner, mgr, answer_file=True)
         # --- Step 3.
         self.run_cmd("snapshot", r2, "--actor", mgr)
-        self.run_cmd("add-run", r2, "spec", "spec-B", "--scope", "everything", "--model", "m-2", "--status",
+        self.run_cmd("add-run", r2, "spec", "spec-B", "--scope", "everything", "--model", SUBMODEL, "--status",
                      "running", "--actor", mgr)
-        self.run_cmd("add-run", r2, "tests", "tests-B", "--scope", "everything", "--model", "m-2", "--status",
+        self.run_cmd("add-run", r2, "tests", "tests-B", "--scope", "everything", "--model", SUBMODEL, "--status",
                      "running", "--actor", mgr)
         self.run_cmd("review-status", r2, "running", "--note", "reviewers started", "--actor", mgr)
         # --- Step 4: the reports arrive.

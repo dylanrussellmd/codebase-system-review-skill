@@ -189,8 +189,9 @@ class Shown(browser.ViewerTestCase):
         self.assertEqual(page.count(".md ol li"), 8)
         self.assertIn("Point", page.texts(".md table td:first-child"))
         text = page.text("#app")
-        for raw in ("**", "##", "| ---", "Claude"):
+        for raw in ("**", "##", "| ---"):
             self.assertNotIn(raw, text)
+        self.assertNotRegex(text, r"(?i)claude|anthropic")                    # whichever agent runs the skill
 
 
 class HubShown(unittest.TestCase):

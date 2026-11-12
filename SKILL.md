@@ -1,7 +1,7 @@
 ---
 name: codebase-system-review
 description: Run a managed, read-only, multi-reviewer audit of any codebase (tests, security, performance, architecture, UI, API, DB, docs, logging), verify findings, record every point in a per-project SQLite ledger tracked across reviews, then turn every point into a tracked fix plan.
-version: 1.9.0
+version: 1.9.1
 ---
 
 # Comprehensive review of a software system
@@ -144,13 +144,13 @@ separate review or plan documents: the report and the narrative live in the ledg
 - **Publish** after every review step and fix batch: `ledger.py progress-page [P-0001]` writes `.code-review/hub.html`
   (self-contained); give the owner that file, or the viewer `ledger.py serve [--no-open] [--port N]` (127.0.0.1 only,
   takes answers; from another machine `ssh -L 8765:127.0.0.1:8765 host`, same port both ends). Publishing it elsewhere
-  is optional: only as a page with a database, to the same address (`ledger.py add-artifact progress-page --url`).
+  is optional, always to the same address (`ledger.py add-artifact progress-page --url`).
 - **Ask** with `ledger.py open-gate <kind> --title '...' --question '...' --context @file`, one `--option value=label`
   per choice, linked by `--review`, `--plan`, `--step` or `--issue`; say in chat what you asked (with the harness's
   question tool, when it has one) and that the owner can answer in the hub or in chat.
 - **Collect answers** before resuming paused work and at every session start: `ledger.py gates` (the viewer writes
-  answers directly); when a published page is used, export its `answers` collection to JSON and
-  `ledger.py import-answers answers.json` first; without one, nothing to import. A chat answer:
+  answers directly). The owner downloads `answers.json` from the hub file (a published page exports its answer
+  store, when it has one, to the same file); run `ledger.py import-answers answers.json` first. A chat answer:
   `ledger.py answer-gate GATE-0001 --value approve --text '<their words>'` (refused once the gate is not open).
 - **Act, then close**: `ledger.py apply-gate GATE-0001 --note '<what you did>'` (a `decision` gate also records the
   decision; to withdraw or re-ask: `references/recipes.md#withdraw-or-change-a-gate`).
@@ -372,4 +372,4 @@ ledger.py issue-status ISS-0001 fixed --note '...' --after '<what it does now>' 
 `references/fix-plan.md` (8); `references/implementer-brief.md` (9); `references/writing.md` (before you write for the
 owner or a reviewer: briefs, reports, notes, questions); `references/recipes.md` (an example of each write,
 corrections, a failing check); `references/determinism.md` (a step leaves a choice); `references/schema.sql` or
-`ledger.py schema` (every table, column and view).
+`ledger.py schema` (every table, column and view); `references/tools.md` (tools a domain could run, each optional).

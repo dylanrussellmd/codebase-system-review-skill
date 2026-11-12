@@ -2,6 +2,12 @@
 
 The tool version is `version:` in SKILL.md's frontmatter; `ledger.py --version` prints it with the schema version.
 
+## 1.9.1 (schema 16)
+
+- The hub works with no answer store: answers download as `answers.json`.
+- `references/tools.md` and `references/tools.jsonl`: the tool catalog. `dev/release.py` builds the bundle. Review
+  pages page their issue links. Model-agnostic lint.
+
 ## 1.9.0 (schema 16)
 
 - Deterministic review commands: `env` (what the machine and harness offer, with fallbacks), `scan` (a file-based

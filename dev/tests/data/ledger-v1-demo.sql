@@ -14,9 +14,9 @@ CREATE TABLE actors (
   created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 INSERT INTO "actors" VALUES(1,'owner','Demo Owner',NULL,NULL,NULL,NULL,'2026-11-01T09:01:00.000Z');
-INSERT INTO "actors" VALUES(2,'manager','Review manager','claude-opus-5-5','Claude Code',NULL,NULL,'2026-11-01T09:02:00.000Z');
-INSERT INTO "actors" VALUES(3,'reviewer','security reviewer','claude-opus-5-5',NULL,NULL,2,'2026-11-01T09:03:00.000Z');
-INSERT INTO "actors" VALUES(4,'reviewer','spec reviewer','claude-opus-5-5',NULL,NULL,2,'2026-11-01T09:04:00.000Z');
+INSERT INTO "actors" VALUES(2,'manager','Review manager','model-a','Harness A',NULL,NULL,'2026-11-01T09:02:00.000Z');
+INSERT INTO "actors" VALUES(3,'reviewer','security reviewer','model-a',NULL,NULL,2,'2026-11-01T09:03:00.000Z');
+INSERT INTO "actors" VALUES(4,'reviewer','spec reviewer','model-a',NULL,NULL,2,'2026-11-01T09:04:00.000Z');
 CREATE TABLE artifacts (
   id              INTEGER PRIMARY KEY,
   review_id       INTEGER REFERENCES reviews(id),
