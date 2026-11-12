@@ -1,0 +1,42 @@
+[
+ {
+  "RuleID": "aws-access-token",
+  "Description": "Identified a pattern that may indicate AWS credentials, risking unauthorized cloud resource access and data breaches on AWS platforms.",
+  "StartLine": 1,
+  "EndLine": 1,
+  "StartColumn": 22,
+  "EndColumn": 41,
+  "Match": "REDACTED",
+  "Secret": "REDACTED",
+  "File": "config.py",
+  "SymlinkFile": "",
+  "Commit": "ddb4a51c08a9d05fd36537491c8137dfe78c9388",
+  "Entropy": 3.608695,
+  "Author": "Dev",
+  "Email": "dev@example.com",
+  "Date": "2026-11-12T07:47:07Z",
+  "Message": "first",
+  "Tags": [],
+  "Fingerprint": "ddb4a51c08a9d05fd36537491c8137dfe78c9388:config.py:aws-access-token:1"
+ },
+ {
+  "RuleID": "github-pat",
+  "Description": "Uncovered a GitHub Personal Access Token, potentially leading to unauthorized repository access and sensitive content exposure.",
+  "StartLine": 2,
+  "EndLine": 2,
+  "StartColumn": 17,
+  "EndColumn": 56,
+  "Match": "REDACTED",
+  "Secret": "REDACTED",
+  "File": "config.py",
+  "SymlinkFile": "",
+  "Commit": "948b260630772fc22c8a4806b6354c83a81570fd",
+  "Entropy": 5.071928,
+  "Author": "Dev",
+  "Email": "dev@example.com",
+  "Date": "2026-01-02T10:00:00Z",
+  "Message": "second",
+  "Tags": [],
+  "Fingerprint": "948b260630772fc22c8a4806b6354c83a81570fd:config.py:github-pat:2"
+ }
+]

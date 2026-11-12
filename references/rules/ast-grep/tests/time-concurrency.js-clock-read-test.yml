@@ -1,0 +1,7 @@
+id: time-concurrency.js-clock-read
+valid:
+  - new Date(stamp)
+  - clock.now()
+invalid:
+  - const t = Date.now();
+  - const d = new Date();

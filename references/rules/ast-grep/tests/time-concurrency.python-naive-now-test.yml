@@ -1,0 +1,9 @@
+id: time-concurrency.python-naive-now
+valid:
+  - datetime.now(timezone.utc)
+  - datetime.datetime.now(tz=ZoneInfo("Europe/Oslo"))
+  - clock.now()
+invalid:
+  - datetime.now()
+  - datetime.datetime.utcnow()
+  - date.today()

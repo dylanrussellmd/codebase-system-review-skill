@@ -24,6 +24,7 @@ Ideas:        propose-feature, feature-gate, feature-status, features
 Plans:        new-plan, plan-status, plan-add-review, import-steps, step-status, add-commit, add-guard, confirm-guard,
               conflicts, resolve-conflict
 Review tools: env, scan, brief, prompt, ui-capture, ui-audit, lint-report, compare-runs
+Tools:        tool-run, test-runs, dismiss-lead, cite-lead
 
 Options: --root DIR (project root; default: the nearest folder upward with a ledger, else the
 top of the current git repository, else the current directory), --db FILE, --version.
@@ -36,11 +37,11 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote
 
 TOOL_VERSION = "1.9.2"  # stamped by dev/build.py from `metadata: version:` in SKILL.md's frontmatter
-TOOL_HASH = "26113c9327be0eda7db7001f3ed70955eb4f6d41b87917762e694866a7a1c338"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
+TOOL_HASH = "ef2ae119c76a652811d6f3940efe3fccf4f3d3216c232755bb843cf4e31dcd0d"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
 # Placeholders: dev/build.py puts references/schema.sql, dev/page.html and references/migrations/*.sql in their
 # place when it writes scripts/ledger.py. dev/core.py itself is never run as the tool.
 SCHEMA = r"""-- =====================================================================
--- Code review ledger — schema version 19
+-- Code review ledger — schema version 20
 -- One SQLite file per project: <project root>/.code-review/ledger.sqlite
 -- Every connection must run:  PRAGMA foreign_keys = ON;
 -- Times are UTC ISO-8601 text with milliseconds (strftime('%Y-%m-%dT%H:%M:%fZ','now')); the tr_time_*
@@ -1015,6 +1016,82 @@ CREATE TABLE feature_status_changes (
   at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
+-- ---------- Tool runs and leads (schema 20, plan step 218) -----------
+
+-- Each run of a picked tool on a review's commit, or its import from a file the tool wrote.
+-- ledger.py tool-run runs it on an export of the reviewed commit (never the working tree) and records what ran, the
+-- version printed and the one references/tools.lock pins, the exit code, how long it took and the output's sha256;
+-- the output itself is kept in the review's folder (output_path). status: ran, imported (--from FILE), absent (not
+-- installed: fallback says what the reviewer does instead), skipped (nothing to run on, or it would need the network:
+-- fallback says why) or failed (it exited with an error and wrote nothing usable). A run is never changed.
+CREATE TABLE tool_runs (
+  id             INTEGER PRIMARY KEY,
+  review_id      INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
+  repository_id  INTEGER REFERENCES repositories(id),
+  commit_sha     TEXT CHECK (commit_sha IS NULL OR ((length(commit_sha) = 40 OR length(commit_sha) = 64)
+                                                   AND commit_sha NOT GLOB '*[^0-9a-f]*')),
+  tool           TEXT NOT NULL CHECK (length(trim(tool)) > 0),    -- the adapter's name (references/tools.md)
+  domain_code    TEXT REFERENCES domains(code),                   -- the domain whose reviewer gets its leads
+  status         TEXT NOT NULL CHECK (status IN ('ran','imported','absent','skipped','failed')),
+  version        TEXT,                    -- the version the tool printed
+  pinned_version TEXT,                    -- the version references/tools.lock pins
+  command        TEXT,                    -- what ran, with {checkout} and {out} for the temporary paths
+  exit_code      INTEGER,
+  duration_ms    INTEGER CHECK (duration_ms IS NULL OR duration_ms >= 0),
+  output_format  TEXT CHECK (output_format IS NULL OR output_format IN
+                   ('sarif','junit','lcov','cobertura','json','jsonl')),
+  output_path    TEXT,                    -- the output as imported, in the review's folder
+  output_sha256  TEXT CHECK (output_sha256 IS NULL OR (length(output_sha256) = 64
+                                                       AND output_sha256 NOT GLOB '*[^0-9a-f]*')),
+  rules_sha256   TEXT,                    -- the rule set's hash, for a tool run with rules
+  online         INTEGER NOT NULL DEFAULT 0 CHECK (online IN (0,1)),   -- 1 = the run was allowed to go online
+  fallback       TEXT,                    -- what the reviewer does instead, when the tool did not run
+  note           TEXT,
+  actor_id       INTEGER REFERENCES actors(id),
+  created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  CHECK (status NOT IN ('absent','skipped','failed') OR length(trim(COALESCE(fallback, ''))) > 0),
+  CHECK (status <> 'ran' OR (command IS NOT NULL AND exit_code IS NOT NULL))
+);
+CREATE INDEX ix_fk_tool_runs_review_id     ON tool_runs(review_id);
+CREATE INDEX ix_fk_tool_runs_repository_id ON tool_runs(repository_id);
+CREATE INDEX ix_fk_tool_runs_domain_code   ON tool_runs(domain_code);
+CREATE INDEX ix_fk_tool_runs_actor_id      ON tool_runs(actor_id);
+
+-- Each result a tool run produced, kept as a lead for the domain's reviewer, never as a finding.
+-- A lead (LD-0001) is addressed when a finding of the same review cites it (cite-lead, or a location of a finding on
+-- the same lines), or a reviewer dismisses it with a reason (dismiss-lead); v_unaddressed_tool_results lists the rest.
+-- fingerprint hashes tool, rule, path, message and the occurrence, not the line, so the same lead in a later review
+-- is recognised: its dismissal is carried forward (carried_from_id). Only the disposition columns ever change.
+CREATE TABLE tool_results (
+  id                   INTEGER PRIMARY KEY,
+  code                 TEXT NOT NULL UNIQUE     -- LD-0001
+                         CHECK (code GLOB 'LD-[0-9][0-9][0-9][0-9]*' AND code NOT GLOB 'LD-*[^0-9]*'),
+  tool_run_id          INTEGER NOT NULL REFERENCES tool_runs(id) ON DELETE RESTRICT,
+  domain_code          TEXT REFERENCES domains(code),
+  rule                 TEXT NOT NULL CHECK (length(trim(rule)) > 0),
+  level                TEXT NOT NULL CHECK (level IN ('error','warning','note','none')),
+  path                 TEXT,             -- repository-relative, forward slashes; none for a whole-run result
+  line_start           INTEGER CHECK (line_start IS NULL OR line_start >= 1),
+  line_end             INTEGER CHECK (line_end IS NULL OR (line_start IS NOT NULL AND line_end >= line_start)),
+  message              TEXT NOT NULL CHECK (length(trim(message)) > 0),
+  fingerprint          TEXT NOT NULL,    -- tool, rule, path, message and occurrence, hashed: the same lead later
+  finding_id           INTEGER REFERENCES findings(id),     -- the finding that cites it (cite-lead)
+  dismissed_reason     TEXT,             -- why it is not a finding (dismiss-lead)
+  disposed_by_actor_id INTEGER REFERENCES actors(id),
+  disposed_at          TEXT,
+  carried_from_id      INTEGER REFERENCES tool_results(id),  -- the earlier lead whose dismissal it carries
+  created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  UNIQUE (tool_run_id, fingerprint),
+  CHECK (dismissed_reason IS NULL OR length(trim(dismissed_reason)) > 0),
+  CHECK ((finding_id IS NULL AND dismissed_reason IS NULL) = (disposed_at IS NULL))
+);
+CREATE INDEX ix_fk_tool_results_tool_run_id          ON tool_results(tool_run_id);
+CREATE INDEX ix_fk_tool_results_domain_code          ON tool_results(domain_code);
+CREATE INDEX ix_fk_tool_results_finding_id           ON tool_results(finding_id);
+CREATE INDEX ix_fk_tool_results_disposed_by_actor_id ON tool_results(disposed_by_actor_id);
+CREATE INDEX ix_fk_tool_results_carried_from_id      ON tool_results(carried_from_id);
+CREATE INDEX ix_tool_results_fingerprint             ON tool_results(fingerprint);
+
 -- ---------- Measurements over time ------------------------------------
 
 -- Test runs recorded as evidence, with their results.
@@ -1115,13 +1192,13 @@ CREATE TABLE artifacts (
 -- artifacts, step_commits, guard_tests, decision_issues, plan_reviews, phases, review_repositories, review_goals,
 -- review_domains, review_environment, review_actors, actors, repositories, domains, domain_rules,
 -- domain_checks, checklist_answers, step_touches, step_conflicts, themes, feature_proposals,
--- feature_status_changes, requirements, metric_defs,
+-- feature_status_changes, requirements, metric_defs, tool_runs, tool_results,
 -- meta, schema_migrations, ledger_checks, issue_statuses, severities, match_types, relation_types, gate_kinds,
 -- goal_statuses, enum_labels.
 -- Why not: feature_proposals keep their own history in feature_status_changes; finding_locations, finding_goals and
 -- finding_requirements belong to their finding (logged when it is
--- created) and cannot change but for fill-refs; review_requirement_checks, test_runs and artifacts are themselves
--- timestamped records written once; step_commits, guard_tests, decision_issues, plan_reviews and phases are plan
+-- created) and cannot change but for fill-refs; review_requirement_checks, test_runs, artifacts and tool_runs are
+-- themselves timestamped records written once, and a tool result's disposition carries its own actor and time; step_commits, guard_tests, decision_issues, plan_reviews and phases are plan
 -- and evidence links whose rows are their own record; the rest are setup and configuration (who, which
 -- repositories, the catalogs and word lists, requirements, the schema's own bookkeeping), whose
 -- changes do not drive an issue's history.
@@ -3120,6 +3197,65 @@ WHEN (NEW.at IS NOT NULL AND (NEW.at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[
   SELECT RAISE(ABORT, 'feature_status_changes: at must be UTC times like 2026-11-10T09:30:00.000Z');
 END;
 
+-- ----- Tool runs and leads
+
+-- A tool run is a record: it is never changed or deleted.
+CREATE TRIGGER tr_tool_run_fixed BEFORE UPDATE ON tool_runs BEGIN
+  SELECT RAISE(ABORT, 'a tool run is a record: it cannot be changed (run the tool again)');
+END;
+
+-- Nor deleted.
+CREATE TRIGGER tr_tool_run_no_delete BEFORE DELETE ON tool_runs BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: tool_runs cannot be deleted');
+END;
+
+-- A lead keeps what the tool said; only its disposition (cited, dismissed) is written later.
+CREATE TRIGGER tr_tool_result_fixed BEFORE UPDATE ON tool_results
+WHEN NEW.code IS NOT OLD.code OR NEW.tool_run_id IS NOT OLD.tool_run_id OR NEW.domain_code IS NOT OLD.domain_code
+  OR NEW.rule IS NOT OLD.rule OR NEW.level IS NOT OLD.level OR NEW.path IS NOT OLD.path
+  OR NEW.line_start IS NOT OLD.line_start OR NEW.line_end IS NOT OLD.line_end OR NEW.message IS NOT OLD.message
+  OR NEW.fingerprint IS NOT OLD.fingerprint OR NEW.created_at IS NOT OLD.created_at BEGIN
+  SELECT RAISE(ABORT, 'a lead keeps what the tool said: only cite-lead and dismiss-lead change it');
+END;
+
+-- A lead is addressed once: a cited or dismissed lead keeps that disposition.
+CREATE TRIGGER tr_tool_result_disposed_once BEFORE UPDATE OF finding_id, dismissed_reason ON tool_results
+WHEN OLD.finding_id IS NOT NULL OR OLD.dismissed_reason IS NOT NULL BEGIN
+  SELECT RAISE(ABORT, 'the lead is already addressed (cited by a finding or dismissed)');
+END;
+
+-- The finding that cites a lead belongs to the review the tool ran for.
+CREATE TRIGGER tr_tool_result_finding_review BEFORE UPDATE OF finding_id ON tool_results
+WHEN NEW.finding_id IS NOT NULL AND (SELECT review_id FROM findings WHERE id = NEW.finding_id)
+     IS NOT (SELECT review_id FROM tool_runs WHERE id = NEW.tool_run_id) BEGIN
+  SELECT RAISE(ABORT, 'a lead is cited by a finding of the review its tool ran for');
+END;
+
+-- Leads are never deleted.
+CREATE TRIGGER tr_tool_result_no_delete BEFORE DELETE ON tool_results BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: tool_results cannot be deleted');
+END;
+
+CREATE TRIGGER tr_time_tool_runs_ins BEFORE INSERT ON tool_runs
+WHEN (NEW.created_at IS NOT NULL AND (NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at) IS NOT NEW.created_at)) BEGIN
+  SELECT RAISE(ABORT, 'tool_runs: created_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_tool_runs_upd BEFORE UPDATE OF created_at ON tool_runs
+WHEN (NEW.created_at IS NOT NULL AND (NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at) IS NOT NEW.created_at)) BEGIN
+  SELECT RAISE(ABORT, 'tool_runs: created_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_tool_results_ins BEFORE INSERT ON tool_results
+WHEN (NEW.created_at IS NOT NULL AND (NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at) IS NOT NEW.created_at)) OR (NEW.disposed_at IS NOT NULL AND (NEW.disposed_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.disposed_at) IS NOT NEW.disposed_at)) BEGIN
+  SELECT RAISE(ABORT, 'tool_results: created_at and disposed_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_tool_results_upd BEFORE UPDATE OF created_at, disposed_at ON tool_results
+WHEN (NEW.created_at IS NOT NULL AND (NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at) IS NOT NEW.created_at)) OR (NEW.disposed_at IS NOT NULL AND (NEW.disposed_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.disposed_at) IS NOT NEW.disposed_at)) BEGIN
+  SELECT RAISE(ABORT, 'tool_results: created_at and disposed_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
 -- ---------- Views ---------------------------------------------------------
 
 -- Issues still to fix, most severe first, then oldest.
@@ -3544,7 +3680,9 @@ UNION ALL SELECT 'G', 'G-' || printf('%02d', COALESCE(max(CAST(substr(code, 3) A
 UNION ALL SELECT 'IQ', 'IQ-' || printf('%04d', COALESCE(max(CAST(substr(code, 4) AS INTEGER)), 0) + 1)
 FROM interview_questions
 UNION ALL SELECT 'FP', 'FP-' || printf('%04d', COALESCE(max(CAST(substr(code, 4) AS INTEGER)), 0) + 1)
-FROM feature_proposals;
+FROM feature_proposals
+UNION ALL SELECT 'LD', 'LD-' || printf('%04d', COALESCE(max(CAST(substr(code, 4) AS INTEGER)), 0) + 1)
+FROM tool_results;
 
 -- Plan steps still to do whose issues are already closed.
 -- Closed for example by a review's check of 'fixed': mark the step done or dropped. Superseded and abandoned plans
@@ -3793,6 +3931,53 @@ LEFT JOIN actors a ON a.id = f.decided_by_actor_id LEFT JOIN gates gt ON gt.id =
 LEFT JOIN steps s ON s.id = f.step_id LEFT JOIN plans p ON p.id = s.plan_id
 LEFT JOIN enum_labels vl ON vl.enum = 'feature_value' AND vl.value = f.value
 LEFT JOIN enum_labels el ON el.enum = 'feature_effort' AND el.value = f.effort;
+
+-- Every lead with its disposition: cited by a finding, dismissed with a reason, or still open.
+-- cited_by is the finding that cites it (R-0001:SEC-H3), through cite-lead or a location on the same lines.
+CREATE VIEW v_tool_results AS
+SELECT t.code AS lead, r.code AS review, tr.tool, t.domain_code AS domain, t.rule, t.level, t.path, t.line_start,
+       t.line_end, t.message,
+       CASE WHEN t.finding_id IS NOT NULL OR c.id IS NOT NULL THEN 'cited'
+            WHEN t.dismissed_reason IS NOT NULL THEN 'dismissed' ELSE 'open' END AS disposition,
+       r.code || ':' || COALESCE(f.point_id, c.point_id) AS cited_by, t.dismissed_reason,
+       'A-' || printf('%04d', t.disposed_by_actor_id) AS disposed_by, t.disposed_at, cf.code AS carried_from,
+       t.fingerprint, t.tool_run_id
+FROM tool_results t JOIN tool_runs tr ON tr.id = t.tool_run_id JOIN reviews r ON r.id = tr.review_id
+LEFT JOIN findings f ON f.id = t.finding_id
+LEFT JOIN tool_results cf ON cf.id = t.carried_from_id
+LEFT JOIN findings c ON c.id = (
+  SELECT fl.finding_id FROM finding_locations fl JOIN findings ff ON ff.id = fl.finding_id
+  WHERE t.finding_id IS NULL AND ff.review_id = tr.review_id AND t.path IS NOT NULL AND fl.path = t.path
+    AND (tr.repository_id IS NULL OR fl.repository_id = tr.repository_id)
+    AND (t.line_start IS NULL OR fl.line_start IS NULL
+         OR (fl.line_start <= COALESCE(t.line_end, t.line_start)
+             AND COALESCE(fl.line_end, fl.line_start) >= t.line_start))
+  ORDER BY ff.point_id LIMIT 1);
+
+-- Tool results no finding cites and no reviewer dismissed: must be empty.
+-- A lead is addressed by a finding of the same review whose location covers its lines, by cite-lead, or by
+-- dismiss-lead with a reason (lint-report also records the dismissals a report lists under its Leads section).
+-- Leads of an abandoned review are left out.
+CREATE VIEW v_unaddressed_tool_results AS
+SELECT v.review, v.lead, v.tool, v.domain, v.rule, v.level,
+       COALESCE(v.path, '') || CASE WHEN v.line_start IS NULL THEN '' ELSE ':' || v.line_start END AS location,
+       v.message, v.tool_run_id
+FROM v_tool_results v JOIN reviews r ON r.code = v.review
+WHERE v.disposition = 'open' AND r.status <> 'abandoned'
+ORDER BY v.review, v.lead;
+
+-- Every tool run of every review, newest last, with how many leads it gave and how many are still unaddressed.
+-- The tools page and `ledger.py env` read it; absent and skipped runs carry the fallback the reviewer follows.
+CREATE VIEW v_tool_runs AS
+SELECT t.id, r.code AS review, t.tool, t.domain_code AS domain, t.status, t.version, t.pinned_version,
+       CASE WHEN t.version IS NULL OR t.pinned_version IS NULL THEN NULL
+            ELSE t.version = t.pinned_version END AS pinned_match,
+       rp.name AS repo, t.commit_sha, t.command, t.exit_code, t.duration_ms, t.output_format, t.output_path,
+       t.output_sha256, t.rules_sha256, t.online, t.fallback, t.note,
+       (SELECT count(*) FROM tool_results x WHERE x.tool_run_id = t.id) AS leads,
+       (SELECT count(*) FROM v_unaddressed_tool_results u WHERE u.tool_run_id = t.id) AS unaddressed,
+       t.created_at
+FROM tool_runs t JOIN reviews r ON r.id = t.review_id LEFT JOIN repositories rp ON rp.id = t.repository_id;
 
 -- ---------- Catalog seed (extend with custom domains/themes as needed) ---
 
@@ -4250,7 +4435,19 @@ INSERT INTO enum_labels(enum, value, label, position) VALUES
  ('feature_status','declined','Declined',3), ('feature_status','built','Built',4),
  ('feature_value','high','High',1), ('feature_value','medium','Medium',2), ('feature_value','low','Low',3),
  ('feature_effort','small','Small',1), ('feature_effort','medium','Medium',2), ('feature_effort','large','Large',3);
-INSERT INTO meta(key, value) VALUES ('schema_version','19');
+INSERT INTO ledger_checks(view, label, tier, position) VALUES
+ ('v_unaddressed_tool_results','Tool results no finding cites and no reviewer dismissed','error',84);
+
+INSERT INTO enum_labels(enum, value, label, position) VALUES
+ ('tool_run_status','ran','Ran',1), ('tool_run_status','imported','Imported from a file',2),
+ ('tool_run_status','absent','Not installed',3), ('tool_run_status','skipped','Not run',4),
+ ('tool_run_status','failed','Failed',5),
+ ('tool_output_format','sarif','SARIF',1), ('tool_output_format','junit','JUnit XML',2),
+ ('tool_output_format','lcov','LCOV',3), ('tool_output_format','cobertura','Cobertura XML',4),
+ ('tool_output_format','json','JSON',5), ('tool_output_format','jsonl','JSON lines',6),
+ ('tool_result_level','error','Error',1), ('tool_result_level','warning','Warning',2),
+ ('tool_result_level','note','Note',3), ('tool_result_level','none','No level',4);
+INSERT INTO meta(key, value) VALUES ('schema_version','20');
 INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger schema'),
   (2, 'url, path, hash and code checks; repositories.allow_outside_root; finding_locations.excerpt_redacted'),
   (3, 'integrity rules: codes, hashes, checks, append-only history, owner actor on gate answers'),
@@ -4269,7 +4466,8 @@ INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger s
   (16, 'step_touches and step_conflicts: what each plan step touches, and the pairs of steps that touch the same thing'),
   (17, 'a step may depend on any step of its plan, cycles refused; v_step_order: the order to work in'),
   (18, 'multi-select gates: gates.multi and gates.preselect; a multi-select answer is a JSON list of option values'),
-  (19, 'the features domain and feature_proposals: additions to the reviewed codebase that would serve the owner''s goals');
+  (19, 'the features domain and feature_proposals: additions to the reviewed codebase that would serve the owner''s goals'),
+  (20, 'tool_runs and tool_results: the picked tools'' runs at the reviewed commit, and their results as leads');
 """
 PAGE = r"""<!doctype html>
 <html lang="en">
@@ -7721,6 +7919,89 @@ INSERT INTO enum_labels(enum, value, label, position) VALUES
  ('feature_status','declined','Declined',3), ('feature_status','built','Built',4),
  ('feature_value','high','High',1), ('feature_value','medium','Medium',2), ('feature_value','low','Low',3),
  ('feature_effort','small','Small',1), ('feature_effort','medium','Medium',2), ('feature_effort','large','Large',3);
+-- migration: 0020-tool-runs.sql
+-- tool_runs and tool_results: the picked tools' runs at the reviewed commit, and their results as leads
+-- Plan P-0001 step 218 (FIX-31, decision D-0015). `ledger.py tool-run` runs one tool of references/tools.md on a
+-- clean export of a review's commit (or imports a file it wrote) and records the run: tool, version and the pinned
+-- one, command, exit code, duration, the output's sha256, or that the tool is absent and what to do instead. Each
+-- result is a lead (LD-0001), never a finding: v_unaddressed_tool_results lists the leads no finding cites and no
+-- reviewer dismissed with a reason, and must be empty. migrate creates the triggers and views with the shipped schema.
+
+CREATE TABLE tool_runs (
+  id             INTEGER PRIMARY KEY,
+  review_id      INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
+  repository_id  INTEGER REFERENCES repositories(id),
+  commit_sha     TEXT CHECK (commit_sha IS NULL OR ((length(commit_sha) = 40 OR length(commit_sha) = 64)
+                                                   AND commit_sha NOT GLOB '*[^0-9a-f]*')),
+  tool           TEXT NOT NULL CHECK (length(trim(tool)) > 0),    -- the adapter's name (references/tools.md)
+  domain_code    TEXT REFERENCES domains(code),                   -- the domain whose reviewer gets its leads
+  status         TEXT NOT NULL CHECK (status IN ('ran','imported','absent','skipped','failed')),
+  version        TEXT,                    -- the version the tool printed
+  pinned_version TEXT,                    -- the version references/tools.lock pins
+  command        TEXT,                    -- what ran, with {checkout} and {out} for the temporary paths
+  exit_code      INTEGER,
+  duration_ms    INTEGER CHECK (duration_ms IS NULL OR duration_ms >= 0),
+  output_format  TEXT CHECK (output_format IS NULL OR output_format IN
+                   ('sarif','junit','lcov','cobertura','json','jsonl')),
+  output_path    TEXT,                    -- the output as imported, in the review's folder
+  output_sha256  TEXT CHECK (output_sha256 IS NULL OR (length(output_sha256) = 64
+                                                       AND output_sha256 NOT GLOB '*[^0-9a-f]*')),
+  rules_sha256   TEXT,                    -- the rule set's hash, for a tool run with rules
+  online         INTEGER NOT NULL DEFAULT 0 CHECK (online IN (0,1)),   -- 1 = the run was allowed to go online
+  fallback       TEXT,                    -- what the reviewer does instead, when the tool did not run
+  note           TEXT,
+  actor_id       INTEGER REFERENCES actors(id),
+  created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  CHECK (status NOT IN ('absent','skipped','failed') OR length(trim(COALESCE(fallback, ''))) > 0),
+  CHECK (status <> 'ran' OR (command IS NOT NULL AND exit_code IS NOT NULL))
+);
+CREATE INDEX ix_fk_tool_runs_review_id     ON tool_runs(review_id);
+CREATE INDEX ix_fk_tool_runs_repository_id ON tool_runs(repository_id);
+CREATE INDEX ix_fk_tool_runs_domain_code   ON tool_runs(domain_code);
+CREATE INDEX ix_fk_tool_runs_actor_id      ON tool_runs(actor_id);
+
+CREATE TABLE tool_results (
+  id                   INTEGER PRIMARY KEY,
+  code                 TEXT NOT NULL UNIQUE     -- LD-0001
+                         CHECK (code GLOB 'LD-[0-9][0-9][0-9][0-9]*' AND code NOT GLOB 'LD-*[^0-9]*'),
+  tool_run_id          INTEGER NOT NULL REFERENCES tool_runs(id) ON DELETE RESTRICT,
+  domain_code          TEXT REFERENCES domains(code),
+  rule                 TEXT NOT NULL CHECK (length(trim(rule)) > 0),
+  level                TEXT NOT NULL CHECK (level IN ('error','warning','note','none')),
+  path                 TEXT,             -- repository-relative, forward slashes; none for a whole-run result
+  line_start           INTEGER CHECK (line_start IS NULL OR line_start >= 1),
+  line_end             INTEGER CHECK (line_end IS NULL OR (line_start IS NOT NULL AND line_end >= line_start)),
+  message              TEXT NOT NULL CHECK (length(trim(message)) > 0),
+  fingerprint          TEXT NOT NULL,    -- tool, rule, path, message and occurrence, hashed: the same lead later
+  finding_id           INTEGER REFERENCES findings(id),     -- the finding that cites it (cite-lead)
+  dismissed_reason     TEXT,             -- why it is not a finding (dismiss-lead)
+  disposed_by_actor_id INTEGER REFERENCES actors(id),
+  disposed_at          TEXT,
+  carried_from_id      INTEGER REFERENCES tool_results(id),  -- the earlier lead whose dismissal it carries
+  created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  UNIQUE (tool_run_id, fingerprint),
+  CHECK (dismissed_reason IS NULL OR length(trim(dismissed_reason)) > 0),
+  CHECK ((finding_id IS NULL AND dismissed_reason IS NULL) = (disposed_at IS NULL))
+);
+CREATE INDEX ix_fk_tool_results_tool_run_id          ON tool_results(tool_run_id);
+CREATE INDEX ix_fk_tool_results_domain_code          ON tool_results(domain_code);
+CREATE INDEX ix_fk_tool_results_finding_id           ON tool_results(finding_id);
+CREATE INDEX ix_fk_tool_results_disposed_by_actor_id ON tool_results(disposed_by_actor_id);
+CREATE INDEX ix_fk_tool_results_carried_from_id      ON tool_results(carried_from_id);
+CREATE INDEX ix_tool_results_fingerprint             ON tool_results(fingerprint);
+
+INSERT INTO ledger_checks(view, label, tier, position) VALUES
+ ('v_unaddressed_tool_results','Tool results no finding cites and no reviewer dismissed','error',84);
+
+INSERT INTO enum_labels(enum, value, label, position) VALUES
+ ('tool_run_status','ran','Ran',1), ('tool_run_status','imported','Imported from a file',2),
+ ('tool_run_status','absent','Not installed',3), ('tool_run_status','skipped','Not run',4),
+ ('tool_run_status','failed','Failed',5),
+ ('tool_output_format','sarif','SARIF',1), ('tool_output_format','junit','JUnit XML',2),
+ ('tool_output_format','lcov','LCOV',3), ('tool_output_format','cobertura','Cobertura XML',4),
+ ('tool_output_format','json','JSON',5), ('tool_output_format','jsonl','JSON lines',6),
+ ('tool_result_level','error','Error',1), ('tool_result_level','warning','Warning',2),
+ ('tool_result_level','note','Note',3), ('tool_result_level','none','No level',4);
 """
 
 
@@ -9653,6 +9934,7 @@ CHECK_ACTIONS = {
     "v_artifacts_outside_ledger": "The agent copies the file into the ledger's folder and records it there.",
     "v_unresolved_conflicts": "The agent judges each pair of steps with resolve-conflict before the plan is approved.",
     "v_late_step_conflicts": "The agent judges each pair with resolve-conflict before the added step starts.",
+    "v_unaddressed_tool_results": "The agent has each tool lead cited by a finding or dismissed with a reason.",
 }
 RECIPES_FILE = "references/recipes.md"
 
@@ -11677,7 +11959,7 @@ class GateRefused(Exception):
         self.status = status
 
 
-CODE_PREFIXES = ("ISS", "R", "P", "D", "GATE", "REQ", "G", "IQ", "FP")
+CODE_PREFIXES = ("ISS", "R", "P", "D", "GATE", "REQ", "G", "IQ", "FP", "LD")
 
 
 def next_code(con, prefix):
@@ -14629,6 +14911,29 @@ def add_write_commands(sub):
 
 def add_write_commands_131(p):
     """The subparsers of the step 131-132 writes (new-plan ... redact); p is add_write_commands' maker."""
+    s = p("tool-run"); s.add_argument("tool", help="the tool or import format (references/tools.md, How a tool is "
+                                                   "wired in)")
+    s.add_argument("--review", required=True); s.add_argument("--domain", help="whose reviewer gets the leads")
+    s.add_argument("--repo"); s.add_argument("--from", dest="source", metavar="FILE",
+                                             help="import this output instead of running the tool")
+    s.add_argument("--tool-version", help="with --from: the version that wrote the file")
+    s.add_argument("--rules", help="the rule file, for a tool that takes one")
+    s.add_argument("--online", action="store_true", help="allow the steps that need the network (fetching pinned "
+                                                         "rules or advisory databases)")
+    s.add_argument("--unpinned", action="store_true", help="run a version other than the pinned one, and say so")
+    s.add_argument("--note")
+    s = p("dismiss-lead"); s.add_argument("leads", nargs="+", metavar="LEAD", help="the leads (LD-0001)")
+    s.add_argument("--reason", help="why it is not a finding")
+    s = p("test-runs"); s.add_argument("--review", required=True)
+    s.add_argument("--command", help="the test command; {junit} is where it writes JUnit XML, {seed} the seed")
+    s.add_argument("--random-command", help="the command for the random-order run, with the runner's seed flag "
+                                            "({seed}); default --command")
+    s.add_argument("--variants", help=f"which runs after the baseline (default all): {', '.join(TEST_VARIANTS)}")
+    s.add_argument("--repeat", type=int, default=3, help="how many repeated runs (default 3)")
+    s.add_argument("--seed", type=int, help="the random-order seed (default: from the commit)")
+    s.add_argument("--repo"); s.add_argument("--domain", help="whose reviewer gets the leads (default test-quality)")
+    s = p("cite-lead"); s.add_argument("lead", help="the lead (LD-0001)")
+    s.add_argument("finding", help="the finding that covers it (R-0001:SEC-H3)")
     s = p("resolve-conflict"); s.add_argument("plan", help="the plan (P-0001)")
     s.add_argument("step_a", help="one step's number"); s.add_argument("step_b", help="the other step's number")
     s.add_argument("--resolution", help=", ".join(CONFLICT_RESOLUTIONS)); s.add_argument("--note")
@@ -14993,7 +15298,7 @@ def environment_lines(caps):
     """`env`'s text: one line per capability, yes or no, with how to enable a missing one."""
     width = max(len(c["capability"]) for c in caps)
     return [f"{'yes' if c['available'] else 'no ':3}  {c['capability']:{width}}  {c['detail']}"
-            + ("" if c["available"] else f"; to enable: {c['how_to_enable']}") for c in caps]
+            + ("" if c["available"] or not c["how_to_enable"] else f"; to enable: {c['how_to_enable']}") for c in caps]
 
 
 @_review_tool("env")
@@ -15003,8 +15308,11 @@ def env_command(a, root, db):
     if unknown:
         return _refuse("env", f"--has {unknown[0]}: not one of {', '.join(STATED_CAPABILITIES)}")
     caps = environment(root, a.harness, set(a.has or []))
-    text = (json.dumps({"capabilities": caps}, indent=1, ensure_ascii=False).split("\n") if a.json
-            else environment_lines(caps))
+    tools = tool_inventory()
+    marks = tool_lines(tools)
+    text = (json.dumps({"capabilities": caps, "tools": tools}, indent=1, ensure_ascii=False).split("\n") if a.json
+            else environment_lines(caps + [{"capability": c, "available": y, "detail": d, "how_to_enable": ""}
+                                           for y, c, d in marks]))
     if not a.review:
         print("\n".join(text))
         return 0
@@ -15912,6 +16220,7 @@ def prompt_text(con, root, db, rv, domain, scope=None, report=None, tool="ledger
     out += _goal_lines(con, d["code"]) or ["- none approved"]
     out += ["", "Known issues of this domain. Report on each in your \"Known issues\" table.", ""]
     out += _known_issue_lines(con, d["code"]) or ["- none"]
+    out += lead_prompt_lines(con, rv, d["code"], tool)
     out += ["", "Checklist. Answer every item in your \"Checklist\" table: yes, no, partly or not applicable, with the "
                 "evidence or the reason.", ""]
     checks = rows(con, "SELECT code, question, evidence FROM domain_checks WHERE domain_code=? ORDER BY position",
@@ -16188,6 +16497,8 @@ def lint_report(con, root, text, domain, rv=None):
                           (domain, rv["id"])):
                 if i["code"] not in reported:
                     problems.append((0, f"known issue {i['code']} is not reported (one row in '## Known issues')"))
+    if rv is not None:
+        lint_leads(con, text, sections, domain, rv, problems)
     severities = [r["value"] for r in rows(con, "SELECT value FROM severities ORDER BY position")]
     seen, counts = set(), {}
     for f in findings:
@@ -16273,6 +16584,12 @@ def lint_report_command(a, root, db):
         return 0
 
     def record(ctx):
+        dismissed = lint_leads(ctx.con, text, parse_report(text)[0], a.domain, rv, []) if rv else []
+        for code, why in dismissed:
+            ctx.x("UPDATE tool_results SET dismissed_reason=?, disposed_by_actor_id=?, disposed_at=? WHERE code=?",
+                  (f"{why} ({name})", ctx.actor_id, now(), code))
+        if dismissed:
+            lines.append(f"{name}: recorded {len(dismissed)} dismissed lead{'s' if len(dismissed) != 1 else ''}")
         for code, (answer, evidence) in sorted(answers.items()):
             ctx.x("""INSERT INTO checklist_answers(review_id, check_code, report, answer, evidence) VALUES (?,?,?,?,?)
                      ON CONFLICT(review_id, check_code, report) DO UPDATE SET answer=excluded.answer,
@@ -16609,6 +16926,1392 @@ REVIEW_ARG_HELP = {  # the review tools' arguments that need the same words ever
     "width": "the width in pixels", "theme": "light or dark", "domain": "the domain's code (spec, ui ...)",
     "file": "the report (Markdown)", "record": "store the checklist answers of a report that passes",
 }
+
+
+# ---------------------------------------------------------------- the picked tools (plan P-0001 steps 218-221)
+#
+# Decision D-0015: the tools the owner picked from references/tools.md, wired in through one runner. `tool-run TOOL`
+# runs a tool on an export of the reviewed commit (`git archive`, so no tool reads the working tree or writes into the
+# repository), with the version references/tools.lock pins, offline unless --online, and imports its output: each
+# result becomes a lead (tool_results, LD-0001), never a finding. `--from FILE` imports what a tool wrote elsewhere.
+# A tool that is not installed is recorded as absent with its fallback, which is not a failure. Every list is sorted
+# and the same output gives the same rows, so two runs at one commit agree (G-09). references/tools.md, "How a tool
+# is wired in", is the interface for adding a tool: an adapter in TOOL_ADAPTERS, a pin, a recorded sample, a test.
+
+import tarfile
+import tempfile
+import time
+import xml.etree.ElementTree as ElementTree
+
+TOOLS_LOCK = "references/tools.lock"
+RULES_DIR = "references/rules"
+TOOL_SECONDS = 1800          # how long one tool run may take
+TOOL_OUTPUT_BYTES = 200_000_000  # the most output a run may leave to import
+LEAD_MESSAGE_CHARS = 400     # a lead's message is cut to this many characters
+LEAD_LEVELS = ("error", "warning", "note", "none")
+FORMAT_SUFFIX = {"sarif": "sarif", "junit": "xml", "lcov": "lcov", "cobertura": "xml", "json": "json",
+                 "jsonl": "jsonl"}
+
+
+class ToolSkip(Exception):
+    """The tool has nothing to run on here, or would need the network: the run is recorded as skipped."""
+
+
+class ToolAdapter:
+    """One tool wired into tool-run. See references/tools.md, "How a tool is wired in".
+
+    name      the command-line name (tool-run NAME) and the key in references/tools.lock
+    binary    the executable looked for on PATH; None for a built-in or an import-only format
+    fmt       the output format, one of FORMAT_SUFFIX
+    domain    the domain whose reviewer gets the leads when --domain is not given (None: no domain)
+    parse     parse(data: bytes, call: ToolCall) -> {"leads": [...], "metrics": [...], "version": str or None}
+    argv      argv(call: ToolCall) -> the command as a list (None: import only); may raise ToolSkip(reason)
+    stdout    True when the output is the tool's standard output, False when it writes call.out
+    ok_exits  the exit codes that still mean the output is complete (a scanner exits 1 when it found something)
+    store     store(data) -> the bytes kept in the review folder and hashed (default: the output as it is)
+    run       run(call) -> (exit code, output bytes): a built-in that runs in-process instead of argv
+    env       env(call) -> extra environment variables for the tool (where it keeps a database)
+    install, fallback   how to install it; what the reviewer does when it is absent
+    online    'no', or 'optional' when a mode needs the network (only with --online)
+    """
+    def __init__(self, name, *, fmt, parse, domain=None, binary=None, argv=None, version_args=("--version",),
+                 stdout=False, ok_exits=(0,), store=None, run=None, install="", fallback="", online="no",
+                 source="checkout", env=None, step=218):
+        self.name, self.fmt, self.parse, self.domain, self.binary, self.argv = name, fmt, parse, domain, binary, argv
+        self.version_args, self.stdout, self.ok_exits, self.store, self.run = version_args, stdout, ok_exits, store, run
+        self.install, self.fallback, self.online, self.source, self.step = install, fallback, online, source, step
+        self.env = env
+
+
+class ToolCall:
+    """What an adapter's argv, run and parse get: the export of the commit (work), the output file (out), the
+    repository's own folder and the commit (for history tools), the rules file, whether it may go online, the
+    ledger's folder (for cached rules and databases), and the parsed arguments."""
+    def __init__(self, work=None, out=None, repo_dir=None, commit=None, rules=None, online=False, ledger_dir=None,
+                 a=None):
+        self.work, self.out, self.repo_dir, self.commit, self.rules = work, out, repo_dir, commit, rules
+        self.online, self.ledger_dir, self.a = online, ledger_dir, a
+        self.stderr = ""
+        self.placeholders = {}  # path -> placeholder, so the recorded command holds no temporary path
+
+
+TOOL_ADAPTERS = {}
+
+
+def tool_adapter(name, **kw):
+    """Register an adapter (TOOL_ADAPTERS)."""
+    TOOL_ADAPTERS[name] = ToolAdapter(name, **kw)
+    return TOOL_ADAPTERS[name]
+
+
+def skill_file(rel):
+    """A file of the skill beside this ledger.py (references/...), or None when this copy has none (the project's
+    copy in .code-review/ carries no references)."""
+    p = Path(__file__).resolve().parent.parent / rel
+    return p if p.exists() else None
+
+
+def read_tools_lock(path=None):
+    """{tool: version} from references/tools.lock (mise's format: a [tools] table of `name = "version"` lines; a key
+    with a backend, "pipx:semgrep", names the tool after the colon). {} when there is no lock file."""
+    path = Path(path) if path else skill_file(TOOLS_LOCK)
+    try:
+        text = path.read_text(encoding="utf-8") if path else ""
+    except OSError:
+        text = ""
+    pins, table = {}, None
+    for line in text.split("\n"):
+        line = line.split("#", 1)[0].strip()
+        if line.startswith("["):
+            table = line.strip("[] ")
+            continue
+        m = re.match(r'^"?([A-Za-z0-9@:/._-]+)"?\s*=\s*"([^"]+)"$', line)
+        if table == "tools" and m:
+            pins[m.group(1).rsplit(":", 1)[-1].rsplit("/", 1)[-1]] = m.group(2)
+    return pins
+
+
+def tool_version(adapter):
+    """The installed version of an adapter's binary: a version string, '' when it prints none, None when the binary
+    is not on PATH or does not run."""
+    if not adapter.binary:
+        return None
+    exe = shutil.which(adapter.binary)
+    if not exe:
+        return None
+    try:   # with the tools' update checks off: semgrep --version otherwise asks its server first
+        p = subprocess.run([exe, *adapter.version_args], capture_output=True, timeout=PROBE_SECONDS,
+                           stdin=subprocess.DEVNULL, env=_tool_env(False))
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if p.returncode != 0:
+        return None
+    m = re.search(r"\d+(?:\.\d+)+", (p.stdout + p.stderr).decode("utf-8", "replace"))
+    return m.group() if m else ""
+
+
+def tool_inventory(pins=None):
+    """For `env`: each adapter with a binary, sorted by name: installed version (None = not found), pinned version,
+    how to install it and the fallback."""
+    pins = read_tools_lock() if pins is None else pins
+    out = []
+    for name in sorted(TOOL_ADAPTERS):
+        ad = TOOL_ADAPTERS[name]
+        if not ad.binary:
+            continue
+        v = tool_version(ad)
+        out.append({"tool": name, "installed": v, "pinned": pins.get(name), "how_to_install": ad.install,
+                    "fallback": ad.fallback, "online": ad.online})
+    return out
+
+
+def tool_lines(tools):
+    """`env`'s lines for the picked tools: yes or no, the version found and the one pinned."""
+    out = []
+    for t in tools:
+        pin = f"pinned {t['pinned']}" if t["pinned"] else "not pinned"
+        if t["installed"] is not None:
+            differs = t["pinned"] and t["installed"] != t["pinned"]
+            out.append((True, f"tool:{t['tool']}", f"{t['installed'] or 'version unknown'} ({pin})"
+                        + ("; differs from the pin: install the pinned version" if differs else "")))
+        else:
+            out.append((False, f"tool:{t['tool']}", f"not installed ({pin}); to install: {t['how_to_install']}; "
+                                                    f"without it: {t['fallback']}"))
+    return out
+
+
+def _relative_lead_path(raw, call):
+    """A path a tool reported, made repository-relative with forward slashes; None when it is not inside the
+    export (or the repository)."""
+    if not raw:
+        return None
+    p = str(raw)
+    if p.startswith("file://"):
+        p = p[7:]
+    p = p.replace("\\", "/")
+    for base in (call.work, call.repo_dir):
+        if base:
+            b = str(Path(base).resolve()).replace("\\", "/").rstrip("/") + "/"
+            if p.startswith(b):
+                p = p[len(b):]
+    while p.startswith("./"):
+        p = p[2:]
+    if not p or p.startswith("/") or re.match(r"^[A-Za-z]:/", p) or ".." in p.split("/"):
+        return None
+    return p
+
+
+def _lead(rule, level, path, start, end, message, domain=None):
+    """One lead, its fields checked and cut to size."""
+    level = level if level in LEAD_LEVELS else "warning"
+    start = start if isinstance(start, int) and start >= 1 else None
+    end = end if isinstance(end, int) and start and end >= start else None
+    message = " ".join(str(message or rule).split())[:LEAD_MESSAGE_CHARS] or str(rule)
+    return {"rule": str(rule)[:200], "level": level, "path": path, "line_start": start, "line_end": end,
+            "message": message, "domain": domain}
+
+
+def _json_of(data, what):
+    """The output parsed as JSON; WriteError naming the format when it is not."""
+    try:
+        return json.loads(data.decode("utf-8-sig"))
+    except (UnicodeDecodeError, ValueError) as e:
+        raise WriteError(f"cannot read the output as {what}: {_one_line(e)}")
+
+
+def _xml_of(data, what):
+    """An XML document, refusing any with a DOCTYPE (no entity tricks from a tool's output)."""
+    head = data[:4096].decode("utf-8", "replace")
+    if "<!DOCTYPE" in head or "<!ENTITY" in data.decode("utf-8", "replace"):
+        raise WriteError(f"cannot read the output as {what}: it declares a DOCTYPE or entities")
+    try:
+        return ElementTree.fromstring(data)
+    except ElementTree.ParseError as e:
+        raise WriteError(f"cannot read the output as {what}: {_one_line(e)}")
+
+
+def parse_sarif(data, call):
+    """SARIF 2.1.0: one lead per result (rule id, level, first location, message); the tool's version from the
+    first run's driver."""
+    doc = _json_of(data, "SARIF 2.1.0")
+    if not isinstance(doc, dict) or not isinstance(doc.get("runs"), list):
+        raise WriteError("cannot read the output as SARIF 2.1.0: it has no runs list")
+    leads, version = [], None
+    for run in doc["runs"]:
+        driver = ((run or {}).get("tool") or {}).get("driver") or {}
+        version = version or driver.get("semanticVersion") or driver.get("version")
+        rules = [r for r in driver.get("rules") or [] if isinstance(r, dict)]
+        by_id = {r.get("id"): r for r in rules}
+        for res in run.get("results") or []:
+            if not isinstance(res, dict):
+                continue
+            rule_id = res.get("ruleId") or (res.get("rule") or {}).get("id")
+            if rule_id is None and isinstance(res.get("ruleIndex"), int) and res["ruleIndex"] < len(rules):
+                rule_id = rules[res["ruleIndex"]].get("id")
+            rule = by_id.get(rule_id) or {}
+            level = res.get("level") or (rule.get("defaultConfiguration") or {}).get("level") or "warning"
+            msg = (res.get("message") or {}).get("text") or (rule.get("shortDescription") or {}).get("text")
+            path = start = end = None
+            locs = res.get("locations") or []
+            if locs and isinstance(locs[0], dict):
+                phys = locs[0].get("physicalLocation") or {}
+                path = _relative_lead_path((phys.get("artifactLocation") or {}).get("uri"), call)
+                region = phys.get("region") or {}
+                start, end = region.get("startLine"), region.get("endLine")
+            leads.append(_lead(rule_id or "unnamed", level, path, start, end, msg))
+    return {"leads": leads, "metrics": [], "version": version}
+
+
+def parse_junit(data, call):
+    """JUnit XML: one lead per failed or errored test (its file and line when the runner names them); counts."""
+    root = _xml_of(data, "JUnit XML")
+    if root.tag not in ("testsuites", "testsuite"):
+        raise WriteError("cannot read the output as JUnit XML: the root is not testsuites or testsuite")
+    leads, counts = [], {"passed": 0, "failed": 0, "errored": 0, "skipped": 0}
+    for case in root.iter("testcase"):
+        name = ".".join(x for x in (case.get("classname"), case.get("name")) if x)
+        bad = next((c for c in case if c.tag in ("failure", "error")), None)
+        if bad is None:
+            counts["skipped" if case.find("skipped") is not None else "passed"] += 1
+            continue
+        counts["failed" if bad.tag == "failure" else "errored"] += 1
+        path, line = _relative_lead_path(case.get("file"), call), None
+        if case.get("line", "").isdigit():
+            line = int(case.get("line"))
+        found = re.findall(r"(?m)^\s*([^\s:\"']+\.[A-Za-z0-9]+):(\d+)(?::|\b)", bad.text or "")
+        for p, n in reversed(found):
+            rel = _relative_lead_path(p, call)
+            if rel and (path is None or rel == path):
+                path, line = rel, line or int(n)
+                break
+        msg = f"{name} {'failed' if bad.tag == 'failure' else 'errored'}: {bad.get('message') or ''}".strip(": ")
+        leads.append(_lead(f"junit.{bad.tag}", "error", path, line, None, msg))
+    metrics = [(f"tests_{k}", "all", v, "tests") for k, v in sorted(counts.items())]
+    return {"leads": leads, "metrics": metrics, "version": None, "counts": counts}
+
+
+def _coverage_result(files, functions, total):
+    """Leads and metrics of a coverage import: files no test reaches are leads; line (and branch) coverage per file
+    and overall, and per function, are metrics."""
+    leads, metrics = [], []
+    for path in sorted(files):
+        f = files[path]
+        if f["lines"]:
+            metrics.append(("line_coverage", path, round(100.0 * f["hit"] / f["lines"], 2), "%"))
+            if f["hit"] == 0:
+                leads.append(_lead("coverage.untested-file", "note", path, None, None,
+                                   f"no test runs any of its {f['lines']} measured lines"))
+        if f.get("branches"):
+            metrics.append(("branch_coverage", path, round(100.0 * f["branch_hit"] / f["branches"], 2), "%"))
+    for (path, name), (value, unit, metric) in sorted(functions.items()):
+        metrics.append((metric, f"{path}#{name}", value, unit))
+    if total is not None:
+        metrics.append(("line_coverage", "all", total, "%"))
+    return {"leads": leads, "metrics": metrics, "version": None}
+
+
+def parse_lcov(data, call):
+    """LCOV tracefile: per file its lines found and hit (DA, LF, LH) and branches (BRF, BRH); per function its hit
+    count (FN, FNDA)."""
+    text = data.decode("utf-8", "replace")
+    if "SF:" not in text:
+        raise WriteError("cannot read the output as LCOV: no SF: record")
+    files, functions, cur, da = {}, {}, None, {}
+    for line in text.split("\n"):
+        line = line.strip()
+        key, _, val = line.partition(":")
+        if key == "SF":
+            cur = _relative_lead_path(val, call) or val
+            files.setdefault(cur, {"lines": 0, "hit": 0, "branches": 0, "branch_hit": 0, "fn": {}})
+            da = {}
+        elif cur is None:
+            continue
+        elif key == "DA":
+            parts = val.split(",")
+            if len(parts) >= 2 and parts[0].isdigit():
+                da[int(parts[0])] = int(parts[1]) if parts[1].lstrip("-").isdigit() else 0
+        elif key == "FN":
+            parts = val.split(",")
+            files[cur]["fn"].setdefault(parts[-1], 0)
+        elif key == "FNDA":
+            hits, _, fname = val.partition(",")
+            files[cur]["fn"][fname] = int(hits) if hits.isdigit() else 0
+        elif key in ("BRF", "BRH") and val.isdigit():
+            files[cur]["branches" if key == "BRF" else "branch_hit"] = int(val)
+        elif line == "end_of_record":
+            files[cur]["lines"], files[cur]["hit"] = len(da), sum(1 for h in da.values() if h > 0)
+            cur = None
+    for path, f in files.items():
+        for fname, hits in f["fn"].items():
+            functions[(path, fname)] = (hits, "calls", "function_calls")
+    lines = sum(f["lines"] for f in files.values())
+    total = round(100.0 * sum(f["hit"] for f in files.values()) / lines, 2) if lines else None
+    return _coverage_result(files, functions, total)
+
+
+def parse_cobertura(data, call):
+    """Cobertura XML (coverage.py, coverlet, gcovr, JaCoCo converted): line rate per class file and overall, and per
+    method its line coverage."""
+    root = _xml_of(data, "Cobertura XML")
+    if root.tag != "coverage":
+        raise WriteError("cannot read the output as Cobertura XML: the root is not coverage")
+    files, functions = {}, {}
+    for cls in root.iter("class"):
+        path = _relative_lead_path(cls.get("filename"), call) or cls.get("filename")
+        if not path:
+            continue
+        f = files.setdefault(path, {"lines": 0, "hit": 0, "branches": 0, "branch_hit": 0})
+        own = cls.find("lines")
+        for ln in (own if own is not None else []):
+            f["lines"] += 1
+            f["hit"] += 1 if (ln.get("hits") or "0") not in ("0", "") else 0
+            m = re.match(r"\d+% \((\d+)/(\d+)\)", ln.get("condition-coverage") or "")
+            if ln.get("branch") == "true" and m:
+                f["branch_hit"] += int(m.group(1))
+                f["branches"] += int(m.group(2))
+        for meth in cls.iter("method"):
+            lines = [ln for ln in meth.iter("line")]
+            if lines:
+                hit = sum(1 for ln in lines if (ln.get("hits") or "0") != "0")
+                functions[(path, meth.get("name") or "?")] = (round(100.0 * hit / len(lines), 2), "%",
+                                                              "function_line_coverage")
+    try:
+        total = round(100.0 * float(root.get("line-rate")), 2)
+    except (TypeError, ValueError):
+        total = None
+    return _coverage_result(files, functions, total)
+
+
+def _formats_note(name):
+    """The fallback text of an import-only format."""
+    return f"import only: give --from FILE (the {name} file a tool wrote)"
+
+
+tool_adapter("sarif", fmt="sarif", parse=parse_sarif, fallback=_formats_note("SARIF 2.1.0"))
+tool_adapter("junit", fmt="junit", parse=parse_junit, domain="tests", fallback=_formats_note("JUnit XML"))
+tool_adapter("lcov", fmt="lcov", parse=parse_lcov, domain="tests", fallback=_formats_note("LCOV"))
+tool_adapter("cobertura", fmt="cobertura", parse=parse_cobertura, domain="tests",
+             fallback=_formats_note("Cobertura XML"))
+
+
+def _semgrep_rules(call):
+    """The rule file semgrep runs with: --rules FILE, else the pinned rule set fetched into the ledger's folder."""
+    if call.rules:
+        return call.rules
+    cached = _semgrep_cached_rules(call) if call.ledger_dir else None
+    if cached:
+        return cached
+    raise ToolSkip("no rule set: give --rules FILE, or run `tool-run semgrep --online` once to fetch the pinned one")
+
+
+def _semgrep_argv(call):
+    """semgrep's command: the rule file, SARIF to {out}, telemetry and version checks off."""
+    rules = _semgrep_rules(call)
+    call.placeholders[str(rules)] = "{rules}"
+    call.rules = rules
+    return ["semgrep", "scan", "--config", str(rules), f"--sarif-output={call.out}", "--metrics=off",
+            "--disable-version-check", "--oss-only", "--quiet", "."]
+
+
+tool_adapter("semgrep", fmt="sarif", parse=parse_sarif, domain="security", binary="semgrep", argv=_semgrep_argv,
+             ok_exits=(0, 1), install="pipx install semgrep==<pinned> (or mise install)",
+             fallback="read for the sinks of security.2 by hand and say 'not machine-checked'", online="optional")
+
+
+# ----- the code tools (step 219): ast-grep rule packs, scc, jscpd, git history
+
+AST_GREP_LEVELS = {"error": "error", "warning": "warning", "info": "note", "hint": "note"}
+SCC_LEADS = 10            # the most complex files scc turns into leads
+HISTORY_COMMITS = 5000    # the most commits git-history reads back from the reviewed commit
+HISTORY_LEADS = 10        # the most leads of each kind git-history gives
+HOTSPOT_MIN_COMMITS = 3   # a file changed in fewer commits is no hotspot
+COCHANGE_MIN = 3          # two files that changed together in fewer commits are not a pair
+COCHANGE_MAX_FILES = 20   # a commit touching more files (a rename, a reformat) says nothing about pairs
+SINGLE_AUTHOR_MIN = 5     # a file one author changed fewer times is not knowledge held by one person
+
+
+def parse_ast_grep(data, call):
+    """ast-grep `scan --json=stream`: one JSON object per match; lines are 0-based there. A shipped rule's id
+    starts with its domain (time-concurrency.python-naive-now), which the lead takes."""
+    leads = []
+    for n, line in enumerate(data.decode("utf-8", "replace").split("\n"), 1):
+        if not line.strip():
+            continue
+        try:
+            m = json.loads(line)
+        except ValueError as e:
+            raise WriteError(f"cannot read the output as ast-grep JSON lines: line {n}: {_one_line(e)}")
+        rng = m.get("range") or {}
+        start = (rng.get("start") or {}).get("line")
+        end = (rng.get("end") or {}).get("line")
+        rule = str(m.get("ruleId") or "unnamed")
+        pack = rule.split(".", 1)[0] if "." in rule else None
+        leads.append(_lead(rule, AST_GREP_LEVELS.get(m.get("severity"), "warning"),
+                           _relative_lead_path(m.get("file"), call),
+                           start + 1 if isinstance(start, int) else None, end + 1 if isinstance(end, int) else None,
+                           m.get("message"), domain=pack if pack in SHIPPED_PACKS else None))
+    return {"leads": leads, "metrics": [], "version": None}
+
+
+SHIPPED_PACKS = ("decision-placement", "time-concurrency", "resilience", "server", "client-api", "logging")
+
+
+def _ast_grep_argv(call):
+    """ast-grep's command: one --rules file, else the shipped rule packs' sgconfig.yml."""
+    if call.rules:
+        call.placeholders[str(call.rules)] = "{rules}"
+        return ["ast-grep", "scan", "--rule", str(call.rules), "--json=stream", "."]
+    cfg = skill_file(f"{RULES_DIR}/ast-grep/sgconfig.yml")
+    if cfg is None:
+        raise ToolSkip(f"the rule packs ({RULES_DIR}/ast-grep/) are not beside this ledger.py: run the skill's copy")
+    call.rules = cfg.parent
+    call.placeholders[str(cfg)] = "{rules}"
+    return ["ast-grep", "scan", "--config", str(cfg), "--json=stream", "."]
+
+
+tool_adapter("ast-grep", fmt="jsonl", parse=parse_ast_grep, binary="ast-grep", argv=_ast_grep_argv, stdout=True,
+             ok_exits=(0, 1), install="pipx install ast-grep-cli==<pinned> (or npm i -g @ast-grep/cli, or mise install)",
+             fallback="search with git grep for the API names each rule pack lists (more false positives) and say "
+                      "'not machine-checked'", step=219)
+
+
+def parse_scc(data, call):
+    """scc `--format json --by-file`: code lines, complexity and files overall; complexity per file; the most complex
+    files as leads."""
+    doc = _json_of(data, "scc JSON")
+    if not isinstance(doc, list):
+        raise WriteError("cannot read the output as scc JSON: it is not a list of languages")
+    files = []
+    for lang in doc:
+        for f in (lang or {}).get("Files") or []:
+            path = _relative_lead_path(f.get("Location"), call)
+            if path:
+                files.append((path, int(f.get("Code") or 0), int(f.get("Complexity") or 0), lang.get("Name") or "?"))
+    metrics = [("code_lines", "all", sum(f[1] for f in files), "lines"),
+               ("complexity", "all", sum(f[2] for f in files), None), ("code_files", "all", len(files), "files")]
+    top = sorted((f for f in files if f[2] > 0), key=lambda f: (-f[2], f[0]))[:SCC_LEADS]
+    leads = []
+    for path, code, cx, lang in top:
+        metrics.append(("complexity", path, cx, None))
+        leads.append(_lead("scc.complex-file", "note", path, None, None,
+                           f"complexity {cx} in {code} code lines ({lang}); among the {SCC_LEADS} most complex files"))
+    return {"leads": leads, "metrics": metrics, "version": None}
+
+
+tool_adapter("scc", fmt="json", parse=parse_scc, domain="abstraction", binary="scc", stdout=True,
+             argv=lambda call: ["scc", "--format", "json", "--by-file", "--no-cocomo", "."],
+             install="download the release binary from github.com/boyter/scc (or mise install)",
+             fallback="count lines per file with git ls-files and wc -l; complexity not measured", step=219)
+
+
+def _jscpd_argv(call):
+    """jscpd's command: its JSON report into a folder of its own, which becomes call.out."""
+    folder = Path(call.out).parent / "jscpd"
+    call.out = folder / "jscpd-report.json"
+    call.placeholders[str(folder)] = "{outdir}"
+    return ["jscpd", "--reporters", "json", "--output", str(folder), "--silent", "--min-lines", "5",
+            "--min-tokens", "50", "."]
+
+
+def parse_jscpd(data, call):
+    """jscpd's JSON report: one lead per copy, at its first place, naming the second; totals as metrics."""
+    doc = _json_of(data, "jscpd JSON")
+    if not isinstance(doc, dict) or not isinstance(doc.get("duplicates"), list):
+        raise WriteError("cannot read the output as jscpd JSON: it has no duplicates list")
+    leads = []
+    for d in doc["duplicates"]:
+        a, b = d.get("firstFile") or {}, d.get("secondFile") or {}
+        pa, pb = _relative_lead_path(a.get("name"), call), _relative_lead_path(b.get("name"), call)
+        leads.append(_lead("jscpd.clone", "warning", pa, a.get("start"), a.get("end"),
+                           f"{d.get('lines')} lines ({d.get('format')}) also at {pb}:{b.get('start')}-{b.get('end')}"))
+    total = ((doc.get("statistics") or {}).get("total")) or {}
+    metrics = [("clones", "all", len(doc["duplicates"]), None)]
+    if "duplicatedLines" in total:
+        metrics.append(("duplicated_lines", "all", total["duplicatedLines"], "lines"))
+    if "percentage" in total:
+        metrics.append(("duplicated_percent", "all", round(float(total["percentage"]), 2), "%"))
+    return {"leads": leads, "metrics": metrics, "version": None}
+
+
+tool_adapter("jscpd", fmt="json", parse=parse_jscpd, domain="abstraction", binary="jscpd", argv=_jscpd_argv,
+             ok_exits=(0, 1), install="npm install -g jscpd@<pinned> (or mise install)",
+             fallback="compare the modules that hold the same kind of rule by reading; say 'copies not measured'",
+             step=219)
+
+
+def git_history(call):
+    """The built-in history analysis, as JSON (sorted, no time in it): per file still present at the commit, its
+    commits, lines changed and authors; the pairs of files that change together; the authors' commit counts."""
+    d, sha = call.repo_dir, call.commit
+    present = set(_git_out(d, "ls-tree", "-r", "--name-only", "-z", sha).split("\0")) - {""}
+    log = _git_out(d, "log", "--no-merges", "--no-renames", f"-n{HISTORY_COMMITS}", "--format=%x00%H%x09%aN%x09%aE",
+                   "--numstat", sha)
+    files, pairs, authors, commits = {}, {}, {}, 0
+    for chunk in log.split("\0")[1:]:
+        head, _, rest = chunk.partition("\n")
+        parts = head.split("\t")
+        if len(parts) < 3:
+            continue
+        commits += 1
+        who = parts[2].strip().lower() or parts[1].strip()
+        name = parts[1].strip() or who
+        authors.setdefault(who, {"name": name, "commits": 0})["commits"] += 1
+        touched = []
+        for line in rest.split("\n"):
+            cells = line.split("\t")
+            if len(cells) != 3 or cells[2] not in present:
+                continue
+            added, deleted = (int(c) if c.isdigit() else 0 for c in cells[:2])
+            f = files.setdefault(cells[2], {"commits": 0, "lines": 0, "authors": {}})
+            f["commits"] += 1
+            f["lines"] += added + deleted
+            f["authors"][who] = f["authors"].get(who, 0) + 1
+            touched.append(cells[2])
+        touched = sorted(set(touched))
+        if 2 <= len(touched) <= COCHANGE_MAX_FILES:
+            for i, a in enumerate(touched):
+                for b in touched[i + 1:]:
+                    pairs[(a, b)] = pairs.get((a, b), 0) + 1
+    out = {"commit": sha, "commits_read": commits, "commits_limit": HISTORY_COMMITS,
+           "authors": [{"id": k, "name": v["name"], "commits": v["commits"]} for k, v in sorted(authors.items())],
+           "files": [{"path": p, "commits": f["commits"], "lines": f["lines"],
+                      "authors": [{"id": k, "commits": n} for k, n in sorted(f["authors"].items())]}
+                     for p, f in sorted(files.items())],
+           "pairs": [{"a": a, "b": b, "commits": n} for (a, b), n in sorted(pairs.items()) if n >= COCHANGE_MIN]}
+    return 0, (json.dumps(out, indent=1, sort_keys=True) + "\n").encode("utf-8")
+
+
+def _apart(a, b):
+    """Two paths in different folders, the top folder included."""
+    return a.rpartition("/")[0] != b.rpartition("/")[0]
+
+
+def parse_git_history(data, call):
+    """git-history's JSON: hotspots (most commits), pairs that change together while living apart, files only one
+    author changed; per-file commits and authors and the history's totals as metrics."""
+    doc = _json_of(data, "git-history JSON")
+    if not isinstance(doc, dict) or "files" not in doc:
+        raise WriteError("cannot read the output as git-history JSON")
+    names = {a["id"]: a["name"] for a in doc.get("authors") or []}
+    files = {f["path"]: f for f in doc["files"]}
+    metrics = [("history_commits", "all", doc.get("commits_read", 0), "commits"),
+               ("history_authors", "all", len(names), "authors")]
+    by_commits = sorted(files.values(), key=lambda f: (-f["commits"], -f["lines"], f["path"]))
+    total = sum(a["commits"] for a in doc.get("authors") or [])
+    covered, bus = 0, 0
+    for a in sorted(doc.get("authors") or [], key=lambda a: (-a["commits"], a["id"])):
+        if total and covered * 2 >= total:
+            break
+        covered += a["commits"]
+        bus += 1
+    metrics.append(("bus_factor", "all", bus, "authors"))
+    leads = []
+    for f in by_commits[:HISTORY_LEADS]:
+        metrics += [("file_commits", f["path"], f["commits"], "commits"),
+                    ("file_authors", f["path"], len(f["authors"]), "authors")]
+        if f["commits"] >= HOTSPOT_MIN_COMMITS:
+            leads.append(_lead("git-history.hotspot", "note", f["path"], None, None,
+                               f"changed in {f['commits']} commits ({f['lines']} lines) by {len(f['authors'])} "
+                               f"author{'s' if len(f['authors']) != 1 else ''}", domain="hotspots"))
+    pairs = [p for p in doc.get("pairs") or [] if _apart(p["a"], p["b"]) and p["a"] in files and p["b"] in files
+             and p["commits"] * 2 >= min(files[p["a"]]["commits"], files[p["b"]]["commits"])]
+    for p in sorted(pairs, key=lambda p: (-p["commits"], p["a"], p["b"]))[:HISTORY_LEADS]:
+        leads.append(_lead("git-history.co-change", "note", p["a"], None, None,
+                           f"changes with {p['b']} in {p['commits']} commits, though they live apart",
+                           domain="hotspots"))
+    single = [f for f in by_commits if len(f["authors"]) == 1 and f["commits"] >= SINGLE_AUTHOR_MIN]
+    for f in single[:HISTORY_LEADS]:
+        who = names.get(f["authors"][0]["id"], "one author")
+        leads.append(_lead("git-history.single-author", "note", f["path"], None, None,
+                           f"all {f['commits']} commits by {who}", domain="handover"))
+    return {"leads": leads, "metrics": metrics, "version": None}
+
+
+tool_adapter("git-history", fmt="json", parse=parse_git_history, domain="hotspots", run=git_history, source="repo",
+             fallback="read git log by hand for the most changed files", step=219)
+
+
+# ----- the security and operations tools (step 220): Semgrep CE, gitleaks, OSV-Scanner, actionlint, zizmor
+
+SEMGREP_RULES_URL = "https://semgrep.dev/c/p/default"   # the registry's default pack, fetched only with --online
+FETCH_SECONDS = 120
+GITLEAKS_SECRET_FIELDS = ("Secret", "Match", "Line")
+
+
+def _fetch_once(url, target):
+    """Download url to target (through a temporary file); WriteError when it cannot."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(url, timeout=FETCH_SECONDS) as r:
+            data = r.read(TOOL_OUTPUT_BYTES)
+    except (OSError, ValueError) as e:
+        raise WriteError(f"cannot fetch {url}: {_one_line(e)}")
+    if not data.strip():
+        raise WriteError(f"{url} returned nothing")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    write_atomic(target, data, 0o644)
+    return target
+
+
+def _semgrep_cached_rules(call):
+    """The rule set kept in the ledger's folder: fetched from the registry the first time --online is given."""
+    cached = Path(call.ledger_dir) / "tools" / "semgrep-rules.yml"
+    if not cached.is_file() and call.online:
+        _fetch_once(os.environ.get("LEDGER_SEMGREP_RULES_URL") or SEMGREP_RULES_URL, cached)
+    return cached if cached.is_file() else None
+
+
+def parse_gitleaks(data, call):
+    """gitleaks' JSON report: one lead per secret found, at its file and lines in the commit that added it. The
+    value is never read: the message is the rule's description and the commit."""
+    doc = _json_of(data, "gitleaks JSON")
+    if not isinstance(doc, list):
+        raise WriteError("cannot read the output as gitleaks JSON: it is not a list of findings")
+    leads = []
+    for f in doc:
+        if not isinstance(f, dict):
+            continue
+        commit = str(f.get("Commit") or "")[:10]
+        leads.append(_lead(f.get("RuleID") or "secret", "error", _relative_lead_path(f.get("File"), call),
+                           f.get("StartLine"), f.get("EndLine"),
+                           f"{f.get('Description') or 'a secret'}" + (f" (added in commit {commit})" if commit else "")))
+    return {"leads": leads, "metrics": [("secrets_found", "all", len(leads), None)], "version": None}
+
+
+def store_gitleaks(data):
+    """The report as kept: every value field replaced by REDACTED, whatever --redact did."""
+    try:
+        doc = json.loads(data.decode("utf-8-sig"))
+    except (UnicodeDecodeError, ValueError):
+        return b"[]\n"
+    for f in doc if isinstance(doc, list) else []:
+        if isinstance(f, dict):
+            for k in GITLEAKS_SECRET_FIELDS:
+                if k in f:
+                    f[k] = "REDACTED"
+    return (json.dumps(doc, indent=1, sort_keys=True) + "\n").encode("utf-8")
+
+
+tool_adapter("gitleaks", fmt="json", parse=parse_gitleaks, store=store_gitleaks, domain="security",
+             binary="gitleaks", version_args=("version",), source="repo", ok_exits=(0, 1),
+             argv=lambda call: ["gitleaks", "git", "--report-format", "json", "--report-path", str(call.out),
+                                "--redact", "--no-banner", "--no-color", f"--log-opts={call.commit}", "."],
+             install="download the release binary from github.com/gitleaks/gitleaks (or mise install)",
+             fallback="search the history for key shapes (git log -p | grep -E 'AKIA|ghp_|-----BEGIN') and cite "
+                      "locations only", step=220)
+
+
+def _lock_files(work):
+    """The lockfiles and requirement files in an export, sorted."""
+    found = []
+    for p in sorted(Path(work).rglob("*")):
+        if p.is_file() and (p.name in LOCK_FILES or re.match(r"requirements[^/]*\.txt$", p.name)) and \
+                not {"node_modules", "vendor", ".venv"} & set(p.relative_to(work).parts):
+            found.append(p.relative_to(work).as_posix())
+    return found
+
+
+def _osv_db(call):
+    """The folder where OSV-Scanner keeps its advisory databases (inside the ledger's folder)."""
+    return Path(call.ledger_dir) / "tools" / "osv-db"
+
+
+def _osv_argv(call):
+    """OSV-Scanner's command: offline against the lockfiles; --online also downloads the databases."""
+    if not _lock_files(call.work):
+        raise ToolSkip("no lockfile or requirements file at the commit")
+    db = _osv_db(call)
+    has_db = db.is_dir() and any(p.is_file() for p in db.rglob("*"))
+    if not has_db and not call.online:
+        raise ToolSkip("no advisory databases yet: run `tool-run osv-scanner --online` once to download them into "
+                       ".code-review/tools/osv-db")
+    call.placeholders[str(db)] = "{osv-db}"
+    return ["osv-scanner", "scan", "source", "-r", "--format", "json", "--output", str(call.out),
+            "--offline-vulnerabilities"] + (["--download-offline-databases"] if call.online else ["--offline"]) + ["."]
+
+
+def parse_osv(data, call):
+    """OSV-Scanner's JSON: one lead per advisory group of a package (the first id, every alias in the message), at
+    the lockfile that names the package; CVSS 7 or more is an error."""
+    doc = _json_of(data, "OSV-Scanner JSON")
+    if not isinstance(doc, dict) or not isinstance(doc.get("results", []), list):
+        raise WriteError("cannot read the output as OSV-Scanner JSON: it has no results list")
+    leads, packages = [], set()
+    for res in doc.get("results") or []:
+        path = _relative_lead_path(((res or {}).get("source") or {}).get("path"), call)
+        for pkg in res.get("packages") or []:
+            p = pkg.get("package") or {}
+            vulns = {v.get("id"): v for v in pkg.get("vulnerabilities") or [] if isinstance(v, dict)}
+            groups = pkg.get("groups") or [{"ids": [i], "aliases": vulns[i].get("aliases") or []} for i in vulns]
+            for g in groups:
+                ids = sorted(g.get("ids") or [])
+                if not ids:
+                    continue
+                packages.add((p.get("ecosystem"), p.get("name"), p.get("version")))
+                try:
+                    sev = float(g.get("max_severity") or 0)
+                except ValueError:
+                    sev = 0.0
+                summary = next((vulns[i].get("summary") for i in ids if vulns.get(i, {}).get("summary")), "")
+                aliases = sorted(set(g.get("aliases") or []) - {ids[0]})
+                leads.append(_lead(ids[0], "error" if sev >= 7 else "warning", path, None, None,
+                                   f"{p.get('name')} {p.get('version')} ({p.get('ecosystem')}): {summary}"
+                                   + (f"; also {', '.join(aliases)}" if aliases else "")
+                                   + (f"; CVSS {g.get('max_severity')}" if g.get("max_severity") else "")))
+    metrics = [("vulnerable_packages", "all", len(packages), "packages"), ("vulnerabilities", "all", len(leads), None)]
+    return {"leads": leads, "metrics": metrics, "version": None}
+
+
+tool_adapter("osv-scanner", fmt="json", parse=parse_osv, domain="dependencies", binary="osv-scanner",
+             argv=_osv_argv, ok_exits=(0, 1),
+             env=lambda call: {"OSV_SCANNER_LOCAL_DB_CACHE_DIRECTORY": str(_osv_db(call))},
+             install="download the release binary from github.com/google/osv-scanner (or mise install)",
+             fallback="list each lockfile's packages and versions and say 'advisories not checked'",
+             online="optional", step=220)
+
+
+def _workflows(call):
+    """The commit's GitHub Actions workflow files; ToolSkip when it has none."""
+    folder = Path(call.work) / ".github" / "workflows"
+    found = sorted(p for p in folder.glob("*") if p.suffix in (".yml", ".yaml")) if folder.is_dir() else []
+    if not found:
+        raise ToolSkip("no GitHub Actions workflows at the commit (.github/workflows/)")
+    return found
+
+
+def _actionlint_argv(call):
+    """actionlint's command on each workflow file, with shellcheck and pyflakes off."""
+    files = [p.relative_to(call.work).as_posix() for p in _workflows(call)]
+    return ["actionlint", "-format", "{{json .}}", "-no-color", "-shellcheck=", "-pyflakes=", *files]
+
+
+def parse_actionlint(data, call):
+    """actionlint's `-format '{{json .}}'`: a JSON list of errors, each with its kind, file and line."""
+    text = data.decode("utf-8", "replace").strip()
+    doc = json.loads(text) if text else []
+    if not isinstance(doc, list):
+        raise WriteError("cannot read the output as actionlint JSON: it is not a list")
+    leads = [_lead(f"actionlint.{e.get('kind') or 'error'}", "error", _relative_lead_path(e.get("filepath"), call),
+                   e.get("line"), None, e.get("message")) for e in doc if isinstance(e, dict)]
+    return {"leads": leads, "metrics": [], "version": None}
+
+
+def _parse_actionlint(data, call):
+    """parse_actionlint, with unreadable JSON refused as a WriteError."""
+    try:
+        return parse_actionlint(data, call)
+    except ValueError as e:
+        raise WriteError(f"cannot read the output as actionlint JSON: {_one_line(e)}")
+
+
+tool_adapter("actionlint", fmt="json", parse=_parse_actionlint, domain="operations", binary="actionlint",
+             version_args=("-version",), argv=_actionlint_argv, stdout=True, ok_exits=(0, 1),
+             install="download the release binary from github.com/rhysd/actionlint (or mise install)",
+             fallback="read each workflow against operations.1 and dependencies.2 by hand", step=220)
+
+
+def _zizmor_argv(call):
+    """zizmor's command: SARIF, offline unless --online."""
+    _workflows(call)
+    return ["zizmor", "--format", "sarif"] + ([] if call.online else ["--offline"]) + ["."]
+
+
+tool_adapter("zizmor", fmt="sarif", parse=parse_sarif, domain="operations", binary="zizmor", argv=_zizmor_argv,
+             stdout=True, ok_exits=(0, 10, 11, 12, 13, 14),
+             install="pipx install zizmor==<pinned> (or mise install)",
+             fallback="read each workflow for unpinned actions, broad permissions and injected expressions",
+             online="optional", step=220)
+
+
+# ----- coverage and the test-suite runs (step 221)
+
+def parse_coverage(data, call):
+    """The project's own coverage file: Cobertura XML when it starts with '<', else LCOV."""
+    if data.lstrip()[:1] == b"<":
+        return {**parse_cobertura(data, call), "format": "cobertura"}
+    return {**parse_lcov(data, call), "format": "lcov"}
+
+
+tool_adapter("coverage", fmt="lcov", parse=parse_coverage, domain="tests",
+             fallback=_formats_note("LCOV or Cobertura coverage") + "; without one, read the tests and mark totals "
+                                                                   "'estimated'", step=221)
+
+TEST_VARIANTS = ("repeat", "random-order", "network-off", "clock")
+TEST_VARIANT_RULES = {"repeat": "test-runs.flaky", "random-order": "test-runs.order-dependent",
+                      "network-off": "test-runs.network", "clock": "test-runs.clock"}
+CLOCK_YEAR = 2027          # the year whose daylight-saving changes the clock runs straddle
+UNREACHABLE_PROXY = "http://127.0.0.1:9"   # the network-off fallback points every proxy here (the discard port)
+UNSHARE_PROBE_SECONDS = 10                 # how long the check that unshare -rn works may take
+
+
+def _dst_change(zone, year, forward):
+    """The local time 30 seconds before the zone's first daylight-saving change of the year in that direction
+    (forward: clocks go ahead), from zoneinfo; None when zoneinfo or the zone is not available."""
+    try:
+        from zoneinfo import ZoneInfo
+        z = ZoneInfo(zone)
+    except Exception:  # noqa: BLE001 - no zoneinfo module or no tz database: the instant is left out
+        return None
+    t = datetime(year, 1, 1, tzinfo=timezone.utc)
+    end = datetime(year + 1, 1, 1, tzinfo=timezone.utc)
+    prev = t.astimezone(z).utcoffset()
+    while t < end:
+        nxt = t + timedelta(hours=1)
+        off = nxt.astimezone(z).utcoffset()
+        if off != prev and (off > prev) == forward:
+            lo, hi = t, nxt
+            while (hi - lo) > timedelta(seconds=1):
+                mid = lo + (hi - lo) / 2
+                if mid.astimezone(z).utcoffset() == prev:
+                    lo = mid
+                else:
+                    hi = mid
+            return (hi - timedelta(seconds=30)).astimezone(z).strftime("%Y-%m-%d %H:%M:%S")
+        prev, t = off, nxt
+    return None
+
+
+def clock_instants():
+    """[(name, zone, local time)] the clock runs use: the end of a leap day in the earliest zone, the end of a year in
+    a half-hour zone, and the two daylight-saving changes of CLOCK_YEAR (those whose zone zoneinfo lacks are left
+    out)."""
+    out = [("leap-day", "Pacific/Kiritimati", "2028-02-29 23:59:30"),
+           ("year-end", "America/St_Johns", f"{CLOCK_YEAR}-12-31 23:59:30")]
+    for name, zone, forward in (("dst-start", "America/New_York", True), ("dst-end", "Europe/Berlin", False)):
+        local = _dst_change(zone, CLOCK_YEAR, forward)
+        if local:
+            out.append((name, zone, local))
+    return out
+
+
+def network_off_prefix():
+    """['unshare', '-rn'] when this machine lets an unprivileged process drop its network (Linux), else None."""
+    exe = shutil.which("unshare") if sys.platform.startswith("linux") else None
+    if not exe:
+        return None
+    try:
+        ok_ = subprocess.run([exe, "-rn", "true"], capture_output=True, timeout=UNSHARE_PROBE_SECONDS).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        ok_ = False
+    return [exe, "-rn"] if ok_ else None
+
+
+def junit_outcomes(data, call):
+    """{test id: (outcome, path, line)} of a JUnit XML file (outcome passed, failed, errored or skipped)."""
+    parsed = parse_junit(data, call)
+    out = {}
+    root = _xml_of(data, "JUnit XML")
+    failed = {l["message"].split(" ", 1)[0]: l for l in parsed["leads"]}
+    for case in root.iter("testcase"):
+        tid = ".".join(x for x in (case.get("classname"), case.get("name")) if x)
+        bad = next((c for c in case if c.tag in ("failure", "error")), None)
+        lead = failed.get(tid)
+        path = lead["path"] if lead else _relative_lead_path(case.get("file"), call)
+        line = lead["line_start"] if lead else None
+        outcome = ("failed" if bad.tag == "failure" else "errored") if bad is not None else \
+            ("skipped" if case.find("skipped") is not None else "passed")
+        out[tid] = (outcome, path, line)
+    return out, parsed.get("counts") or {}
+
+
+def _test_run_plan(a, seed):
+    """[(variant, label, extra env, prefix, note, fallback)] for the runs test-runs makes, in order."""
+    plan = [("baseline", "baseline", {}, [], "baseline", None)]
+    variants = [v.strip() for v in (a.variants or ",".join(TEST_VARIANTS)).split(",") if v.strip()]
+    bad = sorted(set(variants) - set(TEST_VARIANTS))
+    if bad:
+        raise WriteError(f"--variants {bad[0]}: not one of {', '.join(TEST_VARIANTS)}")
+    for v in TEST_VARIANTS:
+        if v not in variants:
+            continue
+        if v == "repeat":
+            for i in range(1, a.repeat + 1):
+                plan.append((v, f"repeat {i} of {a.repeat}", {}, [], f"repeat {i} of {a.repeat}", None))
+        elif v == "random-order":
+            how = "" if a.random_command else "; the runner gets the seed only as LEDGER_TEST_SEED and PYTHONHASHSEED"
+            plan.append((v, "random order", {"LEDGER_TEST_SEED": str(seed), "PYTHONHASHSEED": str(seed)}, [],
+                         f"random order, seed {seed}{how}", None))
+        elif v == "network-off":
+            prefix = network_off_prefix()
+            if prefix:
+                plan.append((v, "network off", {}, prefix, "network off (unshare -rn)", None))
+            else:
+                proxies = {k: UNREACHABLE_PROXY for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy",
+                                                          "https_proxy", "all_proxy")}
+                plan.append((v, "network off", {**proxies, "NO_PROXY": "", "no_proxy": ""}, [],
+                             "network not cut: every proxy variable points at a closed port",
+                             "unshare -rn is not available here (Linux only); tests that open sockets directly were "
+                             "not cut off: look for network calls in the tests by reading"))
+        elif v == "clock":
+            fake = shutil.which("faketime")
+            for name, zone, local in clock_instants():
+                plan.append((v, f"clock {name}", {"TZ": zone}, [fake, local] if fake else [],
+                             f"clock {name}: TZ={zone}" + (f", faketime {local}" if fake else
+                                                           f"; faketime not installed, so zone only ({local} not set)"),
+                             None if fake else "faketime is not installed: the zone was set, the clock was not"))
+    return plan
+
+
+@_command("test-runs", "run the project's tests on the reviewed commit: baseline, repeated, random order, network "
+                       "off and shifted clocks; newly failing tests become leads",
+          "ledger.py test-runs --review R-0001 --command 'CMD writing JUnit XML to {junit}' [--random-command CMD] "
+          "[--variants repeat,random-order,network-off,clock] [--repeat 3] [--seed N] [--repo NAME] [--domain D] "
+          "[--actor A-0001]")
+def cmd_test_runs(ctx):
+    a, con = ctx.a, ctx.con
+    rv = review_row(con, a.review)
+    command = _need(a.command, "--command (the test command, writing JUnit XML to {junit})")
+    for c in (command, a.random_command):
+        if c is not None and "{junit}" not in c:
+            raise WriteError("the command must write JUnit XML to {junit} (for example: python3 -m pytest "
+                             "--junitxml={junit})")
+    if a.repeat < 1:
+        raise WriteError("--repeat is a count (1 or more)")
+    domain = _domain_or_none(con, a.domain or "test-quality", "--domain")
+    repo, sha = _review_repo(con, rv, a.repo)
+    seed = a.seed if a.seed is not None else int(sha[:8], 16) % 1000000
+    plan = _test_run_plan(a, seed)
+    d = repo_dir(ctx.root, repo["path"], bool(repo["allow_outside_root"]))
+    tmp = Path(tempfile.mkdtemp(prefix="ledger-tests-"))
+    out, base, reported, total = [], None, set(), 0
+    try:
+        for k, (variant, label, extra, prefix, note, fallback) in enumerate(plan):
+            work = tmp / f"checkout-{k}"
+            work.mkdir()
+            _export_commit(d, sha, work)
+            junit = tmp / f"junit-{k}.xml"
+            template = a.random_command if variant == "random-order" and a.random_command else command
+            words = [w.replace("{junit}", str(junit)).replace("{seed}", str(seed)) for w in shlex.split(template)]
+            shown = (" ".join(shlex.quote(w) for w in [Path(prefix[0]).name, *prefix[1:]]) + " " if prefix else "") \
+                + template.replace("{seed}", str(seed))
+            started = time.monotonic()
+            try:
+                p = subprocess.run([*prefix, *words], cwd=str(work), capture_output=True, timeout=TOOL_SECONDS,
+                                   stdin=subprocess.DEVNULL, env={**os.environ, **extra})
+                code = p.returncode
+            except OSError as e:
+                raise WriteError(f"cannot run {words[0]}: {e.strerror or e}")
+            ms = int((time.monotonic() - started) * 1000)
+            call = ToolCall(work=work, repo_dir=d, commit=sha, a=a)
+            data = junit.read_bytes() if junit.is_file() else b""
+            if not data.strip():
+                if variant == "baseline":
+                    raise WriteError(f"the baseline run (exit {code}) wrote no JUnit XML to {{junit}}; nothing was "
+                                     f"recorded")
+                run_id, _, _ = record_tool_run(ctx, rv, repo, sha, "test-runs", status="failed", domain=domain,
+                                               command=f"{variant}: {shown}", exit_code=code, duration_ms=ms,
+                                               fallback=fallback or "rerun it by hand", note=f"{note}; no JUnit XML")
+                out.append(f"{label}: exit {code}, no JUnit XML (tool run {run_id})")
+                continue
+            results, counts = junit_outcomes(data, call)
+            bad = {t for t, (o, _, _) in results.items() if o in ("failed", "errored")}
+            leads = []
+            if base is None:
+                base = (bad, results)
+            else:
+                newly = bad - base[0]
+                if variant == "repeat":
+                    newly |= {t for t in base[0] if results.get(t, ("",))[0] == "passed"}
+                for t in sorted(newly - reported):
+                    reported.add(t)
+                    _, path, line = results.get(t) or base[1].get(t) or (None, None, None)
+                    what = {"repeat": "on one run and not on another, with nothing changed",
+                            "random-order": f"in random order (seed {seed}) and passes in the given order",
+                            "network-off": "with the network off and passes with it",
+                            "clock": f"at {note.split(':', 1)[0]} and passes at the real time"}[variant]
+                    leads.append(_lead(TEST_VARIANT_RULES[variant], "warning", path, line, None,
+                                       f"{t} {'passes' if t in base[0] else 'fails'} {what}"
+                                       if variant != "repeat" else f"{t} fails {what}"))
+            run_id, codes, kept = record_tool_run(
+                ctx, rv, repo, sha, "test-runs", status="ran", domain=domain, fmt="junit", data=data,
+                parsed={"leads": leads, "metrics": []}, command=f"{variant}: {shown}", exit_code=code,
+                duration_ms=ms, fallback=fallback, note=note)
+            ctx.x("""INSERT INTO test_runs(review_id, repository_id, commit_sha, command, purpose, passed, failed,
+                     skipped, errored, exit_code, duration_ms, output_path, notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                  (rv["id"], repo["id"], sha, shown, "baseline" if variant == "baseline" else "flake-check",
+                   counts.get("passed"), counts.get("failed"), counts.get("skipped"), counts.get("errored"), code, ms,
+                   kept, note + (f"; fallback: {fallback}" if fallback else "")))
+            total += len(codes)
+            out.append(f"{label}: {counts.get('passed', 0)} passed, {counts.get('failed', 0)} failed, "
+                       f"{counts.get('errored', 0)} errored" + (f"; {_lead_summary(codes)}" if codes else "")
+                       + (f" ({note})" if variant in ("random-order", "network-off", "clock") else ""))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    out.append(f"{rv['code']}: {len(plan)} runs at {sha[:10]}, seed {seed}, {total} lead{'s' if total != 1 else ''}")
+    return out
+
+
+def _export_commit(repo_dir, sha, into):
+    """Write the files of a commit into an empty folder with `git archive` (no symlink is followed out of it)."""
+    p = subprocess.Popen(["git", "-C", str(repo_dir), "archive", "--format=tar", sha], stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE)
+    base = Path(into).resolve()
+    try:
+        with tarfile.open(fileobj=p.stdout, mode="r|") as tar:
+            for m in tar:
+                target = (base / m.name).resolve()
+                if m.name.startswith("/") or ".." in Path(m.name).parts or base not in (target, *target.parents):
+                    continue
+                if m.isdir():
+                    target.mkdir(parents=True, exist_ok=True)
+                elif m.isfile():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    src = tar.extractfile(m)
+                    with open(target, "wb") as f:
+                        shutil.copyfileobj(src, f)
+                    if m.mode & 0o111:
+                        target.chmod(0o755)
+                # symlinks and other members are left out: a tool reads the commit's regular files
+    finally:
+        err = p.stderr.read()
+        if p.wait() != 0:
+            raise RuntimeError(f"git archive {sha[:12]} failed: {err.decode('utf-8', 'replace').strip()}")
+
+
+def _tool_env(online):
+    """The environment a tool runs in: this one, with each picked tool's telemetry and update checks off."""
+    env = dict(os.environ)
+    env.update({"SEMGREP_SEND_METRICS": "off", "SEMGREP_ENABLE_VERSION_CHECK": "0", "NO_COLOR": "1",
+                "DO_NOT_TRACK": "1"})
+    return env
+
+
+def _command_text(argv, call):
+    """The command as recorded: temporary paths as {checkout}, {out} and the adapter's own placeholders."""
+    subs = sorted({**call.placeholders, **({str(call.out): "{out}"} if call.out else {}),
+                   **({str(call.work): "{checkout}"} if call.work else {})}.items(), key=lambda kv: -len(kv[0]))
+    words = []
+    for w in argv:
+        w = str(w)
+        for path, ph in subs:
+            w = w.replace(path, ph)
+        words.append(w)
+    return " ".join(shlex.quote(w) if not re.fullmatch(r"[{}A-Za-z0-9_@%+=:,./-]+", w) else w for w in words)
+
+
+def _run_adapter(ad, call):
+    """Run one adapter on its export; (exit code, output bytes, command text, duration in ms)."""
+    started = time.monotonic()
+    if ad.run:
+        code, data = ad.run(call)
+        return code, data, f"(built in) {ad.name}", int((time.monotonic() - started) * 1000)
+    argv = ad.argv(call)
+    exe = shutil.which(argv[0])
+    p = subprocess.run([exe or argv[0], *argv[1:]], cwd=str(call.work or call.repo_dir), capture_output=True,
+                       timeout=TOOL_SECONDS, stdin=subprocess.DEVNULL,
+                       env={**_tool_env(call.online), **(ad.env(call) if ad.env else {})})
+    ms = int((time.monotonic() - started) * 1000)
+    if ad.stdout:
+        data = p.stdout
+    else:
+        try:
+            data = Path(call.out).read_bytes() if Path(call.out).is_file() else b""
+        except OSError:
+            data = b""
+    if len(data) > TOOL_OUTPUT_BYTES:
+        raise WriteError(f"{ad.name} wrote {len(data)} bytes, more than {TOOL_OUTPUT_BYTES} can be imported")
+    call.stderr = p.stderr.decode("utf-8", "replace")
+    return p.returncode, data, _command_text(argv, call), ms
+
+
+def _fingerprinted(tool, leads):
+    """The leads sorted (path, line, rule, message), each with its fingerprint: tool, rule, path, message and the
+    occurrence among identical ones, hashed (no line, so a lead that moved keeps it)."""
+    leads = sorted(leads, key=lambda l: (l["path"] or "", l["line_start"] or 0, l["rule"], l["message"],
+                                         l["line_end"] or 0))
+    seen = {}
+    for l in leads:
+        key = (l["rule"], l["path"] or "", l["message"])
+        seen[key] = seen.get(key, 0) + 1
+        l["fingerprint"] = hashlib.sha256("\0".join((tool, *key, str(seen[key]))).encode("utf-8")).hexdigest()
+    return leads
+
+
+def _domain_or_none(con, code, what):
+    """The domain code when the catalog has it, None for None; WriteError for an unknown one."""
+    if code is None:
+        return None
+    if not one(con, "SELECT 1 x FROM domains WHERE code=?", (code,)):
+        raise WriteError(f"{what}: no domain {code!r} in the catalog")
+    return code
+
+
+def record_tool_run(ctx, rv, repo, sha, tool, *, status, domain, fmt=None, data=None, parsed=None, version=None,
+                    pinned=None, command=None, exit_code=None, duration_ms=None, rules=None, online=False,
+                    fallback=None, note=None, store=None):
+    """Insert a tool run, keep its output in the review's folder, and its leads (with dismissals carried from earlier
+    reviews) and metrics. Returns (run id, [lead codes], output path)."""
+    con = ctx.con
+    run_no = one(con, "SELECT COALESCE(max(id), 0) + 1 n FROM tool_runs")["n"]
+    out_path = sha256 = None
+    if data is not None:
+        kept = store(data) if store else data
+        folder = Path(ctx.db).parent.resolve() / "reviews" / rv["code"] / "tools"
+        folder.mkdir(parents=True, exist_ok=True)
+        target = folder / f"{run_no:04d}-{tool}.{FORMAT_SUFFIX.get(fmt, 'out')}"
+        write_atomic(target, kept)
+        ctx.files.append(str(target))
+        sha256 = hashlib.sha256(kept).hexdigest()
+        try:
+            out_path = target.relative_to(Path(ctx.root).resolve()).as_posix()
+        except ValueError:
+            out_path = target.as_posix()
+    rules_sha = rules_hash(rules) if rules else None
+    run_id = ctx.x("""INSERT INTO tool_runs(review_id, repository_id, commit_sha, tool, domain_code, status, version,
+                      pinned_version, command, exit_code, duration_ms, output_format, output_path, output_sha256,
+                      rules_sha256, online, fallback, note, actor_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   (rv["id"], repo["id"] if repo else None, sha, tool, domain, status, version or None, pinned,
+                    command, exit_code, duration_ms, fmt if data is not None else None, out_path, sha256,
+                    rules_sha, int(bool(online)), fallback, note, ctx.actor_id)).lastrowid
+    codes = []
+    if parsed:
+        n = int(one(con, "SELECT next_code FROM v_next_codes WHERE prefix='LD'")["next_code"][3:])
+        for lead in _fingerprinted(tool, parsed.get("leads") or []):
+            code = f"LD-{n:04d}"
+            n += 1
+            lead_domain = _domain_or_none(con, lead.get("domain"), f"{tool} rule {lead['rule']}") or domain
+            rid = ctx.x("""INSERT INTO tool_results(code, tool_run_id, domain_code, rule, level, path, line_start,
+                           line_end, message, fingerprint) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                        (code, run_id, lead_domain, lead["rule"], lead["level"], lead["path"], lead["line_start"],
+                         lead["line_end"], lead["message"], lead["fingerprint"])).lastrowid
+            codes.append(code)
+            before = one(con, """SELECT t.id, t.code, t.dismissed_reason FROM tool_results t
+                                 JOIN tool_runs r ON r.id = t.tool_run_id
+                                 WHERE t.fingerprint=? AND r.tool=? AND r.review_id<>? AND t.dismissed_reason IS NOT NULL
+                                 ORDER BY t.id DESC LIMIT 1""", (lead["fingerprint"], tool, rv["id"]))
+            if before:
+                reason = before["dismissed_reason"]
+                reason = reason if reason.startswith("carried from LD-") else f"carried from {before['code']}: {reason}"
+                ctx.x("""UPDATE tool_results SET dismissed_reason=?, disposed_by_actor_id=?, disposed_at=?,
+                         carried_from_id=? WHERE id=?""", (reason, ctx.actor_id, now(), before["id"], rid))
+        for name, scope, value, unit in sorted(parsed.get("metrics") or [], key=lambda m: (m[0], m[1])):
+            ctx.x("""INSERT INTO metrics(review_id, domain_code, repository_id, name, scope, value, unit, method, note)
+                     VALUES (?,?,?,?,?,?,?,'counted',?)
+                     ON CONFLICT(review_id, name, scope, repository_id) DO UPDATE SET value=excluded.value,
+                       unit=excluded.unit, note=excluded.note, domain_code=excluded.domain_code""",
+                  (rv["id"], domain, repo["id"] if repo else None, name, scope, float(value), unit,
+                   f"{tool} run {run_id}"))
+    return run_id, codes, out_path
+
+
+def rules_hash(rules):
+    """The sha256 of a rule file, or of a rule folder's files (each path and its bytes, in path order)."""
+    p = Path(rules)
+    if p.is_file():
+        return hashlib.sha256(p.read_bytes()).hexdigest()
+    h = hashlib.sha256()
+    for f in sorted(x for x in p.rglob("*") if x.is_file()):
+        h.update(f.relative_to(p).as_posix().encode("utf-8") + b"\0" + f.read_bytes() + b"\0")
+    return h.hexdigest()
+
+
+def _review_repo(con, rv, name):
+    """(repository row, reviewed commit) of a review: the one named, or its only one."""
+    rs = rows(con, """SELECT r.*, rr.commit_sha FROM review_repositories rr JOIN repositories r ON r.id = rr.repository_id
+                      WHERE rr.review_id=? ORDER BY r.name""", (rv["id"],))
+    if name:
+        rs = [r for r in rs if r["name"] == name]
+        if not rs:
+            raise WriteError(f"{rv['code']} did not look at a repository named {name!r}")
+    if not rs:
+        raise WriteError(f"{rv['code']} has no reviewed commit (new-review records one per repository)")
+    if len(rs) > 1:
+        raise WriteError(f"{rv['code']} looked at {len(rs)} repositories; name one with --repo")
+    return rs[0], rs[0]["commit_sha"]
+
+
+def _lead_summary(codes):
+    """'N leads (LD-0001..LD-0004)' for a command's output line."""
+    if not codes:
+        return "no leads"
+    return f"{len(codes)} lead{'s' if len(codes) != 1 else ''} ({codes[0]}" + (f"..{codes[-1]})" if len(codes) > 1 else ")")
+
+
+def cmd_tool_run(ctx):
+    """tool-run TOOL --review R: run (or import) one picked tool and record the run and its leads."""
+    a, con = ctx.a, ctx.con
+    ad = TOOL_ADAPTERS.get(a.tool)
+    if ad is None:
+        raise WriteError(f"tool {a.tool!r} is not one of {', '.join(sorted(TOOL_ADAPTERS))}")
+    rv = review_row(con, a.review)
+    if rv["status"] == "abandoned":
+        raise WriteError(f"{rv['code']} is abandoned")
+    domain = _domain_or_none(con, a.domain or ad.domain, "--domain")
+    repo, sha = _review_repo(con, rv, a.repo)
+    pinned = read_tools_lock().get(ad.name)
+    rules = Path(a.rules).resolve() if getattr(a, "rules", None) else None
+    if rules is not None and not rules.is_file():
+        raise WriteError(f"--rules {a.rules}: no such file")
+    ledger_dir = Path(ctx.db).parent.resolve()
+    base = dict(status=None, domain=domain, pinned=pinned, online=a.online)
+    if a.source:
+        src = Path(a.source)
+        try:
+            data = src.read_bytes()
+        except OSError as e:
+            raise WriteError(f"--from {a.source}: {e.strerror or e}")
+        call = ToolCall(repo_dir=repo_dir(ctx.root, repo["path"], bool(repo["allow_outside_root"])), commit=sha,
+                        rules=rules, ledger_dir=ledger_dir, a=a)
+        parsed = ad.parse(data, call)
+        version = a.tool_version or parsed.get("version")
+        base.update(status="imported", fmt=parsed.get("format") or ad.fmt, data=data, parsed=parsed,
+                    version=version, rules=rules,
+                    command=f"(imported) {src.name}", store=ad.store,
+                    note=a.note or (None if not (pinned and version and version != pinned)
+                                    else f"made by {version}; references/tools.lock pins {pinned}"))
+        run_id, codes, out = record_tool_run(ctx, rv, repo, sha, ad.name, **base)
+        return [f"tool run {run_id}: {ad.name} imported from {src.name}" + (f" ({version})" if version else "")
+                + f": {_lead_summary(codes)}"]
+    if ad.argv is None and ad.run is None:
+        raise WriteError(f"{ad.name} is an import format: give --from FILE")
+    version = None
+    if ad.binary:
+        version = tool_version(ad)
+        if version is None:
+            run_id, _, _ = record_tool_run(ctx, rv, repo, sha, ad.name, **{**base, "status": "absent",
+                                           "fallback": f"{ad.fallback} (to install: {ad.install})"})
+            return [f"tool run {run_id}: {ad.name} absent (pinned {pinned or 'nothing'}); instead: {ad.fallback}; "
+                    f"to install: {ad.install}"]
+        if pinned and version != pinned and not a.unpinned:
+            raise WriteError(f"{ad.name} {version or '(version unknown)'} is installed; {TOOLS_LOCK} pins {pinned}: "
+                             f"install the pinned one (mise install), or pass --unpinned to record the run anyway")
+    d = repo_dir(ctx.root, repo["path"], bool(repo["allow_outside_root"]))
+    tmp = Path(tempfile.mkdtemp(prefix="ledger-tool-"))
+    try:
+        work = None
+        if ad.source == "checkout":
+            work = tmp / "checkout"
+            work.mkdir()
+            _export_commit(d, sha, work)
+        call = ToolCall(work=work, out=tmp / f"out.{FORMAT_SUFFIX.get(ad.fmt, 'out')}", repo_dir=d, commit=sha,
+                        rules=rules, online=a.online, ledger_dir=ledger_dir, a=a)
+        try:
+            code, data, command, ms = _run_adapter(ad, call)
+        except ToolSkip as e:
+            run_id, _, _ = record_tool_run(ctx, rv, repo, sha, ad.name, **{**base, "status": "skipped",
+                                           "version": version, "fallback": f"{e}; meanwhile: {ad.fallback}"})
+            return [f"tool run {run_id}: {ad.name} not run: {e}"]
+        rules = call.rules if call.rules else rules
+        if code not in ad.ok_exits or (not data.strip() and ad.fmt not in ("json", "jsonl")):
+            why = (getattr(call, "stderr", "") or "").strip().split("\n")[-1][:300] or "no output"
+            run_id, _, _ = record_tool_run(ctx, rv, repo, sha, ad.name, **{**base, "status": "failed",
+                                           "version": version, "command": command, "exit_code": code,
+                                           "duration_ms": ms, "rules": rules,
+                                           "fallback": ad.fallback, "note": f"exit {code}: {why}"})
+            return [f"tool run {run_id}: {ad.name} failed (exit {code}: {why}); instead: {ad.fallback}"]
+        parsed = ad.parse(data, call)
+        run_id, codes, out = record_tool_run(ctx, rv, repo, sha, ad.name, **{
+            **base, "status": "ran", "fmt": ad.fmt, "data": data, "parsed": parsed,
+            "version": version or parsed.get("version"), "command": command, "exit_code": code, "duration_ms": ms,
+            "rules": rules, "store": ad.store, "note": a.note or (f"version differs from the pin ({pinned})"
+                                                                   if pinned and version != pinned else None)})
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return [f"tool run {run_id}: {ad.name} {version or ''}".rstrip() + (f" (pinned {pinned})" if pinned else "")
+            + f" at {sha[:10]}: exit {code}, {_lead_summary(codes)}; output {out}"]
+
+
+cmd_tool_run.cli = ("run a picked tool on the reviewed commit (or import what it wrote) and record its results as "
+                    "leads", "ledger.py tool-run TOOL --review R-0001 [--domain D] [--repo NAME] [--from FILE] "
+                             "[--rules FILE] [--online] [--unpinned] [--note TEXT] [--actor A-0001]")
+WRITE_COMMANDS["tool-run"] = cmd_tool_run
+
+
+def lead_row(con, code):
+    """The tool_results row of a lead code; WriteError for an unknown one."""
+    if not re.fullmatch(r"LD-\d{4,}", str(code or "")):
+        raise WriteError(f"{code!r} is not a lead code (LD-0001)")
+    r = one(con, "SELECT * FROM tool_results WHERE code=?", (code,))
+    if not r:
+        raise WriteError(f"no lead {code}")
+    return r
+
+
+@_command("dismiss-lead", "record why tool leads are not findings",
+          "ledger.py dismiss-lead LD-0001 [LD-0002 ...] --reason TEXT [--actor A-0001]")
+def cmd_dismiss_lead(ctx):
+    reason = _need(_text_arg(ctx.a.reason, "--reason"), "--reason (why it is not a finding)")
+    out = []
+    for code in ctx.a.leads:
+        r = lead_row(ctx.con, code)
+        if r["finding_id"] is not None or r["dismissed_reason"] is not None:
+            raise WriteError(f"{code} is already addressed (cited by a finding or dismissed)")
+        ctx.x("UPDATE tool_results SET dismissed_reason=?, disposed_by_actor_id=?, disposed_at=? WHERE id=?",
+              (reason, ctx.actor_id, now(), r["id"]))
+        out.append(f"{code}: dismissed")
+    return out
+
+
+@_command("cite-lead", "record the finding that covers a tool lead",
+          "ledger.py cite-lead LD-0001 R-0001:SEC-H3 [--actor A-0001]")
+def cmd_cite_lead(ctx):
+    con = ctx.con
+    r = lead_row(con, ctx.a.lead)
+    review, _, point = (ctx.a.finding or "").partition(":")
+    rv = review_row(con, review)
+    f = one(con, "SELECT id FROM findings WHERE review_id=? AND point_id=?", (rv["id"], point))
+    if not f:
+        raise WriteError(f"no finding {point!r} in {rv['code']} (give R-0001:SEC-H3)")
+    if r["finding_id"] is not None or r["dismissed_reason"] is not None:
+        raise WriteError(f"{ctx.a.lead} is already addressed (cited by a finding or dismissed)")
+    ctx.x("UPDATE tool_results SET finding_id=?, disposed_by_actor_id=?, disposed_at=? WHERE id=?",
+          (f["id"], ctx.actor_id, now(), r["id"]))
+    return [f"{ctx.a.lead}: cited by {rv['code']}:{point}"]
+
+
+def domain_leads(con, rv, domain, disposition="open"):
+    """The leads of a review's domain (v_tool_results), by code."""
+    return rows(con, "SELECT * FROM v_tool_results WHERE review=? AND domain IS ? AND disposition=? ORDER BY lead",
+                (rv["code"], domain, disposition))
+
+
+def report_lead_rows(lines):
+    """[(line, code, disposition, why)] of a report's '## Leads' table."""
+    out = []
+    for no, cells in _table_rows(lines or []):
+        if cells and re.fullmatch(r"LD-\d{4,}", cells[0]):
+            out.append((no, cells[0], (cells[1] if len(cells) > 1 else "").lower(), cells[2] if len(cells) > 2 else ""))
+    return out
+
+
+def lint_leads(con, text, sections, domain, rv, problems):
+    """Each open lead of the domain must be named in the report: in a finding, or in '## Leads' with a disposition
+    (dismissed, with why it is not a finding). Returns the dismissals to record."""
+    lead_lines = next((v for k, v in sections.items() if k.startswith("Leads")), None)
+    listed = {code: (no, disp, why) for no, code, disp, why in report_lead_rows(lead_lines)}
+    dismissals = []
+    for lead in domain_leads(con, rv, domain):
+        code = lead["lead"]
+        if code in listed:
+            no, disp, why = listed[code]
+            if disp.startswith("dismiss") or disp == "not a finding":
+                if len(why.strip()) < 3:
+                    problems.append((no, f"{code}: say why it is not a finding"))
+                else:
+                    dismissals.append((code, why.strip()))
+            continue
+        if not re.search(rf"\b{re.escape(code)}\b", text):
+            where = f"{lead['path']}:{lead['line_start']}" if lead["path"] and lead["line_start"] else \
+                (lead["path"] or "the whole run")
+            problems.append((0, f"lead {code} ({lead['tool']} {lead['rule']} at {where}) is not addressed: name it in "
+                                f"a finding, or list it under '## Leads' as dismissed with why it is not a finding"))
+    return dismissals
+
+
+def lead_prompt_lines(con, rv, domain, tool="ledger.py"):
+    """The prompt's list of a domain's open leads (empty when it has none)."""
+    leads = domain_leads(con, rv, domain)
+    if not leads:
+        return []
+    out = ["", "Tool leads for this domain. A lead is a tool's result, not a finding: judge each. Name its code in the "
+               "finding it supports, or list it in a \"## Leads\" table (| LD-0001 | dismissed | why |).", ""]
+    for l in leads[:200]:
+        where = l["path"] + (f":{l['line_start']}" if l["line_start"] else "") if l["path"] else "the whole run"
+        out.append(f"- {l['lead']} {l['tool']} {l['rule']} [{l['level']}] {where}: {l['message']}")
+    if len(leads) > 200:
+        out.append(f"- and {len(leads) - 200} more: {tool} query \"SELECT * FROM v_tool_results WHERE review="
+                   f"'{rv['code']}' AND domain='{domain}' AND disposition='open'\"")
+    return out
 
 
 def add_review_tool_parsers(sub):

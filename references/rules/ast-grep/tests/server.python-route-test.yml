@@ -1,0 +1,19 @@
+id: server.python-route
+valid:
+  - |
+    @functools.cache
+    def f():
+        pass
+  - |
+    @login_required
+    def f():
+        pass
+invalid:
+  - |
+    @app.route("/users")
+    def users():
+        pass
+  - |
+    @router.post("/items")
+    async def add():
+        pass

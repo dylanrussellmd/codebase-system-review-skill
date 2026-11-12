@@ -1,0 +1,9 @@
+id: time-concurrency.js-clock-read
+language: javascript
+severity: warning
+message: Reads the machine clock directly; whose zone and today is this?
+note: Take the time from one injected clock so tests can set it.
+rule:
+  any:
+    - pattern: Date.now()
+    - pattern: new Date()

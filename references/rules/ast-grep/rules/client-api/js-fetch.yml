@@ -1,0 +1,9 @@
+id: client-api.js-fetch
+language: javascript
+severity: hint
+message: A call from the client to a server; check it handles every response the server can give.
+rule:
+  any:
+    - pattern: fetch($$$)
+    - pattern: axios.$M($$$)
+    - pattern: axios($$$)

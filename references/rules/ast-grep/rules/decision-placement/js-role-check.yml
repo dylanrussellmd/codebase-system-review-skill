@@ -1,0 +1,10 @@
+id: decision-placement.js-role-check
+language: javascript
+severity: warning
+message: A permission decided inline by comparing a role; is this the one place that decides it?
+rule:
+  kind: binary_expression
+  has:
+    kind: member_expression
+    regex: \.(role|roles|isAdmin|permission|permissions)$
+  regex: (===|!==|==|!=)

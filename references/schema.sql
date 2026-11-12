@@ -1,5 +1,5 @@
 -- =====================================================================
--- Code review ledger — schema version 19
+-- Code review ledger — schema version 20
 -- One SQLite file per project: <project root>/.code-review/ledger.sqlite
 -- Every connection must run:  PRAGMA foreign_keys = ON;
 -- Times are UTC ISO-8601 text with milliseconds (strftime('%Y-%m-%dT%H:%M:%fZ','now')); the tr_time_*
@@ -974,6 +974,82 @@ CREATE TABLE feature_status_changes (
   at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
+-- ---------- Tool runs and leads (schema 20, plan step 218) -----------
+
+-- Each run of a picked tool on a review's commit, or its import from a file the tool wrote.
+-- ledger.py tool-run runs it on an export of the reviewed commit (never the working tree) and records what ran, the
+-- version printed and the one references/tools.lock pins, the exit code, how long it took and the output's sha256;
+-- the output itself is kept in the review's folder (output_path). status: ran, imported (--from FILE), absent (not
+-- installed: fallback says what the reviewer does instead), skipped (nothing to run on, or it would need the network:
+-- fallback says why) or failed (it exited with an error and wrote nothing usable). A run is never changed.
+CREATE TABLE tool_runs (
+  id             INTEGER PRIMARY KEY,
+  review_id      INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
+  repository_id  INTEGER REFERENCES repositories(id),
+  commit_sha     TEXT CHECK (commit_sha IS NULL OR ((length(commit_sha) = 40 OR length(commit_sha) = 64)
+                                                   AND commit_sha NOT GLOB '*[^0-9a-f]*')),
+  tool           TEXT NOT NULL CHECK (length(trim(tool)) > 0),    -- the adapter's name (references/tools.md)
+  domain_code    TEXT REFERENCES domains(code),                   -- the domain whose reviewer gets its leads
+  status         TEXT NOT NULL CHECK (status IN ('ran','imported','absent','skipped','failed')),
+  version        TEXT,                    -- the version the tool printed
+  pinned_version TEXT,                    -- the version references/tools.lock pins
+  command        TEXT,                    -- what ran, with {checkout} and {out} for the temporary paths
+  exit_code      INTEGER,
+  duration_ms    INTEGER CHECK (duration_ms IS NULL OR duration_ms >= 0),
+  output_format  TEXT CHECK (output_format IS NULL OR output_format IN
+                   ('sarif','junit','lcov','cobertura','json','jsonl')),
+  output_path    TEXT,                    -- the output as imported, in the review's folder
+  output_sha256  TEXT CHECK (output_sha256 IS NULL OR (length(output_sha256) = 64
+                                                       AND output_sha256 NOT GLOB '*[^0-9a-f]*')),
+  rules_sha256   TEXT,                    -- the rule set's hash, for a tool run with rules
+  online         INTEGER NOT NULL DEFAULT 0 CHECK (online IN (0,1)),   -- 1 = the run was allowed to go online
+  fallback       TEXT,                    -- what the reviewer does instead, when the tool did not run
+  note           TEXT,
+  actor_id       INTEGER REFERENCES actors(id),
+  created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  CHECK (status NOT IN ('absent','skipped','failed') OR length(trim(COALESCE(fallback, ''))) > 0),
+  CHECK (status <> 'ran' OR (command IS NOT NULL AND exit_code IS NOT NULL))
+);
+CREATE INDEX ix_fk_tool_runs_review_id     ON tool_runs(review_id);
+CREATE INDEX ix_fk_tool_runs_repository_id ON tool_runs(repository_id);
+CREATE INDEX ix_fk_tool_runs_domain_code   ON tool_runs(domain_code);
+CREATE INDEX ix_fk_tool_runs_actor_id      ON tool_runs(actor_id);
+
+-- Each result a tool run produced, kept as a lead for the domain's reviewer, never as a finding.
+-- A lead (LD-0001) is addressed when a finding of the same review cites it (cite-lead, or a location of a finding on
+-- the same lines), or a reviewer dismisses it with a reason (dismiss-lead); v_unaddressed_tool_results lists the rest.
+-- fingerprint hashes tool, rule, path, message and the occurrence, not the line, so the same lead in a later review
+-- is recognised: its dismissal is carried forward (carried_from_id). Only the disposition columns ever change.
+CREATE TABLE tool_results (
+  id                   INTEGER PRIMARY KEY,
+  code                 TEXT NOT NULL UNIQUE     -- LD-0001
+                         CHECK (code GLOB 'LD-[0-9][0-9][0-9][0-9]*' AND code NOT GLOB 'LD-*[^0-9]*'),
+  tool_run_id          INTEGER NOT NULL REFERENCES tool_runs(id) ON DELETE RESTRICT,
+  domain_code          TEXT REFERENCES domains(code),
+  rule                 TEXT NOT NULL CHECK (length(trim(rule)) > 0),
+  level                TEXT NOT NULL CHECK (level IN ('error','warning','note','none')),
+  path                 TEXT,             -- repository-relative, forward slashes; none for a whole-run result
+  line_start           INTEGER CHECK (line_start IS NULL OR line_start >= 1),
+  line_end             INTEGER CHECK (line_end IS NULL OR (line_start IS NOT NULL AND line_end >= line_start)),
+  message              TEXT NOT NULL CHECK (length(trim(message)) > 0),
+  fingerprint          TEXT NOT NULL,    -- tool, rule, path, message and occurrence, hashed: the same lead later
+  finding_id           INTEGER REFERENCES findings(id),     -- the finding that cites it (cite-lead)
+  dismissed_reason     TEXT,             -- why it is not a finding (dismiss-lead)
+  disposed_by_actor_id INTEGER REFERENCES actors(id),
+  disposed_at          TEXT,
+  carried_from_id      INTEGER REFERENCES tool_results(id),  -- the earlier lead whose dismissal it carries
+  created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  UNIQUE (tool_run_id, fingerprint),
+  CHECK (dismissed_reason IS NULL OR length(trim(dismissed_reason)) > 0),
+  CHECK ((finding_id IS NULL AND dismissed_reason IS NULL) = (disposed_at IS NULL))
+);
+CREATE INDEX ix_fk_tool_results_tool_run_id          ON tool_results(tool_run_id);
+CREATE INDEX ix_fk_tool_results_domain_code          ON tool_results(domain_code);
+CREATE INDEX ix_fk_tool_results_finding_id           ON tool_results(finding_id);
+CREATE INDEX ix_fk_tool_results_disposed_by_actor_id ON tool_results(disposed_by_actor_id);
+CREATE INDEX ix_fk_tool_results_carried_from_id      ON tool_results(carried_from_id);
+CREATE INDEX ix_tool_results_fingerprint             ON tool_results(fingerprint);
+
 -- ---------- Measurements over time ------------------------------------
 
 -- Test runs recorded as evidence, with their results.
@@ -1074,13 +1150,13 @@ CREATE TABLE artifacts (
 -- artifacts, step_commits, guard_tests, decision_issues, plan_reviews, phases, review_repositories, review_goals,
 -- review_domains, review_environment, review_actors, actors, repositories, domains, domain_rules,
 -- domain_checks, checklist_answers, step_touches, step_conflicts, themes, feature_proposals,
--- feature_status_changes, requirements, metric_defs,
+-- feature_status_changes, requirements, metric_defs, tool_runs, tool_results,
 -- meta, schema_migrations, ledger_checks, issue_statuses, severities, match_types, relation_types, gate_kinds,
 -- goal_statuses, enum_labels.
 -- Why not: feature_proposals keep their own history in feature_status_changes; finding_locations, finding_goals and
 -- finding_requirements belong to their finding (logged when it is
--- created) and cannot change but for fill-refs; review_requirement_checks, test_runs and artifacts are themselves
--- timestamped records written once; step_commits, guard_tests, decision_issues, plan_reviews and phases are plan
+-- created) and cannot change but for fill-refs; review_requirement_checks, test_runs, artifacts and tool_runs are
+-- themselves timestamped records written once, and a tool result's disposition carries its own actor and time; step_commits, guard_tests, decision_issues, plan_reviews and phases are plan
 -- and evidence links whose rows are their own record; the rest are setup and configuration (who, which
 -- repositories, the catalogs and word lists, requirements, the schema's own bookkeeping), whose
 -- changes do not drive an issue's history.
@@ -3079,6 +3155,65 @@ WHEN (NEW.at IS NOT NULL AND (NEW.at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[
   SELECT RAISE(ABORT, 'feature_status_changes: at must be UTC times like 2026-11-10T09:30:00.000Z');
 END;
 
+-- ----- Tool runs and leads
+
+-- A tool run is a record: it is never changed or deleted.
+CREATE TRIGGER tr_tool_run_fixed BEFORE UPDATE ON tool_runs BEGIN
+  SELECT RAISE(ABORT, 'a tool run is a record: it cannot be changed (run the tool again)');
+END;
+
+-- Nor deleted.
+CREATE TRIGGER tr_tool_run_no_delete BEFORE DELETE ON tool_runs BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: tool_runs cannot be deleted');
+END;
+
+-- A lead keeps what the tool said; only its disposition (cited, dismissed) is written later.
+CREATE TRIGGER tr_tool_result_fixed BEFORE UPDATE ON tool_results
+WHEN NEW.code IS NOT OLD.code OR NEW.tool_run_id IS NOT OLD.tool_run_id OR NEW.domain_code IS NOT OLD.domain_code
+  OR NEW.rule IS NOT OLD.rule OR NEW.level IS NOT OLD.level OR NEW.path IS NOT OLD.path
+  OR NEW.line_start IS NOT OLD.line_start OR NEW.line_end IS NOT OLD.line_end OR NEW.message IS NOT OLD.message
+  OR NEW.fingerprint IS NOT OLD.fingerprint OR NEW.created_at IS NOT OLD.created_at BEGIN
+  SELECT RAISE(ABORT, 'a lead keeps what the tool said: only cite-lead and dismiss-lead change it');
+END;
+
+-- A lead is addressed once: a cited or dismissed lead keeps that disposition.
+CREATE TRIGGER tr_tool_result_disposed_once BEFORE UPDATE OF finding_id, dismissed_reason ON tool_results
+WHEN OLD.finding_id IS NOT NULL OR OLD.dismissed_reason IS NOT NULL BEGIN
+  SELECT RAISE(ABORT, 'the lead is already addressed (cited by a finding or dismissed)');
+END;
+
+-- The finding that cites a lead belongs to the review the tool ran for.
+CREATE TRIGGER tr_tool_result_finding_review BEFORE UPDATE OF finding_id ON tool_results
+WHEN NEW.finding_id IS NOT NULL AND (SELECT review_id FROM findings WHERE id = NEW.finding_id)
+     IS NOT (SELECT review_id FROM tool_runs WHERE id = NEW.tool_run_id) BEGIN
+  SELECT RAISE(ABORT, 'a lead is cited by a finding of the review its tool ran for');
+END;
+
+-- Leads are never deleted.
+CREATE TRIGGER tr_tool_result_no_delete BEFORE DELETE ON tool_results BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: tool_results cannot be deleted');
+END;
+
+CREATE TRIGGER tr_time_tool_runs_ins BEFORE INSERT ON tool_runs
+WHEN (NEW.created_at IS NOT NULL AND (NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at) IS NOT NEW.created_at)) BEGIN
+  SELECT RAISE(ABORT, 'tool_runs: created_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_tool_runs_upd BEFORE UPDATE OF created_at ON tool_runs
+WHEN (NEW.created_at IS NOT NULL AND (NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at) IS NOT NEW.created_at)) BEGIN
+  SELECT RAISE(ABORT, 'tool_runs: created_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_tool_results_ins BEFORE INSERT ON tool_results
+WHEN (NEW.created_at IS NOT NULL AND (NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at) IS NOT NEW.created_at)) OR (NEW.disposed_at IS NOT NULL AND (NEW.disposed_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.disposed_at) IS NOT NEW.disposed_at)) BEGIN
+  SELECT RAISE(ABORT, 'tool_results: created_at and disposed_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_tool_results_upd BEFORE UPDATE OF created_at, disposed_at ON tool_results
+WHEN (NEW.created_at IS NOT NULL AND (NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at) IS NOT NEW.created_at)) OR (NEW.disposed_at IS NOT NULL AND (NEW.disposed_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.disposed_at) IS NOT NEW.disposed_at)) BEGIN
+  SELECT RAISE(ABORT, 'tool_results: created_at and disposed_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
 -- ---------- Views ---------------------------------------------------------
 
 -- Issues still to fix, most severe first, then oldest.
@@ -3503,7 +3638,9 @@ UNION ALL SELECT 'G', 'G-' || printf('%02d', COALESCE(max(CAST(substr(code, 3) A
 UNION ALL SELECT 'IQ', 'IQ-' || printf('%04d', COALESCE(max(CAST(substr(code, 4) AS INTEGER)), 0) + 1)
 FROM interview_questions
 UNION ALL SELECT 'FP', 'FP-' || printf('%04d', COALESCE(max(CAST(substr(code, 4) AS INTEGER)), 0) + 1)
-FROM feature_proposals;
+FROM feature_proposals
+UNION ALL SELECT 'LD', 'LD-' || printf('%04d', COALESCE(max(CAST(substr(code, 4) AS INTEGER)), 0) + 1)
+FROM tool_results;
 
 -- Plan steps still to do whose issues are already closed.
 -- Closed for example by a review's check of 'fixed': mark the step done or dropped. Superseded and abandoned plans
@@ -3752,6 +3889,53 @@ LEFT JOIN actors a ON a.id = f.decided_by_actor_id LEFT JOIN gates gt ON gt.id =
 LEFT JOIN steps s ON s.id = f.step_id LEFT JOIN plans p ON p.id = s.plan_id
 LEFT JOIN enum_labels vl ON vl.enum = 'feature_value' AND vl.value = f.value
 LEFT JOIN enum_labels el ON el.enum = 'feature_effort' AND el.value = f.effort;
+
+-- Every lead with its disposition: cited by a finding, dismissed with a reason, or still open.
+-- cited_by is the finding that cites it (R-0001:SEC-H3), through cite-lead or a location on the same lines.
+CREATE VIEW v_tool_results AS
+SELECT t.code AS lead, r.code AS review, tr.tool, t.domain_code AS domain, t.rule, t.level, t.path, t.line_start,
+       t.line_end, t.message,
+       CASE WHEN t.finding_id IS NOT NULL OR c.id IS NOT NULL THEN 'cited'
+            WHEN t.dismissed_reason IS NOT NULL THEN 'dismissed' ELSE 'open' END AS disposition,
+       r.code || ':' || COALESCE(f.point_id, c.point_id) AS cited_by, t.dismissed_reason,
+       'A-' || printf('%04d', t.disposed_by_actor_id) AS disposed_by, t.disposed_at, cf.code AS carried_from,
+       t.fingerprint, t.tool_run_id
+FROM tool_results t JOIN tool_runs tr ON tr.id = t.tool_run_id JOIN reviews r ON r.id = tr.review_id
+LEFT JOIN findings f ON f.id = t.finding_id
+LEFT JOIN tool_results cf ON cf.id = t.carried_from_id
+LEFT JOIN findings c ON c.id = (
+  SELECT fl.finding_id FROM finding_locations fl JOIN findings ff ON ff.id = fl.finding_id
+  WHERE t.finding_id IS NULL AND ff.review_id = tr.review_id AND t.path IS NOT NULL AND fl.path = t.path
+    AND (tr.repository_id IS NULL OR fl.repository_id = tr.repository_id)
+    AND (t.line_start IS NULL OR fl.line_start IS NULL
+         OR (fl.line_start <= COALESCE(t.line_end, t.line_start)
+             AND COALESCE(fl.line_end, fl.line_start) >= t.line_start))
+  ORDER BY ff.point_id LIMIT 1);
+
+-- Tool results no finding cites and no reviewer dismissed: must be empty.
+-- A lead is addressed by a finding of the same review whose location covers its lines, by cite-lead, or by
+-- dismiss-lead with a reason (lint-report also records the dismissals a report lists under its Leads section).
+-- Leads of an abandoned review are left out.
+CREATE VIEW v_unaddressed_tool_results AS
+SELECT v.review, v.lead, v.tool, v.domain, v.rule, v.level,
+       COALESCE(v.path, '') || CASE WHEN v.line_start IS NULL THEN '' ELSE ':' || v.line_start END AS location,
+       v.message, v.tool_run_id
+FROM v_tool_results v JOIN reviews r ON r.code = v.review
+WHERE v.disposition = 'open' AND r.status <> 'abandoned'
+ORDER BY v.review, v.lead;
+
+-- Every tool run of every review, newest last, with how many leads it gave and how many are still unaddressed.
+-- The tools page and `ledger.py env` read it; absent and skipped runs carry the fallback the reviewer follows.
+CREATE VIEW v_tool_runs AS
+SELECT t.id, r.code AS review, t.tool, t.domain_code AS domain, t.status, t.version, t.pinned_version,
+       CASE WHEN t.version IS NULL OR t.pinned_version IS NULL THEN NULL
+            ELSE t.version = t.pinned_version END AS pinned_match,
+       rp.name AS repo, t.commit_sha, t.command, t.exit_code, t.duration_ms, t.output_format, t.output_path,
+       t.output_sha256, t.rules_sha256, t.online, t.fallback, t.note,
+       (SELECT count(*) FROM tool_results x WHERE x.tool_run_id = t.id) AS leads,
+       (SELECT count(*) FROM v_unaddressed_tool_results u WHERE u.tool_run_id = t.id) AS unaddressed,
+       t.created_at
+FROM tool_runs t JOIN reviews r ON r.id = t.review_id LEFT JOIN repositories rp ON rp.id = t.repository_id;
 
 -- ---------- Catalog seed (extend with custom domains/themes as needed) ---
 
@@ -4209,7 +4393,19 @@ INSERT INTO enum_labels(enum, value, label, position) VALUES
  ('feature_status','declined','Declined',3), ('feature_status','built','Built',4),
  ('feature_value','high','High',1), ('feature_value','medium','Medium',2), ('feature_value','low','Low',3),
  ('feature_effort','small','Small',1), ('feature_effort','medium','Medium',2), ('feature_effort','large','Large',3);
-INSERT INTO meta(key, value) VALUES ('schema_version','19');
+INSERT INTO ledger_checks(view, label, tier, position) VALUES
+ ('v_unaddressed_tool_results','Tool results no finding cites and no reviewer dismissed','error',84);
+
+INSERT INTO enum_labels(enum, value, label, position) VALUES
+ ('tool_run_status','ran','Ran',1), ('tool_run_status','imported','Imported from a file',2),
+ ('tool_run_status','absent','Not installed',3), ('tool_run_status','skipped','Not run',4),
+ ('tool_run_status','failed','Failed',5),
+ ('tool_output_format','sarif','SARIF',1), ('tool_output_format','junit','JUnit XML',2),
+ ('tool_output_format','lcov','LCOV',3), ('tool_output_format','cobertura','Cobertura XML',4),
+ ('tool_output_format','json','JSON',5), ('tool_output_format','jsonl','JSON lines',6),
+ ('tool_result_level','error','Error',1), ('tool_result_level','warning','Warning',2),
+ ('tool_result_level','note','Note',3), ('tool_result_level','none','No level',4);
+INSERT INTO meta(key, value) VALUES ('schema_version','20');
 INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger schema'),
   (2, 'url, path, hash and code checks; repositories.allow_outside_root; finding_locations.excerpt_redacted'),
   (3, 'integrity rules: codes, hashes, checks, append-only history, owner actor on gate answers'),
@@ -4228,4 +4424,5 @@ INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger s
   (16, 'step_touches and step_conflicts: what each plan step touches, and the pairs of steps that touch the same thing'),
   (17, 'a step may depend on any step of its plan, cycles refused; v_step_order: the order to work in'),
   (18, 'multi-select gates: gates.multi and gates.preselect; a multi-select answer is a JSON list of option values'),
-  (19, 'the features domain and feature_proposals: additions to the reviewed codebase that would serve the owner''s goals');
+  (19, 'the features domain and feature_proposals: additions to the reviewed codebase that would serve the owner''s goals'),
+  (20, 'tool_runs and tool_results: the picked tools'' runs at the reviewed commit, and their results as leads');

@@ -1,0 +1,8 @@
+id: server.js-express-route
+valid:
+  - axios.get("/users", config)
+  - app.get(name)
+  - cache.get("key", fallback)
+invalid:
+  - app.get("/users", listUsers)
+  - router.post("/items", auth, addItem)

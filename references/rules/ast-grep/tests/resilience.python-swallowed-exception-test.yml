@@ -1,0 +1,19 @@
+id: resilience.python-swallowed-exception
+valid:
+  - |
+    try:
+        run()
+    except ValueError:
+        log.warning("bad value")
+  - |
+    try:
+        run()
+    except ValueError:
+        log.warning("bad value")
+        pass
+invalid:
+  - |
+    try:
+        run()
+    except Exception:
+        pass

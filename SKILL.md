@@ -92,7 +92,7 @@ push tags (`git push origin review/R-0001`, then `ledger.py tag-review R-0001 --
 - **`check` fails** while a must-be-empty view has rows: `v_unmatched_findings`, `v_unchecked_known_issues`,
   `v_untraceable_refs`, `v_uncovered_findings`, `v_coverage_problems`, `v_unplanned_discoveries`, `v_history_gaps`,
   `v_match_problems`, `v_off_plan_coverage`, `v_done_steps_open_issues`, `v_closed_without_reason`,
-  `v_relation_problems`, `v_check_finding_owner`, `v_unresolved_conflicts` (what to do: `references/recipes.md#a-failing-check`).
+  `v_relation_problems`, `v_check_finding_owner`, `v_unresolved_conflicts`, `v_unaddressed_tool_results` (`references/recipes.md#a-failing-check`).
 
 ### Privacy of the ledger
 
@@ -264,10 +264,11 @@ ledger.py add-run R-0001 security security-1 --scope '<what it covers>' --model 
 ledger.py review-status R-0001 running --note 'reviewers started' --actor A-0002
 ```
 
-`snapshot` re-records the commits. Launch one subagent per approved scope with the subagent tool, all at once (without
-one, run the scopes yourself in turn), each with its generated prompt: brief, scope, its domain's approved goals, the
-line `ledger.py goals --domain <D>`, known issues, checklist, report file.
-For `ui` and `walkthroughs`: `ledger.py ui-capture <pages> --review R-0001`, `ledger.py ui-audit <pages>` (`references/environment.md#rendered-pages`).
+`snapshot` re-records the commits. Run each picked tool that applies (`references/tools.md#how-a-tool-is-wired-in`):
+`ledger.py tool-run <tool> --review R-0001`, and `ledger.py test-runs` for the suites; each lead is cited by a
+finding or `dismiss-lead`. Launch one subagent per approved scope with the subagent tool, all at once (without one,
+run the scopes yourself in turn), each with its generated prompt: brief, scope, its domain's approved goals, the line
+`ledger.py goals --domain <D>`, known issues, tool leads, checklist, report file. For `ui` and `walkthroughs`: `ledger.py ui-capture <pages> --review R-0001`, `ledger.py ui-audit <pages>` (`references/environment.md#rendered-pages`).
 
 ## Step 4: Verify before reporting
 
@@ -289,8 +290,7 @@ Every point of every report goes into the ledger, not only the summary's: `ledge
 - **5a. Index**: one read-only indexer per report, in parallel, briefed with `references/indexing.md` (record each:
   `add-actor indexer ...`). Each writes `points.tsv`, `known.tsv` (and `trace.tsv` for spec) in
   `.code-review/reviews/R-0001/index/`, in the formats of `references/formats/index.md`.
-- **5b. Check** each index: counts against the report's own totals, a spot check of a few sections; send gaps back to
-  the indexer, never guess.
+- **5b. Check** each index: counts against the report's own totals, a spot check of a few sections; send gaps back to the indexer, never guess.
 - **5c. Load**, one report per command, all or nothing:
   `ledger.py load-index R-0001 security-1 points.tsv known.tsv --trace trace.tsv --actor A-0002`. Record what the
   reports measured (`ledger.py add-metric`, `record-test-run`) and each index (`ledger.py add-artifact index`). Then

@@ -97,9 +97,114 @@ The three researchers agree on one design:
   marked online runs in its offline mode where it has one; the rest wait for an owner decision recorded once. A tool
   marked runs code runs in a container on code the owner does not fully trust, or is skipped with a note.
 
-What exists already: `ledger.py env` (which tools are here), `ledger.py prompt` (prompts rendered from the ledger),
-`lint-report` (checks what a reviewer hands back) and `compare-runs` (how far two runs differ). The generic tool
-command, the tool-results table and its check do not exist yet.
+`ledger.py tool-run` is that command, `tool_runs` and `tool_results` hold the runs and their leads, and
+`v_unaddressed_tool_results` is the check; the next section is how a tool is added to it.
+
+## How a tool is wired in
+
+The tools the owner picked (decision D-0015) run through one command:
+
+```
+ledger.py tool-run <tool> --review R-0001 [--domain D] [--repo NAME] [--rules FILE] [--online] [--unpinned]
+ledger.py tool-run <tool or format> --review R-0001 --from <file the tool wrote> [--tool-version V]
+ledger.py dismiss-lead LD-0001 [LD-0002 ...] --reason '<why it is not a finding>'
+ledger.py cite-lead LD-0001 R-0001:SEC-H3
+```
+
+- **Where it runs.** On an export of the review's commit (`git archive` into a temporary folder, regular files
+  only), with that folder as the working directory and `.` as the target, so reported paths are already relative.
+  History tools (gitleaks, git-history) read the repository itself, up to the reviewed commit. Nothing is written
+  into the repository.
+- **What is recorded.** One `tool_runs` row per run: tool, version printed, version pinned, the command with
+  `{checkout}`, `{out}` and `{rules}` in place of temporary paths, exit code, duration, output format, the output
+  kept as `.code-review/reviews/R-0001/tools/NNNN-<tool>.<ext>` and its sha256, the rule file's sha256, and whether
+  it could go online. Status `ran`, `imported` (`--from`), `absent` (not on PATH: the fallback is recorded and the
+  command exits 0), `skipped` (nothing to run on, or it needs the network: the reason and fallback are recorded) or
+  `failed` (an exit code the adapter does not accept, or no output).
+- **Pins.** `references/tools.lock` (mise's `[tools]` table) holds one version per tool. `env` lists each tool as
+  `tool:<name>` with the version found and the pinned one; `tool-run` refuses another version unless `--unpinned`,
+  and records both. The lock is read beside `scripts/ledger.py`; the project's copy in `.code-review/` has none, so
+  run the skill's copy.
+- **Offline.** No adapter goes online unless `--online` is given: Semgrep's registry rules and OSV-Scanner's advisory
+  databases are fetched only then, into `.code-review/tools/`, and later runs read them from there. Tools run (and
+  print their versions) with their update checks and telemetry off; zizmor runs with `--offline`. gitleaks redacts
+  values itself and the kept report has every value field replaced by `REDACTED`. actionlint and zizmor run only when
+  the commit has `.github/workflows/`, OSV-Scanner only when it has a lockfile or requirements file.
+- **Leads.** Each result is a `tool_results` row with a code `LD-0001` (one sequence per ledger), the rule as the tool
+  names it (the shipped ast-grep rules are `<pack>.<rule>`, built-in checks `<tool>.<check>`), a level (`error`,
+  `warning`, `note`, `none`), path and lines at the reviewed commit, and a message of at most 400 characters. Leads
+  are inserted sorted by path, line, rule and message, so the same output gives the same rows. The fingerprint hashes
+  tool, rule, path, message and occurrence (no line): a lead dismissed in an earlier review is dismissed again in the
+  next, its reason starting "carried from LD-0007".
+- **Addressing a lead.** A finding of the same review with a location on the lead's lines covers it; otherwise
+  `cite-lead` links it to a finding, or `dismiss-lead` records why it is not one. A reviewer names each lead of its
+  domain in the report: its code in a finding, or a row of a `## Leads` table (`| LD-0001 | dismissed | why |`);
+  `lint-report --review` refuses a report that leaves one out, and `--record` stores the dismissals. The reviewer's
+  prompt lists the domain's open leads. `check` fails while `v_unaddressed_tool_results` has rows.
+- **Rule packs.** `references/rules/ast-grep/` holds one rule per file under `rules/<domain>/` (decision
+  placement, time, resilience, server entry points, client calls, logging), each with a message and a test under
+  `tests/` that `ast-grep test -c references/rules/ast-grep/sgconfig.yml` runs: the rule matches its `invalid`
+  samples and none of its `valid` ones.
+- **Built in.** `git-history` needs no install: from `git log` up to the reviewed commit (at most 5,000 commits) it
+  lists the most changed files (hotspots), pairs of files in different folders that change together in at least
+  half their commits, and files one author changed five times or more (handover); per-file commits and authors,
+  the history's commits, authors and bus factor are metrics.
+- **Coverage.** `tool-run coverage --from <file>` reads the project's own LCOV or Cobertura file (Cobertura when it
+  starts with `<`): line and branch coverage per file and overall, per function its calls (LCOV) or line coverage
+  (Cobertura), and a lead for each file no test reaches.
+- **Test runs.** `ledger.py test-runs --review R-0001 --command '<command writing JUnit XML to {junit}>'` runs the
+  suite on a fresh export for each run: the baseline, `--repeat` more times (default 3), in random order (seed
+  `--seed`, default from the commit, given as `{seed}` in `--random-command` and as `LEDGER_TEST_SEED` and
+  `PYTHONHASHSEED`), with the network off (`unshare -rn` on Linux; elsewhere every proxy variable points at a closed
+  port, recorded as the fallback) and at four clocks: the end of a leap day in Pacific/Kiritimati, the end of a year
+  in America/St_Johns, and the minute before the 2027 daylight-saving changes in America/New_York and Europe/Berlin
+  (from zoneinfo), each with `TZ` set and the time set by `faketime` when it is installed (not verified: faketime could not be
+  installed where this was built). Each run is a `test_runs`
+  row and a `tool_runs` row; a test that fails in a variant and passed in the baseline (or that flips between
+  repeats) is a lead `test-runs.flaky`, `.order-dependent`, `.network` or `.clock`, once per test per invocation.
+- **Metrics.** Counts and coverage go to `metrics` (method `counted`, the run named in the note), one row per name and
+  scope: `scope` is `all`, a path, or `path#function`.
+
+### The adapter
+
+An adapter is one `tool_adapter(...)` call in `dev/core.py`; `TOOL_ADAPTERS` holds them all.
+
+```python
+tool_adapter("semgrep", fmt="sarif", parse=parse_sarif, domain="security", binary="semgrep", argv=_semgrep_argv,
+             ok_exits=(0, 1), install="pipx install semgrep==<pinned>", fallback="what the reviewer does instead",
+             online="optional")
+```
+
+| argument | what it is |
+|---|---|
+| `name` | `tool-run NAME`, the key in `tools.lock`, the prefix of the output file |
+| `fmt` | `sarif`, `junit`, `lcov`, `cobertura`, `json` or `jsonl` |
+| `parse(data, call)` | the output bytes to `{"leads": [...], "metrics": [(name, scope, value, unit)], "version": str or None}`; each lead from `_lead(rule, level, path, start, end, message, domain=None)`, paths through `_relative_lead_path(raw, call)`; raise `WriteError` for output it cannot read (nothing is then written) |
+| `argv(call)` | the command as a list, run in `call.work` (the export); write to `call.out` or set `stdout=True`; register extra temporary paths in `call.placeholders`; raise `ToolSkip(reason)` when there is nothing to run on |
+| `run(call)` | instead of `argv`: a built-in that returns `(exit code, output bytes)` |
+| `binary`, `version_args` | the executable `env` and `tool-run` look for, and how it prints its version |
+| `ok_exits` | the exit codes that still mean complete output (scanners exit 1 when they find something) |
+| `store(data)` | the bytes kept and hashed, when the output holds what must not be kept (gitleaks: secret values) |
+| `domain` | whose reviewer gets the leads when `--domain` is not given; a lead may name its own (`_lead(..., domain=)`) |
+| `source` | `checkout` (the export) or `repo` (history tools) |
+| `install`, `fallback`, `online` | shown by `env` and recorded on an absent or skipped run |
+
+`call` (a `ToolCall`) carries `work`, `out`, `repo_dir`, `commit`, `rules`, `online`, `ledger_dir` (the ledger's
+folder, for cached rules and databases) and the parsed arguments `a`.
+
+Adding a tool takes four things: the adapter; its version in `tools.lock`; a recorded output in
+`dev/tests/data/tools/<tool>.<ext>`; and a test that imports it with `--from` (it runs without the tool) and, where
+the tool runs, one through a stand-in executable on `PATH` (`dev/tests/_w7a_tools_helpers.py`, `shim()`).
+
+### The recorded samples
+
+Real outputs, from the pinned versions run on a small scratch project on 2026-11-11: `semgrep.sarif` (one local
+rule), `ast-grep.jsonl` (the shipped packs), `zizmor.sarif`, `actionlint.json`, `gitleaks.json` (run with `--redact`), `scc.json`, `jscpd.json` (its
+`detectionDate` makes each run's bytes differ; the leads do not), `junit.xml` (pytest), `coverage.lcov` and
+`coverage.xml` (coverage.py; the `<source>` folder replaced with `/project`), `osv-no-database.json` (OSV-Scanner
+offline with no database). Written from the documented format: those whose names end in `-documented`
+(`cobertura-methods-documented.xml`, since coverage.py writes no methods; `osv-documented.json`: the proxy here refused the advisory database download, so OSV-Scanner's `--online` path is
+not verified).
 
 ### Harness features (optional)
 

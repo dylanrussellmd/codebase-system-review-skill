@@ -1,0 +1,6 @@
+id: logging.python-print
+valid:
+  - log.info("started")
+  - printer.print(page)
+invalid:
+  - print("started")

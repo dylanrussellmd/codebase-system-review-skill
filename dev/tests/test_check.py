@@ -136,6 +136,11 @@ def offend(L, view, count=1):
             a, b = [L.step(plan, ph, 2 * n + k, no_findings_reason="checks the conflict view") for k in (1, 2)]
             L.insert("step_conflicts", step_a_id=a, step_b_id=b, kind="file", target="demo:src/app.py",
                      reason="file demo:src/app.py: both change it")
+    elif view == "v_unaddressed_tool_results":   # step 218: leads no finding cites and nobody dismissed
+        run = L.insert("tool_runs", review_id=r1, tool="sarif", status="imported", output_format="sarif")
+        for n in range(count):
+            L.insert("tool_results", code=L._code("LD-"), tool_run_id=run, rule="r", level="warning",
+                     path="src/app.py", line_start=n + 1, message="A lead.", fingerprint=f"fp{n}")
     else:
         raise AssertionError(f"no offending fixture for {view}")
     L.commit()

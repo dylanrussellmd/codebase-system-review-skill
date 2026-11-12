@@ -1,0 +1,13 @@
+id: server.js-express-route
+language: javascript
+severity: hint
+message: A server entry point; list it with who may call it and its tests.
+rule:
+  pattern: $APP.$M($PATH, $$$HANDLERS)
+constraints:
+  APP:
+    regex: ^(app|router|server|api)$
+  M:
+    regex: ^(get|post|put|patch|delete|all|use)$
+  PATH:
+    kind: string

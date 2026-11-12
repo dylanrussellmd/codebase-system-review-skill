@@ -1,0 +1,7 @@
+# The rule packs `ledger.py tool-run ast-grep` scans with (references/tools.md, "How a tool is wired in").
+# One file per rule under rules/<domain>/, its id <domain>.<rule>, so a lead goes to that domain's reviewer.
+# Each rule has a test under tests/: `ast-grep test -c sgconfig.yml` checks it matches what it should and nothing else.
+ruleDirs:
+  - rules
+testConfigs:
+  - testDir: tests

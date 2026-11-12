@@ -1,0 +1,16 @@
+# The versions of the picked tools (decision D-0015) that `ledger.py tool-run` runs, in mise's format:
+# `mise install` in a folder holding this file (or `mise use -g` per line) installs exactly these.
+# tool-run refuses another installed version unless --unpinned is given, and records both on the run.
+# A key with a backend ("pipx:semgrep") names the tool after the colon. Registry names not verified with mise.
+# Pinned 2026-11-11 to the releases each tool's own page listed that day; the samples in
+# dev/tests/data/tools/ come from these versions.
+
+[tools]
+actionlint = "1.7.8"
+ast-grep = "0.51.2"
+gitleaks = "8.28.0"
+"npm:jscpd" = "5.4.3"
+osv-scanner = "2.2.4"
+"pipx:semgrep" = "1.185.0"
+"pipx:zizmor" = "1.32.0"
+scc = "3.6.0"

@@ -371,6 +371,12 @@ approved until it is empty (`references/fix-plan.md#deconflict-the-steps-8c`).
 A warning: a step added after approval touches what another step touches. Judge each pair with `resolve-conflict` as
 above; until then only that step cannot start.
 
+#### `v_unaddressed_tool_results`
+
+A tool lead nobody judged. Give it to its domain's reviewer (the prompt lists it), or judge it: a finding whose
+location covers its lines addresses it; else `ledger.py cite-lead LD-0001 R-0001:SEC-H3`, or
+`ledger.py dismiss-lead LD-0001 --reason '<why it is not a finding>'` (`references/tools.md#how-a-tool-is-wired-in`).
+
 #### `quick_check`
 
 The file is damaged. Stop writing. `ledger.py restore .code-review/ledger.sql --to /tmp/check.sqlite` rebuilds the last
