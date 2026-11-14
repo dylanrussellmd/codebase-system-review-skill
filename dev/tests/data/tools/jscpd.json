@@ -6,14 +6,14 @@
         "endLoc": {
           "column": 1,
           "line": 19,
-          "position": 396
+          "position": 410
         },
         "name": "src/util.js",
         "start": 11,
         "startLoc": {
           "column": 21,
           "line": 11,
-          "position": 194
+          "position": 208
         }
       },
       "format": "javascript",
@@ -26,21 +26,21 @@
         "endLoc": {
           "column": 1,
           "line": 29,
-          "position": 621
+          "position": 635
         },
         "name": "src/util.js",
         "start": 21,
         "startLoc": {
           "column": 21,
           "line": 21,
-          "position": 419
+          "position": 433
         }
       },
       "tokens": 64
     }
   ],
   "statistics": {
-    "detectionDate": "2026-11-12T07:47:32.940Z",
+    "detectionDate": "2026-11-14T17:48:00.418Z",
     "formats": {
       "javascript": {
         "clones": 1,
@@ -50,9 +50,9 @@
         "newClones": 0,
         "newDuplicatedLines": 0,
         "percentage": 31.03448275862069,
-        "percentageTokens": 35.16483516483517,
+        "percentageTokens": 36.36363636363637,
         "sources": 1,
-        "tokens": 182
+        "tokens": 176
       },
       "python": {
         "clones": 0,
@@ -64,32 +64,20 @@
         "percentage": 0.0,
         "percentageTokens": 0.0,
         "sources": 2,
-        "tokens": 189
-      },
-      "yaml": {
-        "clones": 0,
-        "duplicatedLines": 0,
-        "duplicatedTokens": 0,
-        "lines": 8,
-        "newClones": 0,
-        "newDuplicatedLines": 0,
-        "percentage": 0.0,
-        "percentageTokens": 0.0,
-        "sources": 1,
-        "tokens": 40
+        "tokens": 188
       }
     },
     "total": {
       "clones": 1,
       "duplicatedLines": 9,
       "duplicatedTokens": 64,
-      "lines": 88,
+      "lines": 80,
       "newClones": 0,
       "newDuplicatedLines": 0,
-      "percentage": 10.227272727272728,
-      "percentageTokens": 15.571776155717762,
-      "sources": 4,
-      "tokens": 411
+      "percentage": 11.25,
+      "percentageTokens": 17.582417582417584,
+      "sources": 3,
+      "tokens": 364
     }
   }
 }

@@ -1,10 +1,11 @@
-# The versions of the picked tools (decision D-0015) that `ledger.py tool-run` runs, in mise's format:
-# `mise install` in a folder holding this file (or `mise use -g` per line) installs exactly these.
+# The versions of the picked tools (decision D-0015) that `ledger.py tool-run` runs, in mise's format. mise reads
+# this file under its own name when told to: `cd references && MISE_DEFAULT_CONFIG_FILENAME=tools.lock mise install`
+# installs exactly these (CI's tools job does), and `mise bin-paths` there lists where they went.
 # tool-run refuses another installed version unless --unpinned is given, and records both on the run.
-# A key with a backend ("pipx:semgrep") names the tool after the colon; an adapter whose name differs (odiff,
-# from npm's odiff-bin; axe, from axe-core; wallace, from wallace-cli) says so. Registry names not verified with mise.
-# Pinned on 2026-11-11 and 2026-11-12 to the releases each tool's page or registry listed that day; the samples in
-# dev/tests/data/tools/ come from these versions.
+# A key with a backend ("pipx:semgrep", "aqua:boyter/scc") names the tool after the colon and the last slash; an
+# adapter whose name differs (odiff, from npm's odiff-bin; axe, from axe-core; wallace, from wallace-cli) says so.
+# Every key without a backend is in mise's registry. Pinned on 2026-11-11 and 2026-11-12 to the releases each tool's
+# page or registry listed that day; the samples in dev/tests/data/tools/ come from these versions.
 
 [tools]
 actionlint = "1.7.8"
@@ -20,11 +21,11 @@ hyperfine = "2.0.0"
 "npm:jscpd" = "5.4.3"
 lychee = "0.24.2"
 mailpit = "1.30.2"
-oasdiff = "1.30.0"
+"github:oasdiff/oasdiff" = "1.30.0"
 "npm:odiff-bin" = "4.5.0"
 osv-scanner = "2.2.4"
 postgres = "16.15"
-scc = "3.6.0"
+"aqua:boyter/scc" = "3.6.0"
 "pipx:schemathesis" = "4.33.2"
 "pipx:semgrep" = "1.185.0"
 "pipx:squawk-cli" = "2.71.0"

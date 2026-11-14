@@ -12,14 +12,31 @@ import sys
 import unittest
 
 _results = []
+_depth = [0]
+REQUIRED = "LEDGER_ENVIRONMENT_REQUIRED"   # =1: a test skipped for this machine fails the run (CI's tools job)
 
 
 class _Suite(unittest.TestSuite):
-    """The discovered suite; it keeps the result it ran into, for the summary of environment skips."""
+    """The discovered suite; it keeps the result it ran into, for the summary of environment skips. With
+    LEDGER_ENVIRONMENT_REQUIRED=1 each such skip is also a failure, once the outermost suite has run."""
 
     def run(self, result, debug=False):
         _results.append(result)
-        return super().run(result, debug)
+        _depth[0] += 1
+        try:
+            return super().run(result, debug)
+        finally:
+            _depth[0] -= 1
+            if _depth[0] == 0 and os.environ.get(REQUIRED) == "1":
+                _fail_environment_skips(result)
+
+
+def _fail_environment_skips(result):
+    from dev.tests.fixtures import ENVIRONMENT
+    for test, reason in list(result.skipped):
+        if reason.startswith(ENVIRONMENT):
+            err = AssertionError(f"skipped with {REQUIRED}=1: {reason}")
+            result.addFailure(test, (AssertionError, err, None))
 
 
 def _environment_skips():

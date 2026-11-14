@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 
 from dev.tests import fixtures
-from dev.tests._w7a_tools_helpers import DATA, env_with, leads, ok, shim, tool_project
+from dev.tests._w7a_tools_helpers import DATA, assert_matches_recording, env_with, leads, ok, shim, tool_project
 
 PACKS = fixtures.REPO_ROOT / "references" / "rules" / "ast-grep"
 
@@ -118,6 +118,12 @@ class SizeAndCopies(unittest.TestCase):
         out = ok(L, "tool-run", "scc", "--review", "R-0001", "--actor", "A-0001", env=env_with(shim("scc", script)))
         self.assertIn("scc 3.6.0", out[0])
 
+    def test_scc_matches_the_recording(self):
+        assert_matches_recording(self, "scc", DATA / "scc.json")
+
+    def test_jscpd_matches_the_recording(self):
+        assert_matches_recording(self, "jscpd", DATA / "jscpd.json")
+
     def test_jscpd_import(self):
         repo, L, sha = tool_project(self)
         ok(L, "tool-run", "jscpd", "--review", "R-0001", "--from", str(DATA / "jscpd.json"), "--actor", "A-0001")
@@ -128,7 +134,7 @@ class SizeAndCopies(unittest.TestCase):
         self.assertIn("src/util.js:21-29", r["message"])
         m = {r["name"]: r["value"] for r in L.all("SELECT name, value FROM metrics WHERE scope='all'")}
         self.assertEqual((m["duplicated_lines"], m["clones"]), (9, 1))
-        self.assertAlmostEqual(m["duplicated_percent"], 10.23, places=2)
+        self.assertAlmostEqual(m["duplicated_percent"], 11.25, places=2)
 
 
 class History(unittest.TestCase):

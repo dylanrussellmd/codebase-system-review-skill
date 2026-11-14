@@ -4,6 +4,9 @@ Browser tests import this module and subclass ViewerTestCase. Nothing here is ne
 when Playwright is not installed, or no Chrome/Chromium can be launched, every browser test is skipped with the reason
 (unittest.SkipTest), and the suite still passes.
 
+With LEDGER_BROWSER_REQUIRED=1 (CI's browser and slow jobs) each of those skips is a failure instead, and so is a
+LEDGER_CHROME that names no executable: unavailable() decides.
+
 Browser used: $LEDGER_CHROME if set, else /usr/bin/google-chrome when present, else Playwright's own Chromium if it is
 installed. One headless browser is started per test process (on first use) and closed at exit; each test gets a fresh
 browser context (its own storage, viewport and colour scheme), so tests stay fast and independent.
@@ -128,15 +131,29 @@ def skip_reason():
     return None if get_browser() is not None else (_state["reason"] or "no browser")
 
 
+REQUIRED = "LEDGER_BROWSER_REQUIRED"
+
+
+def unavailable(reason):
+    """A browser, Playwright or axe-core is missing: an environment skip, or with LEDGER_BROWSER_REQUIRED=1 a
+    failure (AssertionError), so a job that must run the browser tests cannot pass without them."""
+    if os.environ.get(REQUIRED) == "1":
+        raise AssertionError(f"{REQUIRED}=1 and {reason}")
+    raise unittest.SkipTest(f"environment: {reason}")
+
+
 def require_browser():
     """Raise unittest.SkipTest unless browser tests are switched on (LEDGER_BROWSER_TESTS=1) and a browser is
-    available. Returns the browser. They are off by default so the everyday suite stays quick; CI runs them in their
-    own job."""
+    available (unavailable(): a failure with LEDGER_BROWSER_REQUIRED=1). Returns the browser. They are off by
+    default so the everyday suite stays quick; CI runs them in their own jobs."""
     if os.environ.get("LEDGER_BROWSER_TESTS") != "1":
         raise unittest.SkipTest("browser tests skipped: set LEDGER_BROWSER_TESTS=1 to run them")
+    named = os.environ.get("LEDGER_CHROME")
+    if named and chrome_path() is None and os.environ.get(REQUIRED) == "1":
+        unavailable(f"LEDGER_CHROME={named} is not an executable file")
     b = get_browser()
     if b is None:
-        raise unittest.SkipTest(f"environment: browser tests skipped: {_state['reason']}")
+        unavailable(f"browser tests skipped: {_state['reason']}")
     return b
 
 

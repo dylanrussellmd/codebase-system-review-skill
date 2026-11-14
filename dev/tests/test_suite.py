@@ -1,5 +1,6 @@
 """The suite itself: discovery works with the documented command, and the shared fixtures behave as documented."""
 import ast
+import os
 import re
 import socket
 import sqlite3
@@ -153,6 +154,22 @@ def ci_steps(text):
     return out
 
 
+def runner_pin_problems(text):
+    """What is wrong with ci.yml's tests job for ISS-0341: its matrix must list Python 3.9 (the oldest supported) and
+    3.12, and its runner must be a named image, since setup-python has no 3.9 for newer images. [] when right."""
+    m = re.search(r"(?ms)^  tests:\n(.*?)(?=^  \S|\Z)", text)
+    if not m:
+        return ["no tests job"]
+    job = m.group(1)
+    runs_on = re.search(r"(?m)^    runs-on:\s*(\S+)", job)
+    versions = re.search(r"(?m)^\s+python-version:\s*\[([^\]]*)\]", job)
+    found = set(re.findall(r'"([0-9.]+)"', versions.group(1))) if versions else set()
+    problems = [f"the matrix lacks Python {v}" for v in ("3.9", "3.12") if v not in found]
+    if not runs_on or not re.match(r"^ubuntu-\d+\.\d+$", runs_on.group(1)):
+        problems.append(f"runs-on is {runs_on.group(1) if runs_on else 'missing'}, not a pinned image")
+    return problems
+
+
 class Discovery(unittest.TestCase):
     def test_suite_discovers_and_runs(self):
         loader = unittest.TestLoader()
@@ -199,11 +216,39 @@ class Discovery(unittest.TestCase):
                     bad.append(f"{f.name}:{no}: {line.strip()}")
         self.assertEqual(bad, [])
 
+    def test_slow_marker_runs_when_set(self):
+        """A test marked @fixtures.slow runs with LEDGER_SLOW_TESTS=1 and is skipped without it."""
+        folder = fixtures.temp_dir("slow-child-")
+        (folder / "test_slow_probe.py").write_text(
+            "import unittest\nfrom dev.tests import fixtures\n\n\nclass Probe(unittest.TestCase):\n"
+            "    @fixtures.slow\n    def test_marked(self):\n        print('RAN')\n", encoding="utf-8")
+        env = dict(fixtures.git_env(), PYTHONPATH=f"{folder}{os.pathsep}{ROOT}")
+        env.pop("LEDGER_SLOW_TESTS", None)
+        args = [sys.executable, "-m", "unittest", "test_slow_probe"]
+        off = subprocess.run(args, cwd=str(ROOT), capture_output=True, text=True, timeout=120, env=env)
+        on = subprocess.run(args, cwd=str(ROOT), capture_output=True, text=True, timeout=120,
+                            env=dict(env, LEDGER_SLOW_TESTS="1"))
+        self.assertRegex(off.stderr, r"(?m)^OK \(skipped=1\)$")
+        self.assertNotIn("RAN", off.stdout)
+        self.assertRegex(on.stderr, r"(?m)^OK$")
+        self.assertIn("RAN", on.stdout)
+
     def test_readme_names_the_command(self):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn("## Testing", readme)
         self.assertIn(COMMAND, readme)
         self.assertIn("python3 dev/build.py --check", readme)
+
+    def test_ci_pins_runner_for_oldest_python(self):
+        """Guards ISS-0341: the tests job runs Python 3.9 and 3.12 on a pinned runner image."""
+        ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        self.assertEqual(runner_pin_problems(ci), [])
+        no_39 = ci.replace('python-version: ["3.9", "3.12"]', 'python-version: ["3.12"]')
+        latest = re.sub(r"(?m)^(  tests:\n(?:.*\n)*?    runs-on:) ubuntu-24\.04$", r"\1 ubuntu-latest", ci)
+        self.assertNotEqual(no_39, ci)
+        self.assertNotEqual(latest, ci)
+        self.assertEqual(runner_pin_problems(no_39), ["the matrix lacks Python 3.9"])
+        self.assertEqual(runner_pin_problems(latest), ["runs-on is ubuntu-latest, not a pinned image"])
 
     def test_ci_runs_build_check_and_suite(self):
         ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
@@ -237,6 +282,20 @@ class Discovery(unittest.TestCase):
         self.assertIn("LEDGER_SLOW_TESTS", read)
         self.assertEqual(sorted(v for v in read if not self.reaching({v})), [])
 
+    def test_browser_jobs_require_the_browser(self):
+        """Each job that runs the browser tests fails without a browser or axe-core instead of skipping them."""
+        text = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        steps = ci_steps(text)
+        jobs = {job for job, env, cmd, _ in steps if "LEDGER_BROWSER_TESTS" in env and DISCOVER_ALL.match(cmd)}
+        self.assertEqual(jobs, {"browser-tests", "slow-tests"})
+        for job in sorted(jobs):
+            with self.subTest(job=job):
+                self.assertTrue(all("LEDGER_BROWSER_REQUIRED" in env for j, env, cmd, _ in steps
+                                    if j == job and DISCOVER_ALL.match(cmd)))
+                cmds = [cmd for j, _, cmd, _ in steps if j == job]
+                self.assertTrue(any('"axe-core@$axe"' in c for c in cmds), cmds)
+                self.assertTrue(any(c.startswith('echo "LEDGER_AXE=') for c in cmds), cmds)
+
     def test_ci_reader(self):
         text = ("jobs:\n  a:\n    steps:\n      - name: x\n        env:\n          LEDGER_SLOW_TESTS: \"1\"\n"
                 "        run: python3 -m unittest discover -s dev/tests -t . -v\n  b:\n    steps:\n"
@@ -245,6 +304,67 @@ class Discovery(unittest.TestCase):
         got = ci_steps(text)
         self.assertIn(("a", {"LEDGER_SLOW_TESTS"}, "python3 -m unittest discover -s dev/tests -t . -v", False), got)
         self.assertIn(("b", {"LEDGER_BROWSER_TESTS"}, "python3 -m unittest discover -s dev/tests -t .", True), got)
+
+
+# Every adapter whose recorded sample is a real run, by the test module that compares a real run with it.
+RECORDING_TESTS = {"test_w7a_tools_code": ("scc", "jscpd"),
+                   "test_w7a_tools_security": ("gitleaks", "actionlint", "zizmor", "osv", "semgrep"),
+                   "test_w7b_tools_ui": ("wallace", "impeccable", "stylelint"),
+                   "test_w7b_tools_docs": ("vale", "lychee")}
+
+
+class ToolsJob(unittest.TestCase):
+    """CI's tools job runs the tool tests with the pinned tools, and a missing tool fails it."""
+
+    def test_ci_tools_job_runs_the_tool_tests_with_the_pinned_tools(self):
+        text = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        steps = [(env, cmd) for job, env, cmd, _ in ci_steps(text) if job == "tools"]
+        cmds = [cmd for _, cmd in steps]
+        self.assertTrue(any(c.startswith("mise install ") for c in cmds), cmds)
+        self.assertIn("MISE_DEFAULT_CONFIG_FILENAME: tools.lock", text)
+        run = [env for env, cmd in steps
+               if cmd == 'python3 -m unittest discover -s dev/tests -t . -p "test_w7[ab]_tools_*.py" -v']
+        self.assertEqual(len(run), 1, cmds)
+        self.assertIn("LEDGER_ENVIRONMENT_REQUIRED", run[0])
+        self.assertTrue(any(c.startswith("python3 dev/pin_manifests.py ") for c in cmds), cmds)
+        self.assertTrue(any(c.startswith("osv-scanner scan source ") for c in cmds), cmds)
+
+    def test_recorded_samples_have_a_real_run_test(self):
+        for mod, tools in RECORDING_TESTS.items():
+            text = (ROOT / "dev" / "tests" / f"{mod}.py").read_text(encoding="utf-8")
+            for tool in tools:
+                with self.subTest(tool=tool):
+                    self.assertIn(f"def test_{tool}_matches_the_recording(self)", text)
+
+    def test_environment_skip_fails_when_required(self):
+        """With LEDGER_ENVIRONMENT_REQUIRED=1 a test skipped for want of a tool is a failure."""
+        from dev.tests._w7a_tools_helpers import bare_bin
+        env = dict(fixtures.git_env(), PATH=bare_bin(), LEDGER_ENVIRONMENT_REQUIRED="1")
+        p = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "dev/tests", "-t", ".",
+                            "-p", "test_w7b_tools_docs.py", "-k", "matches_the_recording"], cwd=str(ROOT),
+                           capture_output=True, text=True, timeout=300, env=env)
+        self.assertEqual(p.returncode, 1, p.stderr[-2000:])
+        self.assertRegex(p.stderr, r"(?m)^FAILED \(failures=2, skipped=2\)$")
+        self.assertIn("skipped with LEDGER_ENVIRONMENT_REQUIRED=1: environment: Vale is not installed", p.stderr)
+        env.pop("LEDGER_ENVIRONMENT_REQUIRED")
+        p = subprocess.run(p.args, cwd=str(ROOT), capture_output=True, text=True, timeout=300, env=env)
+        self.assertEqual(p.returncode, 0, p.stderr[-2000:])
+
+    def test_pin_manifests_place_every_pin(self):
+        sys.path.insert(0, str(ROOT / "dev"))
+        try:
+            import pin_manifests
+        finally:
+            sys.path.pop(0)
+        out = pin_manifests.manifests((ROOT / "references" / "tools.lock").read_text(encoding="utf-8"))
+        named = sum(len(re.findall(p, out[f])) for f, p in (("package-lock.json", r'"node_modules/'),
+                                                              ("requirements.txt", r"=="), ("go.mod", r"\tgithub"),
+                                                              ("Cargo.lock", r"\[\[package\]\]")))
+        pins = pin_manifests.pins((ROOT / "references" / "tools.lock").read_text(encoding="utf-8"))
+        self.assertEqual(named, len(pins) - len(pin_manifests.NO_PACKAGE))
+        self.assertIn("\tgithub.com/boyter/scc/v3 v3.6.0\n", out["go.mod"])
+        with self.assertRaises(SystemExit):
+            pin_manifests.manifests('[tools]\nnewtool = "1.0"\n')
 
 
 class ScratchRepoFixture(unittest.TestCase):

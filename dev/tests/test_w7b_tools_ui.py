@@ -12,8 +12,9 @@ import zlib
 import struct
 from pathlib import Path
 
-from dev.tests import fixtures
-from dev.tests._w7a_tools_helpers import DATA, env_with, leads, ok, shared_project, shim, tool_project
+from dev.tests import browser, fixtures
+from dev.tests._w7a_tools_helpers import (DATA, assert_matches_recording, env_with, leads, ok, shared_project,
+                                          shim, tool_project)
 
 STYLES_CSS = (".low { color: #aaaaaa; }\n.btn { color: #6366f1; padding: 12px 20px; }\n")
 TOKENS = {"tokens/colors.json": json.dumps({"color": {"brand": {"primary": {"value": "#6366f1"},
@@ -94,6 +95,20 @@ class Axe(unittest.TestCase):
         self.assertIsNone(tools["axe"]["installed"])
 
 
+# The stylesheet wallace.json and impeccable.json were recorded from: Impeccable reads it inside the page.
+RECORDED_CSS = (":root { --color-text: #222222; --space-2: 8px; }\n"
+                "body { margin: 0; padding: 16px; font-size: 15px; color: #333; }\n"
+                ".low { color: #aaaaaa; background: #ffffff; }\n"
+                ".card { background: linear-gradient(135deg, #6366f1, #a855f7); padding: 24px; border-radius: 12px; "
+                "box-shadow: 0 4px 24px rgba(0,0,0,.08); }\n"
+                ".btn { color: #6366f1; padding: 8px 16px; font-size: 14px; }\n.btn:hover { color: #4f46e5; }\n"
+                "h1 { font-size: 1rem; margin: 0 0 8px; color: #222222; }\n"
+                "@media (max-width: 600px) { .card { padding: 12px; } }\n")
+RECORDED_PAGE = ("<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>Demo</title>\n"
+                 f"<style>\n{RECORDED_CSS}</style>\n</head>\n<body>\n<h1>Demo</h1>\n<p class=\"low\">Muted note</p>\n"
+                 "<div class=\"card\"><p>Card text</p><a class=\"btn\" href=\"#\">Go</a></div>\n</body>\n</html>\n")
+
+
 class Wallace(unittest.TestCase):
     def test_wallace_inventory(self):
         """Distinct colours, font sizes and other values become metrics that trend between reviews; a category
@@ -112,6 +127,9 @@ class Wallace(unittest.TestCase):
         f.write_text(json.dumps(doc))
         ok(L, "tool-run", "wallace", "--review", "R-0001", "--from", str(f), "--actor", "A-0001")
         self.assertEqual([g[1] for g in leads(L)], ["wallace.many-colors"])
+
+    def test_wallace_matches_the_recording(self):
+        assert_matches_recording(self, "wallace", DATA / "wallace.json", {"web/styles.css": RECORDED_CSS})
 
     def test_wallace_reads_every_stylesheet(self):
         script = ("import sys\ncss = sys.stdin.read()\nassert '.low' in css and '.extra' in css, css\n"
@@ -139,6 +157,9 @@ class Impeccable(unittest.TestCase):
                                ("impeccable.low-contrast", "templates/page.html", None, "warning")])
         L.commit()
         self.assertEqual(L.scalar("SELECT value FROM metrics WHERE name='generic_look_findings'"), 1)
+
+    def test_impeccable_matches_the_recording(self):
+        assert_matches_recording(self, "impeccable", DATA / "impeccable.json", {"templates/page.html": RECORDED_PAGE})
 
     def test_impeccable_runs_on_the_ui_only(self):
         script = ("import sys, os\nif '--version' in sys.argv:\n    print('4.8.2'); sys.exit(0)\n"
@@ -310,14 +331,14 @@ class UiAuditAxe(unittest.TestCase):
         mod = fixtures.load_ledger_module()
         found = mod.axe_script(Path.cwd())
         if found is None:
-            self.skipTest("environment: axe-core is not installed (LEDGER_AXE)")
+            browser.unavailable("axe-core is not installed (LEDGER_AXE)")
         repo, L, sha = tool_project(self)
         page = L.dir / "planted.html"
         page.write_text(AXE_PAGE, encoding="utf-8")
         env = fixtures.git_env({"LEDGER_AXE": str(found)})
         p = L.run("ui-audit", page, "--json", env=env, timeout=180)
         if p.returncode == 2:
-            self.skipTest("environment: " + p.stderr.strip())
+            browser.unavailable(p.stderr.strip())
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         axe = json.loads(p.stdout)["pages"][0]["axe"]
         self.assertTrue(axe["available"])

@@ -4,11 +4,36 @@ Every route of the viewer is drawn from the demo ledger at desktop (1280 px) and
 dark colour schemes; no page error, console error, error banner or request leaving 127.0.0.1 is allowed. Skipped
 cleanly when Playwright or a browser is missing (see dev/tests/browser.py).
 """
+import os
 import subprocess
 import sys
 import unittest
 
 from dev.tests import browser, fixtures
+
+# A browser test module a child unittest run loads: its page fetches an outside address and throws.
+NOISY_TEST = """from dev.tests import browser
+
+
+class Noisy(browser.ViewerTestCase):
+    @classmethod
+    def build_ledger(cls, ledger):
+        return None
+
+    def test_noisy_page(self):
+        page = self.open("#/")
+        page.js("() => { fetch('http://example.invalid/').catch(() => 0); setTimeout(() => { throw new Error('boom'); }, 0); }")
+        page.page.wait_for_timeout(300)
+"""
+
+
+def child_unittest(module_text, env, name="test_child_probe"):
+    """Run one test module in a child `python -m unittest`, with the repository importable; the finished process."""
+    folder = fixtures.temp_dir("browser-child-")
+    (folder / f"{name}.py").write_text(module_text, encoding="utf-8")
+    path = os.pathsep.join([str(folder), str(fixtures.REPO_ROOT)])
+    return subprocess.run([sys.executable, "-m", "unittest", name], cwd=str(fixtures.REPO_ROOT), capture_output=True,
+                          text=True, timeout=300, env=dict(fixtures.git_env(), PYTHONPATH=path, **env))
 
 # Every view, with and without arguments, plus an unknown hash (falls back to the overview).
 ROUTES = [
@@ -49,6 +74,24 @@ class ViewerSmoke(browser.ViewerTestCase):
                     bg = page.js("getComputedStyle(document.body).backgroundColor")
                     # The dark palette applies under prefers-color-scheme: dark (theme "auto").
                     self.assertEqual(bg, "rgb(18, 23, 21)" if scheme == "dark" else "rgb(247, 248, 246)")
+
+    def test_required_browser_fails_instead_of_skipping(self):
+        """With LEDGER_BROWSER_REQUIRED=1, a browser that does not start fails the run instead of skipping it."""
+        probe = "from dev.tests import browser\n\n\nclass Probe(browser.ViewerTestCase):\n" \
+                "    def test_probe(self):\n        pass\n"
+        env = {"LEDGER_BROWSER_TESTS": "1", "LEDGER_CHROME": "/nonexistent"}
+        p = child_unittest(probe, dict(env, LEDGER_BROWSER_REQUIRED="1"))
+        self.assertNotEqual(p.returncode, 0, p.stderr[-2000:])
+        self.assertIn("LEDGER_BROWSER_REQUIRED=1", p.stderr)
+        self.assertIn("/nonexistent", p.stderr)
+        p = child_unittest(probe, env)
+        self.assertEqual(p.returncode, 0, p.stderr[-2000:])
+
+    def test_teardown_fails_on_outside_request_and_page_error(self):
+        p = child_unittest(NOISY_TEST, {"LEDGER_BROWSER_TESTS": "1"})
+        self.assertRegex(p.stderr, r"(?m)^FAILED \(failures=1\)$", p.stderr[-3000:])
+        self.assertIn("page errors", p.stderr)
+        self.assertIn("boom", p.stderr)
 
     def test_unknown_hash_shows_overview(self):
         page = self.open("#/no-such-view")

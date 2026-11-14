@@ -254,8 +254,8 @@ the tool runs, one through a stand-in executable on `PATH` (`dev/tests/_w7a_tool
 ### The recorded samples
 
 Real outputs, from the pinned versions run on a small scratch project on 2026-11-11: `semgrep.sarif` (one local
-rule), `ast-grep.jsonl` (the shipped packs), `zizmor.sarif`, `actionlint.json`, `gitleaks.json` (run with `--redact`), `scc.json`, `jscpd.json` (its
-`detectionDate` makes each run's bytes differ; the leads do not), `junit.xml` (pytest), `coverage.lcov` and
+rule), `ast-grep.jsonl` (the shipped packs), `zizmor.sarif`, `actionlint.json`, `gitleaks.json` (run with `--redact`), `scc.json`, `jscpd.json` (from
+2026-11-14; its `detectionDate` makes each run's bytes differ, the leads do not), `junit.xml` (pytest), `coverage.lcov` and
 `coverage.xml` (coverage.py; the `<source>` folder replaced with `/project`), `osv-no-database.json` (OSV-Scanner
 offline with no database). From 2026-11-12: `vale.json` (Vale 3.26.0 with the shipped rules on `vale-samples/`, where every rule raises its
 alert), `lychee.json` (lychee 0.24.2 offline; the scratch folder replaced with `/project`), `axe.json` (axe-core
@@ -269,6 +269,11 @@ the pins of oasdiff 1.30.0 and Mailpit 1.30.2 are not verified. Mailpit was not 
 API as Mailpit's documentation describes it. Written from the documented format: those whose names end in `-documented`
 (`cobertura-methods-documented.xml`, since coverage.py writes no methods; `osv-documented.json`: the proxy here refused the advisory database download, so OSV-Scanner's `--online` path is
 not verified).
+
+That scratch project is `RECORDED` in `dev/tests/_w7a_tools_helpers.py` (the stylesheet and page of `wallace.json`
+and `impeccable.json` are in `test_w7b_tools_ui.py`). Each `test_<tool>_matches_the_recording` runs the tool on it
+and requires the leads and metrics of an import of the sample; OSV-Scanner's runs offline against a database of the
+advisories `osv-documented.json` names. CI's tools job runs them all with the pinned tools.
 
 ### Harness features (optional)
 

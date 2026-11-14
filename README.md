@@ -183,15 +183,21 @@ run ends. Skipped by default:
   (`pip install playwright && python3 -m playwright install chromium`).
 
 A test that needs what the machine lacks (a tool on PATH, IPv6, an address besides loopback, a browser) skips with a
-reason that starts `environment:`, and the run lists those tests after its result line. Tool tests that check only
-how a tool is called and read run against stand-ins in `dev/tests` and never skip.
+reason that starts `environment:`, and the run lists those tests after its result line; with
+`LEDGER_ENVIRONMENT_REQUIRED=1` each of them fails instead. Tool tests that check only how a tool is called and read
+run against stand-ins in `dev/tests` and never skip.
 
 CI (`.github/workflows/ci.yml`) runs on every push and pull request:
 
 - `python3 dev/build.py --check`;
 - the suite on Python 3.9 and 3.12;
-- the suite with `LEDGER_BROWSER_TESTS=1`, Playwright and Chromium installed;
-- the suite with `LEDGER_SLOW_TESTS=1 LEDGER_BROWSER_TESTS=1`: scale builds, speed budgets and page budgets.
+- the suite with `LEDGER_BROWSER_TESTS=1`, Playwright, Chromium and the pinned axe-core installed;
+- the suite with `LEDGER_SLOW_TESTS=1 LEDGER_BROWSER_TESTS=1`: scale builds, speed budgets and page budgets;
+- in both browser jobs `LEDGER_BROWSER_REQUIRED=1`: a browser, Playwright or axe-core that is missing or does not
+  start fails the job instead of skipping its tests;
+- the tool tests with the tools `references/tools.lock` pins, installed by mise, and `LEDGER_ENVIRONMENT_REQUIRED=1`:
+  each `*_matches_the_recording` test runs a tool for real and compares it with its recorded sample. OSV-Scanner then
+  looks up advisories for the pinned versions (`dev/pin_manifests.py`).
 
 Speed budgets are written for the baseline machine and scaled to the one running them: `dev/tests/helpers.py` times
 a reference workload and multiplies each budget by how much slower this machine runs it.

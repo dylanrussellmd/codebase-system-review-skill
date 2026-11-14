@@ -34,10 +34,15 @@ def refused(test, L, *args, **kw):
     return err[0]
 
 
-def project(test, *, approved=True, files=None):
+def project(test, *, approved=True, files=None, earlier=()):
     """A git project with src/app.py committed, a ledger with repository 'demo', a manager A-0001 and review R-0001
-    (approved and running, domain spec included, reviewer run spec-A) unless approved=False (planning)."""
+    (approved and running, domain spec included, reviewer run spec-A) unless approved=False (planning). Each dict
+    of `earlier` is committed first, in order, so the reviewed commit has a history."""
     repo = fixtures.ScratchRepo()
+    for n, older in enumerate(earlier, 1):
+        for rel, text in older.items():
+            repo.write(rel, text)
+        repo.commit(f"earlier {n}")
     for rel, text in (files or {"src/app.py": APP}).items():
         repo.write(rel, text)
     sha = repo.commit("first")

@@ -1,9 +1,15 @@
 # Checks every push and pull request: the shipped scripts/ledger.py matches its sources, and the test suite passes.
 #   build-check    dev/build.py --check
 #   tests          the whole suite on Python 3.9 and 3.12, standard library only (gated tests skip)
-#   browser-tests  the whole suite with LEDGER_BROWSER_TESTS=1, Playwright and Chromium installed
-#   slow-tests     the whole suite with LEDGER_SLOW_TESTS=1 and LEDGER_BROWSER_TESTS=1: scale builds, speed budgets
-#                  (scaled to the runner by dev/tests/helpers.budget) and the browser page budgets
+#   browser-tests  the whole suite with LEDGER_BROWSER_TESTS=1, Playwright, Chromium and the pinned axe-core installed;
+#                  LEDGER_BROWSER_REQUIRED=1 makes a browser or axe-core that cannot start a failure, not a skip
+#   slow-tests     the whole suite with LEDGER_SLOW_TESTS=1 and LEDGER_BROWSER_TESTS=1 (and LEDGER_BROWSER_REQUIRED=1):
+#                  scale builds, speed budgets (scaled to the runner by dev/tests/helpers.budget) and the browser
+#                  page budgets
+#   tools          the tool tests (test_w7a_tools_*, test_w7b_tools_*) with the tools references/tools.lock pins,
+#                  installed by mise: each *_matches_the_recording test compares a real run with its recorded
+#                  sample, and a test skipped for want of a tool fails (LEDGER_ENVIRONMENT_REQUIRED=1); then
+#                  OSV-Scanner looks up advisories for the pinned versions (dev/pin_manifests.py)
 # Gated tests are chosen by their marker, never by file name: dev/tests/test_suite.py checks that every test a
 # LEDGER_*_TESTS variable switches on is reached by one of these jobs.
 name: ci
@@ -48,13 +54,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install Playwright and Chromium (test-only; the tool itself needs nothing)
+      - name: Install Playwright, Chromium and the pinned axe-core (test-only; the tool itself needs nothing)
         run: |
           python3 -m pip install playwright
           python3 -m playwright install --with-deps chromium
+          axe=$(sed -n 's/^"npm:axe-core" = "\(.*\)"$/\1/p' references/tools.lock)
+          npm install --prefix "$RUNNER_TEMP/axe" "axe-core@$axe"
+          echo "LEDGER_AXE=$RUNNER_TEMP/axe/node_modules/axe-core" >> "$GITHUB_ENV"
       - name: Browser tests
         env:
           LEDGER_BROWSER_TESTS: "1"
+          LEDGER_BROWSER_REQUIRED: "1"
         run: python3 -m unittest discover -s dev/tests -t . -v
 
   slow-tests:
@@ -65,12 +75,60 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install Playwright and Chromium (test-only; the tool itself needs nothing)
+      - name: Install Playwright, Chromium and the pinned axe-core (test-only; the tool itself needs nothing)
         run: |
           python3 -m pip install playwright
           python3 -m playwright install --with-deps chromium
+          axe=$(sed -n 's/^"npm:axe-core" = "\(.*\)"$/\1/p' references/tools.lock)
+          npm install --prefix "$RUNNER_TEMP/axe" "axe-core@$axe"
+          echo "LEDGER_AXE=$RUNNER_TEMP/axe/node_modules/axe-core" >> "$GITHUB_ENV"
       - name: Scale, speed-budget and browser page-budget tests
         env:
           LEDGER_SLOW_TESTS: "1"
           LEDGER_BROWSER_TESTS: "1"
+          LEDGER_BROWSER_REQUIRED: "1"
         run: python3 -m unittest discover -s dev/tests -t . -v
+
+  tools:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:   # for pg-explain; the version tools.lock pins
+        image: postgres:16.15
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      MISE_DEFAULT_CONFIG_FILENAME: tools.lock
+      MISE_YES: "1"
+      GITHUB_TOKEN: ${{ github.token }}   # mise downloads release binaries from GitHub
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install mise
+        run: npm install -g @jdxcode/mise@2026.11.8
+      - name: Install the pinned tools (PostgreSQL is the service above)
+        working-directory: references
+        run: |
+          mise install $(sed -n 's/^"\{0,1\}\([^"= ]*\)"\{0,1\} = .*/\1/p' tools.lock | grep -vx postgres)
+          mise bin-paths >> "$GITHUB_PATH"
+      - name: ESLint with the pinned eslint-plugin-i18next beside it, and psql
+        run: |
+          plugin=$(sed -n 's/^"npm:eslint-plugin-i18next" = "\(.*\)"$/\1/p' references/tools.lock)
+          npm install -g eslint@10.14.0 "eslint-plugin-i18next@$plugin"
+          command -v psql || (sudo apt-get update && sudo apt-get install -y postgresql-client)
+      - name: Tool tests with the real tools
+        env:
+          LEDGER_ENVIRONMENT_REQUIRED: "1"
+          LEDGER_TEST_POSTGRES: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+        run: python3 -m unittest discover -s dev/tests -t . -p "test_w7[ab]_tools_*.py" -v
+      - name: Advisories for the pinned versions
+        run: |
+          python3 dev/pin_manifests.py "$RUNNER_TEMP/pins"
+          osv-scanner scan source --no-call-analysis=go -r "$RUNNER_TEMP/pins"

@@ -4,15 +4,49 @@ commit, with every secret value left out of the ledger and the kept output; OSV-
 offline, reading advisory databases downloaded only with --online; actionlint and zizmor when the commit has GitHub
 Actions workflows. Each imports from a recorded output, so none needs the tool installed."""
 import json
+import re
 import unittest
+import zipfile
 from pathlib import Path
 
 from dev.tests import fixtures
-from dev.tests._w7a_tools_helpers import APP_PY, DATA, env_with, leads, ok, shim, tool_project
+from dev.tests._w7a_tools_helpers import APP_PY, DATA, assert_matches_recording, env_with, leads, ok, shim, tool_project
 
 VERSION = "import sys\nif '--version' in sys.argv or 'version' in sys.argv[1:2] or '-version' in sys.argv:\n" \
           "    print(%r); sys.exit(0)\n"
 WORKFLOW = "on: [push]\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"
+SEMGREP_RULE = ("rules:\n  - id: requests-without-timeout\n    languages: [python]\n    severity: WARNING\n"
+                "    message: requests call without a timeout\n    patterns:\n      - pattern: requests.$M(...)\n"
+                "      - pattern-not: requests.$M(..., timeout=$T, ...)\n")
+
+
+def osv_record(vid, alias, summary, fixed, vector=None):
+    """One OSV advisory for requests on PyPI, affected below `fixed`."""
+    rec = {"schema_version": "1.6.0", "id": vid, "modified": "2024-01-01T00:00:00Z", "aliases": [alias],
+           "summary": summary,
+           "affected": [{"package": {"ecosystem": "PyPI", "name": "requests", "purl": "pkg:pypi/requests"},
+                         "ranges": [{"type": "ECOSYSTEM", "events": [{"introduced": "0"}, {"fixed": fixed}]}]}]}
+    if vector:
+        rec["severity"] = [{"type": "CVSS_V3", "score": vector}]
+    return rec
+
+
+# The advisories osv-documented.json reports, as an offline database (OSV-Scanner's PyPI/all.zip).
+OSV_DB = [osv_record("GHSA-x84v-xcm2-53pg", "CVE-2018-18074", "Insufficiently protected credentials in Requests",
+                     "2.20.0", "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"),
+          osv_record("PYSEC-2018-28", "CVE-2018-18074",
+                     "Requests sends an Authorization header after an https to http redirect", "2.20.0"),
+          osv_record("GHSA-j8r2-6x86-q33q", "CVE-2023-32681",
+                     "Unintended leak of Proxy-Authorization header in requests", "2.31.0",
+                     "CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:C/C:H/I:N/A:N")]
+
+
+def write_osv_db(L):
+    folder = L.dir / "tools" / "osv-db" / "osv-scanner" / "PyPI"
+    folder.mkdir(parents=True)
+    with zipfile.ZipFile(str(folder / "all.zip"), "w") as z:
+        for rec in OSV_DB:
+            z.writestr(f"{rec['id']}.json", json.dumps(rec))
 
 
 class Semgrep(unittest.TestCase):
@@ -43,7 +77,23 @@ class Semgrep(unittest.TestCase):
         self.assertEqual(b["online"], 0)
 
 
+    # Semgrep names a rule from a --config file by that file's folder and its id
+    # ("tmp.ledger-tests-x.w7a-rule-y.requests-without-timeout"), so a lead's rule depends on where the rule file is.
+    @unittest.expectedFailure
+    def test_semgrep_matches_the_recording(self):
+        rules = fixtures.temp_dir("w7a-rule-") / "rules.yml"
+        rules.write_text(SEMGREP_RULE, encoding="utf-8")
+        assert_matches_recording(self, "semgrep", DATA / "semgrep.sarif", args=("--rules", str(rules)))
+
+
 class Gitleaks(unittest.TestCase):
+    def test_gitleaks_matches_the_recording(self):
+        """Both secrets, each at the commit that added it; the commit ids differ between the two projects."""
+        leads_, repo = assert_matches_recording(self, "gitleaks", DATA / "gitleaks.json",
+                                                same=lambda m: re.sub(r"commit [0-9a-f]{10}\)", "commit)", m))
+        added = {lead[0]: re.search(r"commit ([0-9a-f]{10})\)", lead[-1]).group(1) for lead in leads_}
+        self.assertEqual(added, {"aws-access-token": repo.commits[0][:10], "github-pat": repo.commits[1][:10]})
+
     def test_gitleaks_import(self):
         repo, L, sha = tool_project(self)
         ok(L, "tool-run", "gitleaks", "--review", "R-0001", "--from", str(DATA / "gitleaks.json"), "--actor",
@@ -107,6 +157,11 @@ class Dependencies(unittest.TestCase):
            "--actor", "A-0001")
         self.assertEqual(L.count("tool_results", "tool_run_id=2"), 0)
 
+    def test_osv_matches_the_recording(self):
+        """Offline, against a database holding the advisories osv-documented.json names: the real report gives the
+        leads and metrics the documented one does."""
+        assert_matches_recording(self, "osv-scanner", DATA / "osv-documented.json", prepare=write_osv_db)
+
     def test_osv_offline_without_databases_is_skipped(self):
         repo, L, sha = tool_project(self, files={"src/app.py": APP_PY, "requirements.txt": "requests==2.19.0\n"})
         script = VERSION % "osv-scanner version: 2.2.4" + "a = sys.argv\nassert '--offline' in a, a\nsys.exit(3)\n"
@@ -148,6 +203,12 @@ class Workflows(unittest.TestCase):
         self.assertIn("zizmor/template-injection", got)
         self.assertEqual(L.scalar("SELECT version FROM tool_runs"), "1.32.0")
         self.assertEqual(L.scalar("SELECT DISTINCT domain_code FROM tool_results"), "operations")
+
+    def test_actionlint_matches_the_recording(self):
+        assert_matches_recording(self, "actionlint", DATA / "actionlint.json")
+
+    def test_zizmor_matches_the_recording(self):
+        assert_matches_recording(self, "zizmor", DATA / "zizmor.sarif")
 
     def test_workflow_tools_need_workflows(self):
         repo, L, sha = tool_project(self)
