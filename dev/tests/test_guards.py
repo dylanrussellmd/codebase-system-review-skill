@@ -301,3 +301,61 @@ class InTheTree(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PlainDefinitions(unittest.TestCase):
+    """check finds a guard test by its plain definition without parsing the file, and the answer matches the parse."""
+
+    SRC = '''import unittest
+from dev.tests.base import Base
+
+
+def top_level():
+    pass
+
+
+class Direct(unittest.TestCase):
+    """A docstring."""
+
+    def test_here(self):
+        def test_nested():
+            pass
+
+    class Inner:
+        def test_inner(self):
+            pass
+
+
+class Inherits(Base):
+    pass
+
+
+DOC = """
+def test_in_a_string():
+    pass
+"""
+'''
+    BASE = "class Base:\n    def test_from_base(self):\n        pass\n"
+
+    def setUp(self):
+        self.mod = fixtures.load_ledger_module()
+
+    def read(self, p):
+        return self.BASE if p == "dev/tests/base.py" else None
+
+    def test_plain_answers_agree_with_the_parse(self):
+        m = self.mod
+        cases = {  # name: (plain shortcut, the whole answer)
+            "top_level": (True, True),
+            "Direct.test_here": (True, True),
+            "Direct::test_here": (True, True),
+            "Direct.test_nested": (False, False),
+            "Direct.test_inner": (False, False),
+            "Inherits.test_from_base": (False, True),   # through the base class: only the parse finds it
+            "Direct.test_missing": (False, False),
+            "Missing.test_here": (False, False),
+        }
+        for name, (plain, whole) in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(m._py_defined_plainly(self.SRC, m._guard_parts(name)), plain)
+                self.assertEqual(m.guard_in_source("dev/tests/t.py", name, self.SRC, self.read), whole)

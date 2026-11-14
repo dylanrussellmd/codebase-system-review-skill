@@ -6914,6 +6914,8 @@ def guard_in_source(path, name, text, read=None):
         return False
     if not path.endswith(".py"):
         return all(p in text for p in parts)
+    if _py_defined_plainly(text, parts):
+        return True
     tree = _py_tree(text)
     if tree is None:
         return False
@@ -6923,12 +6925,38 @@ def guard_in_source(path, name, text, read=None):
     return len(parts) == 2 and _py_class_has(read, path, tree, parts[0], parts[1], set())
 
 
+def _py_defined_plainly(text, parts):
+    """Whether the source visibly defines the test without parsing it: a top-level def or class at column 0, or a
+    def one level inside a column-0 class (before the class's block ends). False means "parse to find out", so a
+    test defined through a base class or an import is still found by the syntax tree. A column-0 def written inside
+    a triple-quoted string also reads as defined."""
+    if len(parts) == 1:
+        return re.search(rf"^(?:async\s+def|def|class)\s+{re.escape(parts[0])}\b", text, re.M) is not None
+    if len(parts) != 2:
+        return False
+    m = re.search(rf"^class\s+{re.escape(parts[0])}\b[^\n]*:[ \t]*$", text, re.M)
+    if not m:
+        return False
+    body = re.split(r"\n(?=\S)", text[m.end():], maxsplit=1)[0]   # up to the next line at column 0
+    indent = re.search(r"\n([ \t]+)\S", body)
+    return bool(indent) and re.search(rf"\n{indent.group(1)}(?:async\s+)?def\s+{re.escape(parts[1])}\s*\(",
+                                      body) is not None
+
+
+_PY_TREES = {}   # source text -> its syntax tree (or None); check reads the same test file once per guard row
+
+
 def _py_tree(text):
-    """The syntax tree of Python source, or None when it does not parse."""
-    try:
-        return ast.parse(text)
-    except (SyntaxError, ValueError):
-        return None
+    """The syntax tree of Python source, or None when it does not parse. Trees are cached by text and must not be
+    changed by callers."""
+    if text not in _PY_TREES:
+        if len(_PY_TREES) >= 256:
+            _PY_TREES.clear()
+        try:
+            _PY_TREES[text] = ast.parse(text)
+        except (SyntaxError, ValueError):
+            _PY_TREES[text] = None
+    return _PY_TREES[text]
 
 
 def _py_module_path(path, module, level, read):
