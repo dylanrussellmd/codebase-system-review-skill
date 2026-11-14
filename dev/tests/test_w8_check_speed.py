@@ -31,7 +31,11 @@ def compare(testcase, db, must_have=()):
     try:
         con.executescript(BEFORE_SQL)
         counts = {}
+        before = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE name GLOB 'before_v_*' "
+                                            "UNION SELECT name FROM sqlite_temp_master WHERE name GLOB 'before_v_*'")}
         for (view,) in con.execute("SELECT view FROM ledger_checks ORDER BY position").fetchall():
+            if f"before_{view}" not in before:  # added after schema 21: there is no older text to compare
+                continue
             new = con.execute(f"SELECT * FROM {view}").fetchall()
             old = con.execute(f"SELECT * FROM before_{view}").fetchall()
             with testcase.subTest(db=db.name, view=view):

@@ -401,7 +401,8 @@ class FindingPlanAndEventTables(SchemaCase):
 
     def test_constraints_guard_tests(self):
         self.run_cases(
-            "guard_tests", lambda n: {"issue_id": self.iss, "test_path": "t.py", "test_name": f"test_{n}"},
+            "guard_tests", lambda n: {"issue_id": self.iss, "test_path": "t.py", "test_name": f"test_{n}",
+                                      "measured_at": "2026-11-10T09:30:00.000Z"},
             good=each("failed_before_fix", (0, 1, None)) + each("passes_after_fix", (0, 1, None))
             + each("still_exists", (0, 1)),
             bad=[("failed_before_fix 2", {"failed_before_fix": 2}, ck("failed_before_fix")),

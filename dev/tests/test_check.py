@@ -111,6 +111,7 @@ def offend(L, view, count=1):
               for _ in range(count)]
         step = L.step(plan, ph, 1, findings=fs)
         L.update("steps", step, status="done", change_note="Done, but its issues were left planned.")
+        L.insert("test_runs", step_id=step, command="python3 -m unittest", purpose="before-fix", failed=1)
     elif view == "v_closed_without_reason":
         with without_trigger(L, "tr_issue_closed_needs_reason_ins"):
             for _ in range(count):
@@ -271,7 +272,8 @@ class CheckFunction(unittest.TestCase):
         self.assertLessEqual({"v_unmatched_findings", "v_unchecked_known_issues", "v_untraceable_refs",
                               "v_uncovered_findings", "v_coverage_problems"}, set(self.views))
         self.assertEqual([(v, t) for v, _, t in self.checks if t == "warning"],
-                         [("v_unguarded_fixes", "warning"), ("v_artifacts_outside_ledger", "warning"),
+                         [("v_unguarded_fixes", "warning"), ("v_unproven_steps", "warning"),
+                          ("v_artifacts_outside_ledger", "warning"),
                           ("v_late_step_conflicts", "warning")])
         for v in self.views:
             self.assertIn(v, views)

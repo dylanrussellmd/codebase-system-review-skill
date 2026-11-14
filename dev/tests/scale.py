@@ -421,7 +421,7 @@ def build(proj, scale=1, reviews=5, files=300, reports=None, ledger_py=None, see
             print(f"review {k + 1}: {len(fids)} findings, {next_iss - 1} issues", flush=True)
 
     if plan:
-        _build_plan(con, rnd, text, review_ids, all_findings, n_steps, snaps[-1][0], T)
+        _build_plan(con, rnd, text, review_ids, all_findings, n_steps, snaps[-1][0], T, paths)
     con.close()
 
     if tag:  # tag every review so v_untraceable_refs is empty
@@ -441,7 +441,7 @@ def build(proj, scale=1, reviews=5, files=300, reports=None, ledger_py=None, see
             "prose": prose.kind, "per_review": per_review, "shas": [s for s, _ in snaps]}
 
 
-def _build_plan(con, rnd, text, review_ids, all_findings, n_steps, head_sha, T):
+def _build_plan(con, rnd, text, review_ids, all_findings, n_steps, head_sha, T, paths):
     x = con.execute
 
     def lastid():
@@ -516,8 +516,9 @@ def _build_plan(con, rnd, text, review_ids, all_findings, n_steps, head_sha, T):
                      change_actor_id=?, change_review_id=NULL, change_note='step done'
                      WHERE id=? AND status NOT IN ('fixed','verified')""", (text(20), sid, head_sha, agent, iid))
                 x("""INSERT OR IGNORE INTO guard_tests(issue_id,repository_id,test_path,test_name,step_id,
-                     added_commit_sha,failed_before_fix,passes_after_fix) VALUES (?,1,?,?,?,?,1,1)""",
-                  (iid, f"tests/test_{iid % 50}.py", f"test_issue_{iid}", sid, head_sha))
+                     added_commit_sha,failed_before_fix,passes_after_fix,measured_at,measured_commit_sha)
+                     VALUES (?,1,?,?,?,?,1,1,'2025-01-01T00:00:00.000Z',?)""",
+                  (iid, paths[iid % len(paths)], f"func_{iid % len(paths)}_0", sid, head_sha, head_sha))
                 nupd += 1
         elif r < 0.5:
             x("UPDATE steps SET status='doing', change_actor_id=?, change_note='started' WHERE id=?", (agent, sid))

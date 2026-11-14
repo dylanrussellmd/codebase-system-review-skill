@@ -27,13 +27,23 @@ class Noisy(browser.ViewerTestCase):
 """
 
 
+def child_env(**extra):
+    """git_env() for a child test run, without the CI switches that turn skips into failures (a test sets them itself
+    when that is what it checks)."""
+    env = fixtures.git_env()
+    for k in ("LEDGER_BROWSER_REQUIRED", "LEDGER_ENVIRONMENT_REQUIRED"):
+        env.pop(k, None)
+    env.update(extra)
+    return env
+
+
 def child_unittest(module_text, env, name="test_child_probe"):
     """Run one test module in a child `python -m unittest`, with the repository importable; the finished process."""
     folder = fixtures.temp_dir("browser-child-")
     (folder / f"{name}.py").write_text(module_text, encoding="utf-8")
     path = os.pathsep.join([str(folder), str(fixtures.REPO_ROOT)])
     return subprocess.run([sys.executable, "-m", "unittest", name], cwd=str(fixtures.REPO_ROOT), capture_output=True,
-                          text=True, timeout=300, env=dict(fixtures.git_env(), PYTHONPATH=path, **env))
+                          text=True, timeout=300, env=child_env(PYTHONPATH=path, **env))
 
 # Every view, with and without arguments, plus an unknown hash (falls back to the overview).
 ROUTES = [
@@ -131,7 +141,7 @@ class HarnessSkips(unittest.TestCase):
                 "assert 'Playwright is not installed' in browser.skip_reason(), browser.skip_reason()\n"
                 "try:\n    browser.require_browser()\nexcept unittest.SkipTest as e:\n    print('SKIP', e)\n")
         p = subprocess.run([sys.executable, "-c", code], cwd=str(fixtures.REPO_ROOT), capture_output=True, text=True,
-                           timeout=60, env=fixtures.git_env())
+                           timeout=60, env=child_env())
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("SKIP environment: browser tests skipped: Playwright is not installed", p.stdout)
 
@@ -154,7 +164,7 @@ class HarnessSkips(unittest.TestCase):
                 "assert browser.get_browser() is None\n"
                 "try:\n    browser.require_browser()\nexcept unittest.SkipTest as e:\n    print('SKIP', e)\n")
         p = subprocess.run([sys.executable, "-c", code], cwd=str(fixtures.REPO_ROOT), capture_output=True, text=True,
-                           timeout=60, env=fixtures.git_env())
+                           timeout=60, env=child_env())
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("SKIP environment: browser tests skipped: no browser could be launched (Playwright Chromium)", p.stdout)
 
@@ -164,7 +174,7 @@ class HarnessSkips(unittest.TestCase):
                 "try:\n    browser.require_browser()\nexcept unittest.SkipTest as e:\n    print('SKIP', e)\n"
                 "assert browser._state['tried'] is False, 'no browser may be started when switched off'\n")
         p = subprocess.run([sys.executable, "-c", code], cwd=str(fixtures.REPO_ROOT), capture_output=True, text=True,
-                           timeout=60, env=fixtures.git_env())
+                           timeout=60, env=child_env())
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("SKIP browser tests skipped: set LEDGER_BROWSER_TESTS=1 to run them", p.stdout)
 

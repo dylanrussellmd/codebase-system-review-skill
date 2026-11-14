@@ -1,5 +1,5 @@
 -- =====================================================================
--- Code review ledger — schema version 22
+-- Code review ledger — schema version 23
 -- One SQLite file per project: <project root>/.code-review/ledger.sqlite
 -- Every connection must run:  PRAGMA foreign_keys = ON;
 -- Times are UTC ISO-8601 text with milliseconds (strftime('%Y-%m-%dT%H:%M:%fZ','now')); the tr_time_*
@@ -907,9 +907,12 @@ CREATE TABLE step_commits (
 );
 
 -- The tests that keep a fixed issue fixed.
--- failed_before_fix and passes_after_fix record the proof. A later review checks that each test is still there:
--- `confirm-guard` sets still_exists and last_confirmed_review_id. A fixed issue whose guard tests are all gone is
--- listed by v_unguarded_fixes.
+-- failed_before_fix and passes_after_fix record the proof, measured by the tool (step-status done --guard, add-guard,
+-- measure-guards): the test is run with the fix's files at their parent version and again at the fix commit
+-- (measured_commit_sha), at measured_at. tr_guard_measured refuses either outcome without measured_at. A later review
+-- checks that each test is still there: `confirm-guard` sets still_exists and last_confirmed_review_id, and `check`
+-- names each live guard test that is not in the tree. A fixed issue whose guard tests are all gone is listed by
+-- v_unguarded_fixes. drop-guard removes a row with an event on its issue.
 CREATE TABLE guard_tests (
   id                      INTEGER PRIMARY KEY,
   issue_id                INTEGER NOT NULL REFERENCES issues(id),
@@ -923,6 +926,8 @@ CREATE TABLE guard_tests (
   still_exists            INTEGER NOT NULL DEFAULT 1 CHECK (still_exists IN (0,1)),
   last_confirmed_review_id INTEGER REFERENCES reviews(id),
   created_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  measured_at             TEXT,
+  measured_commit_sha     TEXT CHECK (measured_commit_sha IS NULL OR ((length(measured_commit_sha) = 40 OR length(measured_commit_sha) = 64) AND measured_commit_sha NOT GLOB '*[^0-9a-f]*')),
   UNIQUE (issue_id, test_path, test_name)
 );
 
@@ -3078,13 +3083,26 @@ WHEN (NEW.committed_at IS NOT NULL AND (NEW.committed_at NOT GLOB '[0-9][0-9][0-
 END;
 
 CREATE TRIGGER tr_time_guard_tests_ins BEFORE INSERT ON guard_tests
-WHEN (NEW.created_at IS NOT NULL AND (NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at) IS NOT NEW.created_at)) BEGIN
-  SELECT RAISE(ABORT, 'guard_tests: created_at must be UTC times like 2026-11-10T09:30:00.000Z');
+WHEN (NEW.created_at IS NOT NULL AND (NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at) IS NOT NEW.created_at)) OR (NEW.measured_at IS NOT NULL AND (NEW.measured_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.measured_at) IS NOT NEW.measured_at)) BEGIN
+  SELECT RAISE(ABORT, 'guard_tests: created_at, measured_at must be UTC times like 2026-11-10T09:30:00.000Z');
 END;
 
-CREATE TRIGGER tr_time_guard_tests_upd BEFORE UPDATE OF created_at ON guard_tests
-WHEN (NEW.created_at IS NOT NULL AND (NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at) IS NOT NEW.created_at)) BEGIN
-  SELECT RAISE(ABORT, 'guard_tests: created_at must be UTC times like 2026-11-10T09:30:00.000Z');
+CREATE TRIGGER tr_time_guard_tests_upd BEFORE UPDATE OF created_at, measured_at ON guard_tests
+WHEN (NEW.created_at IS NOT NULL AND (NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at) IS NOT NEW.created_at)) OR (NEW.measured_at IS NOT NULL AND (NEW.measured_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.measured_at) IS NOT NEW.measured_at)) BEGIN
+  SELECT RAISE(ABORT, 'guard_tests: created_at, measured_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+-- A guard test's outcomes come from a run the tool measured (schema 23), never typed: on insert.
+CREATE TRIGGER tr_guard_measured_ins BEFORE INSERT ON guard_tests
+WHEN (NEW.failed_before_fix IS NOT NULL OR NEW.passes_after_fix IS NOT NULL) AND NEW.measured_at IS NULL BEGIN
+  SELECT RAISE(ABORT, 'guard_tests: failed_before_fix and passes_after_fix come from a measured run (measured_at); use step-status done --guard, add-guard or measure-guards');
+END;
+
+-- The same on update: new outcomes need a new measured_at.
+CREATE TRIGGER tr_guard_measured_upd BEFORE UPDATE OF failed_before_fix, passes_after_fix, measured_at ON guard_tests
+WHEN (NEW.failed_before_fix IS NOT OLD.failed_before_fix OR NEW.passes_after_fix IS NOT OLD.passes_after_fix)
+     AND NEW.measured_at IS OLD.measured_at BEGIN
+  SELECT RAISE(ABORT, 'guard_tests: failed_before_fix and passes_after_fix come from a measured run (measured_at); use measure-guards');
 END;
 
 CREATE TRIGGER tr_time_test_runs_ins BEFORE INSERT ON test_runs
@@ -3689,6 +3707,21 @@ SELECT i.code, i.title, i.status,
 FROM issues i
 WHERE i.status IN (SELECT value FROM issue_statuses WHERE fixed = 1) AND COALESCE(i.kind, '') NOT IN ('docs','design')
   AND NOT EXISTS (SELECT 1 FROM guard_tests g WHERE g.issue_id = i.id AND g.still_exists = 1);
+
+-- Done steps that close issues with no proof that a test failed before the fix.
+-- Proof is a before-fix test run of the step, or a guard test of the step measured failing without it (schema 23).
+CREATE VIEW v_unproven_steps AS
+SELECT p.code AS plan, s.number AS step, s.title,
+       (SELECT group_concat(code, ', ') FROM (SELECT DISTINCT i.code FROM step_findings sf
+          JOIN findings f ON f.id = sf.finding_id JOIN issues i ON i.id = f.issue_id
+          WHERE sf.step_id = s.id ORDER BY i.code)) AS issues
+FROM steps s JOIN plans p ON p.id = s.plan_id
+WHERE s.status = 'done'
+  AND EXISTS (SELECT 1 FROM step_findings sf JOIN findings f ON f.id = sf.finding_id
+              WHERE sf.step_id = s.id AND f.issue_id IS NOT NULL)
+  AND NOT EXISTS (SELECT 1 FROM test_runs t WHERE t.step_id = s.id AND t.purpose = 'before-fix')
+  AND NOT EXISTS (SELECT 1 FROM guard_tests g WHERE g.step_id = s.id AND g.failed_before_fix = 1
+                  AND g.measured_at IS NOT NULL);
 
 -- How each measured number changed from review to review.
 -- Label and direction come from metric_defs; a metric without a unit takes the catalog's.
@@ -4363,10 +4396,14 @@ INSERT INTO enum_labels(enum, value, label, position) VALUES
 INSERT INTO enum_labels(enum, value, label, position) VALUES
  ('event','rematched','A point was moved to the right issue',32),
  ('event','location-corrected','Where a point is was corrected',33),
- ('event','check-corrected','A review check was corrected',34);
+ ('event','check-corrected','A review check was corrected',34),
+ ('event','guard-dropped','A guard test was dropped',35),
+ ('event','guard-renamed','A guard test was renamed',36);
 
 INSERT INTO ledger_checks(view, label, tier, position) VALUES
  ('v_artifacts_outside_ledger','Review files recorded outside the ledger''s folder','warning',110);
+INSERT INTO ledger_checks(view, label, tier, position) VALUES
+ ('v_unproven_steps','Done steps with no test seen failing before the fix','warning',105);
 -- Each domain's checklist (the table "Checklists" in references/domains.md).
 INSERT INTO domain_checks(code, domain_code, position, severity, question, evidence) VALUES
  ('spec.1','spec',1,'H','Is every stated requirement listed, with its source quoted?','A row per requirement: its code or quote, source and location.'),
@@ -4524,7 +4561,7 @@ INSERT INTO enum_labels(enum, value, label, position) VALUES
  ('tool_output_format','json','JSON',5), ('tool_output_format','jsonl','JSON lines',6),
  ('tool_result_level','error','Error',1), ('tool_result_level','warning','Warning',2),
  ('tool_result_level','note','Note',3), ('tool_result_level','none','No level',4);
-INSERT INTO meta(key, value) VALUES ('schema_version','22');
+INSERT INTO meta(key, value) VALUES ('schema_version','23');
 INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger schema'),
   (2, 'url, path, hash and code checks; repositories.allow_outside_root; finding_locations.excerpt_redacted'),
   (3, 'integrity rules: codes, hashes, checks, append-only history, owner actor on gate answers'),
@@ -4546,4 +4583,5 @@ INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger s
   (19, 'the features domain and feature_proposals: additions to the reviewed codebase that would serve the owner''s goals'),
   (20, 'tool_runs and tool_results: the picked tools'' runs at the reviewed commit, and their results as leads'),
   (21, 'indexes for check''s views, which read them instead of every row; the answers-imported event'),
-  (22, 'correction commands: who corrects a gate, a location or a check, and why');
+  (22, 'correction commands: who corrects a gate, a location or a check, and why'),
+  (23, 'measured guard tests: guard_tests.measured_at and measured_commit_sha; v_unproven_steps; the guard-dropped and guard-renamed events');

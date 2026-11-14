@@ -48,6 +48,9 @@ APP_V3 = 'import csv\n\n\ndef parse(text):\n    """Split one CSV line into field
          '    data = parse(request)\n    return data[0]\n'
 TEST_V2 = 'import unittest\nfrom src.app import handler\n\n\nclass T(unittest.TestCase):\n' \
           '    def test_empty_request(self):\n        self.assertIsNone(handler(""))\n'
+TEST_V3 = TEST_V2.replace("import handler", "import handler, parse") + \
+    '\n    def test_parse_quoted(self):\n        self.assertEqual(parse(\'"a,b",c\'), ["a,b", "c"])\n' \
+    '\n    def test_doc(self):\n        self.assertTrue(parse.__doc__)\n'
 
 PAGE = '<!doctype html><title>Demo</title><form><input name="request"><button>Send</button></form>\n'
 
@@ -470,7 +473,8 @@ class Walkthrough(unittest.TestCase):
         self.assertIn(f"commit {fix1[:10]} on main", self.run_cmd(
             "step-status", "1", "done", "--note", "done", "--progress-note",
             "An empty request now returns nothing instead of crashing.", "--commit", fix1, "--guard",
-            "src/test_app.py::test_empty_request", "--failed-before", "--plan", plan, "--actor", fixer))
+            "ISS-0001=src/test_app.py::T::test_empty_request", "--guard", "ISS-0003=src/test_app.py::T::test_empty_request",
+            "--plan", plan, "--actor", fixer))
         for iss, after in (("ISS-0001", "handler returns None for an empty request"),
                            ("ISS-0003", "test_empty_request covers handler")):
             self.run_cmd("issue-status", iss, "fixed", "--note", "step 1 done", "--after", after, "--step", "1",
@@ -490,13 +494,14 @@ class Walkthrough(unittest.TestCase):
             self.run_cmd("issue-status", iss, "in-progress", "--note", "step 2 started", "--step", "2", "--plan",
                          plan, "--actor", fixer)
         self.repo.write("src/app.py", APP_V3)
+        self.repo.write("src/test_app.py", TEST_V3)
         fix2 = self.repo.commit("Parse with csv")
         self.run_cmd("add-commit", "2", fix2, "--plan", plan, "--pr", "https://example.invalid/demo/pull/2",
                      "--actor", fixer)
         self.run_cmd("step-status", "2", "done", "--note", "done", "--progress-note", "Quoted commas are kept.",
-                     "--commit", fix2, "--guard", "ISS-0002=src/test_app.py::test_parse_quoted", "--plan", plan,
+                     "--commit", fix2, "--guard", "ISS-0002=src/test_app.py::T::test_parse_quoted", "--plan", plan,
                      "--actor", fixer)
-        self.run_cmd("add-guard", "ISS-0004", "src/test_app.py", "test_doc", "--step", "2", "--plan", plan,
+        self.run_cmd("add-guard", "ISS-0004", "src/test_app.py", "T::test_doc", "--step", "2", "--plan", plan,
                      "--commit", fix2, "--actor", fixer)
         for iss in step2:
             self.run_cmd("issue-status", iss, "fixed", "--note", "step 2 done", "--after",

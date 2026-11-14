@@ -22,7 +22,9 @@ writes the rest (issue statuses, gates, the plan).
 - Start: `python3 .code-review/ledger.py step-status <step> doing --note "<what you start>" --actor <your A- code>`.
 - Finish: `step-status <step> done --note "<for the owner, in plain sentences: what a person sees or what is refused
   once the step is in, anything that turned out different from the plan>" --commit <sha> --guard <test path>::<test name>`
-  (`--failed-before` when you saw the test fail without the fix). Notes follow `references/writing.md`: <its rules,
+  (`ISS-0001=<test path>::<test name>` when the step closes several issues). The tool runs each guard test with the
+  step's changes undone and at its commit, and refuses one that does not fail, then pass. Notes follow
+  `references/writing.md`: <its rules,
   copied here>. A further commit or a pull request:
   `add-commit <step> <sha> --pr <URL>`; a guard test for one issue: `add-guard ISS-0001 <test path> <test name>`.
   Leave out `--commit` where the owner's rules keep you from committing, and say so in the note.

@@ -32,9 +32,9 @@ class _Suite(unittest.TestSuite):
 
 
 def _fail_environment_skips(result):
-    from dev.tests.fixtures import ENVIRONMENT
+    from dev.tests.fixtures import ENVIRONMENT, HOST_POLICY
     for test, reason in list(result.skipped):
-        if reason.startswith(ENVIRONMENT):
+        if reason.startswith(ENVIRONMENT) and not reason.startswith(HOST_POLICY):
             err = AssertionError(f"skipped with {REQUIRED}=1: {reason}")
             result.addFailure(test, (AssertionError, err, None))
 

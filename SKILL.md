@@ -353,7 +353,7 @@ Brief every implementer with `references/implementer-brief.md` (it runs `ledger.
 - **Commit**, then record it: `--commit` on `step-status`, or `ledger.py add-commit 12 <sha> --pr <URL>`.
 - **Done:** `step-status 12 done` with a progress note for the owner, to `references/writing.md` (what a user sees or
   what is refused, what turned out different and why, what to do on deploy) and its guard tests (`--guard`, or
-  `add-guard` for one issue), and each issue `issue-status ISS-0001 fixed` (below).
+  `add-guard`: each must fail with the step's changes undone and pass at its commit), and `issue-status ... fixed`.
 - **Blocked on the owner:** `step-status 12 waiting-owner --question '...'` and a gate of its `owner_need`'s kind.
 - **After each step or batch:** `ledger.py check`, `ledger.py dump`, `ledger.py progress-md P-0001` (to a file only if
   the ledger-location decision commits review data), publish the hub, tell the owner how many steps are done.
@@ -361,7 +361,7 @@ Brief every implementer with `references/implementer-brief.md` (it runs `ledger.
 
 ```
 ledger.py report-finding --step 12 --severity M --domain <code> --where 'path:10-20#symbol' --summary '...' --before '...' --fix '...' --test 'test_name: what it asserts' --actor A-0002
-ledger.py step-status 12 done --note '...' --progress-note '<for the owner>' --commit <full sha> --guard tests/test_auth.py::test_name --failed-before --actor A-0002
+ledger.py step-status 12 done --note '...' --progress-note '<for the owner>' --commit <full sha> --guard ISS-0001=tests/test_auth.py::Auth::test_name --actor A-0002
 ledger.py issue-status ISS-0001 fixed --note '...' --after '<what it does now>' --step 12 --commit <full sha> --actor A-0002
 ```
 

@@ -135,7 +135,8 @@ ledger.py confirm-guard R-0002 ISS-0001
 ```
 
 One that is gone takes `--gone` (and `--test PATH::NAME` when the issue has several); `v_unguarded_fixes` then lists
-its issue.
+its issue. confirm-guard refuses to confirm a test that is not in the file at the review's commit. `check` names
+every live guard test that is not in the tree at HEAD.
 
 ### Record that tags were pushed
 
@@ -184,12 +185,38 @@ The branch and the summary come from git. If a step's own commit cannot name its
 
 ### Record a guard test
 
-The test that would fail if the fixed issue came back; `--failed-before` when you saw it fail without the fix.
-`step-status 2 done --guard PATH::NAME` records one for each issue of the step.
+The test that would fail if the fixed issue came back. The tool proves it: in a scratch copy of the fix's newest
+commit it puts every file the fix's commits changed back to its version before them (the test's own file stays),
+runs the test, and requires it to fail; then it runs it at the commit and requires it to pass. It stores both
+outcomes with the commit and the time, and refuses a test that passes without the fix, fails with it, or is not in
+the file. `step-status 2 done --guard PATH::NAME` records one for the step's issue; a step closing several issues
+names each test's issue (`--guard ISS-0004=PATH::NAME`).
+
+The built-in runner is Python's unittest loader (`Class::method`). Any other runner is given as `--test-command`,
+with `{test}` (path::name), `{id}` (the unittest name), `{path}` or `{name}`, and `{junit}` for a JUnit XML file
+(without it, the exit code says pass or fail).
 
 ```sh
-ledger.py add-guard ISS-0004 tests/test_auth.py test_sign_in_code_is_unpredictable --failed-before --step 2 --plan P-0001
+ledger.py add-guard ISS-0001 tests/test_auth.py Auth::test_code_not_from_random --step 2 --plan P-0001 --actor A-0002
 ```
+
+A pytest project: `add-guard ISS-0001 tests/test_auth.py test_code_uses_secrets --step 2 --test-command 'python3 -m
+pytest {test}'`.
+
+### Re-measure, rename or drop guard tests
+
+`measure-guards` runs recorded guard tests the same way and stores the outcomes (`--issue`, `--step` or `--all`;
+`--unmeasured` for those never measured). With `--drop --note` it removes those that pass without the fix, each
+with a guard-dropped event on its issue. A test under a new name keeps its row with `rename-guard` (the new name
+must be in the tree at HEAD); one that guards nothing goes with `drop-guard`.
+
+```sh
+ledger.py measure-guards --issue ISS-0001 --drop --note 'passes without its fix' --actor A-0002
+ledger.py drop-guard ISS-0001 tests/test_auth.py::Auth::test_code_not_from_random --note 'test_code_uses_secrets proves the same' --actor A-0002
+```
+
+A test under a new name: `rename-guard ISS-0001 tests/test_auth.py::Auth::test_old tests/test_auth.py::Auth::test_new
+--reason 'renamed in <commit>' --actor A-0002`.
 
 ### Record the hub address
 
@@ -375,6 +402,11 @@ Point the check at its own issue's point, or at none when the other point is onl
 #### `v_unguarded_fixes`
 
 A warning: record one with `add-guard` for each fixed issue listed.
+
+#### `v_unproven_steps`
+
+A warning: the step is done, but nothing shows a test failed before its fix. Record the guard test with `add-guard
+--step` (it is measured), or the before-fix run with `record-test-run --purpose before-fix --step`.
 
 #### `v_artifacts_outside_ledger`
 

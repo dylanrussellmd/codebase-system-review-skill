@@ -131,7 +131,7 @@ class TestRuns(unittest.TestCase):
         repo, L, sha = self.suite_project()
         mod = fixtures.load_ledger_module()
         if not mod.network_off_prefix():
-            self.skipTest("environment: unshare -rn is not allowed here")
+            self.skipTest("environment: host policy: " + "unshare -rn is not allowed here (user namespaces are off)")
         ok(L, "test-runs", "--review", "R-0001", "--command", f"{sys.executable} tests/run.py {{junit}}",
            "--variants", "network-off", "--actor", "A-0001")
         L.commit()

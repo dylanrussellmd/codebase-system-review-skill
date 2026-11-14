@@ -57,6 +57,8 @@ SLOW = os.environ.get("LEDGER_SLOW_TESTS") == "1"
 # The reason of every skip that depends on the machine (a tool not on PATH, a platform, an address, a browser) starts
 # with this; the suite's summary counts them (dev/tests/__init__.py).
 ENVIRONMENT = "environment: "
+# A skip for what the host forbids (not a tool or library one can install): LEDGER_ENVIRONMENT_REQUIRED does not fail it.
+HOST_POLICY = ENVIRONMENT + "host policy: "
 
 
 def slow(test):
@@ -732,6 +734,14 @@ DEMO_FILES_2 = {
                     "    return f\"{secrets.randbelow(1000000):06d}\"\n"
                     "def check(code, expected):\n"
                     "    return code == expected\n"),
+    "tests/test_auth.py": ("import inspect\nimport unittest\n\nfrom src import auth\n\n\n"
+                           "def test_code_uses_secrets():\n"
+                           "    assert \"secrets.\" in inspect.getsource(auth.make_code)\n\n\n"
+                           "class Auth(unittest.TestCase):\n"
+                           "    def test_code_not_from_random(self):\n"
+                           "        self.assertNotIn(\"random.\", inspect.getsource(auth.make_code))\n\n"
+                           "    def test_code_has_six_digits(self):\n"
+                           "        self.assertEqual(len(auth.make_code()), 6)\n"),
 }
 
 
@@ -865,7 +875,8 @@ def seed_demo(ledger):
     L.update("issues", i1, status="fixed", after_state="Codes come from secrets.randbelow.", change_step_id=s2,
              change_commit_sha=c2, change_actor_id=manager, change_note="Step 2 done")
     L.guard_test(i1, "tests/test_auth.py", "test_code_uses_secrets", repository_id=ids["repository"], step_id=s2,
-                 added_commit_sha=c2, failed_before_fix=1, passes_after_fix=1)
+                 added_commit_sha=c2, failed_before_fix=1, passes_after_fix=1, measured_commit_sha=c2,
+                 measured_at=L.clock.tick())
     L.update("steps", s3, status="waiting-owner", change_note="Waiting for the owner: Should the default stay 14 days?")
     _expect(L.scalar("SELECT status FROM steps WHERE id=?", (s2,)) == "done", "step 2 should be done")
     _expect(L.scalar("SELECT done_at IS NOT NULL FROM steps WHERE id=?", (s2,)) == 1, "step 2 should have done_at")

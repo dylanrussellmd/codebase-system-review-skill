@@ -204,35 +204,51 @@ class FixWritesTest(unittest.TestCase):
                          [{"commit_sha": sha, "summary": "first"}, {"commit_sha": fix, "summary": "Fix the handler"}])
 
     def test_add_guard_and_step_status_guard(self):
+        """Guard tests are measured: each runs with the fix undone (and fails) and at the fix (and passes)."""
         repo, L, sha = self.plan()
+        repo.write("src/app.py", "def handler(request):\n    return request.split(',')\n")
+        repo.commit("handler")
+        repo.write("src/app.py", "import csv\n\n\ndef handler(request):\n    return next(csv.reader([request])) "
+                                 "if request else []\n")
+        repo.write("tests/test_app.py", "import unittest\nfrom src.app import handler\n\n\n"
+                                        "class App(unittest.TestCase):\n"
+                                        "    def test_refuses_empty(self):\n        self.assertEqual(handler(''), [])\n\n"
+                                        "    def test_keeps_quotes(self):\n"
+                                        "        self.assertEqual(handler('\"a,b\",c'), ['a,b', 'c'])\n")
+        fix = repo.commit("Parse with csv")
         self.assertIn("no issue ISS-0009", refused(self, L, "add-guard", "ISS-0009", "tests/t.py", "test_x"))
-        out = ok(L, "add-guard", "ISS-0001", "tests/test_app.py", "test_refuses_empty", "--failed-before",
-                 "--step", "1", "--commit", sha)
-        self.assertEqual(out, ["ISS-0001: guard test tests/test_app.py::test_refuses_empty"])
+        out = ok(L, "add-guard", "ISS-0001", "tests/test_app.py", "App::test_refuses_empty", "--step", "1",
+                 "--commit", fix)
+        self.assertEqual(out, ["ISS-0001: guard test tests/test_app.py::App::test_refuses_empty (fails without the "
+                               "fix, passes with it)"])
         g = L.one("""SELECT issue_id, repository_id, test_path, test_name, step_id, added_commit_sha, failed_before_fix,
-                     passes_after_fix, still_exists FROM guard_tests""")
+                     passes_after_fix, still_exists, measured_commit_sha FROM guard_tests""")
         self.assertEqual(g, {"issue_id": 1, "repository_id": 1, "test_path": "tests/test_app.py",
-                             "test_name": "test_refuses_empty", "step_id": 1, "added_commit_sha": sha,
-                             "failed_before_fix": 1, "passes_after_fix": 1, "still_exists": 1})
-        self.assertIn("already", refused(self, L, "add-guard", "ISS-0001", "tests/test_app.py", "test_refuses_empty"))
+                             "test_name": "App::test_refuses_empty", "step_id": 1, "added_commit_sha": fix,
+                             "failed_before_fix": 1, "passes_after_fix": 1, "still_exists": 1,
+                             "measured_commit_sha": fix})
+        self.assertIn("already", refused(self, L, "add-guard", "ISS-0001", "tests/test_app.py",
+                                         "App::test_refuses_empty", "--commit", fix))
         self.assertIn("PATH::NAME", refused(self, L, "step-status", "1", "done", "--note", "done", "--guard",
                                             "test_only_a_name"))
-        ok(L, "step-status", "1", "done", "--note", "done", "--commit", sha, "--guard",
-           "tests/test_app.py::test_keeps_quotes", "--failed-before")
+        ok(L, "step-status", "1", "done", "--note", "done", "--commit", fix, "--guard",
+           "tests/test_app.py::App::test_keeps_quotes")
         self.assertEqual(L.all("SELECT test_name, step_id, failed_before_fix, passes_after_fix FROM guard_tests "
                                "ORDER BY id"),
-                         [{"test_name": "test_refuses_empty", "step_id": 1, "failed_before_fix": 1,
+                         [{"test_name": "App::test_refuses_empty", "step_id": 1, "failed_before_fix": 1,
                            "passes_after_fix": 1},
-                          {"test_name": "test_keeps_quotes", "step_id": 1, "failed_before_fix": 1,
+                          {"test_name": "App::test_keeps_quotes", "step_id": 1, "failed_before_fix": 1,
                            "passes_after_fix": 1}])
         L.x("UPDATE issues SET status='fixed', after_state='ok', change_note='done' WHERE code='ISS-0001'")
+        L.x("UPDATE review_repositories SET commit_sha=?", (fix,))
         L.commit()
         self.assertEqual(L.count("v_unguarded_fixes"), 0)
         with self.subTest("a later review confirms them, or finds one gone"):
             self.assertIn("no guard test", refused(self, L, "confirm-guard", "R-0001", "ISS-0001", "--test",
                                                    "tests/other.py::test_y"))
             self.assertEqual(len(ok(L, "confirm-guard", "R-0001", "ISS-0001")), 2)
-            ok(L, "confirm-guard", "R-0001", "ISS-0001", "--test", "tests/test_app.py::test_keeps_quotes", "--gone")
+            ok(L, "confirm-guard", "R-0001", "ISS-0001", "--test", "tests/test_app.py::App::test_keeps_quotes",
+               "--gone")
             self.assertEqual(L.all("SELECT still_exists, last_confirmed_review_id FROM guard_tests ORDER BY id"),
                              [{"still_exists": 1, "last_confirmed_review_id": 1},
                               {"still_exists": 0, "last_confirmed_review_id": 1}])

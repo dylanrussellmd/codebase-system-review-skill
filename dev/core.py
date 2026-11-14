@@ -18,19 +18,20 @@ Files:        dump, restore, merge, progress-page, import-answers, set-report, s
 Reviews:      new-review, review-status, add-repo, add-actor, add-domain, review-domain, add-run, finish-run,
               set-verdict, set-doc-url, add-requirement, add-metric, add-artifact, record-test-run, redact
 Points:       import-findings, import-checks, load-index, match, verify, report-finding, issue-status
-Corrections:  rematch, correct-location, supersede-check, correct-issue, withdraw-gate, reopen-gate
+Corrections:  rematch, correct-location, supersede-check, correct-issue, withdraw-gate, reopen-gate, rename-guard,
+              drop-guard
 Owner:        open-gate, answer-gate, apply-gate, interview-ask, interview-answer, propose-goal, approve-goals,
               reject-goal, link-step-goals
 Ideas:        propose-feature, feature-gate, feature-status, features
 Plans:        new-plan, plan-status, plan-add-review, import-steps, step-status, add-commit, add-guard, confirm-guard,
-              conflicts, resolve-conflict
+              measure-guards, conflicts, resolve-conflict
 Review tools: env, scan, brief, prompt, ui-capture, ui-audit, lint-report, compare-runs
 Tools:        tool-run, test-runs, dismiss-lead, cite-lead
 
 Options: --root DIR (project root; default: the nearest folder upward with a ledger, else the
 top of the current git repository, else the current directory), --db FILE, --version.
 """
-import argparse, hashlib, json, os, re, secrets, shlex, sqlite3, subprocess, sys, threading
+import argparse, ast, hashlib, json, os, re, secrets, shlex, sqlite3, subprocess, sys, threading
 import webbrowser
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1663,6 +1664,58 @@ def check_git_refs(root, con, quiet=False):
     return bad
 
 
+def guard_rows_not_in_tree(root, con):
+    """[{issue, test, commit, why}] of the live guard tests (still_exists = 1) whose test is not in the tree at HEAD
+    of its repository (read through each file's syntax tree, guard_in_source). A repository folder that is not here
+    is left out. Raises sqlite3.Error on a ledger without guard_tests."""
+    out = []
+    found = rows(con, """SELECT g.id, i.code, g.repository_id, g.test_path, g.test_name FROM guard_tests g
+                         JOIN issues i ON i.id = g.issue_id WHERE g.still_exists = 1 ORDER BY i.code, g.id""")
+    repos = {r["id"]: r for r in rows(con, "SELECT * FROM repositories")}
+    lone = next(iter(repos.values())) if len(repos) == 1 else None
+    readers = {}
+    try:
+        for g in found:
+            repo = repos.get(g["repository_id"]) if g["repository_id"] else lone
+            if repo is None:
+                continue
+            if repo["id"] not in readers:
+                try:
+                    d = repo_dir(root, repo["path"], bool(repo.get("allow_outside_root")))
+                    head = git(d, "rev-parse", "--verify", "HEAD^{commit}").decode().strip()
+                    readers[repo["id"]] = (BlobReader(d), head)
+                except (RuntimeError, OSError, ValueError, subprocess.SubprocessError):
+                    readers[repo["id"]] = None
+            if readers[repo["id"]] is None:
+                continue
+            reader, head = readers[repo["id"]]
+            why = guard_problem(reader, head, g["test_path"], g["test_name"])
+            if why:
+                out.append({"issue": g["code"], "test": f"{g['test_path']}::{g['test_name']}", "commit": head,
+                            "why": why})
+    finally:
+        for r in readers.values():
+            if r:
+                r[0].close()
+    return out
+
+
+def check_guard_refs(root, con, quiet=False):
+    """Part of `check`: each live guard test must be in the tree at HEAD (guard_rows_not_in_tree). Returns the
+    number of guard tests that are not."""
+    try:
+        missing = guard_rows_not_in_tree(root, con)
+    except (sqlite3.Error, KeyError) as e:  # an older schema (check_schema has already reported it)
+        print(f"    note: guard tests were not checked ({e})")
+        return 0
+    for m in missing:
+        print(f"guard: {m['issue']} {m['test']} is not in the tree at {m['commit'][:10]} (confirm-guard --gone, or "
+              f"add-guard under its new name)")
+    if not missing and not quiet:
+        print("    0  Guard tests missing from the tree")
+    return len(missing)
+
+
 TEXT_TARGETS = {"set-report": ("reviews", "report_md", "review", REVIEW_CODE),
                 "set-narrative": ("plans", "narrative_md", "plan", re.compile(r"P-[0-9]{4,}"))}
 
@@ -1983,6 +2036,7 @@ CHECK_ACTIONS = {
     "v_relation_problems": "The agent records the link between the two issues once, in one direction.",
     "v_check_finding_owner": "The agent points the check at its own issue's point, or at none.",
     "v_unguarded_fixes": "The agent records a test that guards each fix listed.",
+    "v_unproven_steps": "The agent records, for each step listed, a test seen failing before its fix.",
     "v_artifacts_outside_ledger": "The agent copies the file into the ledger's folder and records it there.",
     "v_unresolved_conflicts": "The agent judges each pair of steps with resolve-conflict before the plan is approved.",
     "v_late_step_conflicts": "The agent judges each pair with resolve-conflict before the added step starts.",
@@ -4566,10 +4620,11 @@ STEP_STATUSES = ('not-started', 'doing', 'waiting-owner', 'done', 'dropped')
 
 
 @_command("step-status", "change a plan step's status with its note (waiting-owner needs the owner's question); "
-                         "--commit also records the step's commit, done --guard its guard tests",
+                         "--commit also records the step's commit, done --guard its guard tests (each run with the "
+                         "fix undone and in place: it must fail, then pass)",
           "ledger.py step-status 12|P-0001#12|KEY doing|waiting-owner|done|dropped|not-started --note TEXT "
           "[--question TEXT] [--progress-note TEXT] [--commit REF [--repo NAME]] "
-          "[--guard PATH::NAME|ISS-0001=PATH::NAME]... [--failed-before] [--plan P-0001] [--actor A-0001]")
+          "[--guard PATH::NAME|ISS-0001=PATH::NAME]... [--test-command CMD] [--plan P-0001] [--actor A-0001]")
 def cmd_step_status(ctx):
     a, con = ctx.a, ctx.con
     s = step_row(con, a.step, a.plan)
@@ -4582,6 +4637,7 @@ def cmd_step_status(ctx):
     guards = [_guard_spec(g) for g in getattr(a, "guard", None) or []]
     if guards and a.status != "done":
         raise WriteError("--guard goes with done (the guard tests the finished step added)")
+    measured = _step_guards(ctx, s, guards) if guards else None
     out = []
     sha = None
     if a.commit:  # recorded in step_commits too (add-commit)
@@ -4595,18 +4651,44 @@ def cmd_step_status(ctx):
     if progress or a.status == "done":
         sets["progress_note"] = progress or s["progress_note"] or a.note
     ctx.x(f"UPDATE steps SET {', '.join(k + '=?' for k in sets)} WHERE id=?", (*sets.values(), s["id"]))
-    if guards:
-        issues = rows(con, """SELECT DISTINCT i.* FROM step_findings sf JOIN findings f ON f.id = sf.finding_id
-                              JOIN issues i ON i.id = f.issue_id WHERE sf.step_id=? ORDER BY i.code""", (s["id"],))
-        repo = _one_repo(con, getattr(a, "repo", None))
-        for code, path, name in guards:
-            targets = [issue_row(con, code)] if code else issues
-            if not targets:
-                raise WriteError(f"step {s['number']} closes no matched issue; name it: --guard ISS-0001=PATH::NAME")
-            for iss in targets:
-                out.append(record_guard(ctx, iss, path, name, step=s, commit=sha,
-                                        failed_before=True if a.failed_before else None, repo=repo))
+    if measured:
+        repo, head, at, results, targets = measured
+        for (iss, path, name) in targets:
+            out.append(record_guard(ctx, iss, path, name, results[(path, name)], step=s, commit=head,
+                                    measured=(head, at), repo=repo))
     return [f"step {s['number']}: {s['status']} -> {a.status}"] + out
+
+
+def _step_guards(ctx, s, guards):
+    """Measure step-status done's --guard tests before anything is written: (repo, head commit, time, results,
+    [(issue, path, name)]). Refused when the step has no commit, when a guard names no issue and the step closes
+    several, or when a test does not fail with the fix undone and pass with it."""
+    a, con = ctx.a, ctx.con
+    issues = rows(con, """SELECT DISTINCT i.* FROM step_findings sf JOIN findings f ON f.id = sf.finding_id
+                          JOIN issues i ON i.id = f.issue_id WHERE sf.step_id=? ORDER BY i.code""", (s["id"],))
+    targets = []
+    for code, path, name in guards:
+        if code:
+            targets.append((issue_row(con, code), path, name))
+        elif len(issues) > 1:
+            raise WriteError(f"step {s['number']} closes {', '.join(i['code'] for i in issues)}: name the issue each "
+                             f"test guards: --guard {issues[0]['code']}={path}::{name}")
+        elif not issues:
+            raise WriteError(f"step {s['number']} closes no matched issue; name it: --guard ISS-0001=PATH::NAME")
+        else:
+            targets.append((issues[0], path, name))
+    repo = _one_repo(con, getattr(a, "repo", None))
+    extra = _repo_commit(ctx, repo, a.commit)[1] if a.commit else None
+    commits = _fix_commits(con, s, repo, extra)
+    if not commits:
+        raise WriteError(f"step {s['number']} has no commit to measure its guard tests against: give --commit")
+    head, at, results = measure_guards(ctx, repo, commits, [(p, n) for _, p, n in targets],
+                                       getattr(a, "test_command", None))
+    for _, path, name in targets:
+        why = guard_refusal(path, name, results[(path, name)])
+        if why:
+            raise WriteError(why)
+    return repo, head, at, results, targets
 
 
 OWNER_NEEDS = ('none', 'decision', 'confirm', 'review', 'production')
@@ -6777,17 +6859,407 @@ def cmd_add_commit(ctx):
     return [record_step_commit(ctx, s, a.commit, a.repo, a.pr, a.summary)[1]]
 
 
-def record_guard(ctx, iss, path, name, *, step=None, commit=None, failed_before=None, repo=None):
-    """Record the test path::name as guarding the fix of issue iss (with the step and commit that added it, and whether
-    it failed before the fix); WriteError when the issue has that guard test already."""
+# ----- guard tests are measured (plan P-0002 steps 16-19): run with the fix undone and at the fix
+
+GUARD_SECONDS = 120  # how long one guard test may run; one that hangs counts as failing
+GUARD_MARK = "LEDGER-GUARD "
+# The default runner: Python's unittest loader on dotted names, run in the checkout, one after another in one
+# process (as a suite runs). For each it prints one line, LEDGER-GUARD <n> passed|failed|skipped|not-loaded [why].
+GUARD_DRIVER = r"""
+import sys, unittest
+def flat(s):
+    for t in s:
+        if isinstance(t, unittest.TestSuite):
+            yield from flat(t)
+        else:
+            yield t
+def say(n, outcome, why=""):
+    print("LEDGER-GUARD %d %s%s" % (n, outcome, " " + " ".join(why.split())[:300] if why else ""), flush=True)
+def one(n, name):
+    try:
+        suite = unittest.defaultTestLoader.loadTestsFromName(name)
+    except BaseException as e:
+        return say(n, "not-loaded", type(e).__name__ + ": " + str(e))
+    tests = list(flat(suite)) if isinstance(suite, unittest.TestSuite) else [suite]
+    broken = [t for t in tests if type(t).__name__ in ("_FailedTest", "ModuleImportFailure")]
+    if not tests or broken:
+        e = getattr(broken[0], "_exception", None) if broken else None
+        return say(n, "not-loaded", (type(e).__name__ + ": " + str(e)) if e is not None else "no test by that name")
+    r = unittest.TextTestRunner(stream=sys.stderr, verbosity=0).run(suite)
+    bad = r.failures + r.errors
+    if bad or getattr(r, "unexpectedSuccesses", None):
+        say(n, "failed", bad[0][1].strip().splitlines()[-1] if bad else "unexpected success")
+    elif r.skipped and len(r.skipped) >= r.testsRun:
+        say(n, "skipped", str(r.skipped[0][1]))
+    else:
+        say(n, "passed")
+for n, name in enumerate(sys.argv[1:]):
+    one(n, name)
+"""
+GUARD_FIELDS = ("{test}", "{id}", "{path}", "{name}")
+
+
+def _guard_parts(name):
+    """The parts of a guard test name: Class::method, Class.method or a bare function, pytest parameters dropped."""
+    return [p for p in re.split(r"::|\.", re.sub(r"\[.*\]$", "", name.strip())) if p]
+
+
+def guard_in_source(path, name, text, read=None):
+    """Whether the file text (at path) holds the test name. A Python file is read through its syntax tree: a
+    top-level function or class, or Class.method defined in the class or in a base class, followed into the modules
+    this file imports when read(path) gives their text (None when the file is not there). Another kind of file holds
+    the name when each part of it appears in the file."""
+    parts = _guard_parts(name)
+    if not parts:
+        return False
+    if not path.endswith(".py"):
+        return all(p in text for p in parts)
+    tree = _py_tree(text)
+    if tree is None:
+        return False
+    if len(parts) == 1:
+        return any(isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name == parts[0]
+                   for n in tree.body)
+    return len(parts) == 2 and _py_class_has(read, path, tree, parts[0], parts[1], set())
+
+
+def _py_tree(text):
+    """The syntax tree of Python source, or None when it does not parse."""
+    try:
+        return ast.parse(text)
+    except (SyntaxError, ValueError):
+        return None
+
+
+def _py_module_path(path, module, level, read):
+    """The repository path of an imported module (a.b -> a/b.py or a/b/__init__.py, relative to path's folder for
+    `from . import`), or None when read finds neither."""
+    base = path.split("/")[:-1]
+    if level:
+        base = base[:len(base) - (level - 1)] if level - 1 <= len(base) else []
+    else:
+        base = []
+    stem = "/".join([*base, *[m for m in (module or "").split(".") if m]])
+    for cand in (f"{stem}.py", f"{stem}/__init__.py"):
+        if read and read(cand.lstrip("/")) is not None:
+            return cand.lstrip("/")
+    return None
+
+
+def _py_class_has(read, path, tree, cls, method, seen):
+    """Whether class cls, defined in (or imported into) the module at path with syntax tree `tree`, has method:
+    defined in its body or in a base class, followed through imports read can give."""
+    if (path, cls) in seen or len(seen) > 20:
+        return False
+    seen.add((path, cls))
+    imported = {}  # name -> (module path or None, the name there or None for a module)
+    for n in tree.body:
+        if isinstance(n, ast.ImportFrom):
+            for al in n.names:
+                mod = _py_module_path(path, n.module, n.level, read)
+                sub = _py_module_path(path, f"{n.module or ''}.{al.name}".strip("."), n.level, read)
+                imported[al.asname or al.name] = (sub, None) if sub else (mod, al.name)
+        elif isinstance(n, ast.Import):
+            for al in n.names:
+                if al.asname:
+                    imported[al.asname] = (_py_module_path(path, al.name, 0, read), None)
+    node = next((n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == cls), None)
+    if node is None:
+        mod, there = imported.get(cls, (None, None))
+        return bool(mod and there) and _py_class_in(read, mod, there, method, seen)
+    for n in node.body:
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == method:
+            return True
+        if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == method for t in n.targets):
+            return True
+    for b in node.bases:
+        if isinstance(b, ast.Name) and _py_class_has(read, path, tree, b.id, method, seen):
+            return True
+        if isinstance(b, ast.Attribute) and isinstance(b.value, ast.Name):
+            mod, there = imported.get(b.value.id, (None, None))
+            if mod and there is None and _py_class_in(read, mod, b.attr, method, seen):
+                return True
+    return False
+
+
+def _py_class_in(read, path, cls, method, seen):
+    """_py_class_has for a class of another module of the repository."""
+    text = read(path) if read else None
+    tree = _py_tree(text) if text is not None else None
+    return tree is not None and _py_class_has(read, path, tree, cls, method, seen)
+
+
+def guard_problem(reader, sha, path, name):
+    """None when the test path::name is in the tree at sha (read through a BlobReader), else the reason."""
+    def read(p):
+        try:
+            data = reader.read(sha, p)[1]
+        except RuntimeError:
+            return None
+        return data.decode("utf-8", "replace") if data is not None else ""
+    text = read(path)
+    if text is None:
+        return f"{path} is not in the repository at {sha[:10]}"
+    if not guard_in_source(path, name, text, read):
+        return f"{name} is not in {path} at {sha[:10]}"
+    return None
+
+
+def _guard_unittest_id(path, name):
+    """The unittest name of path::Class::method (dev/tests/test_x.py -> dev.tests.test_x.Class.method)."""
+    stem = path[:-3] if path.endswith(".py") else path
+    return ".".join([*[p for p in stem.split("/") if p], *_guard_parts(name)])
+
+
+def _guard_command(work, path, name, template):
+    """(argv, JUnit file or None) that runs the one guard test in the checkout `work`."""
+    if not template:
+        if not path.endswith(".py") or len(_guard_parts(name)) != 2:
+            raise WriteError(f"{path}::{name}: the built-in runner runs unittest Class::method tests; give the "
+                             f"project's own with --test-command (e.g. 'python3 -m pytest {{test}}')")
+        return [sys.executable, "-c", GUARD_DRIVER, _guard_unittest_id(path, name)], None
+    junit = Path(work).parent / (Path(work).name + "-guard.xml") if "{junit}" in template else None
+    values = {"{test}": f"{path}::{'::'.join(_guard_parts(name))}", "{id}": _guard_unittest_id(path, name),
+              "{path}": path, "{name}": name, "{junit}": str(junit) if junit else ""}
+    words = []
+    for w in shlex.split(template):
+        for k, v in values.items():
+            w = w.replace(k, v)
+        words.append(w)
+    return words, junit
+
+
+def _junit_guard_outcome(data, name):
+    """(outcome, why) of the test name in a JUnit XML file, or ('not-loaded', ...) when the file does not hold it."""
+    parts = _guard_parts(name)
+    try:
+        root = _xml_of(data, "JUnit XML")
+    except WriteError as e:
+        return "not-loaded", str(e)
+    for case in root.iter("testcase"):
+        if re.sub(r"\[.*\]$", "", case.get("name") or "") != parts[-1]:
+            continue
+        cls = (case.get("classname") or "").replace("::", ".")
+        if len(parts) > 1 and not (cls == parts[0] or cls.endswith("." + parts[0])):
+            continue
+        bad = next((c for c in case if c.tag in ("failure", "error")), None)
+        if bad is not None:
+            return "failed", (bad.get("message") or bad.tag)
+        if case.find("skipped") is not None:
+            return "skipped", case.find("skipped").get("message") or ""
+        return "passed", ""
+    return "not-loaded", "the runner's JUnit XML has no such test"
+
+
+def _guard_run(argv, work):
+    """(finished process or None when it ran out of time, its stdout so far) of one runner command in the checkout."""
+    try:
+        p = subprocess.run(argv, cwd=str(work), capture_output=True, stdin=subprocess.DEVNULL,
+                           timeout=GUARD_SECONDS, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+        return p, p.stdout
+    except subprocess.TimeoutExpired as e:
+        return None, e.stdout or b""
+    except OSError as e:
+        raise WriteError(f"cannot run {argv[0]}: {e.strerror or e}")
+
+
+def _tail(p):
+    """The last line a runner wrote to stderr, or its exit code."""
+    return ((p.stderr.decode("utf-8", "replace").strip().splitlines() or [f"exit {p.returncode}"])[-1])[:300]
+
+
+def _marked(stdout):
+    """{n: (outcome, why)} of the built-in runner's LEDGER-GUARD lines."""
+    got = {}
+    for line in stdout.decode("utf-8", "replace").splitlines():
+        if line.startswith(GUARD_MARK):
+            k, _, rest = line[len(GUARD_MARK):].partition(" ")
+            outcome, _, why = rest.partition(" ")
+            if k.isdigit():
+                got[int(k)] = (outcome, why)
+    return got
+
+
+def run_guards(work, tests, template=None):
+    """{(path, name): (outcome, why)} of guard tests run in the checkout `work`: passed, failed, skipped or not-loaded.
+    The built-in runner runs them one after another in one process; a test with no result within GUARD_SECONDS
+    counts as failing, and the tests after it run in a new process. A --test-command runs once per test. WriteError
+    (from _guard_command) when a test has no runner."""
+    tests = list(dict.fromkeys(tests))
+    out = {}
+    if template is None:
+        left = tests
+        while left:
+            argvs = [_guard_command(work, p, n, None)[0] for p, n in left]
+            p, stdout = _guard_run([*argvs[0][:3], *[a[3] for a in argvs]], work)
+            got = _marked(stdout)
+            for i, t in enumerate(left):
+                if i in got:
+                    out[t] = got[i]
+                elif p is None:  # this one hung: the rest run again
+                    out[t] = ("failed", f"no result within {GUARD_SECONDS} s")
+                    left = left[i + 1:]
+                    break
+                else:
+                    out[t] = ("failed", f"the runner stopped before this test: {_tail(p)}")
+            else:
+                left = []
+        return out
+    for path, name in tests:
+        argv, junit = _guard_command(work, path, name, template)
+        p, _ = _guard_run(argv, work)
+        if p is None:
+            out[(path, name)] = ("failed", f"no result within {GUARD_SECONDS} s")
+        elif junit is not None:
+            data = junit.read_bytes() if junit.is_file() else b""
+            if junit.is_file():
+                junit.unlink()
+            out[(path, name)] = _junit_guard_outcome(data, name) if data.strip() else \
+                ("not-loaded", f"the runner (exit {p.returncode}) wrote no JUnit XML")
+        else:
+            out[(path, name)] = ("passed", "") if p.returncode == 0 else ("failed", f"exit {p.returncode}: {_tail(p)}")
+    return out
+
+
+def _is_ancestor(d, a, b):
+    """Whether commit a is an ancestor of (or is) commit b."""
+    return subprocess.run(["git", "-C", str(d), "merge-base", "--is-ancestor", a, b], capture_output=True,
+                          timeout=GIT_TIMEOUT).returncode == 0
+
+
+def _fix_files(d, commits):
+    """(the newest commit, {path: (base commit or None, ...)}) of a fix made of `commits` (full hashes): every file
+    they change, with the commit whose version is the one before the fix: the first parent of the oldest of them
+    that changes it (None for a root commit). WriteError when the commits are not on one line of history."""
+    commits = list(dict.fromkeys(commits))
+    order = sorted(commits, key=lambda c: sum(_is_ancestor(d, o, c) for o in commits if o != c))
+    head = order[-1]
+    if any(not _is_ancestor(d, c, head) for c in order):
+        raise WriteError("the fix's commits are not on one line of history; measure from one commit (--commit)")
+    files = {}
+    for c in order:
+        parents = git(d, "rev-list", "--parents", "-n", "1", c).decode().split()[1:]
+        base = parents[0] if parents else None
+        if base:
+            names = git(d, "diff", "--name-only", "-z", "--no-renames", base, c)
+        else:
+            names = git(d, "diff-tree", "--root", "--no-commit-id", "-r", "--name-only", "-z", "--no-renames", c)
+        for f in names.decode("utf-8", "surrogateescape").split("\0"):
+            if f and f not in files:
+                files[f] = base
+    return head, files
+
+
+def measure_guards(ctx, repo, commits, tests, template=None):
+    """Run each guard test (path, name) of a fix twice: in a checkout of the fix's newest commit with every file the
+    fix's commits change put back to its version before them (the guard tests' own files excepted), and in a
+    checkout of that commit. Returns (head commit, measured time, {(path, name): result}), where a result is
+    {"problem": text} when the test is not in the tree at the head commit, else {"before": (outcome, why),
+    "after": (outcome, why)}."""
+    if repo is None:
+        raise WriteError("the ledger has no repositories; add one with: ledger.py add-repo NAME PATH")
+    if template is not None and not any(k in template for k in GUARD_FIELDS):
+        raise WriteError("--test-command must name the test: {test} (path::name), {id} (the unittest name), "
+                         "{path} or {name}")
+    d = repo_dir(ctx.root, repo["path"], bool(repo["allow_outside_root"]))
+    try:
+        head, files = _fix_files(d, commits)
+    except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+        raise WriteError(f"cannot read the fix's commits: {_one_line(e)}")
+    results, todo = {}, []
+    reader = BlobReader(d)
+    try:
+        for path, name in dict.fromkeys(tests):
+            problem = guard_problem(reader, head, path, name)
+            if problem:
+                results[(path, name)] = {"problem": problem}
+            else:
+                todo.append((path, name))
+        own = {p for p, _ in tests}
+        undo = {f: b for f, b in files.items() if f not in own}
+        if not todo:
+            return head, now(), results
+        tmp = Path(tempfile.mkdtemp(prefix="ledger-guard-"))
+        try:
+            after, before = tmp / "fix", tmp / "undone"
+            after.mkdir()
+            _export_commit(d, head, after)
+            shutil.copytree(str(after), str(before), symlinks=True)
+            for f, base in undo.items():
+                target = before / f
+                try:
+                    data = reader.read(base, f)[1] if base else None
+                except RuntimeError:
+                    data = None  # the fix added it
+                if data is None:
+                    if target.is_file() or target.is_symlink():
+                        target.unlink()
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(data)
+            at = now()
+            runnable = []
+            for path, name in todo:
+                try:
+                    _guard_command(after, path, name, template)
+                    runnable.append((path, name))
+                except WriteError as e:  # no runner for it
+                    results[(path, name)] = {"problem": str(e)}
+            done = run_guards(after, runnable, template)
+            undone = run_guards(before, runnable, template)
+            for t in runnable:
+                results[t] = {"after": done[t], "before": undone[t]}
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    finally:
+        reader.close()
+    return head, at, results
+
+
+def guard_refusal(path, name, result):
+    """None when a measured guard fails without the fix and passes with it, else why it cannot be recorded."""
+    if "problem" in result:
+        return result["problem"]
+    (b, bwhy), (a, awhy) = result["before"], result["after"]
+    if a != "passed":
+        return f"{path}::{name} {'fails' if a == 'failed' else 'is ' + a} with the fix in place" + \
+            (f" ({awhy})" if awhy else "")
+    if b in ("passed", "skipped"):
+        return f"{path}::{name} {'passes' if b == 'passed' else 'is skipped'} with the fix undone, so it does not " \
+               f"guard the fix"
+    return None
+
+
+def _measured_line(result):
+    """How a recorded guard ran, for the command's output."""
+    b = result["before"][0]
+    return "fails without the fix, passes with it" if b == "failed" else \
+        f"does not load without the fix ({result['before'][1]}), passes with it"
+
+
+def _fix_commits(con, step, repo, extra=None):
+    """The full hashes of the step's recorded commits in repo, with extra (a hash) added."""
+    found = [r["commit_sha"] for r in rows(con, """SELECT commit_sha FROM step_commits WHERE step_id=?
+                                                   AND (repository_id=? OR repository_id IS NULL) ORDER BY id""",
+                                           (step["id"], repo["id"] if repo else None))] if step else []
+    return list(dict.fromkeys(found + ([extra] if extra else [])))
+
+
+def record_guard(ctx, iss, path, name, result, *, step=None, commit=None, measured=None, repo=None):
+    """Record the test path::name as guarding the fix of issue iss, with the step and commit that added it and its
+    measured run: result is measure_guards' result for it and measured (the commit it ran at, the time). WriteError
+    when the issue has that guard test already, or when the test does not fail without the fix and pass with it."""
     if one(ctx.con, "SELECT 1 x FROM guard_tests WHERE issue_id=? AND test_path=? AND test_name=?",
            (iss["id"], path, name)):
         raise WriteError(f"{iss['code']} already has guard test {path}::{name}")
+    why = guard_refusal(path, name, result)
+    if why:
+        raise WriteError(why)
     ctx.x("""INSERT INTO guard_tests(issue_id, repository_id, test_path, test_name, step_id, added_commit_sha,
-             failed_before_fix, passes_after_fix) VALUES (?,?,?,?,?,?,?,1)""",
+             failed_before_fix, passes_after_fix, measured_at, measured_commit_sha) VALUES (?,?,?,?,?,?,1,1,?,?)""",
           (iss["id"], repo["id"] if repo else None, path, name, step["id"] if step else None, commit,
-           None if failed_before is None else int(bool(failed_before))))
-    return f"{iss['code']}: guard test {path}::{name}"
+           measured[1], measured[0]))
+    return f"{iss['code']}: guard test {path}::{name} ({_measured_line(result)})"
 
 
 def _guard_spec(spec):
@@ -6798,10 +7270,10 @@ def _guard_spec(spec):
     return m.group(1), m.group(2).strip(), m.group(3).strip()
 
 
-@_command("add-guard", "record the test that guards a fixed issue (it passes now; --failed-before if it failed "
-                       "before the fix)",
-          "ledger.py add-guard ISS-0001 TEST_PATH TEST_NAME [--failed-before] [--step 12 [--plan P-0001]] "
-          "[--commit REF] [--repo NAME] [--actor A-0001]")
+@_command("add-guard", "record the test that guards a fixed issue: it is run with the fix (the step's commits, or "
+                       "--commit) undone and in place, and recorded only when it fails, then passes",
+          "ledger.py add-guard ISS-0001 TEST_PATH TEST_NAME (--step 12 [--plan P-0001] | --commit REF) "
+          "[--test-command CMD] [--repo NAME] [--actor A-0001]")
 def cmd_add_guard(ctx):
     a, con = ctx.a, ctx.con
     iss = issue_row(con, a.issue)
@@ -6809,8 +7281,13 @@ def cmd_add_guard(ctx):
     step = step_row(con, a.step, a.plan) if a.step else None
     repo = _one_repo(con, a.repo)
     commit = _repo_commit(ctx, repo, a.commit)[1] if a.commit else None
-    return [record_guard(ctx, iss, path, name, step=step, commit=commit,
-                         failed_before=True if a.failed_before else None, repo=repo)]
+    commits = _fix_commits(con, step, repo, commit)
+    if not commits:
+        raise WriteError("give --step (a step with a recorded commit) or --commit: the fix the test is measured "
+                         "against")
+    head, at, results = measure_guards(ctx, repo, commits, [(path, name)], a.test_command)
+    return [record_guard(ctx, iss, path, name, results[(path, name)], step=step, commit=commit or head,
+                         measured=(head, at), repo=repo)]
 
 
 @_command("confirm-guard", "record that a review checked fixed issues' guard tests: still there, or --gone",
@@ -6822,7 +7299,7 @@ def cmd_confirm_guard(ctx):
     out = []
     for code in dict.fromkeys(a.issues):
         iss = issue_row(con, code)
-        sql, args = "SELECT id, test_path, test_name FROM guard_tests WHERE issue_id=?", [iss["id"]]
+        sql, args = "SELECT id, repository_id, test_path, test_name FROM guard_tests WHERE issue_id=?", [iss["id"]]
         if test:
             sql += " AND test_path=? AND test_name=?"; args += list(test)
         found = rows(con, sql, args)
@@ -6830,10 +7307,163 @@ def cmd_confirm_guard(ctx):
             raise WriteError(f"{iss['code']} has no guard test{' ' + '::'.join(test) if test else ''} "
                              f"(record one with add-guard)")
         for g in found:
+            if not a.gone:
+                why = _guard_not_in_review(ctx, rv, g)
+                if why:
+                    raise WriteError(f"{iss['code']}: {why}; record it with --gone (and add-guard under its new "
+                                     f"name)")
             ctx.x("UPDATE guard_tests SET still_exists=?, last_confirmed_review_id=? WHERE id=?",
                   (0 if a.gone else 1, rv["id"], g["id"]))
             out.append(f"{iss['code']}: {g['test_path']}::{g['test_name']} "
                        f"{'is gone' if a.gone else 'still guards it'} ({rv['code']})")
+    return out
+
+
+def _guard_not_in_review(ctx, rv, g):
+    """Why guard test row g is not in the tree at review rv's commit of its repository, or None (also None when the
+    review has no commit for it or the repository is not here)."""
+    con = ctx.con
+    repo = one(con, "SELECT * FROM repositories WHERE id=?", (g["repository_id"],)) if g["repository_id"] else \
+        _one_repo(con, None)
+    if repo is None:
+        return None
+    at = one(con, "SELECT commit_sha FROM review_repositories WHERE review_id=? AND repository_id=?",
+             (rv["id"], repo["id"]))
+    if not at:
+        return None
+    reader = BlobReader(repo_dir(ctx.root, repo["path"], bool(repo["allow_outside_root"])))
+    try:
+        return guard_problem(reader, at["commit_sha"], g["test_path"], g["test_name"])
+    finally:
+        reader.close()
+
+
+def _drop_guard(ctx, iss_id, g, note):
+    """Delete guard test row g of issue iss_id with a guard-dropped event on the issue (the test, who and why)."""
+    ctx.x("DELETE FROM guard_tests WHERE id=?", (g["id"],))
+    ctx.x("""INSERT INTO events(entity_type, entity_id, event, from_value, actor_id, step_id, note)
+             VALUES ('issue', ?, 'guard-dropped', ?, ?, ?, ?)""",
+          (iss_id, f"{g['test_path']}::{g['test_name']}", ctx.actor_id, g["step_id"], note))
+
+
+@_command("drop-guard", "remove a guard test from an issue, with who and why (an event on the issue)",
+          "ledger.py drop-guard ISS-0001 PATH::NAME --note TEXT --actor A-0001")
+def cmd_drop_guard(ctx):
+    a, con = ctx.a, ctx.con
+    note, _ = _correction_context(ctx, a.note, "--note")
+    iss = issue_row(con, a.issue)
+    _, path, name = _guard_spec(a.test)
+    g = one(con, "SELECT * FROM guard_tests WHERE issue_id=? AND test_path=? AND test_name=?", (iss["id"], path, name))
+    if not g:
+        raise WriteError(f"{iss['code']} has no guard test {path}::{name}")
+    _drop_guard(ctx, iss["id"], g, note)
+    return [f"{iss['code']}: guard test {path}::{name} dropped"]
+
+
+@_command("rename-guard", "record a guard test's new path or name after the test was renamed, with who and why "
+                          "(an event on the issue); the new name must be in the tree at HEAD",
+          "ledger.py rename-guard ISS-0001 OLD_PATH::OLD_NAME NEW_PATH::NEW_NAME --reason TEXT --actor A-0001")
+def cmd_rename_guard(ctx):
+    a, con = ctx.a, ctx.con
+    reason, actor = _correction_context(ctx, a.reason)
+    iss = issue_row(con, a.issue)
+    _, path, name = _guard_spec(a.old)
+    _, new_path, new_name = _guard_spec(a.new)
+    g = one(con, "SELECT * FROM guard_tests WHERE issue_id=? AND test_path=? AND test_name=?", (iss["id"], path, name))
+    if not g:
+        raise WriteError(f"{iss['code']} has no guard test {path}::{name}")
+    if (path, name) == (new_path, new_name):
+        raise WriteError("this changes nothing: the new path and name are the old ones")
+    if one(con, "SELECT 1 x FROM guard_tests WHERE issue_id=? AND test_path=? AND test_name=?",
+           (iss["id"], new_path, new_name)):
+        raise WriteError(f"{iss['code']} already has guard test {new_path}::{new_name}; drop the old one (drop-guard)")
+    repo = one(con, "SELECT * FROM repositories WHERE id=?", (g["repository_id"],)) if g["repository_id"] else \
+        _one_repo(con, None)
+    d, head = _repo_commit(ctx, repo, "HEAD")
+    reader = BlobReader(d)
+    try:
+        why = guard_problem(reader, head, new_path, new_name)
+    finally:
+        reader.close()
+    if why:
+        raise WriteError(why)
+    ctx.x("UPDATE guard_tests SET test_path=?, test_name=? WHERE id=?", (new_path, new_name, g["id"]))
+    ctx.x("""INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, step_id, note)
+             VALUES ('issue', ?, 'guard-renamed', ?, ?, ?, ?, ?)""",
+          (iss["id"], f"{path}::{name}", f"{new_path}::{new_name}", actor, g["step_id"], reason))
+    return [f"{iss['code']}: guard test {path}::{name} -> {new_path}::{new_name}"]
+
+
+@_command("measure-guards", "run recorded guard tests with their step's fix undone and in place and record the "
+                            "outcomes; --drop removes those that pass without the fix",
+          "ledger.py measure-guards (--issue ISS-0001 | --step 12 [--plan P-0001] | --all) [--unmeasured] "
+          "[--drop --note TEXT] [--test-command CMD] --actor A-0001")
+def cmd_measure_guards(ctx):
+    a, con = ctx.a, ctx.con
+    if ctx.actor_id is None:
+        raise WriteError("give --actor (who measures)")
+    note = _need(_text_arg(a.note, "--note"), "--note (why the guard tests that pass without the fix are "
+                                              "dropped)") if a.drop else None
+    if sum(bool(x) for x in (a.issue, a.step, a.all)) != 1:
+        raise WriteError("give one of --issue, --step or --all")
+    sql = """SELECT g.*, i.code FROM guard_tests g JOIN issues i ON i.id = g.issue_id WHERE g.still_exists = 1"""
+    args = []
+    if a.issue:
+        sql += " AND g.issue_id=?"; args.append(issue_row(con, a.issue)["id"])
+    if a.step:
+        sql += " AND g.step_id=?"; args.append(step_row(con, a.step, a.plan)["id"])
+    if a.unmeasured:
+        sql += " AND g.measured_at IS NULL"
+    found = rows(con, sql + " ORDER BY g.step_id, g.repository_id, g.id", args)
+    groups = {}
+    for g in found:
+        groups.setdefault((g["step_id"], g["repository_id"]), []).append(g)
+    out, counts = [], {"guards": 0, "dropped": 0, "kept": 0, "not measured": 0}
+    for (step_id, repo_id), group in groups.items():
+        repo = one(con, "SELECT * FROM repositories WHERE id=?", (repo_id,)) if repo_id else _one_repo(con, None)
+        step = one(con, "SELECT * FROM steps WHERE id=?", (step_id,)) if step_id else None
+        commits = _fix_commits(con, step, repo) if repo else []
+        if not commits:
+            for g in group:
+                counts["not measured"] += 1
+                out.append(f"{g['code']}: {g['test_path']}::{g['test_name']}: not measured: "
+                           f"{'its step has no commit' if step else 'no step records its fix'}")
+            continue
+        head, at, results = measure_guards(ctx, repo, commits, [(g["test_path"], g["test_name"]) for g in group],
+                                           a.test_command)
+        for g in group:
+            r, test = results[(g["test_path"], g["test_name"])], f"{g['test_path']}::{g['test_name']}"
+            if "problem" in r:
+                counts["not measured"] += 1
+                out.append(f"{g['code']}: {test}: not measured: {r['problem']}")
+                continue
+            (b, _), (af, awhy) = r["before"], r["after"]
+            if af == "skipped":
+                counts["not measured"] += 1
+                out.append(f"{g['code']}: {test}: not measured: skipped with the fix in place"
+                           + (f" ({awhy})" if awhy else ""))
+                continue
+            ctx.x("""UPDATE guard_tests SET failed_before_fix=?, passes_after_fix=?, measured_at=?, measured_commit_sha=?
+                     WHERE id=?""", (int(b in ("failed", "not-loaded")), int(af == "passed"), at, head, g["id"]))
+            if af != "passed":
+                counts["kept"] += 1
+                out.append(f"{g['code']}: {test}: {af} with the fix in place" + (f" ({awhy})" if awhy else "")
+                           + " (kept)")
+            elif b in ("passed", "skipped"):
+                verb = "passes" if b == "passed" else "is skipped"
+                if a.drop and b == "passed":
+                    _drop_guard(ctx, g["issue_id"], g, f"passes with the fix undone at {head[:10]}: {note}")
+                    counts["dropped"] += 1
+                    out.append(f"{g['code']}: {test}: {verb} with the fix undone (dropped)")
+                else:
+                    counts["kept"] += 1
+                    out.append(f"{g['code']}: {test}: {verb} with the fix undone (kept"
+                               + ("; --drop drops it)" if b == "passed" else ")"))
+            else:
+                counts["guards"] += 1
+                out.append(f"{g['code']}: {test}: {_measured_line(r)}")
+    out.append(f"{len(found)} guard tests: {counts['guards']} guard their fix, {counts['dropped']} dropped, "
+               f"{counts['kept']} kept without proof, {counts['not measured']} not measured")
     return out
 
 
@@ -7095,7 +7725,9 @@ def cmd_redact(ctx):
 # something else there. fill_arg_help() gives it to every argument added without one.
 ARG_HELP = {
     "review": "the review's code (R-0001)", "plan": "the plan's code (P-0001; default: the current plan)",
-    "step": "the step's number in the plan", "issue": "the issue's code (ISS-0001)", "gate": "the gate's code (GATE-0001)",
+    "step": "the step's number in the plan", "issue": "the issue's code (ISS-0001)",
+    "test_command": "the project's command for one test: {test} (path::name), {id} (the unittest name), {path}, "
+                    "{name}; {junit} for JUnit XML, else the exit code says", "gate": "the gate's code (GATE-0001)",
     "decision": "the decision's code (D-0001)", "goal": "the design goal's code (G-01)",
     "goals": "design goal codes (G-01 G-02)", "question": "the question's text, or its IQ- code",
     "note": "why, in one or two plain sentences", "status": "the new status", "commit": "a commit id or ref (default HEAD)",
@@ -7193,7 +7825,7 @@ def add_write_commands(sub):
         s.add_argument(o)
     s.add_argument("--guard", action="append", help="with done: PATH::NAME (each issue of the step) or "
                                                     "ISS-0001=PATH::NAME, a guard test the step added")
-    s.add_argument("--failed-before", action="store_true", help="the --guard tests failed before the fix")
+    s.add_argument("--test-command")
     s = p("import-steps"); s.add_argument("plan"); s.add_argument("file", help="JSON lines, or - for standard input")
     s = p("open-gate"); s.add_argument("kind")
     for o in ("--title", "--question", "--context", "--options-json", "--review", "--plan", "--step", "--issue",
@@ -7327,12 +7959,20 @@ def add_write_commands_131(p):
     for o in ("--plan", "--repo", "--pr", "--summary"):
         s.add_argument(o)
     s = p("add-guard"); s.add_argument("issue"); s.add_argument("test_path"); s.add_argument("test_name")
-    s.add_argument("--failed-before", action="store_true", help="it failed before the fix")
-    for o in ("--step", "--plan", "--commit", "--repo"):
+    for o in ("--step", "--plan", "--commit", "--repo", "--test-command"):
         s.add_argument(o)
     s = p("confirm-guard"); s.add_argument("review"); s.add_argument("issues", nargs="+")
     s.add_argument("--test", help="PATH::NAME (default: every guard test of the issue)")
     s.add_argument("--gone", action="store_true", help="the test no longer exists or no longer guards the issue")
+    s = p("drop-guard"); s.add_argument("issue"); s.add_argument("test", help="PATH::NAME"); s.add_argument("--note")
+    s = p("rename-guard"); s.add_argument("issue"); s.add_argument("old", help="OLD_PATH::OLD_NAME")
+    s.add_argument("new", help="NEW_PATH::NEW_NAME"); s.add_argument("--reason")
+    s = p("measure-guards")
+    for o in ("--issue", "--step", "--plan", "--note", "--test-command"):
+        s.add_argument(o)
+    s.add_argument("--all", action="store_true", help="every live guard test")
+    s.add_argument("--unmeasured", action="store_true", help="only guard tests not measured yet")
+    s.add_argument("--drop", action="store_true", help="drop those that pass with the fix undone (needs --note)")
     s = p("set-verdict"); s.add_argument("review"); s.add_argument("--verdict"); s.add_argument("--summary")
     s = p("set-doc-url"); s.add_argument("code", help="R-0001 or P-0001"); s.add_argument("url")
     s = p("plan-add-review"); s.add_argument("plan"); s.add_argument("review")
@@ -12219,6 +12859,8 @@ def _export_commit(repo_dir, sha, into):
                 # symlinks and other members are left out: a tool reads the commit's regular files
     finally:
         err = p.stderr.read()
+        p.stdout.close()
+        p.stderr.close()
         if p.wait() != 0:
             raise RuntimeError(f"git archive {sha[:12]} failed: {err.decode('utf-8', 'replace').strip()}")
 
@@ -12867,6 +13509,7 @@ def _main():
         try:
             bad = check(con, quiet=a.quiet, full=a.full)
             bad += check_git_refs(root, con, quiet=a.quiet)
+            bad += check_guard_refs(root, con, quiet=a.quiet)
             if import_reminder(con):
                 print(import_reminder(con))
         except sqlite3.DatabaseError as e:  # a damaged file stops a later read: what was found is printed already
