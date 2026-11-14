@@ -396,7 +396,8 @@ class GateAnswers(IntegrityCase):
     def test_open_to_applied_refused(self):
         gid = self.gate()
         self.raises("UPDATE gates SET status='applied', applied_note='x' WHERE id=?", (gid,), "answer it before")
-        self.x("UPDATE gates SET status='withdrawn' WHERE id=?", (gid,))
+        self.x("UPDATE gates SET status='withdrawn', change_actor_id=?, change_note='not needed' WHERE id=?",
+               (self.actor(), gid))
         self.raises("UPDATE gates SET status='answered', answer_value='keep' WHERE id=?", (gid,),
                     ("answer it before", "cannot be changed"))
 

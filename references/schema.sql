@@ -1,5 +1,5 @@
 -- =====================================================================
--- Code review ledger — schema version 21
+-- Code review ledger — schema version 22
 -- One SQLite file per project: <project root>/.code-review/ledger.sqlite
 -- Every connection must run:  PRAGMA foreign_keys = ON;
 -- Times are UTC ISO-8601 text with milliseconds (strftime('%Y-%m-%dT%H:%M:%fZ','now')); the tr_time_*
@@ -561,6 +561,8 @@ CREATE TABLE finding_locations (
                                             -- where the excerpt was read: the commit, or (schema 8) the working
                                             -- tree of a review that recorded uncommitted changes (is_dirty), since
                                             -- that is the text its reviewers saw (snapshot saves the patch)
+  change_actor_id INTEGER REFERENCES actors(id),  -- who corrects the path, lines or symbol (correct-location),
+  change_note     TEXT,                           -- and why: both go into its event, then are cleared (schema 22)
   CHECK (line_end IS NULL OR line_start IS NULL OR line_end >= line_start),
   -- path: relative (no leading / or -), no backslash, no .. segment, no control characters
   CHECK (length(path) > 0 AND path NOT GLOB '/*' AND path NOT GLOB '-*' AND path NOT GLOB '*\*'
@@ -611,6 +613,8 @@ CREATE TABLE review_issue_checks (
   evidence   TEXT,
   actor_id   INTEGER REFERENCES actors(id),
   checked_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  change_actor_id INTEGER REFERENCES actors(id),  -- who corrects the outcome, evidence or finding (supersede-check)
+  change_note     TEXT,                           -- and why: both go into its event, then are cleared (schema 22)
   PRIMARY KEY (review_id, issue_id)
 );
 
@@ -688,8 +692,10 @@ CREATE TABLE gates (
   change_actor_id INTEGER REFERENCES actors(id),       -- who made the next status change (applied, withdrawn);
                                             -- copied into its event, then cleared
   multi INTEGER NOT NULL DEFAULT 0 CHECK (multi IN (0,1)),   -- takes any number of its options (schema 18)
-  preselect TEXT CHECK (preselect IS NULL OR (json_valid(preselect) AND json_type(preselect) = 'array'))
+  preselect TEXT CHECK (preselect IS NULL OR (json_valid(preselect) AND json_type(preselect) = 'array')),
                                             -- the option values a multi-select gate shows ticked first
+  change_note TEXT                          -- why the next status change (withdrawn, reopened) is made; copied into
+                                            -- its event with change_actor_id, then cleared (schema 22)
 );
 
 -- ---------- The owner interview (schema 9, plan step 129) --------------
@@ -1143,10 +1149,10 @@ CREATE TABLE artifacts (
 -- The history: every status change and every other tracked change, in order.
 -- Append-only (G-04): triggers refuse every UPDATE and DELETE on events (tr_events_no_update/no_delete).
 -- Which tables write events (plan step 73; a test keeps these two lists equal to the triggers and the tables):
--- Logged: reviews, reviewer_runs, issues, issue_relations, findings, review_issue_checks, decisions, gates, plans,
--- steps, step_dependencies, step_findings, metrics, design_goals, interview_questions, interview_answers,
--- goal_sources, step_goals.
--- Not logged: finding_locations, finding_goals, finding_requirements, review_requirement_checks, test_runs,
+-- Logged: reviews, reviewer_runs, issues, issue_relations, findings, finding_locations,
+-- review_issue_checks, decisions, gates, plans, steps, step_dependencies, step_findings, metrics, design_goals,
+-- interview_questions, interview_answers, goal_sources, step_goals.
+-- Not logged: finding_goals, finding_requirements, review_requirement_checks, test_runs,
 -- artifacts, step_commits, guard_tests, decision_issues, plan_reviews, phases, review_repositories, review_goals,
 -- review_domains, review_environment, review_actors, actors, repositories, domains, domain_rules,
 -- domain_checks, checklist_answers, step_touches, step_conflicts, themes, feature_proposals,
@@ -1286,6 +1292,8 @@ CREATE INDEX ix_fk_finding_requirements_requirement_id ON finding_requirements(r
 CREATE INDEX ix_fk_review_requirement_checks_finding_id ON review_requirement_checks(finding_id);
 CREATE INDEX ix_fk_review_requirement_checks_requirement_id ON review_requirement_checks(requirement_id);
 CREATE INDEX ix_fk_review_issue_checks_actor_id      ON review_issue_checks(actor_id);
+CREATE INDEX ix_fk_review_issue_checks_change_actor_id ON review_issue_checks(change_actor_id);
+CREATE INDEX ix_fk_finding_locations_change_actor_id ON finding_locations(change_actor_id);
 CREATE INDEX ix_ric_finding                          ON review_issue_checks(finding_id);
 CREATE INDEX ix_fk_decisions_asked_by_actor_id       ON decisions(asked_by_actor_id);
 CREATE INDEX ix_fk_decisions_decided_by_actor_id     ON decisions(decided_by_actor_id);
@@ -1691,12 +1699,33 @@ WHEN NEW.commit_sha IS NULL BEGIN
   WHERE id = NEW.id;
 END;
 
--- Where a point was found does not change; fill-refs may still fill lines, excerpt, blob and permalink.
+-- Where a point was found does not change; fill-refs may still fill lines, excerpt, blob and permalink. A wrong
+-- path or symbol is corrected with who and why (change_actor_id, change_note: ledger.py
+-- correct-location), which tr_location_corrected logs.
 CREATE TRIGGER tr_location_immutable BEFORE UPDATE ON finding_locations
-WHEN OLD.finding_id IS NOT NEW.finding_id OR OLD.repository_id IS NOT NEW.repository_id
-  OR OLD.path IS NOT NEW.path OR OLD.symbol IS NOT NEW.symbol OR OLD.role IS NOT NEW.role
-  OR (OLD.commit_sha IS NOT NULL AND OLD.commit_sha IS NOT NEW.commit_sha) BEGIN
-  SELECT RAISE(ABORT, 'history is append-only: a location''s finding, repository, commit, path, symbol and role cannot change');
+WHEN OLD.finding_id IS NOT NEW.finding_id OR OLD.repository_id IS NOT NEW.repository_id OR OLD.role IS NOT NEW.role
+  OR (OLD.commit_sha IS NOT NULL AND OLD.commit_sha IS NOT NEW.commit_sha)
+  OR ((OLD.path IS NOT NEW.path OR OLD.symbol IS NOT NEW.symbol)
+      AND (NEW.change_actor_id IS NULL OR NULLIF(trim(NEW.change_note), '') IS NULL)) BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: a location''s finding, repository, commit and role cannot change, and its path and symbol change only with who and why (ledger.py correct-location)');
+END;
+
+-- Logs 'location-corrected' on the finding (from and to: path[:start[-end]][#symbol]) with who and why, then clears
+-- them.
+CREATE TRIGGER tr_location_corrected AFTER UPDATE ON finding_locations
+WHEN NEW.change_actor_id IS NOT NULL AND NEW.change_note IS NOT NULL BEGIN
+  INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id, note)
+  VALUES ('finding', NEW.finding_id, 'location-corrected',
+          OLD.path || CASE WHEN OLD.whole_file = 1 OR OLD.line_start IS NULL THEN ''
+                           ELSE ':' || OLD.line_start || CASE WHEN COALESCE(OLD.line_end, OLD.line_start) = OLD.line_start
+                                                              THEN '' ELSE '-' || OLD.line_end END END
+                   || COALESCE('#' || OLD.symbol, ''),
+          NEW.path || CASE WHEN NEW.whole_file = 1 OR NEW.line_start IS NULL THEN ''
+                           ELSE ':' || NEW.line_start || CASE WHEN COALESCE(NEW.line_end, NEW.line_start) = NEW.line_start
+                                                              THEN '' ELSE '-' || NEW.line_end END END
+                   || COALESCE('#' || NEW.symbol, ''),
+          NEW.change_actor_id, (SELECT review_id FROM findings WHERE id = NEW.finding_id), NEW.change_note);
+  UPDATE finding_locations SET change_actor_id = NULL, change_note = NULL WHERE id = NEW.id;
 END;
 
 -- Refuses DELETE: where a point was found is history.
@@ -1806,9 +1835,43 @@ CREATE TRIGGER tr_check_guard BEFORE INSERT ON review_issue_checks BEGIN
                   AND f.verification <> 'false');
 END;
 
--- A recorded check is never changed.
-CREATE TRIGGER tr_check_no_update BEFORE UPDATE ON review_issue_checks BEGIN
-  SELECT RAISE(ABORT, 'history is append-only: review checks cannot be changed');
+-- A recorded check is never changed, except its outcome, evidence or finding corrected with who and why
+-- (change_actor_id, change_note: ledger.py supersede-check), which tr_check_corrected logs with the old check.
+CREATE TRIGGER tr_check_no_update BEFORE UPDATE ON review_issue_checks
+WHEN OLD.review_id IS NOT NEW.review_id OR OLD.issue_id IS NOT NEW.issue_id OR OLD.actor_id IS NOT NEW.actor_id
+  OR OLD.checked_at IS NOT NEW.checked_at
+  OR ((OLD.outcome IS NOT NEW.outcome OR OLD.evidence IS NOT NEW.evidence OR OLD.finding_id IS NOT NEW.finding_id)
+      AND (NEW.change_actor_id IS NULL OR NULLIF(trim(NEW.change_note), '') IS NULL)) BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: a review check changes only by a correction with who and why (ledger.py supersede-check)');
+END;
+
+-- A corrected check keeps the rules of a new one (tr_check_needs_evidence, tr_check_guard).
+CREATE TRIGGER tr_check_correction_rules BEFORE UPDATE OF outcome, evidence, finding_id ON review_issue_checks
+WHEN NEW.change_actor_id IS NOT NULL AND NEW.change_note IS NOT NULL BEGIN
+  SELECT RAISE(ABORT, 'a fixed, regressed or changed check needs evidence (what the review saw)')
+  WHERE NEW.outcome IN ('fixed','regressed','changed') AND NULLIF(trim(NEW.evidence), '') IS NULL;
+  SELECT RAISE(ABORT, 'the check''s finding belongs to another review')
+  WHERE NEW.finding_id IS NOT NULL
+    AND (SELECT review_id FROM findings WHERE id = NEW.finding_id) IS NOT NEW.review_id;
+  SELECT RAISE(ABORT, 'this review raised the issue again in a finding; it cannot also record it fixed')
+  WHERE NEW.outcome = 'fixed' AND OLD.outcome IS NOT 'fixed'
+    AND EXISTS (SELECT 1 FROM findings f WHERE f.review_id = NEW.review_id AND f.issue_id = NEW.issue_id
+                  AND f.verification <> 'false');
+END;
+
+-- Logs 'check-corrected' on the issue: the old and the new check ('outcome: evidence (point)'), who and why; then
+-- clears them. The issue's status stays: issue-status moves it.
+CREATE TRIGGER tr_check_corrected AFTER UPDATE ON review_issue_checks
+WHEN NEW.change_actor_id IS NOT NULL AND NEW.change_note IS NOT NULL BEGIN
+  INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id, note)
+  VALUES ('issue', NEW.issue_id, 'check-corrected',
+          OLD.outcome || COALESCE(': ' || OLD.evidence, '')
+            || COALESCE(' (' || (SELECT point_id FROM findings WHERE id = OLD.finding_id) || ')', ''),
+          NEW.outcome || COALESCE(': ' || NEW.evidence, '')
+            || COALESCE(' (' || (SELECT point_id FROM findings WHERE id = NEW.finding_id) || ')', ''),
+          NEW.change_actor_id, NEW.review_id, NEW.change_note);
+  UPDATE review_issue_checks SET change_actor_id = NULL, change_note = NULL
+   WHERE review_id = NEW.review_id AND issue_id = NEW.issue_id;
 END;
 
 -- Refuses DELETE: checks are history.
@@ -2413,11 +2476,15 @@ END;
 
 -- A gate moves open -> answered -> applied (or withdrawn); it cannot be applied before it is answered. Any
 -- status may go back to open (reopening, with the answer cleared: tr_gate_answer_final, tr_gate_answer_cleared).
+-- Withdrawing names who and why (change_actor_id, change_note: ledger.py withdraw-gate).
 CREATE TRIGGER tr_gate_transition BEFORE UPDATE OF status ON gates
-WHEN OLD.status IS NOT NEW.status AND NEW.status <> 'open'
- AND NOT ((OLD.status = 'open' AND NEW.status IN ('answered','withdrawn'))
-       OR (OLD.status = 'answered' AND NEW.status IN ('applied','withdrawn'))) BEGIN
-  SELECT RAISE(ABORT, 'a gate moves open -> answered -> applied (or withdrawn); answer it before applying it');
+WHEN OLD.status IS NOT NEW.status BEGIN
+  SELECT RAISE(ABORT, 'a gate moves open -> answered -> applied (or withdrawn); answer it before applying it')
+  WHERE NEW.status <> 'open'
+    AND NOT ((OLD.status = 'open' AND NEW.status IN ('answered','withdrawn'))
+          OR (OLD.status = 'answered' AND NEW.status IN ('applied','withdrawn')));
+  SELECT RAISE(ABORT, 'a gate is withdrawn with change_actor_id and change_note (who and why: ledger.py withdraw-gate)')
+  WHERE NEW.status = 'withdrawn' AND (NEW.change_actor_id IS NULL OR NULLIF(trim(NEW.change_note), '') IS NULL);
 END;
 
 -- Logs 'opened' with the gate's title and who opened it.
@@ -2426,15 +2493,19 @@ CREATE TRIGGER tr_gate_created AFTER INSERT ON gates BEGIN
   VALUES ('gate', NEW.id, 'opened', NEW.status, NEW.opened_by_actor_id, NEW.review_id, NEW.step_id, NEW.title);
 END;
 
--- Answered: the event carries who answered and 'value: text'; applied: who applied it and applied_note.
+-- Answered: the event carries who answered and 'value: text'; applied: who applied it and applied_note; withdrawn
+-- or reopened: who and change_note. A reopening that clears an answer is logged once, by tr_gate_answer_cleared.
 CREATE TRIGGER tr_gate_status AFTER UPDATE OF status ON gates
-WHEN OLD.status IS NOT NEW.status BEGIN
+WHEN OLD.status IS NOT NEW.status
+ AND NOT (NEW.status = 'open' AND (OLD.answer_value IS NOT NULL OR OLD.answer_text IS NOT NULL)
+          AND NEW.answer_value IS NULL AND NEW.answer_text IS NULL) BEGIN
   INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id, step_id, note)
   VALUES ('gate', NEW.id, 'status-changed', OLD.status, NEW.status,
           CASE WHEN NEW.status = 'answered' THEN COALESCE(NEW.answered_by_actor_id, NEW.change_actor_id)
                ELSE NEW.change_actor_id END,
           NEW.review_id, NEW.step_id,
           CASE WHEN NEW.status = 'applied' THEN NEW.applied_note
+               WHEN NEW.status IN ('withdrawn','open') THEN NEW.change_note
                ELSE COALESCE(CASE WHEN NEW.multi = 1 AND json_valid(NEW.answer_value)
                                    THEN (SELECT COALESCE(group_concat(value, ', '), 'none') FROM json_each(NEW.answer_value))
                                    ELSE NEW.answer_value END || ': ', '') || COALESCE(NEW.answer_text, '') END);
@@ -2464,13 +2535,15 @@ WHEN OLD.status <> 'open' AND NEW.status <> 'open'
   SELECT RAISE(ABORT, 'who answered a gate, how and when cannot be changed once it is answered');
 END;
 
--- Logs 'answer-cleared', with the answer it held, when a gate is reopened.
+-- Logs 'answer-cleared' when a gate is reopened: who reopened it and why (change_actor_id, change_note: ledger.py
+-- reopen-gate), and the answer it held.
 CREATE TRIGGER tr_gate_answer_cleared AFTER UPDATE OF answer_value, answer_text ON gates
 WHEN OLD.status <> 'open' AND NEW.status = 'open'
  AND (OLD.answer_value IS NOT NULL OR OLD.answer_text IS NOT NULL) BEGIN
-  INSERT INTO events(entity_type, entity_id, event, from_value, to_value, review_id, step_id, note)
-  VALUES ('gate', NEW.id, 'answer-cleared', OLD.answer_value, NULL, NEW.review_id, NEW.step_id,
-          'reopened; the answer was: ' || COALESCE(OLD.answer_value || ': ', '') || COALESCE(OLD.answer_text, ''));
+  INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id, step_id, note)
+  VALUES ('gate', NEW.id, 'answer-cleared', OLD.answer_value, NULL, NEW.change_actor_id, NEW.review_id, NEW.step_id,
+          'reopened' || COALESCE(': ' || NEW.change_note, '') || '; the answer was: '
+          || COALESCE(OLD.answer_value || ': ', '') || COALESCE(OLD.answer_text, ''));
 END;
 
 -- An answer replaced while the gate is still open is logged with the old and new answer.
@@ -2482,15 +2555,16 @@ WHEN OLD.status = 'open' AND (OLD.answer_value IS NOT NULL OR OLD.answer_text IS
           NEW.step_id, 'was: ' || COALESCE(OLD.answer_text, '') || '; now: ' || COALESCE(NEW.answer_text, ''));
 END;
 
--- Once logged, change_actor_id is cleared.
-CREATE TRIGGER tr_gate_context_cleared AFTER UPDATE ON gates WHEN NEW.change_actor_id IS NOT NULL BEGIN
-  UPDATE gates SET change_actor_id = NULL WHERE id = NEW.id;
+-- Once logged, change_actor_id and change_note are cleared.
+CREATE TRIGGER tr_gate_context_cleared AFTER UPDATE ON gates
+WHEN NEW.change_actor_id IS NOT NULL OR NEW.change_note IS NOT NULL BEGIN
+  UPDATE gates SET change_actor_id = NULL, change_note = NULL WHERE id = NEW.id;
 END;
 
--- The same after an INSERT that carried it.
+-- The same after an INSERT that carried them.
 CREATE TRIGGER tr_gate_context_cleared_ins AFTER INSERT ON gates
-WHEN NEW.change_actor_id IS NOT NULL BEGIN
-  UPDATE gates SET change_actor_id = NULL WHERE id = NEW.id;
+WHEN NEW.change_actor_id IS NOT NULL OR NEW.change_note IS NOT NULL BEGIN
+  UPDATE gates SET change_actor_id = NULL, change_note = NULL WHERE id = NEW.id;
 END;
 
 -- Refuses DELETE: a gate no longer needed is withdrawn.
@@ -4286,6 +4360,11 @@ INSERT INTO enum_labels(enum, value, label, position) VALUES
 INSERT INTO enum_labels(enum, value, label, position) VALUES
  ('event','answers-imported','Answers brought in from the published page',31);
 
+INSERT INTO enum_labels(enum, value, label, position) VALUES
+ ('event','rematched','A point was moved to the right issue',32),
+ ('event','location-corrected','Where a point is was corrected',33),
+ ('event','check-corrected','A review check was corrected',34);
+
 INSERT INTO ledger_checks(view, label, tier, position) VALUES
  ('v_artifacts_outside_ledger','Review files recorded outside the ledger''s folder','warning',110);
 -- Each domain's checklist (the table "Checklists" in references/domains.md).
@@ -4445,7 +4524,7 @@ INSERT INTO enum_labels(enum, value, label, position) VALUES
  ('tool_output_format','json','JSON',5), ('tool_output_format','jsonl','JSON lines',6),
  ('tool_result_level','error','Error',1), ('tool_result_level','warning','Warning',2),
  ('tool_result_level','note','Note',3), ('tool_result_level','none','No level',4);
-INSERT INTO meta(key, value) VALUES ('schema_version','21');
+INSERT INTO meta(key, value) VALUES ('schema_version','22');
 INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger schema'),
   (2, 'url, path, hash and code checks; repositories.allow_outside_root; finding_locations.excerpt_redacted'),
   (3, 'integrity rules: codes, hashes, checks, append-only history, owner actor on gate answers'),
@@ -4466,4 +4545,5 @@ INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger s
   (18, 'multi-select gates: gates.multi and gates.preselect; a multi-select answer is a JSON list of option values'),
   (19, 'the features domain and feature_proposals: additions to the reviewed codebase that would serve the owner''s goals'),
   (20, 'tool_runs and tool_results: the picked tools'' runs at the reviewed commit, and their results as leads'),
-  (21, 'indexes for check''s views, which read them instead of every row; the answers-imported event');
+  (21, 'indexes for check''s views, which read them instead of every row; the answers-imported event'),
+  (22, 'correction commands: who corrects a gate, a location or a check, and why');

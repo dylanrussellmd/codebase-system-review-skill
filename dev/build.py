@@ -13,7 +13,9 @@ The migrations payload is every references/migrations/NNNN-<slug>.sql in order, 
 `-- migration: NNNN-<slug>.sql`. Files must be numbered 0001, 0002, ... without gaps, and each must start with a line
 `-- <description>`. The highest number is the schema version (core.py derives SCHEMA_VERSION from it), and the build
 refuses unless references/schema.sql agrees: its header line says that version, its meta seed sets schema_version to
-it, and its schema_migrations seed holds exactly one (version, description) row per migration file.
+it, and its schema_migrations seed holds exactly one (version, description) row per migration file. A released
+migration never changes: the build refuses when a file dev/tests/data/migrations.sha256 lists has another sha256, or
+when the listed files are not the first ones of the folder (a release appends its migrations' lines).
 
 The stamps: TOOL_VERSION ("@@TOOL_VERSION@@" in core.py) becomes SKILL.md's frontmatter metadata.version (semver), and
 TOOL_HASH ("@@TOOL_HASH@@") becomes the sha256 of the built text in which TOOL_HASH's value is still the placeholder.
@@ -34,6 +36,7 @@ OUTPUT = "scripts/ledger.py"
 CORE = "dev/core.py"
 SKILL = "SKILL.md"
 MIGRATIONS_DIR = "references/migrations"
+RELEASED_HASHES = "dev/tests/data/migrations.sha256"
 PAYLOADS = (("@@SCHEMA@@", "references/schema.sql"), ("@@PAGE@@", "dev/page.html"),
             ("@@MIGRATIONS@@", MIGRATIONS_DIR))
 STAMPS = ("@@TOOL_VERSION@@", "@@TOOL_HASH@@")
@@ -86,7 +89,31 @@ def migrations(root):
     if [n for n, _, _ in out] != list(range(1, len(out) + 1)):
         raise BuildError(f"{MIGRATIONS_DIR}/ must hold files numbered 0001, 0002, ... without gaps "
                          f"(found {', '.join(name for _, name, _ in out) or 'none'})")
+    check_released(root, [name for _, name, _ in out])
     return out
+
+
+def check_released(root, names):
+    """Each migration RELEASED_HASHES lists (when the file is there) still has its sha256, and the listed files are
+    the first of names, in order."""
+    lock = root / RELEASED_HASHES
+    if not lock.is_file():
+        return
+    listed = []
+    for n, line in enumerate(lock.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip() or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) != 2 or not re.fullmatch(r"[0-9a-f]{64}", parts[0]):
+            raise BuildError(f"{RELEASED_HASHES}:{n}: expected '<sha256>  <file name>'")
+        listed.append((parts[1], parts[0]))
+    if [name for name, _ in listed] != names[:len(listed)]:
+        raise BuildError(f"{RELEASED_HASHES} must list the first migrations of {MIGRATIONS_DIR}/ in order "
+                         f"(listed: {', '.join(name for name, _ in listed)})")
+    for name, digest in listed:
+        if hashlib.sha256((root / MIGRATIONS_DIR / name).read_bytes()).hexdigest() != digest:
+            raise BuildError(f"{MIGRATIONS_DIR}/{name} changed after it was released ({RELEASED_HASHES}); a released "
+                             f"migration stays as it shipped: put the change in a new migration")
 
 
 def check_schema_versions(schema, migs):

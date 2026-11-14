@@ -764,7 +764,7 @@ const optOf = (g, v) => ((g.options || []).find(o => o.value === v) || {}).label
 const optLabel = g => g.answer_label || (Array.isArray(g.answer_value) ? g.answer_value.map(v => optOf(g, v)).join(", ") || "None of them" : optOf(g, g.answer_value));
 
 // level: "h3" for a gate listed under a section heading. moved(card, gate, note): called once the gate is answered.
-const FINAL = "You can't change an answer once it is sent.";
+const FINAL = "Wrong answer? Tell the agent; it can reopen the question.";
 const IN_CHAT = "Answer this one in the chat with the agent.";
 // What an open gate is answered with: its options as one radio group (checkboxes, the recommended ones ticked, with
 // Select all and Select none, when it takes several) and, where the gate takes text, a text box. hid: the id of the

@@ -126,7 +126,8 @@ class GatesCommand(unittest.TestCase):
         out = self.gates()
         self.assertIn("step P-0001 #4 [decision] Pick the store: SQLite or files?", out)
         self.assertIn("decision D-0001 [open] Keep data out of the repo?", out)
-        L.x("UPDATE gates SET status='withdrawn' WHERE status IN ('open','answered')")
+        L.x("UPDATE gates SET status='withdrawn', change_actor_id=?, change_note='not needed' "
+            "WHERE status IN ('open','answered')", (L.actor(),))
         out = self.gates()
         self.assertEqual(out[0], "no open gates")
         self.assertEqual(len(out), 3)

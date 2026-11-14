@@ -1,0 +1,1091 @@
+-- A schema-7 ledger with a row in every table: the v1 demo (ledger-v1-demo.sql), migrations 2..7 and the rows of
+-- _migrate_helpers.FILL. Frozen: regenerate only with python3 -m dev.tests._migrate_helpers --write-fixture 7
+BEGIN TRANSACTION;
+CREATE TABLE actors (
+  id              INTEGER PRIMARY KEY,
+  kind            TEXT NOT NULL CHECK (kind IN
+                    ('owner','human','manager','reviewer','verifier','indexer',
+                     'matcher','drafter','fixer','tool')),
+  name            TEXT NOT NULL,         -- person's name, or the agent's role label ("security reviewer")
+  model           TEXT,                  -- model id for agents
+  harness         TEXT,                  -- e.g. Claude Code, CI
+  session_ref     TEXT,                  -- session id or URL
+  parent_actor_id INTEGER REFERENCES actors(id),   -- subagent -> the agent that launched it
+  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+INSERT INTO "actors" VALUES(1,'owner','Demo Owner',NULL,NULL,NULL,NULL,'2026-11-01T09:01:00.000Z');
+INSERT INTO "actors" VALUES(2,'manager','Review manager','model-a','Harness A',NULL,NULL,'2026-11-01T09:02:00.000Z');
+INSERT INTO "actors" VALUES(3,'reviewer','security reviewer','model-a',NULL,NULL,2,'2026-11-01T09:03:00.000Z');
+INSERT INTO "actors" VALUES(4,'reviewer','spec reviewer','model-a',NULL,NULL,2,'2026-11-01T09:04:00.000Z');
+CREATE TABLE artifacts (
+  id              INTEGER PRIMARY KEY,
+  review_id       INTEGER REFERENCES reviews(id),
+  plan_id         INTEGER REFERENCES plans(id),
+  reviewer_run_id INTEGER REFERENCES reviewer_runs(id),
+  kind            TEXT NOT NULL CHECK (kind IN
+                    ('brief','report','index','summary-doc','plan-file','progress-page',
+                     'probe-script','other')),
+  path            TEXT,                    -- repo-relative if kept in the repo
+  url             TEXT,
+  sha256          TEXT,
+  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  CHECK (path IS NOT NULL OR url IS NOT NULL)
+);
+INSERT INTO "artifacts" VALUES(1,1,NULL,NULL,'summary-doc',NULL,'https://example.com/demo/R-0001',NULL,'2026-11-01T09:08:10.000Z');
+CREATE TABLE decision_issues (
+  decision_id INTEGER NOT NULL REFERENCES decisions(id) ON DELETE CASCADE,
+  issue_id    INTEGER NOT NULL REFERENCES issues(id),
+  PRIMARY KEY (decision_id, issue_id)
+);
+INSERT INTO "decision_issues" VALUES(1,2);
+CREATE TABLE "decisions" (
+  id                  INTEGER PRIMARY KEY,
+  code                TEXT NOT NULL UNIQUE
+                        CHECK (code GLOB 'D-[0-9][0-9][0-9][0-9]*' AND code NOT GLOB 'D-*[^0-9]*'),
+  question            TEXT NOT NULL,
+  options             TEXT CHECK (options IS NULL OR json_valid(options)),
+  answer              TEXT,
+  rationale           TEXT,
+  status              TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','decided','revisit'))
+                        CHECK (status <> 'decided' OR answer IS NOT NULL),
+  revisit_when        TEXT,
+  review_id           INTEGER REFERENCES reviews(id),
+  step_id             INTEGER REFERENCES steps(id),
+  asked_by_actor_id   INTEGER REFERENCES actors(id),
+  decided_by_actor_id INTEGER REFERENCES actors(id),
+  asked_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  decided_at          TEXT
+);
+INSERT INTO "decisions" VALUES(1,'D-0001','Should the default notice period stay 14 days?',NULL,NULL,NULL,'open',NULL,1,3,2,NULL,'2026-11-01T09:23:00.000Z',NULL);
+CREATE TABLE "design_goals" (
+  id            INTEGER PRIMARY KEY,
+  code          TEXT NOT NULL UNIQUE
+                  CHECK (code GLOB 'G-[0-9][0-9]*' AND code NOT GLOB 'G-*[^0-9]*'),
+  text          TEXT NOT NULL,
+  source        TEXT,
+  adopted_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  retired_at    TEXT,
+  superseded_by INTEGER REFERENCES design_goals(id),
+  CHECK (superseded_by IS NULL OR retired_at IS NOT NULL)
+);
+INSERT INTO "design_goals" VALUES(1,'G-01','Every rule and behavior is a setting.','owner','2026-11-01T09:05:00.000Z',NULL,NULL);
+INSERT INTO "design_goals" VALUES(2,'G-02','No internal names on screen.','owner','2026-11-01T09:06:00.000Z',NULL,NULL);
+CREATE TABLE domains (
+  code        TEXT PRIMARY KEY,          -- 'security', 'logging', 'docs-developer' ...
+  name        TEXT NOT NULL,
+  category    TEXT NOT NULL CHECK (category IN
+                ('correctness','architecture','user-facing','security-operations',
+                 'documentation','custom')),
+  description TEXT,
+  report_file TEXT,                      -- default report file name
+  retired_at  TEXT
+);
+INSERT INTO "domains" VALUES('spec','Spec conformance','correctness','Applies whenever there are stated requirements anywhere.','spec.md',NULL);
+INSERT INTO "domains" VALUES('tests','Test coverage','correctness','Almost always applies.','tests-<module>.md',NULL);
+INSERT INTO "domains" VALUES('test-quality','Test suite quality','correctness','Applies when there is a meaningful test suite.','test-quality.md',NULL);
+INSERT INTO "domains" VALUES('time-concurrency','Time, dates and concurrency','correctness','Applies to anything with dates, schedules, deadlines, expiries, or more than one writer.','time-concurrency.md',NULL);
+INSERT INTO "domains" VALUES('resilience','Failure handling and resilience','correctness','Applies whenever there are external calls, jobs, or multi-step writes.','resilience.md',NULL);
+INSERT INTO "domains" VALUES('compatibility','Backward compatibility and migrations','correctness','Applies whenever there is stored data, saved settings, public APIs, or deployed clients.','compatibility.md',NULL);
+INSERT INTO "domains" VALUES('decision-placement','Decision placement','architecture','Applies when the system has business rules.','decision-placement.md',NULL);
+INSERT INTO "domains" VALUES('contracts','Internal contracts','architecture','Applies when there is more than one component.','contracts.md',NULL);
+INSERT INTO "domains" VALUES('server','Backend / server','architecture','Applies when there is a server.','server.md',NULL);
+INSERT INTO "domains" VALUES('database','Database','architecture','Applies when there is a database.','database.md',NULL);
+INSERT INTO "domains" VALUES('client-api','Backend-to-client API','architecture','Applies when a client talks to a backend.','client-api.md',NULL);
+INSERT INTO "domains" VALUES('abstraction','Abstraction and shared code','architecture','Almost always applies.','abstraction.md',NULL);
+INSERT INTO "domains" VALUES('hotspots','Hotspots from history','architecture','Applies when there is git history worth mining (a few months or more).','hotspots.md',NULL);
+INSERT INTO "domains" VALUES('ui','Front end / UI','user-facing','Applies when there are screens.','ui-<area>.md',NULL);
+INSERT INTO "domains" VALUES('walkthroughs','Task walkthroughs','user-facing','Applies when users complete multi-step tasks.','walkthroughs.md',NULL);
+INSERT INTO "domains" VALUES('notifications','Email and notifications','user-facing','Applies when the system sends email, SMS, push or calendar feeds.','notifications.md',NULL);
+INSERT INTO "domains" VALUES('localization','Localization','user-facing','Applies only if other languages, regions or conventions are plausible.','localization.md',NULL);
+INSERT INTO "domains" VALUES('security','Security','security-operations','Almost always applies.','security.md',NULL);
+INSERT INTO "domains" VALUES('privacy','Privacy and data map','security-operations','Applies whenever personal data is handled.','privacy.md',NULL);
+INSERT INTO "domains" VALUES('logging','Logging','security-operations','Almost always applies.','logging.md',NULL);
+INSERT INTO "domains" VALUES('operations','Operations, CI/CD and recovery','security-operations','Applies when the system is deployed.','operations.md',NULL);
+INSERT INTO "domains" VALUES('dependencies','Dependencies and supply chain','security-operations','Almost always applies.','dependencies.md',NULL);
+INSERT INTO "domains" VALUES('performance','Performance','security-operations','Applies when speed or scale matters to users or cost.','performance.md',NULL);
+INSERT INTO "domains" VALUES('cost','Cost','security-operations','Applies when the system runs on paid infrastructure or services.','cost.md',NULL);
+INSERT INTO "domains" VALUES('docs-developer','Developer documentation','documentation','Almost always applies.','docs-developer.md',NULL);
+INSERT INTO "domains" VALUES('docs-user','End-user documentation','documentation','Applies when the system has users other than its developers.','docs-user.md',NULL);
+INSERT INTO "domains" VALUES('handover','Maintainability and handover','documentation','Applies whenever someone other than the current author may need to run or change the system.','handover.md',NULL);
+CREATE TABLE enum_labels (
+  enum     TEXT NOT NULL,
+  value    TEXT NOT NULL,
+  label    TEXT NOT NULL,
+  position INTEGER NOT NULL,
+  PRIMARY KEY (enum, value),
+  UNIQUE (enum, position)
+);
+INSERT INTO "enum_labels" VALUES('check_tier','error','Must be empty',1);
+INSERT INTO "enum_labels" VALUES('check_tier','warning','Worth a look',2);
+INSERT INTO "enum_labels" VALUES('actor_kind','owner','Owner',1);
+INSERT INTO "enum_labels" VALUES('actor_kind','human','Person',2);
+INSERT INTO "enum_labels" VALUES('actor_kind','manager','Manager agent',3);
+INSERT INTO "enum_labels" VALUES('actor_kind','reviewer','Reviewer agent',4);
+INSERT INTO "enum_labels" VALUES('actor_kind','verifier','Verifier agent',5);
+INSERT INTO "enum_labels" VALUES('actor_kind','indexer','Indexer agent',6);
+INSERT INTO "enum_labels" VALUES('actor_kind','matcher','Matcher agent',7);
+INSERT INTO "enum_labels" VALUES('actor_kind','drafter','Plan drafter agent',8);
+INSERT INTO "enum_labels" VALUES('actor_kind','fixer','Fixer agent',9);
+INSERT INTO "enum_labels" VALUES('actor_kind','tool','Tool',10);
+INSERT INTO "enum_labels" VALUES('domain_category','correctness','Correctness',1);
+INSERT INTO "enum_labels" VALUES('domain_category','architecture','Architecture',2);
+INSERT INTO "enum_labels" VALUES('domain_category','user-facing','User-facing',3);
+INSERT INTO "enum_labels" VALUES('domain_category','security-operations','Security and operations',4);
+INSERT INTO "enum_labels" VALUES('domain_category','documentation','Documentation',5);
+INSERT INTO "enum_labels" VALUES('domain_category','custom','Custom',6);
+INSERT INTO "enum_labels" VALUES('review_scope','full','Full review',1);
+INSERT INTO "enum_labels" VALUES('review_scope','partial','Partial review',2);
+INSERT INTO "enum_labels" VALUES('review_scope','targeted','Targeted review',3);
+INSERT INTO "enum_labels" VALUES('review_scope','second','Second review',4);
+INSERT INTO "enum_labels" VALUES('review_scope','fix-verification','Fix check',5);
+INSERT INTO "enum_labels" VALUES('review_status','planning','Planning',1);
+INSERT INTO "enum_labels" VALUES('review_status','awaiting-approval','Waiting for your approval',2);
+INSERT INTO "enum_labels" VALUES('review_status','approved','Approved',3);
+INSERT INTO "enum_labels" VALUES('review_status','running','Reviewers running',4);
+INSERT INTO "enum_labels" VALUES('review_status','verifying','Verifying',5);
+INSERT INTO "enum_labels" VALUES('review_status','indexing','Indexing points',6);
+INSERT INTO "enum_labels" VALUES('review_status','consolidating','Writing it up',7);
+INSERT INTO "enum_labels" VALUES('review_status','handed-off','Handed off',8);
+INSERT INTO "enum_labels" VALUES('review_status','abandoned','Abandoned',9);
+INSERT INTO "enum_labels" VALUES('domain_decision','included','Included',1);
+INSERT INTO "enum_labels" VALUES('domain_decision','skipped','Skipped',2);
+INSERT INTO "enum_labels" VALUES('owner_change','none','As proposed',1);
+INSERT INTO "enum_labels" VALUES('owner_change','added-by-owner','Added by you',2);
+INSERT INTO "enum_labels" VALUES('owner_change','removed-by-owner','Removed by you',3);
+INSERT INTO "enum_labels" VALUES('owner_change','modified-by-owner','Changed by you',4);
+INSERT INTO "enum_labels" VALUES('run_status','queued','Queued',1);
+INSERT INTO "enum_labels" VALUES('run_status','running','Running',2);
+INSERT INTO "enum_labels" VALUES('run_status','finished','Finished',3);
+INSERT INTO "enum_labels" VALUES('run_status','failed','Failed',4);
+INSERT INTO "enum_labels" VALUES('run_status','cancelled','Cancelled',5);
+INSERT INTO "enum_labels" VALUES('requirement_status','active','In force',1);
+INSERT INTO "enum_labels" VALUES('requirement_status','superseded','Replaced',2);
+INSERT INTO "enum_labels" VALUES('requirement_status','withdrawn','Withdrawn',3);
+INSERT INTO "enum_labels" VALUES('issue_kind','defect','Defect',1);
+INSERT INTO "enum_labels" VALUES('issue_kind','test','Missing test',2);
+INSERT INTO "enum_labels" VALUES('issue_kind','validation','Validation',3);
+INSERT INTO "enum_labels" VALUES('issue_kind','refactor','Refactor',4);
+INSERT INTO "enum_labels" VALUES('issue_kind','feature','Feature',5);
+INSERT INTO "enum_labels" VALUES('issue_kind','design','Design',6);
+INSERT INTO "enum_labels" VALUES('issue_kind','docs','Documentation',7);
+INSERT INTO "enum_labels" VALUES('issue_kind','logging','Logging',8);
+INSERT INTO "enum_labels" VALUES('issue_kind','perf','Performance',9);
+INSERT INTO "enum_labels" VALUES('issue_kind','security','Security',10);
+INSERT INTO "enum_labels" VALUES('issue_kind','ops','Operations',11);
+INSERT INTO "enum_labels" VALUES('issue_kind','verify','To verify',12);
+INSERT INTO "enum_labels" VALUES('confidence','certain','Certain',1);
+INSERT INTO "enum_labels" VALUES('confidence','likely','Likely',2);
+INSERT INTO "enum_labels" VALUES('confidence','possible','Possible',3);
+INSERT INTO "enum_labels" VALUES('verification','unverified','Not checked yet',1);
+INSERT INTO "enum_labels" VALUES('verification','confirmed','Confirmed',2);
+INSERT INTO "enum_labels" VALUES('verification','partly','Partly confirmed',3);
+INSERT INTO "enum_labels" VALUES('verification','false','False finding',4);
+INSERT INTO "enum_labels" VALUES('verification','not-checkable','Could not be checked',5);
+INSERT INTO "enum_labels" VALUES('location_role','primary','Main place',1);
+INSERT INTO "enum_labels" VALUES('location_role','also','Also here',2);
+INSERT INTO "enum_labels" VALUES('location_role','test','Test',3);
+INSERT INTO "enum_labels" VALUES('location_role','doc','Documentation',4);
+INSERT INTO "enum_labels" VALUES('location_role','config','Configuration',5);
+INSERT INTO "enum_labels" VALUES('excerpt_status','truncated','First 200 lines only',1);
+INSERT INTO "enum_labels" VALUES('excerpt_status','not-text','Not text',2);
+INSERT INTO "enum_labels" VALUES('verdict','matches','Matches',1);
+INSERT INTO "enum_labels" VALUES('verdict','differs','Differs',2);
+INSERT INTO "enum_labels" VALUES('verdict','partly','Partly matches',3);
+INSERT INTO "enum_labels" VALUES('verdict','missing','Missing',4);
+INSERT INTO "enum_labels" VALUES('verdict','untested','Not tested',5);
+INSERT INTO "enum_labels" VALUES('tested','yes','Tested',1);
+INSERT INTO "enum_labels" VALUES('tested','partly','Partly tested',2);
+INSERT INTO "enum_labels" VALUES('tested','no','Not tested',3);
+INSERT INTO "enum_labels" VALUES('check_outcome','still-present','Still present',1);
+INSERT INTO "enum_labels" VALUES('check_outcome','changed','Changed',2);
+INSERT INTO "enum_labels" VALUES('check_outcome','fixed','Fixed',3);
+INSERT INTO "enum_labels" VALUES('check_outcome','regressed','Came back',4);
+INSERT INTO "enum_labels" VALUES('check_outcome','obsolete','No longer applies',5);
+INSERT INTO "enum_labels" VALUES('check_outcome','not-checked','Not checked',6);
+INSERT INTO "enum_labels" VALUES('decision_status','open','Open',1);
+INSERT INTO "enum_labels" VALUES('decision_status','decided','Decided',2);
+INSERT INTO "enum_labels" VALUES('decision_status','revisit','To revisit',3);
+INSERT INTO "enum_labels" VALUES('gate_status','open','Waiting on you',1);
+INSERT INTO "enum_labels" VALUES('gate_status','answered','Answered, waiting for the agent',2);
+INSERT INTO "enum_labels" VALUES('gate_status','applied','Done',3);
+INSERT INTO "enum_labels" VALUES('gate_status','withdrawn','Withdrawn',4);
+INSERT INTO "enum_labels" VALUES('answered_via','chat','In chat',1);
+INSERT INTO "enum_labels" VALUES('answered_via','viewer','In the viewer',2);
+INSERT INTO "enum_labels" VALUES('answered_via','other','Elsewhere',3);
+INSERT INTO "enum_labels" VALUES('plan_status','drafting','Drafting',1);
+INSERT INTO "enum_labels" VALUES('plan_status','awaiting-approval','Waiting for your approval',2);
+INSERT INTO "enum_labels" VALUES('plan_status','approved','Approved',3);
+INSERT INTO "enum_labels" VALUES('plan_status','in-progress','In progress',4);
+INSERT INTO "enum_labels" VALUES('plan_status','complete','Complete',5);
+INSERT INTO "enum_labels" VALUES('plan_status','superseded','Replaced',6);
+INSERT INTO "enum_labels" VALUES('plan_status','abandoned','Abandoned',7);
+INSERT INTO "enum_labels" VALUES('owner_need','none','',1);
+INSERT INTO "enum_labels" VALUES('owner_need','decision','Your decision',2);
+INSERT INTO "enum_labels" VALUES('owner_need','confirm','Your confirmation',3);
+INSERT INTO "enum_labels" VALUES('owner_need','review','Your review',4);
+INSERT INTO "enum_labels" VALUES('owner_need','production','Production action',5);
+INSERT INTO "enum_labels" VALUES('step_status','not-started','Not started',1);
+INSERT INTO "enum_labels" VALUES('step_status','doing','In progress',2);
+INSERT INTO "enum_labels" VALUES('step_status','waiting-owner','Waiting on you',3);
+INSERT INTO "enum_labels" VALUES('step_status','done','Done',4);
+INSERT INTO "enum_labels" VALUES('step_status','dropped','Dropped',5);
+INSERT INTO "enum_labels" VALUES('test_purpose','baseline','Baseline',1);
+INSERT INTO "enum_labels" VALUES('test_purpose','targeted','Targeted',2);
+INSERT INTO "enum_labels" VALUES('test_purpose','flake-check','Flakiness check',3);
+INSERT INTO "enum_labels" VALUES('test_purpose','mutation','Mutation testing',4);
+INSERT INTO "enum_labels" VALUES('test_purpose','before-fix','Before the fix',5);
+INSERT INTO "enum_labels" VALUES('test_purpose','after-fix','After the fix',6);
+INSERT INTO "enum_labels" VALUES('test_purpose','ci','Continuous integration',7);
+INSERT INTO "enum_labels" VALUES('metric_better','higher','Higher is better',1);
+INSERT INTO "enum_labels" VALUES('metric_better','lower','Lower is better',2);
+INSERT INTO "enum_labels" VALUES('metric_better','none','Neither',3);
+INSERT INTO "enum_labels" VALUES('metric_method','measured','Measured',1);
+INSERT INTO "enum_labels" VALUES('metric_method','counted','Counted',2);
+INSERT INTO "enum_labels" VALUES('metric_method','estimated','Estimated',3);
+INSERT INTO "enum_labels" VALUES('artifact_kind','brief','Brief',1);
+INSERT INTO "enum_labels" VALUES('artifact_kind','report','Report',2);
+INSERT INTO "enum_labels" VALUES('artifact_kind','index','Index',3);
+INSERT INTO "enum_labels" VALUES('artifact_kind','summary-doc','Summary document',4);
+INSERT INTO "enum_labels" VALUES('artifact_kind','plan-file','Plan file',5);
+INSERT INTO "enum_labels" VALUES('artifact_kind','progress-page','Progress page',6);
+INSERT INTO "enum_labels" VALUES('artifact_kind','probe-script','Probe script',7);
+INSERT INTO "enum_labels" VALUES('artifact_kind','other','Other',8);
+INSERT INTO "enum_labels" VALUES('entity_type','review','Review',1);
+INSERT INTO "enum_labels" VALUES('entity_type','issue','Issue',2);
+INSERT INTO "enum_labels" VALUES('entity_type','step','Plan step',3);
+INSERT INTO "enum_labels" VALUES('entity_type','plan','Plan',4);
+INSERT INTO "enum_labels" VALUES('entity_type','decision','Decision',5);
+INSERT INTO "enum_labels" VALUES('entity_type','finding','Finding',6);
+INSERT INTO "enum_labels" VALUES('entity_type','gate','Question for you',7);
+INSERT INTO "enum_labels" VALUES('entity_type','relation','Relation',8);
+INSERT INTO "enum_labels" VALUES('entity_type','check','Review check',9);
+INSERT INTO "enum_labels" VALUES('entity_type','step-finding','Step coverage',10);
+CREATE TABLE "events" (
+  id          INTEGER PRIMARY KEY,
+  entity_type TEXT NOT NULL CHECK (entity_type IN ('review','issue','step','plan','decision','finding','gate',
+                                                   'relation','check','step-finding')),
+  entity_id   INTEGER NOT NULL,
+  event       TEXT NOT NULL,
+  from_value  TEXT,
+  to_value    TEXT,
+  actor_id    INTEGER REFERENCES actors(id),
+  review_id   INTEGER REFERENCES reviews(id),
+  step_id     INTEGER REFERENCES steps(id),
+  commit_sha  TEXT CHECK (commit_sha IS NULL OR ((length(commit_sha) = 40 OR length(commit_sha) = 64) AND commit_sha NOT GLOB '*[^0-9a-f]*')),
+  note        TEXT,
+  at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+INSERT INTO "events" VALUES(1,'review',1,'status-changed','planning','handed-off',NULL,1,NULL,NULL,NULL,'2026-11-11T05:25:14.075Z');
+INSERT INTO "events" VALUES(2,'issue',1,'opened',NULL,'open',2,1,NULL,NULL,NULL,'2026-11-11T05:25:14.076Z');
+INSERT INTO "events" VALUES(3,'issue',1,'seen',NULL,'new',NULL,1,NULL,NULL,'SEC-H1','2026-11-11T05:25:14.077Z');
+INSERT INTO "events" VALUES(4,'issue',2,'opened',NULL,'open',2,1,NULL,NULL,NULL,'2026-11-11T05:25:14.077Z');
+INSERT INTO "events" VALUES(5,'issue',2,'seen',NULL,'new',NULL,1,NULL,NULL,'SPEC-M1','2026-11-11T05:25:14.077Z');
+INSERT INTO "events" VALUES(6,'issue',3,'opened',NULL,'open',2,1,NULL,NULL,NULL,'2026-11-11T05:25:14.077Z');
+INSERT INTO "events" VALUES(7,'issue',3,'seen',NULL,'new',NULL,1,NULL,NULL,'SPEC-L1','2026-11-11T05:25:14.077Z');
+INSERT INTO "events" VALUES(8,'plan',1,'status-changed','drafting','in-progress',NULL,NULL,NULL,NULL,NULL,'2026-11-11T05:25:14.078Z');
+INSERT INTO "events" VALUES(9,'step',2,'status-changed','not-started','doing',2,NULL,2,NULL,NULL,'2026-11-11T05:25:14.078Z');
+INSERT INTO "events" VALUES(10,'step',2,'status-changed','doing','done',2,NULL,2,'4de736a28a4bc6e37b58c1b1014cb6f7c68f71ee','Sign-in codes now come from a secure generator.','2026-11-11T05:25:14.078Z');
+INSERT INTO "events" VALUES(11,'issue',1,'status-changed','open','fixed',2,1,2,'4de736a28a4bc6e37b58c1b1014cb6f7c68f71ee','Step 2 done','2026-11-11T05:25:14.078Z');
+INSERT INTO "events" VALUES(12,'step',3,'status-changed','not-started','waiting-owner',NULL,NULL,3,NULL,NULL,'2026-11-11T05:25:14.078Z');
+INSERT INTO "events" VALUES(13,'review',2,'status-changed','planning','awaiting-approval',NULL,2,NULL,NULL,NULL,'2026-11-11T05:25:14.079Z');
+INSERT INTO "events" VALUES(14,'issue',1,'status-changed','fixed','verified',3,2,NULL,NULL,'review check: fixed — make_code now uses secrets.randbelow (src/auth.py:3)','2026-11-11T05:25:14.079Z');
+INSERT INTO "events" VALUES(15,'issue',2,'seen',NULL,'still-present',NULL,2,NULL,NULL,'SPEC-M1','2026-11-11T05:25:14.079Z');
+INSERT INTO "events" VALUES(16,'issue',4,'opened',NULL,'open',2,2,NULL,NULL,NULL,'2026-11-11T05:25:14.084Z');
+INSERT INTO "events" VALUES(17,'issue',4,'seen',NULL,'new',NULL,2,NULL,NULL,'SEC-M1','2026-11-11T05:25:14.084Z');
+CREATE TABLE "finding_goals" (
+  finding_id INTEGER NOT NULL REFERENCES findings(id) ON DELETE RESTRICT,
+  goal_id    INTEGER NOT NULL REFERENCES design_goals(id),
+  PRIMARY KEY (finding_id, goal_id)
+);
+INSERT INTO "finding_goals" VALUES(2,1);
+CREATE TABLE "finding_locations" (
+  id             INTEGER PRIMARY KEY,
+  finding_id     INTEGER NOT NULL REFERENCES findings(id) ON DELETE RESTRICT,
+  repository_id  INTEGER NOT NULL REFERENCES repositories(id),
+  commit_sha     TEXT CHECK (commit_sha IS NULL OR ((length(commit_sha) = 40 OR length(commit_sha) = 64)
+                                                    AND commit_sha NOT GLOB '*[^0-9a-f]*')),
+                                            -- full hash, lowercase hex; filled from review_repositories if left
+                                            -- NULL (the location's repository must be one the review looked at)
+  path           TEXT NOT NULL,             -- repo-relative, forward slashes (see the CHECK below)
+  line_start     INTEGER CHECK (line_start IS NULL OR line_start >= 1),
+  line_end       INTEGER CHECK (line_end IS NULL OR line_start IS NOT NULL),   -- no end without a start
+  symbol         TEXT,                      -- function, class, route, setting name
+  blob_sha       TEXT,                      -- `git rev-parse <commit>:<path>`
+  excerpt        TEXT,                      -- the cited lines, verbatim, at that commit
+  excerpt_sha256 TEXT,                      -- hash of excerpt, to detect the same code later
+  permalink      TEXT CHECK (permalink IS NULL OR permalink GLOB 'https://*' OR permalink GLOB 'http://*'),
+                                            -- e.g. https://github.com/o/r/blob/<sha>/<path>#L10-L20
+  role           TEXT NOT NULL DEFAULT 'primary' CHECK (role IN ('primary','also','test','doc','config')),
+  excerpt_redacted INTEGER NOT NULL DEFAULT 0 CHECK (excerpt_redacted IN (0,1)),
+                                            -- 1 = fill-refs masked secret-looking values in excerpt as [redacted];
+                                            -- excerpt_sha256 is still the hash of the real lines
+  whole_file     INTEGER NOT NULL DEFAULT 0 CHECK (whole_file IN (0,1)),
+                                            -- 1 = the point is about the whole file (location form repo:path, no
+                                            -- lines, no symbol); fill-refs sets it with lines 1..n
+  excerpt_status TEXT CHECK (excerpt_status IS NULL OR excerpt_status IN ('truncated','not-text')),
+                                            -- truncated = a whole-file excerpt holds only its first 200 lines;
+                                            -- not-text = binary or not UTF-8: no excerpt, excerpt_sha256 is of
+                                            -- the file's bytes
+  CHECK (line_end IS NULL OR line_start IS NULL OR line_end >= line_start),
+  -- path: relative (no leading / or -), no backslash, no .. segment, no control characters
+  CHECK (length(path) > 0 AND path NOT GLOB '/*' AND path NOT GLOB '-*' AND path NOT GLOB '*\*'
+         AND path <> '..' AND path NOT GLOB '../*' AND path NOT GLOB '*/../*' AND path NOT GLOB '*/..'
+         AND (path NOT GLOB '*[' || char(1) || '-' || char(31) || char(127) || ']*'))
+);
+INSERT INTO "finding_locations" VALUES(1,1,1,'16822abc0b87e79b664c98f386b3354147e0f1bc','src/auth.py',1,3,'make_code','1baf0b7838848c9d10acbd97f658d4216ef3cb33','import random
+def make_code():
+    return f"{random.randint(0, 999999):06d}"','60ac807b60625602459422c3fc375fe38d986b39458dd1780bdd9e4608b4aecb','https://github.com/example/demo/blob/16822abc0b87e79b664c98f386b3354147e0f1bc/src/auth.py#L1-L3','primary',0,0,NULL);
+INSERT INTO "finding_locations" VALUES(2,2,1,'16822abc0b87e79b664c98f386b3354147e0f1bc','src/timeoff.py',2,4,'can_request','168c600dc4f8f17a3edb63936f393a3420163fc8','def can_request(user, days_ahead, weekend):
+    if days_ahead < NOTICE_DAYS:
+        return False','e744180489f92abed87806426451d36a4e699caef1a83537e1424b902378d881','https://github.com/example/demo/blob/16822abc0b87e79b664c98f386b3354147e0f1bc/src/timeoff.py#L2-L4','primary',0,0,NULL);
+INSERT INTO "finding_locations" VALUES(3,3,1,'16822abc0b87e79b664c98f386b3354147e0f1bc','src/timeoff.py',5,6,'can_request','168c600dc4f8f17a3edb63936f393a3420163fc8','    if user.is_admin:
+        return True','8d85823055eb5d195db34524855c0e47d1f803c5f2b1b1ebc416bd5ae8dbb9b9','https://github.com/example/demo/blob/16822abc0b87e79b664c98f386b3354147e0f1bc/src/timeoff.py#L5-L6','primary',0,0,NULL);
+INSERT INTO "finding_locations" VALUES(4,4,1,'4de736a28a4bc6e37b58c1b1014cb6f7c68f71ee','src/timeoff.py',2,4,'can_request','168c600dc4f8f17a3edb63936f393a3420163fc8','def can_request(user, days_ahead, weekend):
+    if days_ahead < NOTICE_DAYS:
+        return False','e744180489f92abed87806426451d36a4e699caef1a83537e1424b902378d881','https://github.com/example/demo/blob/4de736a28a4bc6e37b58c1b1014cb6f7c68f71ee/src/timeoff.py#L2-L4','primary',0,0,NULL);
+INSERT INTO "finding_locations" VALUES(5,5,1,'4de736a28a4bc6e37b58c1b1014cb6f7c68f71ee','src/auth.py',4,5,'check','a03d48405198b5b43ac074bb87df9678b441c06e','def check(code, expected):
+    return code == expected','124fc58f514b796cceae4dbae31ce6e721561c0f4bc9238e3fa2cf77fc4a03d8','https://github.com/example/demo/blob/4de736a28a4bc6e37b58c1b1014cb6f7c68f71ee/src/auth.py#L4-L5','primary',0,0,NULL);
+CREATE TABLE "finding_requirements" (
+  finding_id     INTEGER NOT NULL REFERENCES findings(id) ON DELETE RESTRICT,
+  requirement_id INTEGER NOT NULL REFERENCES requirements(id),
+  verdict        TEXT NOT NULL CHECK (verdict IN ('matches','differs','partly','missing','untested')),
+  PRIMARY KEY (finding_id, requirement_id)
+);
+INSERT INTO "finding_requirements" VALUES(2,1,'differs');
+CREATE TABLE "findings" (
+  id                   INTEGER PRIMARY KEY,
+  review_id            INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
+  reviewer_run_id      INTEGER REFERENCES reviewer_runs(id),
+  point_id             TEXT NOT NULL,       -- index id: prefix + the report's own id (SEC-H3)
+  issue_id             INTEGER REFERENCES issues(id),   -- set during matching, by an UPDATE (never on INSERT)
+  match_type           TEXT REFERENCES match_types(value)
+                         CHECK (match_type IS NULL OR issue_id IS NOT NULL),   -- a match type needs the issue
+  match_confidence     TEXT CHECK (match_confidence IN ('certain','likely','possible')),
+  match_rationale      TEXT,
+  severity             TEXT NOT NULL REFERENCES severities(value),
+  kind                 TEXT NOT NULL CHECK (kind IN
+                         ('defect','test','validation','refactor','feature','design','docs',
+                          'logging','perf','security','ops','verify')),
+  domain_code          TEXT NOT NULL REFERENCES domains(code),
+  theme_code           TEXT REFERENCES themes(code),
+  sub                  TEXT NOT NULL,
+  summary              TEXT NOT NULL,       -- one self-contained sentence
+  detail               TEXT,
+  before_state         TEXT,                -- what the system does now, as observed
+  recommendation       TEXT,                -- the fix
+  recommended_test     TEXT,                -- test name and what it must assert
+  evidence             TEXT,
+  where_report         TEXT,                -- report line numbers
+  fingerprint          TEXT,
+  related_point_ids    TEXT CHECK (related_point_ids IS NULL OR json_valid(related_point_ids)),
+  verification         TEXT NOT NULL DEFAULT 'unverified' CHECK (verification IN
+                         ('unverified','confirmed','partly','false','not-checkable')),
+  verified_by_actor_id INTEGER REFERENCES actors(id),
+  verified_at          TEXT,
+  verification_note    TEXT,
+  created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  discovered_in_step_id INTEGER REFERENCES steps(id),  -- set when the point was found during fix work on this
+                                            -- plan step (not by a reviewer); v_unplanned_discoveries checks it
+  UNIQUE (review_id, point_id)
+);
+INSERT INTO "findings" VALUES(1,1,1,'SEC-H1',1,'new','certain',NULL,'H','security','security','sign-in','code-randomness','Sign-in codes come from a predictable random generator.',NULL,'make_code uses random.randint, which is not suitable for secrets.','Use secrets.randbelow.','test_code_randomness',NULL,NULL,'security:sign-in:code-randomness',NULL,'confirmed',2,NULL,NULL,'2026-11-01T09:11:00.000Z',NULL);
+INSERT INTO "findings" VALUES(2,1,2,'SPEC-M1',2,'new','certain',NULL,'M','defect','spec','spec-mismatch','notice-period','Notice period is hardcoded to 14 days instead of a setting.',NULL,'can_request refuses anything under 14 days; the owner asked for it to be a setting.','Read the notice period from program settings.','test_notice_period',NULL,NULL,'spec:spec-mismatch:notice-period',NULL,'confirmed',2,NULL,NULL,'2026-11-01T09:12:00.000Z',NULL);
+INSERT INTO "findings" VALUES(3,1,2,'SPEC-L1',3,'new','certain',NULL,'L','defect','spec','spec-mismatch','admin-bypass','Admins skip the weekend limit entirely.',NULL,'Admins bypass the weekend-off rule.','Apply the same rule with an override that is recorded.','test_admin_bypass',NULL,NULL,'spec:spec-mismatch:admin-bypass',NULL,'confirmed',2,NULL,NULL,'2026-11-01T09:13:00.000Z',NULL);
+INSERT INTO "findings" VALUES(4,2,4,'SPEC-M1',2,'still-present','certain','Same function and lines as ISS-0002','M','defect','spec','spec-mismatch','notice-period','Notice period is still 14 days in code.',NULL,'Unchanged since R-0001.','Read it from settings.','test_notice_period',NULL,NULL,'spec:spec-mismatch:notice-period',NULL,'confirmed',2,NULL,NULL,'2026-11-01T09:30:00.000Z',NULL);
+INSERT INTO "findings" VALUES(5,2,3,'SEC-M1',4,'new','certain',NULL,'M','security','security','sign-in','code-compare','Code check uses == instead of a constant-time compare.',NULL,'check compares codes with ==.','Use hmac.compare_digest.','test_code_compare',NULL,NULL,'security:sign-in:code-compare',NULL,'confirmed',2,NULL,NULL,'2026-11-01T09:32:00.000Z',NULL);
+CREATE TABLE gate_kinds (
+  value    TEXT PRIMARY KEY,
+  label    TEXT NOT NULL,
+  position INTEGER NOT NULL UNIQUE
+);
+INSERT INTO "gate_kinds" VALUES('domain-approval','Approve review domains',1);
+INSERT INTO "gate_kinds" VALUES('plan-approval','Approve fix plan',2);
+INSERT INTO "gate_kinds" VALUES('decision','Decision',3);
+INSERT INTO "gate_kinds" VALUES('step-input','Input on a step',4);
+INSERT INTO "gate_kinds" VALUES('confirm-false-finding','Confirm a false finding',5);
+INSERT INTO "gate_kinds" VALUES('accept-risk','Accept a risk',6);
+INSERT INTO "gate_kinds" VALUES('production-action','Production action',7);
+INSERT INTO "gate_kinds" VALUES('review-handoff','Review hand-off',8);
+INSERT INTO "gate_kinds" VALUES('confirm','Confirm',9);
+INSERT INTO "gate_kinds" VALUES('other','Question',10);
+CREATE TABLE "gates" (
+  id              INTEGER PRIMARY KEY,
+  code            TEXT NOT NULL UNIQUE      -- GATE-0001
+                    CHECK (code GLOB 'GATE-[0-9][0-9][0-9][0-9]*' AND code NOT GLOB 'GATE-*[^0-9]*'),
+  kind            TEXT NOT NULL REFERENCES gate_kinds(value),
+  title           TEXT NOT NULL,
+  question        TEXT NOT NULL,
+  context         TEXT,                     -- plain text the owner needs to answer
+  options         TEXT CHECK (options IS NULL OR json_valid(options))
+                    CHECK (options IS NULL OR json_type(options) = 'array'),
+                                            -- JSON array of {"value","label","description"} (value and label
+                                            -- required: tr_gate_options_shape)
+  allow_text      INTEGER NOT NULL DEFAULT 1 CHECK (allow_text IN (0,1))
+                    -- someone must be able to answer: free text, or at least one option
+                    CHECK (allow_text = 1 OR (options IS NOT NULL AND json_array_length(options) > 0)),
+  blocking        INTEGER NOT NULL DEFAULT 1 CHECK (blocking IN (0,1)),  -- work stops until answered
+  status          TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','answered','applied','withdrawn'))
+                    CHECK (status <> 'answered' OR answer_value IS NOT NULL OR answer_text IS NOT NULL)
+                    CHECK (status <> 'applied' OR applied_note IS NOT NULL),
+  answer_value    TEXT,                     -- the option chosen
+  answer_text     TEXT,                     -- the owner's own words
+  answered_by     TEXT,
+  answered_via    TEXT CHECK (answered_via IS NULL OR answered_via IN ('chat','viewer','other')),
+  answered_at     TEXT,
+  applied_note    TEXT,                     -- what the agent did with the answer
+  applied_at      TEXT,
+  review_id       INTEGER REFERENCES reviews(id),
+  plan_id         INTEGER REFERENCES plans(id),
+  step_id         INTEGER REFERENCES steps(id),
+  issue_id        INTEGER REFERENCES issues(id),
+  decision_id     INTEGER REFERENCES decisions(id),
+  opened_by_actor_id INTEGER REFERENCES actors(id),
+  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  answered_by_actor_id INTEGER REFERENCES actors(id),  -- who answered (the viewer: the owner's actors row);
+                                            -- answered_by keeps the text for older rows
+  change_actor_id INTEGER REFERENCES actors(id)        -- who made the next status change (applied, withdrawn);
+                                            -- copied into its event, then cleared
+);
+INSERT INTO "gates" VALUES(1,'GATE-0001','decision','Default notice period','Should the default notice period stay 14 days when it becomes a setting?','Today the code refuses requests made less than 14 days ahead. Programs will be able to change it.','[{"value": "keep-14", "label": "Keep 14 days", "description": "Current behaviour stays the default."}, {"value": "use-7", "label": "Change to 7 days"}]',1,1,'open',NULL,NULL,NULL,NULL,NULL,NULL,NULL,1,1,3,2,1,2,'2026-11-01T09:24:00.000Z',NULL,NULL);
+INSERT INTO "gates" VALUES(2,'GATE-0002','domain-approval','Approve the domains for R-0002','Run these 2 domains with 2 reviewers?','Included: Security, Spec conformance. Skipped: Database (no database).','[{"value": "approve", "label": "Approve as listed"}, {"value": "add", "label": "Add skipped domains"}]',1,1,'open',NULL,NULL,NULL,NULL,NULL,NULL,NULL,2,NULL,NULL,NULL,NULL,2,'2026-11-01T09:36:00.000Z',NULL,NULL);
+CREATE TABLE "guard_tests" (
+  id                      INTEGER PRIMARY KEY,
+  issue_id                INTEGER NOT NULL REFERENCES issues(id),
+  repository_id           INTEGER REFERENCES repositories(id),
+  test_path               TEXT NOT NULL,
+  test_name               TEXT NOT NULL,
+  step_id                 INTEGER REFERENCES steps(id),
+  added_commit_sha        TEXT CHECK (added_commit_sha IS NULL OR ((length(added_commit_sha) = 40 OR length(added_commit_sha) = 64) AND added_commit_sha NOT GLOB '*[^0-9a-f]*')),
+  failed_before_fix       INTEGER CHECK (failed_before_fix IN (0,1)),
+  passes_after_fix        INTEGER CHECK (passes_after_fix IN (0,1)),
+  still_exists            INTEGER NOT NULL DEFAULT 1 CHECK (still_exists IN (0,1)),
+  last_confirmed_review_id INTEGER REFERENCES reviews(id),
+  created_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  UNIQUE (issue_id, test_path, test_name)
+);
+INSERT INTO "guard_tests" VALUES(1,1,1,'tests/test_auth.py','test_code_uses_secrets',2,'4de736a28a4bc6e37b58c1b1014cb6f7c68f71ee',1,1,1,NULL,'2026-11-01T09:22:00.000Z');
+CREATE TABLE "issue_relations" (
+  id                       INTEGER PRIMARY KEY,
+  from_issue_id            INTEGER NOT NULL REFERENCES issues(id),
+  to_issue_id              INTEGER NOT NULL REFERENCES issues(id),
+  relation                 TEXT NOT NULL REFERENCES relation_types(value),
+  confidence               TEXT NOT NULL DEFAULT 'likely' CHECK (confidence IN ('certain','likely','possible')),
+  rationale                TEXT NOT NULL,
+  established_in_review_id INTEGER REFERENCES reviews(id),
+  established_by_actor_id  INTEGER REFERENCES actors(id),
+  created_at               TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  CHECK (from_issue_id <> to_issue_id),
+  UNIQUE (from_issue_id, to_issue_id, relation)
+);
+INSERT INTO "issue_relations" VALUES(1,4,1,'related-to','likely','Same sign-in code path as the earlier randomness issue',2,2,'2026-11-01T09:34:00.000Z');
+CREATE TABLE issue_statuses (
+  value    TEXT PRIMARY KEY,
+  label    TEXT NOT NULL,
+  position INTEGER NOT NULL UNIQUE,
+  active   INTEGER NOT NULL CHECK (active IN (0,1)),    -- still to fix (v_open_issues, the "Still to fix" filter)
+  resolved INTEGER NOT NULL CHECK (resolved IN (0,1)),  -- closed: entering it sets issues.resolved_at
+  fixed    INTEGER NOT NULL CHECK (fixed IN (0,1)),     -- the code was fixed: a regression match or check regresses it
+  reopens  INTEGER NOT NULL CHECK (reopens IN (0,1)),   -- closed without a fix: a recurrence reopens it
+  briefed  INTEGER NOT NULL CHECK (briefed IN (0,1)),   -- given to reviewers as a known issue (not merged away)
+  CHECK (active + resolved = 1),
+  CHECK (fixed = 0 OR resolved = 1),
+  CHECK (reopens = 0 OR (resolved = 1 AND fixed = 0))
+);
+INSERT INTO "issue_statuses" VALUES('open','Open',1,1,0,0,0,1);
+INSERT INTO "issue_statuses" VALUES('needs-decision','Needs your decision',2,1,0,0,0,1);
+INSERT INTO "issue_statuses" VALUES('planned','Planned',3,1,0,0,0,1);
+INSERT INTO "issue_statuses" VALUES('in-progress','In progress',4,1,0,0,0,1);
+INSERT INTO "issue_statuses" VALUES('fixed','Fixed',5,0,1,1,0,1);
+INSERT INTO "issue_statuses" VALUES('verified','Fixed and confirmed',6,0,1,1,0,1);
+INSERT INTO "issue_statuses" VALUES('regressed','Came back',7,1,0,0,0,1);
+INSERT INTO "issue_statuses" VALUES('accepted-risk','Accepted risk',8,0,1,0,0,1);
+INSERT INTO "issue_statuses" VALUES('wont-fix','Won''t fix',9,0,1,0,1,1);
+INSERT INTO "issue_statuses" VALUES('duplicate','Duplicate',10,0,1,0,1,0);
+INSERT INTO "issue_statuses" VALUES('obsolete','No longer applies',11,0,1,0,1,0);
+CREATE TABLE "issues" (
+  id                     INTEGER PRIMARY KEY,
+  code                   TEXT NOT NULL UNIQUE    -- ISS-0001, never reused
+                           CHECK (code GLOB 'ISS-[0-9][0-9][0-9][0-9]*' AND code NOT GLOB 'ISS-*[^0-9]*'),
+  title                  TEXT NOT NULL,
+  domain_code            TEXT NOT NULL REFERENCES domains(code),
+  theme_code             TEXT REFERENCES themes(code),
+  sub                    TEXT,                   -- slug naming the specific thing
+  kind                   TEXT NOT NULL CHECK (kind IN
+                           ('defect','test','validation','refactor','feature','design','docs',
+                            'logging','perf','security','ops','verify')),
+  severity               TEXT NOT NULL REFERENCES severities(value),             -- current
+  status                 TEXT NOT NULL DEFAULT 'open' REFERENCES issue_statuses(value),
+  fingerprint            TEXT,                   -- domain:theme:sub[:symbol], for matching
+  before_state           TEXT,                   -- what the system did when first found
+  current_state          TEXT,                   -- what the latest review observed
+  after_state            TEXT,                   -- what it does once fixed
+  recommendation         TEXT,                   -- current agreed fix
+  resolution             TEXT,                   -- how it was closed, or why it was accepted
+  first_seen_review_id   INTEGER NOT NULL REFERENCES reviews(id),
+  last_seen_review_id    INTEGER REFERENCES reviews(id),   -- last review that raised it
+  last_checked_review_id INTEGER REFERENCES reviews(id),   -- last review that looked for it
+  times_seen             INTEGER NOT NULL DEFAULT 1 CHECK (times_seen >= 1),
+  opened_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  resolved_at            TEXT,
+  verified_at            TEXT,
+  updated_at             TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  -- Context for the next status/severity change, set in the same UPDATE: change_note is required (the
+  -- update is refused without it), the others where they apply. The triggers copy them into events, so
+  -- history records who, why, in which review/step/commit, and then set all five back to NULL, so context
+  -- is never reused by a later change.
+  change_actor_id        INTEGER REFERENCES actors(id),
+  change_review_id       INTEGER REFERENCES reviews(id),
+  change_step_id         INTEGER REFERENCES steps(id),
+  change_commit_sha      TEXT CHECK (change_commit_sha IS NULL OR ((length(change_commit_sha) = 40
+                                     OR length(change_commit_sha) = 64) AND change_commit_sha NOT GLOB '*[^0-9a-f]*')),
+  change_note            TEXT
+);
+INSERT INTO "issues" VALUES(1,'ISS-0001','Predictable sign-in codes','security','sign-in','code-randomness','security','H','verified','security:sign-in:code-randomness','Codes generated with random.randint.','make_code uses random.randint, which is not suitable for secrets.','Codes come from secrets.randbelow.',NULL,NULL,1,1,2,1,'2026-11-01T09:14:00.000Z','2026-11-11T05:25:14.078Z','2026-11-11T05:25:14.079Z','2026-11-11T05:25:14.079Z',3,2,NULL,NULL,'review check: fixed — make_code now uses secrets.randbelow (src/auth.py:3)');
+INSERT INTO "issues" VALUES(2,'ISS-0002','Notice period hardcoded','spec','spec-mismatch','notice-period','defect','M','open','spec:spec-mismatch:notice-period','14 days in code.','Unchanged since R-0001.',NULL,NULL,NULL,1,2,2,2,'2026-11-01T09:15:00.000Z',NULL,NULL,'2026-11-11T05:25:14.079Z',4,2,NULL,NULL,'review check: still-present');
+INSERT INTO "issues" VALUES(3,'ISS-0003','Admins bypass the weekend limit','spec','spec-mismatch','admin-bypass','defect','L','open','spec:spec-mismatch:admin-bypass','Admin bypass.','Admins bypass the weekend-off rule.',NULL,NULL,NULL,1,1,2,1,'2026-11-01T09:16:00.000Z',NULL,NULL,'2026-11-11T05:25:14.084Z',4,2,NULL,NULL,'review check: not-checked');
+INSERT INTO "issues" VALUES(4,'ISS-0004','Sign-in code compare is not constant-time','security','sign-in','code-compare','security','M','open','security:sign-in:code-compare','== compare.','check compares codes with ==.',NULL,NULL,NULL,2,2,2,1,'2026-11-01T09:33:00.000Z',NULL,NULL,'2026-11-11T05:25:14.084Z',NULL,2,NULL,NULL,'matched by finding SEC-M1');
+CREATE TABLE ledger_checks (
+  view     TEXT PRIMARY KEY,
+  label    TEXT NOT NULL,
+  tier     TEXT NOT NULL CHECK (tier IN ('error','warning')),
+  position INTEGER NOT NULL UNIQUE
+);
+INSERT INTO "ledger_checks" VALUES('v_unmatched_findings','Findings not matched to an issue','error',10);
+INSERT INTO "ledger_checks" VALUES('v_unchecked_known_issues','Known issues in a domain that ran, with no check recorded','error',20);
+INSERT INTO "ledger_checks" VALUES('v_untraceable_refs','Code references that cannot be traced to exact lines','error',30);
+INSERT INTO "ledger_checks" VALUES('v_uncovered_findings','Findings no step of their plan closes','error',40);
+INSERT INTO "ledger_checks" VALUES('v_coverage_problems','Steps closing nothing, or findings closed twice without a reason','error',50);
+INSERT INTO "ledger_checks" VALUES('v_unguarded_fixes','Fixed issues with no guard test, or whose guard test is gone','warning',100);
+INSERT INTO "ledger_checks" VALUES('v_unplanned_discoveries','Defects found during fix work that no plan step closes','error',60);
+INSERT INTO "ledger_checks" VALUES('v_history_gaps','Issues and gates whose history is missing an event','error',70);
+INSERT INTO "ledger_checks" VALUES('v_match_problems','Matches whose type disagrees with the issue','error',72);
+INSERT INTO "ledger_checks" VALUES('v_off_plan_coverage','Steps closing a finding of a review their plan does not cover','error',74);
+INSERT INTO "ledger_checks" VALUES('v_done_steps_open_issues','Done steps whose issues are still to do','error',76);
+INSERT INTO "ledger_checks" VALUES('v_closed_without_reason','Issues accepted or declined with no reason recorded','error',78);
+INSERT INTO "ledger_checks" VALUES('v_relation_problems','Related-to pairs stored in both directions','error',80);
+INSERT INTO "ledger_checks" VALUES('v_check_finding_owner','Review checks citing a finding of another issue','error',82);
+CREATE TABLE match_types (
+  value     TEXT PRIMARY KEY,
+  label     TEXT NOT NULL,
+  position  INTEGER NOT NULL UNIQUE,
+  came_back INTEGER NOT NULL CHECK (came_back IN (0,1))  -- the issue was closed and was raised again
+);
+INSERT INTO "match_types" VALUES('new','New',1,0);
+INSERT INTO "match_types" VALUES('still-present','Still present',2,0);
+INSERT INTO "match_types" VALUES('changed','Changed',3,0);
+INSERT INTO "match_types" VALUES('recurrence','Came back',4,1);
+INSERT INTO "match_types" VALUES('regression','Came back after a fix',5,1);
+INSERT INTO "match_types" VALUES('continuation','Continues an earlier issue',6,0);
+CREATE TABLE meta (
+  key   TEXT PRIMARY KEY,                -- schema_version, project_name, created_at, created_by_skill
+  value TEXT NOT NULL
+);
+INSERT INTO "meta" VALUES('schema_version','7');
+INSERT INTO "meta" VALUES('project_name','demo-v1');
+INSERT INTO "meta" VALUES('created_at','2026-11-01T09:00:00.000Z');
+CREATE TABLE metric_defs (
+  name   TEXT PRIMARY KEY,                 -- the stable key used in metrics.name
+  label  TEXT NOT NULL,
+  unit   TEXT,
+  better TEXT NOT NULL DEFAULT 'none' CHECK (better IN ('higher','lower','none'))
+);
+INSERT INTO "metric_defs" VALUES('mutation_score','Mutation score','%','higher');
+INSERT INTO "metric_defs" VALUES('line_coverage','Line coverage','%','higher');
+INSERT INTO "metric_defs" VALUES('branch_coverage','Branch coverage','%','higher');
+INSERT INTO "metric_defs" VALUES('test_cases_asserted','Test cases asserted','cases','higher');
+INSERT INTO "metric_defs" VALUES('test_cases_needed','Test cases needed','cases','none');
+INSERT INTO "metric_defs" VALUES('tests_missing_named','Missing tests named','tests','lower');
+INSERT INTO "metric_defs" VALUES('flaky_tests','Flaky tests','tests','lower');
+INSERT INTO "metric_defs" VALUES('test_suite_seconds','Test suite run time','s','lower');
+INSERT INTO "metric_defs" VALUES('page_weight','Page weight','KB','lower');
+INSERT INTO "metric_defs" VALUES('queries_per_page','Queries per page','queries','lower');
+INSERT INTO "metric_defs" VALUES('p95_job_ms','Job time, 95th percentile','ms','lower');
+INSERT INTO "metric_defs" VALUES('dependency_count','Dependencies','packages','lower');
+INSERT INTO "metric_defs" VALUES('vulnerable_dependencies','Dependencies with known vulnerabilities','packages','lower');
+CREATE TABLE "metrics" (
+  id            INTEGER PRIMARY KEY,
+  review_id     INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
+  domain_code   TEXT REFERENCES domains(code),
+  repository_id INTEGER REFERENCES repositories(id),
+  name          TEXT NOT NULL REFERENCES metric_defs(name),  -- stable key, e.g. 'mutation_score'
+  scope         TEXT NOT NULL DEFAULT 'all',  -- module, page, job ...
+  value         REAL NOT NULL,
+  unit          TEXT,
+  method        TEXT NOT NULL CHECK (method IN ('measured','counted','estimated')),
+  note          TEXT,
+  recorded_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  UNIQUE (review_id, name, scope, repository_id)
+);
+INSERT INTO "metrics" VALUES(1,1,'test-quality',NULL,'mutation_score','src',61.0,'%','measured',NULL,'2026-11-01T09:37:00.000Z');
+INSERT INTO "metrics" VALUES(2,2,'test-quality',NULL,'mutation_score','src',74.5,'%','measured',NULL,'2026-11-01T09:38:00.000Z');
+CREATE TABLE phases (
+  id      INTEGER PRIMARY KEY,
+  plan_id INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+  number  INTEGER NOT NULL,
+  title   TEXT NOT NULL,
+  goal    TEXT NOT NULL,                     -- one sentence
+  why     TEXT,                              -- why it sits where it does
+  UNIQUE (plan_id, number)
+);
+INSERT INTO "phases" VALUES(1,1,1,'Safety net','Every later step is checked by tests.',NULL);
+INSERT INTO "phases" VALUES(2,1,2,'Fix first','Confirmed defects fixed with failing tests first.',NULL);
+CREATE TABLE plan_reviews (
+  plan_id   INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+  review_id INTEGER NOT NULL REFERENCES reviews(id),
+  PRIMARY KEY (plan_id, review_id)
+);
+INSERT INTO "plan_reviews" VALUES(1,1);
+CREATE TABLE "plans" (
+  id                   INTEGER PRIMARY KEY,
+  code                 TEXT NOT NULL UNIQUE
+                         CHECK (code GLOB 'P-[0-9][0-9][0-9][0-9]*' AND code NOT GLOB 'P-*[^0-9]*'),
+  title                TEXT NOT NULL,
+  status               TEXT NOT NULL DEFAULT 'drafting' CHECK (status IN
+                         ('drafting','awaiting-approval','approved','in-progress','complete',
+                          'superseded','abandoned'))
+                         CHECK (status IN ('drafting','awaiting-approval','superseded','abandoned')
+                                OR approved_at IS NOT NULL),
+  approved_by_actor_id INTEGER REFERENCES actors(id),
+  approved_at          TEXT,
+  superseded_by        INTEGER REFERENCES plans(id),
+  doc_url              TEXT,
+  page_url             TEXT,
+  created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  change_actor_id      INTEGER REFERENCES actors(id),
+  change_note          TEXT
+, narrative_md TEXT);
+INSERT INTO "plans" VALUES(1,'P-0001','Fix plan for R-0001','in-progress',1,'2026-11-01T09:17:00.000Z',NULL,NULL,NULL,'2026-11-01T09:18:00.000Z','2026-11-11T05:25:14.078Z',NULL,NULL,NULL);
+CREATE TABLE relation_types (
+  value         TEXT PRIMARY KEY,
+  label         TEXT NOT NULL,              -- read from the issue the relation starts at ("Duplicate of")
+  inverse_label TEXT NOT NULL,              -- read from the issue it points to ("Has duplicate")
+  position      INTEGER NOT NULL UNIQUE,
+  closes        INTEGER NOT NULL CHECK (closes IN (0,1))  -- recording it closes the active issue as duplicate
+);
+INSERT INTO "relation_types" VALUES('duplicate-of','Duplicate of','Has duplicate',1,1);
+INSERT INTO "relation_types" VALUES('continuation-of','Continues','Continued by',2,0);
+INSERT INTO "relation_types" VALUES('regression-of','Regression of','Came back as',3,0);
+INSERT INTO "relation_types" VALUES('related-to','Related to','Related to',4,0);
+INSERT INTO "relation_types" VALUES('caused-by','Caused by','Causes',5,0);
+INSERT INTO "relation_types" VALUES('blocks','Blocks','Blocked by',6,0);
+INSERT INTO "relation_types" VALUES('supersedes','Supersedes','Superseded by',7,0);
+INSERT INTO "relation_types" VALUES('split-from','Split from','Split into',8,0);
+INSERT INTO "relation_types" VALUES('merged-into','Merged into','Absorbed',9,1);
+CREATE TABLE "repositories" (
+  id             INTEGER PRIMARY KEY,
+  name           TEXT NOT NULL UNIQUE,   -- short name used in the brief
+  path           TEXT,                   -- relative to the project root, '.' for the root repo
+  remote_url     TEXT,
+  default_branch TEXT,
+  permalink_template TEXT CHECK (permalink_template IS NULL OR permalink_template GLOB 'https://*'
+                                 OR permalink_template GLOB 'http://*'),
+                                         -- e.g. https://github.com/o/r/blob/{sha}/{path}#L{start}-L{end}
+  notes          TEXT,
+  created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  allow_outside_root INTEGER NOT NULL DEFAULT 0 CHECK (allow_outside_root IN (0,1)),
+                                         -- 1 = the owner listed this repo explicitly as living outside the
+                                         -- project root (a sibling checkout); its path may then be absolute or
+                                         -- start with ../. Otherwise ledger.py refuses to read outside the root.
+  -- path: no leading -, no control characters; and unless allow_outside_root, relative (no leading /, no
+  -- backslash) with no .. segment
+  CHECK (path IS NULL OR (path NOT GLOB '-*' AND (path NOT GLOB '*[' || char(1) || '-' || char(31) || char(127) || ']*')
+         AND (allow_outside_root = 1 OR (path NOT GLOB '/*' AND path NOT GLOB '*\*' AND path <> '..'
+              AND path NOT GLOB '../*' AND path NOT GLOB '*/../*' AND path NOT GLOB '*/..'))))
+);
+INSERT INTO "repositories" VALUES(1,'demo','.',NULL,'main','https://github.com/example/demo/blob/{sha}/{path}#L{start}-L{end}',NULL,'2026-11-01T09:00:00.000Z',0);
+CREATE TABLE "requirements" (
+  id              INTEGER PRIMARY KEY,
+  code            TEXT NOT NULL UNIQUE
+                    CHECK (code GLOB 'REQ-[0-9][0-9][0-9][0-9]*' AND code NOT GLOB 'REQ-*[^0-9]*'),
+  text            TEXT NOT NULL,
+  source          TEXT NOT NULL,
+  source_location TEXT,
+  stated_at       TEXT,
+  status          TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','superseded','withdrawn')),
+  superseded_by   INTEGER REFERENCES requirements(id)
+                    CHECK ((status = 'superseded') = (superseded_by IS NOT NULL)),
+  first_review_id INTEGER REFERENCES reviews(id),
+  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+INSERT INTO "requirements" VALUES(1,'REQ-0001','Requests need 14 days of notice.','owner, chat 2026-11-01',NULL,NULL,'active',NULL,1,'2026-11-01T09:06:30.000Z');
+CREATE TABLE "review_actors" (
+  review_id  INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
+  actor_id   INTEGER NOT NULL REFERENCES actors(id),
+  role_label TEXT NOT NULL,                -- what it did here: 'indexer for security.md', 'matcher'
+  PRIMARY KEY (review_id, actor_id)
+);
+INSERT INTO "review_actors" VALUES(1,3,'security reviewer');
+CREATE TABLE "review_domains" (
+  review_id         INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
+  domain_code       TEXT NOT NULL REFERENCES domains(code),
+  decision          TEXT NOT NULL CHECK (decision IN ('included','skipped')),
+  reason            TEXT NOT NULL,
+  owner_change      TEXT NOT NULL DEFAULT 'none' CHECK (owner_change IN
+                      ('none','added-by-owner','removed-by-owner','modified-by-owner')),
+  reviewers_planned INTEGER,
+  split_note        TEXT,                 -- how the domain was split between reviewers
+  PRIMARY KEY (review_id, domain_code)
+);
+INSERT INTO "review_domains" VALUES(1,'security','included','Sign-in codes and sessions exist','none',1,NULL);
+INSERT INTO "review_domains" VALUES(1,'spec','included','Owner rules for time off are stated','none',1,NULL);
+INSERT INTO "review_domains" VALUES(1,'database','skipped','No database in this project','none',0,NULL);
+INSERT INTO "review_domains" VALUES(2,'security','included','Sign-in codes and sessions exist','none',1,NULL);
+INSERT INTO "review_domains" VALUES(2,'spec','included','Owner rules for time off are stated','none',1,NULL);
+INSERT INTO "review_domains" VALUES(2,'database','skipped','No database in this project','none',0,NULL);
+CREATE TABLE "review_goals" (
+  review_id INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
+  goal_id   INTEGER NOT NULL REFERENCES design_goals(id),
+  PRIMARY KEY (review_id, goal_id)
+);
+INSERT INTO "review_goals" VALUES(1,1);
+INSERT INTO "review_goals" VALUES(1,2);
+INSERT INTO "review_goals" VALUES(2,1);
+INSERT INTO "review_goals" VALUES(2,2);
+CREATE TABLE "review_issue_checks" (
+  review_id  INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
+  issue_id   INTEGER NOT NULL REFERENCES issues(id),
+  outcome    TEXT NOT NULL CHECK (outcome IN
+               ('still-present','changed','fixed','regressed','obsolete','not-checked')),
+  finding_id INTEGER REFERENCES findings(id),
+  evidence   TEXT,
+  actor_id   INTEGER REFERENCES actors(id),
+  checked_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  PRIMARY KEY (review_id, issue_id)
+);
+INSERT INTO "review_issue_checks" VALUES(2,1,'fixed',NULL,'make_code now uses secrets.randbelow (src/auth.py:3)',3,'2026-11-01T09:29:00.000Z');
+INSERT INTO "review_issue_checks" VALUES(2,2,'still-present',4,NULL,4,'2026-11-01T09:31:00.000Z');
+INSERT INTO "review_issue_checks" VALUES(2,3,'not-checked',NULL,NULL,4,'2026-11-01T09:35:00.000Z');
+CREATE TABLE "review_repositories" (
+  review_id     INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
+  repository_id INTEGER NOT NULL REFERENCES repositories(id),
+  commit_sha    TEXT NOT NULL CHECK ((length(commit_sha) = 40 OR length(commit_sha) = 64)
+                                   AND commit_sha NOT GLOB '*[^0-9a-f]*'),  -- full hash, lowercase hex
+  branch        TEXT,
+  commit_time   TEXT,                     -- the commit's committer time in UTC (…Z, like every time here; a git
+                                          -- time with an offset is converted); tag-review fills it when NULL
+  commit_subject TEXT,
+  tag_name      TEXT,                     -- e.g. review/R-0001, keeps the commit reachable
+  tag_pushed    INTEGER NOT NULL DEFAULT 0 CHECK (tag_pushed IN (0,1)),
+  is_dirty      INTEGER NOT NULL DEFAULT 0 CHECK (is_dirty IN (0,1)),
+  dirty_note    TEXT,                     -- what was uncommitted, if anything
+  dirty_patch_path TEXT,                  -- saved `git diff` of uncommitted changes, if any
+  PRIMARY KEY (review_id, repository_id)
+);
+INSERT INTO "review_repositories" VALUES(1,1,'16822abc0b87e79b664c98f386b3354147e0f1bc','main',NULL,'Initial time off and sign-in','review/R-0001',0,0,NULL,NULL);
+INSERT INTO "review_repositories" VALUES(2,1,'4de736a28a4bc6e37b58c1b1014cb6f7c68f71ee','main',NULL,'Use secrets for sign-in codes','review/R-0002',0,0,NULL,NULL);
+CREATE TABLE "review_requirement_checks" (
+  id                INTEGER PRIMARY KEY,
+  review_id         INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
+  requirement_id    INTEGER NOT NULL REFERENCES requirements(id),
+  verdict           TEXT NOT NULL CHECK (verdict IN ('matches','differs','partly','missing','untested')),
+  where_implemented TEXT,                  -- file, function or page that implements it
+  tested            TEXT CHECK (tested IS NULL OR tested IN ('yes','partly','no')),
+  finding_id        INTEGER REFERENCES findings(id),   -- the finding raised for it, if any
+  evidence          TEXT,
+  UNIQUE (review_id, requirement_id)
+);
+INSERT INTO "review_requirement_checks" VALUES(1,1,1,'differs','src/requests.py','no',2,'can_request hardcodes 14 days');
+CREATE TABLE "reviewer_runs" (
+  id             INTEGER PRIMARY KEY,
+  review_id      INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
+  domain_code    TEXT NOT NULL REFERENCES domains(code),
+  actor_id       INTEGER NOT NULL REFERENCES actors(id),
+  label          TEXT NOT NULL,           -- 'tests-engine-A'
+  scope          TEXT NOT NULL,
+  prompt         TEXT,
+  report_path    TEXT,
+  report_sha256  TEXT,
+  status         TEXT NOT NULL DEFAULT 'queued' CHECK (status IN
+                   ('queued','running','finished','failed','cancelled')),
+  items_reviewed INTEGER CHECK (items_reviewed IS NULL OR items_reviewed >= 0),
+  high_count     INTEGER CHECK (high_count IS NULL OR high_count >= 0),
+  medium_count   INTEGER CHECK (medium_count IS NULL OR medium_count >= 0),
+  low_count      INTEGER CHECK (low_count IS NULL OR low_count >= 0),
+  test_count     INTEGER CHECK (test_count IS NULL OR test_count >= 0),
+  final_message  TEXT,
+  started_at     TEXT,
+  finished_at    TEXT,
+  UNIQUE (review_id, label)
+);
+INSERT INTO "reviewer_runs" VALUES(1,1,'security',3,'security','sign-in',NULL,NULL,NULL,'finished',4,1,0,0,NULL,NULL,'2026-11-01T09:09:00.000Z',NULL);
+INSERT INTO "reviewer_runs" VALUES(2,1,'spec',4,'spec','time-off rules',NULL,NULL,NULL,'finished',6,0,1,1,NULL,NULL,'2026-11-01T09:10:00.000Z',NULL);
+INSERT INTO "reviewer_runs" VALUES(3,2,'security',3,'security','sign-in',NULL,NULL,NULL,'finished',4,1,0,0,NULL,NULL,'2026-11-01T09:27:00.000Z',NULL);
+INSERT INTO "reviewer_runs" VALUES(4,2,'spec',4,'spec','time-off rules',NULL,NULL,NULL,'finished',6,0,1,1,NULL,NULL,'2026-11-01T09:28:00.000Z',NULL);
+CREATE TABLE "reviews" (
+  id                    INTEGER PRIMARY KEY,
+  code                  TEXT NOT NULL UNIQUE
+                          CHECK (code GLOB 'R-[0-9][0-9][0-9][0-9]*' AND code NOT GLOB 'R-*[^0-9]*'),
+  title                 TEXT NOT NULL,
+  scope                 TEXT NOT NULL CHECK (scope IN
+                          ('full','partial','targeted','second','fix-verification')),
+  status                TEXT NOT NULL DEFAULT 'planning' CHECK (status IN
+                          ('planning','awaiting-approval','approved','running','verifying',
+                           'indexing','consolidating','handed-off','abandoned'))
+                          CHECK (status IN ('planning','awaiting-approval','abandoned') OR approved_at IS NOT NULL),
+  request_text          TEXT,
+  requested_by_actor_id INTEGER REFERENCES actors(id),
+  manager_actor_id      INTEGER REFERENCES actors(id),
+  approved_by_actor_id  INTEGER REFERENCES actors(id),
+  approved_at           TEXT,
+  previous_review_id    INTEGER REFERENCES reviews(id),
+  skill_version         TEXT,
+  review_folder         TEXT,
+  summary_doc_url       TEXT CHECK (summary_doc_url IS NULL OR summary_doc_url GLOB 'https://*'
+                                    OR summary_doc_url GLOB 'http://*'),
+  verdict               TEXT,
+  summary               TEXT,
+  started_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  completed_at          TEXT CHECK (completed_at IS NULL OR julianday(started_at) <= julianday(completed_at)),
+  updated_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  change_actor_id       INTEGER REFERENCES actors(id),
+  change_note           TEXT
+, report_md TEXT);
+INSERT INTO "reviews" VALUES(1,'R-0001','Comprehensive review R-0001','full','handed-off','Run the full system review',1,2,1,'2026-11-01T09:07:00.000Z',NULL,NULL,NULL,NULL,'Solid core; sign-in codes and notice rules need work.',NULL,'2026-11-01T09:08:00.000Z','2026-11-11T05:25:14.075Z','2026-11-11T05:25:14.075Z',NULL,NULL,NULL);
+INSERT INTO "reviews" VALUES(2,'R-0002','Comprehensive review R-0002','second','awaiting-approval','Run the full system review',1,2,1,'2026-11-01T09:25:00.000Z',1,NULL,NULL,NULL,'Solid core; sign-in codes and notice rules need work.',NULL,'2026-11-01T09:26:00.000Z',NULL,'2026-11-11T05:25:14.079Z',NULL,NULL,NULL);
+CREATE TABLE schema_migrations (
+  version     INTEGER PRIMARY KEY,
+  description TEXT NOT NULL,
+  applied_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+INSERT INTO "schema_migrations" VALUES(1,'initial ledger schema','2026-11-11T05:25:14.017Z');
+INSERT INTO "schema_migrations" VALUES(2,'url, path, hash and code checks; repositories.allow_outside_root; finding_locations.excerpt_redacted','2026-11-02T02:00:00.000Z');
+INSERT INTO "schema_migrations" VALUES(3,'integrity rules: codes, hashes, checks, append-only history, owner actor on gate answers','2026-11-02T03:00:00.000Z');
+INSERT INTO "schema_migrations" VALUES(4,'check registry, requirement trace, review agents, metric catalog, domain descriptions, foreign-key indexes','2026-11-02T04:00:00.000Z');
+INSERT INTO "schema_migrations" VALUES(5,'one UTC time format; whole-file and not-text references; report, plan narrative and fix-time discoveries','2026-11-02T05:00:00.000Z');
+INSERT INTO "schema_migrations" VALUES(6,'lookup tables for the ledger''s words and labels; RESTRICT keys under reviews and findings; metrics.name catalogued','2026-11-02T06:00:00.000Z');
+INSERT INTO "schema_migrations" VALUES(7,'must-be-empty checks for history gaps, matches, off-plan and done-step coverage, closings, relations and checks; steps.no_findings_reason','2026-11-02T07:00:00.000Z');
+CREATE TABLE severities (
+  value    TEXT PRIMARY KEY,                 -- H, M, L, T
+  label    TEXT NOT NULL,
+  position INTEGER NOT NULL UNIQUE           -- most severe first
+);
+INSERT INTO "severities" VALUES('H','High',1);
+INSERT INTO "severities" VALUES('M','Medium',2);
+INSERT INTO "severities" VALUES('L','Low',3);
+INSERT INTO "severities" VALUES('T','Missing test',4);
+CREATE TABLE "step_commits" (
+  id            INTEGER PRIMARY KEY,
+  step_id       INTEGER NOT NULL REFERENCES steps(id) ON DELETE CASCADE,
+  repository_id INTEGER REFERENCES repositories(id),
+  commit_sha    TEXT NOT NULL CHECK ((length(commit_sha) = 40 OR length(commit_sha) = 64)
+                                   AND commit_sha NOT GLOB '*[^0-9a-f]*'),  -- full hash, lowercase hex
+  branch        TEXT,
+  pr_url        TEXT CHECK (pr_url IS NULL OR pr_url GLOB 'https://*' OR pr_url GLOB 'http://*'),
+  summary       TEXT,
+  committed_at  TEXT,
+  UNIQUE (step_id, commit_sha)
+);
+INSERT INTO "step_commits" VALUES(1,2,1,'4de736a28a4bc6e37b58c1b1014cb6f7c68f71ee','main',NULL,'Use secrets for sign-in codes',NULL);
+CREATE TABLE step_dependencies (
+  step_id            INTEGER NOT NULL REFERENCES steps(id) ON DELETE CASCADE,
+  depends_on_step_id INTEGER NOT NULL REFERENCES steps(id),
+  PRIMARY KEY (step_id, depends_on_step_id),
+  CHECK (step_id <> depends_on_step_id)
+);
+INSERT INTO "step_dependencies" VALUES(2,1);
+INSERT INTO "step_dependencies" VALUES(3,1);
+CREATE TABLE step_findings (
+  step_id      INTEGER NOT NULL REFERENCES steps(id) ON DELETE CASCADE,
+  finding_id   INTEGER NOT NULL REFERENCES findings(id),
+  multi_reason TEXT,          -- required when a finding is closed by more than one step
+  PRIMARY KEY (step_id, finding_id)
+);
+INSERT INTO "step_findings" VALUES(2,1,NULL);
+INSERT INTO "step_findings" VALUES(3,2,NULL);
+INSERT INTO "step_findings" VALUES(1,3,NULL);
+CREATE TABLE "steps" (
+  id                INTEGER PRIMARY KEY,
+  plan_id           INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+  phase_id          INTEGER NOT NULL REFERENCES phases(id),
+  number            INTEGER NOT NULL,
+  section           TEXT,
+  title             TEXT NOT NULL,
+  change            TEXT NOT NULL,
+  proof             TEXT NOT NULL,
+  owner_need        TEXT NOT NULL DEFAULT 'none' CHECK (owner_need IN
+                      ('none','decision','confirm','review','production')),
+  owner_question    TEXT,
+  behavior_change   INTEGER NOT NULL DEFAULT 0 CHECK (behavior_change IN (0,1)),
+  behavior_note     TEXT,
+  status            TEXT NOT NULL DEFAULT 'not-started' CHECK (status IN
+                      ('not-started','doing','waiting-owner','done','dropped')),
+  progress_note     TEXT,
+  drafter_key       TEXT,
+  started_at        TEXT,
+  done_at           TEXT,
+  updated_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  change_actor_id   INTEGER REFERENCES actors(id),
+  change_commit_sha TEXT CHECK (change_commit_sha IS NULL OR ((length(change_commit_sha) = 40 OR length(change_commit_sha) = 64) AND change_commit_sha NOT GLOB '*[^0-9a-f]*')),
+  change_note       TEXT, no_findings_reason TEXT,
+  UNIQUE (plan_id, number)
+);
+INSERT INTO "steps" VALUES(1,1,1,1,'CI','Run every suite in CI','Add a CI workflow.','CI fails on a broken test.','none',NULL,0,NULL,'not-started',NULL,NULL,'2026-11-01T09:19:00.000Z',NULL,'2026-11-01T09:19:00.000Z',NULL,NULL,NULL,NULL);
+INSERT INTO "steps" VALUES(2,1,2,2,NULL,'Use secrets for sign-in codes','Replace random with secrets in make_code.','test_code_uses_secrets fails before, passes after.','none',NULL,0,NULL,'done','Sign-in codes now come from a secure generator.',NULL,'2026-11-01T09:20:00.000Z','2026-11-11T05:25:14.078Z','2026-11-11T05:25:14.078Z',2,'4de736a28a4bc6e37b58c1b1014cb6f7c68f71ee',NULL,NULL);
+INSERT INTO "steps" VALUES(3,1,2,3,NULL,'Make the notice period a setting','Add notice_days setting.','Tests with 7 and 21 days.','decision','Should the default stay 14 days?',1,'Programs can set their own notice.','waiting-owner',NULL,NULL,'2026-11-01T09:21:00.000Z',NULL,'2026-11-11T05:25:14.078Z',NULL,NULL,NULL,NULL);
+CREATE TABLE "test_runs" (
+  id            INTEGER PRIMARY KEY,
+  review_id     INTEGER REFERENCES reviews(id),
+  step_id       INTEGER REFERENCES steps(id),
+  repository_id INTEGER REFERENCES repositories(id),
+  commit_sha    TEXT CHECK (commit_sha IS NULL OR ((length(commit_sha) = 40 OR length(commit_sha) = 64) AND commit_sha NOT GLOB '*[^0-9a-f]*')),
+  command       TEXT NOT NULL,
+  purpose       TEXT NOT NULL CHECK (purpose IN
+                  ('baseline','targeted','flake-check','mutation','before-fix','after-fix','ci')),
+  passed        INTEGER,
+  failed        INTEGER,
+  skipped       INTEGER,
+  errored       INTEGER,
+  exit_code     INTEGER,
+  duration_ms   INTEGER,
+  output_path   TEXT,
+  notes         TEXT,
+  started_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+INSERT INTO "test_runs" VALUES(1,1,NULL,1,'16822abc0b87e79b664c98f386b3354147e0f1bc','python3 -m unittest','baseline',12,0,0,0,0,900,NULL,NULL,'2026-11-01T09:08:30.000Z');
+CREATE TABLE themes (
+  code       TEXT PRIMARY KEY,           -- 'authorization', 'logging-audit' ...
+  name       TEXT NOT NULL,
+  retired_at TEXT
+);
+INSERT INTO "themes" VALUES('spec-mismatch','Spec mismatch',NULL);
+INSERT INTO "themes" VALUES('sign-in','Sign-in and sessions',NULL);
+INSERT INTO "themes" VALUES('authorization','Authorization',NULL);
+INSERT INTO "themes" VALUES('ops-security','Operations security',NULL);
+INSERT INTO "themes" VALUES('privacy','Privacy and retention',NULL);
+INSERT INTO "themes" VALUES('access','Access to links and pages',NULL);
+INSERT INTO "themes" VALUES('validation','Input validation',NULL);
+INSERT INTO "themes" VALUES('test-gaps','Test gaps',NULL);
+INSERT INTO "themes" VALUES('test-quality','Test suite quality',NULL);
+INSERT INTO "themes" VALUES('time','Time and dates',NULL);
+INSERT INTO "themes" VALUES('concurrency','Concurrency',NULL);
+INSERT INTO "themes" VALUES('failure-handling','Failure handling and idempotency',NULL);
+INSERT INTO "themes" VALUES('compatibility','Compatibility and migrations',NULL);
+INSERT INTO "themes" VALUES('defect','Defects',NULL);
+INSERT INTO "themes" VALUES('decision-placement','Decision placement',NULL);
+INSERT INTO "themes" VALUES('contracts','Inter-component contracts',NULL);
+INSERT INTO "themes" VALUES('workflow','Approvals and workflow flows',NULL);
+INSERT INTO "themes" VALUES('db-integrity','Database integrity, history, operations',NULL);
+INSERT INTO "themes" VALUES('client-api','Client API',NULL);
+INSERT INTO "themes" VALUES('generic','Generic text and logic',NULL);
+INSERT INTO "themes" VALUES('config-display','Display of configuration',NULL);
+INSERT INTO "themes" VALUES('internal-names','Internal names on screen',NULL);
+INSERT INTO "themes" VALUES('select-not-type','Select, not type',NULL);
+INSERT INTO "themes" VALUES('usability','Usability and accessibility',NULL);
+INSERT INTO "themes" VALUES('task-flows','Task flows',NULL);
+INSERT INTO "themes" VALUES('shared-frontend','Shared front end',NULL);
+INSERT INTO "themes" VALUES('shared-backend','Shared backend code',NULL);
+INSERT INTO "themes" VALUES('perf-backend','Performance: backend',NULL);
+INSERT INTO "themes" VALUES('perf-db','Performance: database',NULL);
+INSERT INTO "themes" VALUES('perf-frontend','Performance: front end',NULL);
+INSERT INTO "themes" VALUES('cost','Cost',NULL);
+INSERT INTO "themes" VALUES('email-jobs-feeds','Email, jobs and feeds',NULL);
+INSERT INTO "themes" VALUES('logging','Logging and audit',NULL);
+INSERT INTO "themes" VALUES('monitoring','Alerting and monitoring',NULL);
+INSERT INTO "themes" VALUES('ci-release','CI and release',NULL);
+INSERT INTO "themes" VALUES('backup-recovery','Backup and recovery',NULL);
+INSERT INTO "themes" VALUES('dependencies','Dependencies',NULL);
+INSERT INTO "themes" VALUES('docs-inline','Inline developer docs',NULL);
+INSERT INTO "themes" VALUES('docs-repo','Repo developer docs',NULL);
+INSERT INTO "themes" VALUES('docs-user','End-user docs',NULL);
+INSERT INTO "themes" VALUES('handover','Handover and ownership',NULL);
+INSERT INTO "themes" VALUES('localization','Localization',NULL);
+INSERT INTO "themes" VALUES('verify','Verify',NULL);
+INSERT INTO "themes" VALUES('other','Other',NULL);
+CREATE INDEX ix_step_findings_find   ON step_findings(finding_id);
+CREATE INDEX ix_deps_on              ON step_dependencies(depends_on_step_id);
+CREATE INDEX ix_steps_phase          ON steps(phase_id);
+CREATE INDEX ix_steps_status         ON steps(plan_id, status);
+CREATE INDEX ix_guard_issue          ON guard_tests(issue_id);
+CREATE INDEX ix_events_entity        ON events(entity_type, entity_id, at);
+CREATE UNIQUE INDEX ux_repositories_path      ON repositories(path);
+CREATE INDEX ix_fk_reviews_change_actor_id    ON reviews(change_actor_id);
+CREATE INDEX ix_fk_plans_change_actor_id      ON plans(change_actor_id);
+CREATE INDEX ix_fk_actors_parent_actor_id            ON actors(parent_actor_id);
+CREATE INDEX ix_fk_design_goals_superseded_by        ON design_goals(superseded_by);
+CREATE INDEX ix_fk_reviews_approved_by_actor_id      ON reviews(approved_by_actor_id);
+CREATE INDEX ix_fk_reviews_manager_actor_id          ON reviews(manager_actor_id);
+CREATE INDEX ix_fk_reviews_previous_review_id        ON reviews(previous_review_id);
+CREATE INDEX ix_fk_reviews_requested_by_actor_id     ON reviews(requested_by_actor_id);
+CREATE INDEX ix_fk_requirements_first_review_id      ON requirements(first_review_id);
+CREATE INDEX ix_fk_requirements_superseded_by        ON requirements(superseded_by);
+CREATE INDEX ix_fk_decisions_asked_by_actor_id       ON decisions(asked_by_actor_id);
+CREATE INDEX ix_fk_decisions_decided_by_actor_id     ON decisions(decided_by_actor_id);
+CREATE INDEX ix_fk_decisions_review_id               ON decisions(review_id);
+CREATE INDEX ix_fk_decisions_step_id                 ON decisions(step_id);
+CREATE INDEX ix_fk_decision_issues_issue_id          ON decision_issues(issue_id);
+CREATE INDEX ix_fk_plans_approved_by_actor_id        ON plans(approved_by_actor_id);
+CREATE INDEX ix_fk_plans_superseded_by               ON plans(superseded_by);
+CREATE INDEX ix_fk_plan_reviews_review_id            ON plan_reviews(review_id);
+CREATE INDEX ix_fk_steps_change_actor_id             ON steps(change_actor_id);
+CREATE INDEX ix_fk_step_commits_repository_id        ON step_commits(repository_id);
+CREATE INDEX ix_fk_guard_tests_last_confirmed_review_id ON guard_tests(last_confirmed_review_id);
+CREATE INDEX ix_fk_guard_tests_repository_id         ON guard_tests(repository_id);
+CREATE INDEX ix_fk_guard_tests_step_id               ON guard_tests(step_id);
+CREATE INDEX ix_fk_test_runs_repository_id           ON test_runs(repository_id);
+CREATE INDEX ix_fk_test_runs_review_id               ON test_runs(review_id);
+CREATE INDEX ix_fk_test_runs_step_id                 ON test_runs(step_id);
+CREATE INDEX ix_fk_artifacts_plan_id                 ON artifacts(plan_id);
+CREATE INDEX ix_fk_artifacts_review_id               ON artifacts(review_id);
+CREATE INDEX ix_fk_artifacts_reviewer_run_id         ON artifacts(reviewer_run_id);
+CREATE INDEX ix_fk_events_actor_id                   ON events(actor_id);
+CREATE INDEX ix_fk_events_review_id                  ON events(review_id);
+CREATE INDEX ix_fk_events_step_id                    ON events(step_id);
+CREATE INDEX ix_findings_review      ON findings(review_id);
+CREATE INDEX ix_findings_issue       ON findings(issue_id);
+CREATE INDEX ix_findings_fingerprint ON findings(fingerprint);
+CREATE INDEX ix_findings_slug        ON findings(domain_code, theme_code, sub);
+CREATE INDEX ix_locations_finding    ON finding_locations(finding_id);
+CREATE INDEX ix_locations_path       ON finding_locations(path, symbol);
+CREATE INDEX ix_issues_status        ON issues(status);
+CREATE INDEX ix_issues_fingerprint   ON issues(fingerprint);
+CREATE INDEX ix_issues_slug          ON issues(domain_code, theme_code, sub);
+CREATE INDEX ix_relations_to         ON issue_relations(to_issue_id);
+CREATE INDEX ix_checks_issue         ON review_issue_checks(issue_id);
+CREATE INDEX ix_metrics_name         ON metrics(name, scope);
+CREATE INDEX ix_runs_review          ON reviewer_runs(review_id);
+CREATE INDEX ix_gates_status         ON gates(status);
+CREATE UNIQUE INDEX ux_metrics_key            ON metrics(review_id, name, scope, COALESCE(repository_id, 0));
+CREATE UNIQUE INDEX ux_locations_one_primary  ON finding_locations(finding_id) WHERE role = 'primary';
+CREATE INDEX ix_fk_gates_change_actor_id      ON gates(change_actor_id);
+CREATE INDEX ix_fk_gates_answered_by_actor_id ON gates(answered_by_actor_id);
+CREATE INDEX ix_fk_review_repositories_repository_id ON review_repositories(repository_id);
+CREATE INDEX ix_fk_review_goals_goal_id              ON review_goals(goal_id);
+CREATE INDEX ix_fk_review_domains_domain_code        ON review_domains(domain_code);
+CREATE INDEX ix_fk_reviewer_runs_actor_id            ON reviewer_runs(actor_id);
+CREATE INDEX ix_fk_reviewer_runs_domain_code         ON reviewer_runs(domain_code);
+CREATE INDEX ix_fk_review_actors_actor_id            ON review_actors(actor_id);
+CREATE INDEX ix_fk_issues_change_actor_id            ON issues(change_actor_id);
+CREATE INDEX ix_fk_issues_change_review_id           ON issues(change_review_id);
+CREATE INDEX ix_fk_issues_change_step_id             ON issues(change_step_id);
+CREATE INDEX ix_fk_issues_first_seen_review_id       ON issues(first_seen_review_id);
+CREATE INDEX ix_fk_issues_last_checked_review_id     ON issues(last_checked_review_id);
+CREATE INDEX ix_fk_issues_last_seen_review_id        ON issues(last_seen_review_id);
+CREATE INDEX ix_fk_issues_theme_code                 ON issues(theme_code);
+CREATE INDEX ix_fk_issue_relations_established_by_actor_id ON issue_relations(established_by_actor_id);
+CREATE INDEX ix_fk_issue_relations_established_in_review_id ON issue_relations(established_in_review_id);
+CREATE INDEX ix_findings_run                         ON findings(reviewer_run_id);
+CREATE INDEX ix_fk_findings_theme_code               ON findings(theme_code);
+CREATE INDEX ix_fk_findings_verified_by_actor_id     ON findings(verified_by_actor_id);
+CREATE INDEX ix_fk_findings_discovered_in_step_id    ON findings(discovered_in_step_id);
+CREATE INDEX ix_fk_finding_locations_repository_id   ON finding_locations(repository_id);
+CREATE INDEX ix_fk_finding_goals_goal_id             ON finding_goals(goal_id);
+CREATE INDEX ix_fk_finding_requirements_requirement_id ON finding_requirements(requirement_id);
+CREATE INDEX ix_fk_review_requirement_checks_finding_id ON review_requirement_checks(finding_id);
+CREATE INDEX ix_fk_review_requirement_checks_requirement_id ON review_requirement_checks(requirement_id);
+CREATE INDEX ix_fk_review_issue_checks_actor_id      ON review_issue_checks(actor_id);
+CREATE INDEX ix_ric_finding                          ON review_issue_checks(finding_id);
+CREATE INDEX ix_gates_decision                       ON gates(decision_id);
+CREATE INDEX ix_fk_gates_issue_id                    ON gates(issue_id);
+CREATE INDEX ix_fk_gates_opened_by_actor_id          ON gates(opened_by_actor_id);
+CREATE INDEX ix_fk_gates_plan_id                     ON gates(plan_id);
+CREATE INDEX ix_fk_gates_review_id                   ON gates(review_id);
+CREATE INDEX ix_gates_step                           ON gates(step_id);
+CREATE INDEX ix_fk_metrics_domain_code               ON metrics(domain_code);
+CREATE INDEX ix_fk_metrics_repository_id             ON metrics(repository_id);
+CREATE INDEX ix_fk_issues_severity                   ON issues(severity);
+CREATE INDEX ix_fk_issue_relations_relation          ON issue_relations(relation);
+CREATE INDEX ix_fk_findings_severity                 ON findings(severity);
+CREATE INDEX ix_fk_findings_match_type               ON findings(match_type);
+CREATE INDEX ix_fk_gates_kind                        ON gates(kind);
+COMMIT;

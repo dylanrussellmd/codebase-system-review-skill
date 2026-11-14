@@ -249,7 +249,7 @@ class Helpers(browser.ViewerTestCase):
         page = self.open("#/reviews")
         self.assertEqual(page.text(".tabs .badge"), "2")
         gate = self.ids["gates"]["GATE-0002"]
-        self.write("UPDATE gates SET status='withdrawn' WHERE id=?", (gate,))
+        self.write("UPDATE gates SET status='withdrawn', change_actor_id=(SELECT min(id) FROM actors), change_note='not needed' WHERE id=?", (gate,))
         try:
             page.hash("#/issues")
             self.assertEqual(page.text(".tabs .badge"), "1")  # ISS-0259 fixed (step 177): current on every page

@@ -18,6 +18,7 @@ Files:        dump, restore, merge, progress-page, import-answers, set-report, s
 Reviews:      new-review, review-status, add-repo, add-actor, add-domain, review-domain, add-run, finish-run,
               set-verdict, set-doc-url, add-requirement, add-metric, add-artifact, record-test-run, redact
 Points:       import-findings, import-checks, load-index, match, verify, report-finding, issue-status
+Corrections:  rematch, correct-location, supersede-check, correct-issue, withdraw-gate, reopen-gate
 Owner:        open-gate, answer-gate, apply-gate, interview-ask, interview-answer, propose-goal, approve-goals,
               reject-goal, link-step-goals
 Ideas:        propose-feature, feature-gate, feature-status, features
@@ -37,11 +38,11 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote
 
 TOOL_VERSION = "1.12.0"  # stamped by dev/build.py from `metadata: version:` in SKILL.md's frontmatter
-TOOL_HASH = "e2910db189f57726a5e0aec8c474df5d1870734304e11b9e2941489032736ef3"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
+TOOL_HASH = "4e6d67bdc3a37b8509698476030d6de60342d8575e7c619db3347e4c7b5128b9"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
 # Placeholders: dev/build.py puts references/schema.sql, dev/page.html and references/migrations/*.sql in their
 # place when it writes scripts/ledger.py. dev/core.py itself is never run as the tool.
 SCHEMA = r"""-- =====================================================================
--- Code review ledger — schema version 21
+-- Code review ledger — schema version 22
 -- One SQLite file per project: <project root>/.code-review/ledger.sqlite
 -- Every connection must run:  PRAGMA foreign_keys = ON;
 -- Times are UTC ISO-8601 text with milliseconds (strftime('%Y-%m-%dT%H:%M:%fZ','now')); the tr_time_*
@@ -603,6 +604,8 @@ CREATE TABLE finding_locations (
                                             -- where the excerpt was read: the commit, or (schema 8) the working
                                             -- tree of a review that recorded uncommitted changes (is_dirty), since
                                             -- that is the text its reviewers saw (snapshot saves the patch)
+  change_actor_id INTEGER REFERENCES actors(id),  -- who corrects the path, lines or symbol (correct-location),
+  change_note     TEXT,                           -- and why: both go into its event, then are cleared (schema 22)
   CHECK (line_end IS NULL OR line_start IS NULL OR line_end >= line_start),
   -- path: relative (no leading / or -), no backslash, no .. segment, no control characters
   CHECK (length(path) > 0 AND path NOT GLOB '/*' AND path NOT GLOB '-*' AND path NOT GLOB '*\*'
@@ -653,6 +656,8 @@ CREATE TABLE review_issue_checks (
   evidence   TEXT,
   actor_id   INTEGER REFERENCES actors(id),
   checked_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  change_actor_id INTEGER REFERENCES actors(id),  -- who corrects the outcome, evidence or finding (supersede-check)
+  change_note     TEXT,                           -- and why: both go into its event, then are cleared (schema 22)
   PRIMARY KEY (review_id, issue_id)
 );
 
@@ -730,8 +735,10 @@ CREATE TABLE gates (
   change_actor_id INTEGER REFERENCES actors(id),       -- who made the next status change (applied, withdrawn);
                                             -- copied into its event, then cleared
   multi INTEGER NOT NULL DEFAULT 0 CHECK (multi IN (0,1)),   -- takes any number of its options (schema 18)
-  preselect TEXT CHECK (preselect IS NULL OR (json_valid(preselect) AND json_type(preselect) = 'array'))
+  preselect TEXT CHECK (preselect IS NULL OR (json_valid(preselect) AND json_type(preselect) = 'array')),
                                             -- the option values a multi-select gate shows ticked first
+  change_note TEXT                          -- why the next status change (withdrawn, reopened) is made; copied into
+                                            -- its event with change_actor_id, then cleared (schema 22)
 );
 
 -- ---------- The owner interview (schema 9, plan step 129) --------------
@@ -1185,10 +1192,10 @@ CREATE TABLE artifacts (
 -- The history: every status change and every other tracked change, in order.
 -- Append-only (G-04): triggers refuse every UPDATE and DELETE on events (tr_events_no_update/no_delete).
 -- Which tables write events (plan step 73; a test keeps these two lists equal to the triggers and the tables):
--- Logged: reviews, reviewer_runs, issues, issue_relations, findings, review_issue_checks, decisions, gates, plans,
--- steps, step_dependencies, step_findings, metrics, design_goals, interview_questions, interview_answers,
--- goal_sources, step_goals.
--- Not logged: finding_locations, finding_goals, finding_requirements, review_requirement_checks, test_runs,
+-- Logged: reviews, reviewer_runs, issues, issue_relations, findings, finding_locations,
+-- review_issue_checks, decisions, gates, plans, steps, step_dependencies, step_findings, metrics, design_goals,
+-- interview_questions, interview_answers, goal_sources, step_goals.
+-- Not logged: finding_goals, finding_requirements, review_requirement_checks, test_runs,
 -- artifacts, step_commits, guard_tests, decision_issues, plan_reviews, phases, review_repositories, review_goals,
 -- review_domains, review_environment, review_actors, actors, repositories, domains, domain_rules,
 -- domain_checks, checklist_answers, step_touches, step_conflicts, themes, feature_proposals,
@@ -1328,6 +1335,8 @@ CREATE INDEX ix_fk_finding_requirements_requirement_id ON finding_requirements(r
 CREATE INDEX ix_fk_review_requirement_checks_finding_id ON review_requirement_checks(finding_id);
 CREATE INDEX ix_fk_review_requirement_checks_requirement_id ON review_requirement_checks(requirement_id);
 CREATE INDEX ix_fk_review_issue_checks_actor_id      ON review_issue_checks(actor_id);
+CREATE INDEX ix_fk_review_issue_checks_change_actor_id ON review_issue_checks(change_actor_id);
+CREATE INDEX ix_fk_finding_locations_change_actor_id ON finding_locations(change_actor_id);
 CREATE INDEX ix_ric_finding                          ON review_issue_checks(finding_id);
 CREATE INDEX ix_fk_decisions_asked_by_actor_id       ON decisions(asked_by_actor_id);
 CREATE INDEX ix_fk_decisions_decided_by_actor_id     ON decisions(decided_by_actor_id);
@@ -1733,12 +1742,33 @@ WHEN NEW.commit_sha IS NULL BEGIN
   WHERE id = NEW.id;
 END;
 
--- Where a point was found does not change; fill-refs may still fill lines, excerpt, blob and permalink.
+-- Where a point was found does not change; fill-refs may still fill lines, excerpt, blob and permalink. A wrong
+-- path or symbol is corrected with who and why (change_actor_id, change_note: ledger.py
+-- correct-location), which tr_location_corrected logs.
 CREATE TRIGGER tr_location_immutable BEFORE UPDATE ON finding_locations
-WHEN OLD.finding_id IS NOT NEW.finding_id OR OLD.repository_id IS NOT NEW.repository_id
-  OR OLD.path IS NOT NEW.path OR OLD.symbol IS NOT NEW.symbol OR OLD.role IS NOT NEW.role
-  OR (OLD.commit_sha IS NOT NULL AND OLD.commit_sha IS NOT NEW.commit_sha) BEGIN
-  SELECT RAISE(ABORT, 'history is append-only: a location''s finding, repository, commit, path, symbol and role cannot change');
+WHEN OLD.finding_id IS NOT NEW.finding_id OR OLD.repository_id IS NOT NEW.repository_id OR OLD.role IS NOT NEW.role
+  OR (OLD.commit_sha IS NOT NULL AND OLD.commit_sha IS NOT NEW.commit_sha)
+  OR ((OLD.path IS NOT NEW.path OR OLD.symbol IS NOT NEW.symbol)
+      AND (NEW.change_actor_id IS NULL OR NULLIF(trim(NEW.change_note), '') IS NULL)) BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: a location''s finding, repository, commit and role cannot change, and its path and symbol change only with who and why (ledger.py correct-location)');
+END;
+
+-- Logs 'location-corrected' on the finding (from and to: path[:start[-end]][#symbol]) with who and why, then clears
+-- them.
+CREATE TRIGGER tr_location_corrected AFTER UPDATE ON finding_locations
+WHEN NEW.change_actor_id IS NOT NULL AND NEW.change_note IS NOT NULL BEGIN
+  INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id, note)
+  VALUES ('finding', NEW.finding_id, 'location-corrected',
+          OLD.path || CASE WHEN OLD.whole_file = 1 OR OLD.line_start IS NULL THEN ''
+                           ELSE ':' || OLD.line_start || CASE WHEN COALESCE(OLD.line_end, OLD.line_start) = OLD.line_start
+                                                              THEN '' ELSE '-' || OLD.line_end END END
+                   || COALESCE('#' || OLD.symbol, ''),
+          NEW.path || CASE WHEN NEW.whole_file = 1 OR NEW.line_start IS NULL THEN ''
+                           ELSE ':' || NEW.line_start || CASE WHEN COALESCE(NEW.line_end, NEW.line_start) = NEW.line_start
+                                                              THEN '' ELSE '-' || NEW.line_end END END
+                   || COALESCE('#' || NEW.symbol, ''),
+          NEW.change_actor_id, (SELECT review_id FROM findings WHERE id = NEW.finding_id), NEW.change_note);
+  UPDATE finding_locations SET change_actor_id = NULL, change_note = NULL WHERE id = NEW.id;
 END;
 
 -- Refuses DELETE: where a point was found is history.
@@ -1848,9 +1878,43 @@ CREATE TRIGGER tr_check_guard BEFORE INSERT ON review_issue_checks BEGIN
                   AND f.verification <> 'false');
 END;
 
--- A recorded check is never changed.
-CREATE TRIGGER tr_check_no_update BEFORE UPDATE ON review_issue_checks BEGIN
-  SELECT RAISE(ABORT, 'history is append-only: review checks cannot be changed');
+-- A recorded check is never changed, except its outcome, evidence or finding corrected with who and why
+-- (change_actor_id, change_note: ledger.py supersede-check), which tr_check_corrected logs with the old check.
+CREATE TRIGGER tr_check_no_update BEFORE UPDATE ON review_issue_checks
+WHEN OLD.review_id IS NOT NEW.review_id OR OLD.issue_id IS NOT NEW.issue_id OR OLD.actor_id IS NOT NEW.actor_id
+  OR OLD.checked_at IS NOT NEW.checked_at
+  OR ((OLD.outcome IS NOT NEW.outcome OR OLD.evidence IS NOT NEW.evidence OR OLD.finding_id IS NOT NEW.finding_id)
+      AND (NEW.change_actor_id IS NULL OR NULLIF(trim(NEW.change_note), '') IS NULL)) BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: a review check changes only by a correction with who and why (ledger.py supersede-check)');
+END;
+
+-- A corrected check keeps the rules of a new one (tr_check_needs_evidence, tr_check_guard).
+CREATE TRIGGER tr_check_correction_rules BEFORE UPDATE OF outcome, evidence, finding_id ON review_issue_checks
+WHEN NEW.change_actor_id IS NOT NULL AND NEW.change_note IS NOT NULL BEGIN
+  SELECT RAISE(ABORT, 'a fixed, regressed or changed check needs evidence (what the review saw)')
+  WHERE NEW.outcome IN ('fixed','regressed','changed') AND NULLIF(trim(NEW.evidence), '') IS NULL;
+  SELECT RAISE(ABORT, 'the check''s finding belongs to another review')
+  WHERE NEW.finding_id IS NOT NULL
+    AND (SELECT review_id FROM findings WHERE id = NEW.finding_id) IS NOT NEW.review_id;
+  SELECT RAISE(ABORT, 'this review raised the issue again in a finding; it cannot also record it fixed')
+  WHERE NEW.outcome = 'fixed' AND OLD.outcome IS NOT 'fixed'
+    AND EXISTS (SELECT 1 FROM findings f WHERE f.review_id = NEW.review_id AND f.issue_id = NEW.issue_id
+                  AND f.verification <> 'false');
+END;
+
+-- Logs 'check-corrected' on the issue: the old and the new check ('outcome: evidence (point)'), who and why; then
+-- clears them. The issue's status stays: issue-status moves it.
+CREATE TRIGGER tr_check_corrected AFTER UPDATE ON review_issue_checks
+WHEN NEW.change_actor_id IS NOT NULL AND NEW.change_note IS NOT NULL BEGIN
+  INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id, note)
+  VALUES ('issue', NEW.issue_id, 'check-corrected',
+          OLD.outcome || COALESCE(': ' || OLD.evidence, '')
+            || COALESCE(' (' || (SELECT point_id FROM findings WHERE id = OLD.finding_id) || ')', ''),
+          NEW.outcome || COALESCE(': ' || NEW.evidence, '')
+            || COALESCE(' (' || (SELECT point_id FROM findings WHERE id = NEW.finding_id) || ')', ''),
+          NEW.change_actor_id, NEW.review_id, NEW.change_note);
+  UPDATE review_issue_checks SET change_actor_id = NULL, change_note = NULL
+   WHERE review_id = NEW.review_id AND issue_id = NEW.issue_id;
 END;
 
 -- Refuses DELETE: checks are history.
@@ -2455,11 +2519,15 @@ END;
 
 -- A gate moves open -> answered -> applied (or withdrawn); it cannot be applied before it is answered. Any
 -- status may go back to open (reopening, with the answer cleared: tr_gate_answer_final, tr_gate_answer_cleared).
+-- Withdrawing names who and why (change_actor_id, change_note: ledger.py withdraw-gate).
 CREATE TRIGGER tr_gate_transition BEFORE UPDATE OF status ON gates
-WHEN OLD.status IS NOT NEW.status AND NEW.status <> 'open'
- AND NOT ((OLD.status = 'open' AND NEW.status IN ('answered','withdrawn'))
-       OR (OLD.status = 'answered' AND NEW.status IN ('applied','withdrawn'))) BEGIN
-  SELECT RAISE(ABORT, 'a gate moves open -> answered -> applied (or withdrawn); answer it before applying it');
+WHEN OLD.status IS NOT NEW.status BEGIN
+  SELECT RAISE(ABORT, 'a gate moves open -> answered -> applied (or withdrawn); answer it before applying it')
+  WHERE NEW.status <> 'open'
+    AND NOT ((OLD.status = 'open' AND NEW.status IN ('answered','withdrawn'))
+          OR (OLD.status = 'answered' AND NEW.status IN ('applied','withdrawn')));
+  SELECT RAISE(ABORT, 'a gate is withdrawn with change_actor_id and change_note (who and why: ledger.py withdraw-gate)')
+  WHERE NEW.status = 'withdrawn' AND (NEW.change_actor_id IS NULL OR NULLIF(trim(NEW.change_note), '') IS NULL);
 END;
 
 -- Logs 'opened' with the gate's title and who opened it.
@@ -2468,15 +2536,19 @@ CREATE TRIGGER tr_gate_created AFTER INSERT ON gates BEGIN
   VALUES ('gate', NEW.id, 'opened', NEW.status, NEW.opened_by_actor_id, NEW.review_id, NEW.step_id, NEW.title);
 END;
 
--- Answered: the event carries who answered and 'value: text'; applied: who applied it and applied_note.
+-- Answered: the event carries who answered and 'value: text'; applied: who applied it and applied_note; withdrawn
+-- or reopened: who and change_note. A reopening that clears an answer is logged once, by tr_gate_answer_cleared.
 CREATE TRIGGER tr_gate_status AFTER UPDATE OF status ON gates
-WHEN OLD.status IS NOT NEW.status BEGIN
+WHEN OLD.status IS NOT NEW.status
+ AND NOT (NEW.status = 'open' AND (OLD.answer_value IS NOT NULL OR OLD.answer_text IS NOT NULL)
+          AND NEW.answer_value IS NULL AND NEW.answer_text IS NULL) BEGIN
   INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id, step_id, note)
   VALUES ('gate', NEW.id, 'status-changed', OLD.status, NEW.status,
           CASE WHEN NEW.status = 'answered' THEN COALESCE(NEW.answered_by_actor_id, NEW.change_actor_id)
                ELSE NEW.change_actor_id END,
           NEW.review_id, NEW.step_id,
           CASE WHEN NEW.status = 'applied' THEN NEW.applied_note
+               WHEN NEW.status IN ('withdrawn','open') THEN NEW.change_note
                ELSE COALESCE(CASE WHEN NEW.multi = 1 AND json_valid(NEW.answer_value)
                                    THEN (SELECT COALESCE(group_concat(value, ', '), 'none') FROM json_each(NEW.answer_value))
                                    ELSE NEW.answer_value END || ': ', '') || COALESCE(NEW.answer_text, '') END);
@@ -2506,13 +2578,15 @@ WHEN OLD.status <> 'open' AND NEW.status <> 'open'
   SELECT RAISE(ABORT, 'who answered a gate, how and when cannot be changed once it is answered');
 END;
 
--- Logs 'answer-cleared', with the answer it held, when a gate is reopened.
+-- Logs 'answer-cleared' when a gate is reopened: who reopened it and why (change_actor_id, change_note: ledger.py
+-- reopen-gate), and the answer it held.
 CREATE TRIGGER tr_gate_answer_cleared AFTER UPDATE OF answer_value, answer_text ON gates
 WHEN OLD.status <> 'open' AND NEW.status = 'open'
  AND (OLD.answer_value IS NOT NULL OR OLD.answer_text IS NOT NULL) BEGIN
-  INSERT INTO events(entity_type, entity_id, event, from_value, to_value, review_id, step_id, note)
-  VALUES ('gate', NEW.id, 'answer-cleared', OLD.answer_value, NULL, NEW.review_id, NEW.step_id,
-          'reopened; the answer was: ' || COALESCE(OLD.answer_value || ': ', '') || COALESCE(OLD.answer_text, ''));
+  INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id, step_id, note)
+  VALUES ('gate', NEW.id, 'answer-cleared', OLD.answer_value, NULL, NEW.change_actor_id, NEW.review_id, NEW.step_id,
+          'reopened' || COALESCE(': ' || NEW.change_note, '') || '; the answer was: '
+          || COALESCE(OLD.answer_value || ': ', '') || COALESCE(OLD.answer_text, ''));
 END;
 
 -- An answer replaced while the gate is still open is logged with the old and new answer.
@@ -2524,15 +2598,16 @@ WHEN OLD.status = 'open' AND (OLD.answer_value IS NOT NULL OR OLD.answer_text IS
           NEW.step_id, 'was: ' || COALESCE(OLD.answer_text, '') || '; now: ' || COALESCE(NEW.answer_text, ''));
 END;
 
--- Once logged, change_actor_id is cleared.
-CREATE TRIGGER tr_gate_context_cleared AFTER UPDATE ON gates WHEN NEW.change_actor_id IS NOT NULL BEGIN
-  UPDATE gates SET change_actor_id = NULL WHERE id = NEW.id;
+-- Once logged, change_actor_id and change_note are cleared.
+CREATE TRIGGER tr_gate_context_cleared AFTER UPDATE ON gates
+WHEN NEW.change_actor_id IS NOT NULL OR NEW.change_note IS NOT NULL BEGIN
+  UPDATE gates SET change_actor_id = NULL, change_note = NULL WHERE id = NEW.id;
 END;
 
--- The same after an INSERT that carried it.
+-- The same after an INSERT that carried them.
 CREATE TRIGGER tr_gate_context_cleared_ins AFTER INSERT ON gates
-WHEN NEW.change_actor_id IS NOT NULL BEGIN
-  UPDATE gates SET change_actor_id = NULL WHERE id = NEW.id;
+WHEN NEW.change_actor_id IS NOT NULL OR NEW.change_note IS NOT NULL BEGIN
+  UPDATE gates SET change_actor_id = NULL, change_note = NULL WHERE id = NEW.id;
 END;
 
 -- Refuses DELETE: a gate no longer needed is withdrawn.
@@ -4328,6 +4403,11 @@ INSERT INTO enum_labels(enum, value, label, position) VALUES
 INSERT INTO enum_labels(enum, value, label, position) VALUES
  ('event','answers-imported','Answers brought in from the published page',31);
 
+INSERT INTO enum_labels(enum, value, label, position) VALUES
+ ('event','rematched','A point was moved to the right issue',32),
+ ('event','location-corrected','Where a point is was corrected',33),
+ ('event','check-corrected','A review check was corrected',34);
+
 INSERT INTO ledger_checks(view, label, tier, position) VALUES
  ('v_artifacts_outside_ledger','Review files recorded outside the ledger''s folder','warning',110);
 -- Each domain's checklist (the table "Checklists" in references/domains.md).
@@ -4487,7 +4567,7 @@ INSERT INTO enum_labels(enum, value, label, position) VALUES
  ('tool_output_format','json','JSON',5), ('tool_output_format','jsonl','JSON lines',6),
  ('tool_result_level','error','Error',1), ('tool_result_level','warning','Warning',2),
  ('tool_result_level','note','Note',3), ('tool_result_level','none','No level',4);
-INSERT INTO meta(key, value) VALUES ('schema_version','21');
+INSERT INTO meta(key, value) VALUES ('schema_version','22');
 INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger schema'),
   (2, 'url, path, hash and code checks; repositories.allow_outside_root; finding_locations.excerpt_redacted'),
   (3, 'integrity rules: codes, hashes, checks, append-only history, owner actor on gate answers'),
@@ -4508,7 +4588,8 @@ INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger s
   (18, 'multi-select gates: gates.multi and gates.preselect; a multi-select answer is a JSON list of option values'),
   (19, 'the features domain and feature_proposals: additions to the reviewed codebase that would serve the owner''s goals'),
   (20, 'tool_runs and tool_results: the picked tools'' runs at the reviewed commit, and their results as leads'),
-  (21, 'indexes for check''s views, which read them instead of every row; the answers-imported event');
+  (21, 'indexes for check''s views, which read them instead of every row; the answers-imported event'),
+  (22, 'correction commands: who corrects a gate, a location or a check, and why');
 """
 PAGE = r"""<!doctype html>
 <html lang="en">
@@ -5276,7 +5357,7 @@ const optOf = (g, v) => ((g.options || []).find(o => o.value === v) || {}).label
 const optLabel = g => g.answer_label || (Array.isArray(g.answer_value) ? g.answer_value.map(v => optOf(g, v)).join(", ") || "None of them" : optOf(g, g.answer_value));
 
 // level: "h3" for a gate listed under a section heading. moved(card, gate, note): called once the gate is answered.
-const FINAL = "You can't change an answer once it is sent.";
+const FINAL = "Wrong answer? Tell the agent; it can reopen the question.";
 const IN_CHAT = "Answer this one in the chat with the agent.";
 // What an open gate is answered with: its options as one radio group (checkboxes, the recommended ones ticked, with
 // Select all and Select none, when it takes several) and, where the gate takes text, a text box. hid: the id of the
@@ -8079,6 +8160,25 @@ CREATE INDEX ix_locations_untraceable ON finding_locations(finding_id)
 
 INSERT INTO enum_labels(enum, value, label, position) VALUES
  ('event','answers-imported','Answers brought in from the published page',31);
+-- migration: 0022-corrections.sql
+-- correction commands: who corrects a gate, a location or a check, and why
+-- Plan P-0002 step 8 (WALK-M9, LOG-M3, OWN-R3-11). withdraw-gate and reopen-gate set gates.change_note with
+-- change_actor_id, and tr_gate_transition refuses a withdrawal without both; correct-location and supersede-check
+-- set change_actor_id and change_note on finding_locations and review_issue_checks, which their triggers log and
+-- clear. migrate re-creates the triggers with the shipped schema. The three events the commands write get labels.
+
+ALTER TABLE gates ADD COLUMN change_note TEXT;
+ALTER TABLE finding_locations ADD COLUMN change_actor_id INTEGER REFERENCES actors(id);
+ALTER TABLE finding_locations ADD COLUMN change_note TEXT;
+ALTER TABLE review_issue_checks ADD COLUMN change_actor_id INTEGER REFERENCES actors(id);
+ALTER TABLE review_issue_checks ADD COLUMN change_note TEXT;
+CREATE INDEX ix_fk_review_issue_checks_change_actor_id ON review_issue_checks(change_actor_id);
+CREATE INDEX ix_fk_finding_locations_change_actor_id ON finding_locations(change_actor_id);
+
+INSERT INTO enum_labels(enum, value, label, position) VALUES
+ ('event','rematched','A point was moved to the right issue',32),
+ ('event','location-corrected','Where a point is was corrected',33),
+ ('event','check-corrected','A review check was corrected',34);
 """
 
 
@@ -10017,7 +10117,7 @@ CHECK_ACTIONS = {
     "v_done_steps_open_issues": "The agent marks the issues of a finished step fixed, or notes why one stays open.",
     "v_closed_without_reason": "The agent records why the issue was accepted or declined.",
     "v_relation_problems": "The agent records the link between the two issues once, in one direction.",
-    "v_check_finding_owner": "The agent records the check again in the review its point belongs to.",
+    "v_check_finding_owner": "The agent points the check at its own issue's point, or at none.",
     "v_unguarded_fixes": "The agent records a test that guards each fix listed.",
     "v_artifacts_outside_ledger": "The agent copies the file into the ledger's folder and records it there.",
     "v_unresolved_conflicts": "The agent judges each pair of steps with resolve-conflict before the plan is approved.",
@@ -13973,6 +14073,244 @@ def cmd_match(ctx):
                           a.relations or "")]
 
 
+# ----- corrections: rematch, correct-location, supersede-check, correct-issue, withdraw-gate, reopen-gate
+#
+# History is never deleted: each correction changes the row in place with who and why, and one event keeps the old
+# value (references/recipes.md#correcting-the-ledger). Each command refuses a missing --reason/--note or --actor and
+# a correction that changes nothing.
+
+def _correction_context(ctx, text, flag="--reason"):
+    """(reason, actor id) of a correction: both are required."""
+    reason = _need(_text_arg(text, flag), f"{flag} (why the correction is right)")
+    if ctx.actor_id is None:
+        raise WriteError("give --actor (who makes the correction, A-0001)")
+    return reason, ctx.actor_id
+
+
+def _review_ref(con, spec, what):
+    """(review row, the part after the colon) of 'R-0001:<what>'."""
+    code, sep, rest = (spec or "").partition(":")
+    if not sep or not REVIEW_CODE.fullmatch(code) or not rest.strip():
+        raise WriteError(f"{spec!r} is not REVIEW:{what} (R-0001:{'SEC-M1' if what == 'POINT' else 'ISS-0001'})")
+    return review_row(con, code), rest.strip()
+
+
+def _review_point(con, spec):
+    """(review row, findings row) of 'R-0001:SEC-M1'."""
+    rv, point = _review_ref(con, spec, "POINT")
+    f = one(con, "SELECT * FROM findings WHERE review_id=? AND point_id=?", (rv["id"], point))
+    if not f:
+        raise WriteError(f"{rv['code']} has no point {point}")
+    return rv, f
+
+
+def location_text(path, a, b, symbol, whole):
+    """path[:start[-end]][#symbol], as the location-corrected event writes it."""
+    lines = "" if whole or a is None else f":{a}" + ("" if (b or a) == a else f"-{b}")
+    return f"{path}{lines}" + (f"#{symbol}" if symbol else "")
+
+
+@_command("rematch", "move matched points to the issue they belong to (an ISS- code, or new with --title); logs a "
+                     "rematched event on each with who and why",
+          f"ledger.py rematch R-0001:SEC-M1 [R-0001:SEC-M2 ...] ISS-0002|new --reason TEXT --actor A-0001 "
+          f"[--type {MATCH_TYPES_HELP}] [--confidence certain|likely|possible] [--title TEXT] "
+          f"[--relations 'related-to:ISS-0003']")
+def cmd_rematch(ctx):
+    a, con = ctx.a, ctx.con
+    reason, actor = _correction_context(ctx, a.reason)
+    new = a.target.lower() == "new"
+    title = (a.title or "").strip()
+    if new and not title:
+        raise WriteError("a new issue needs --title (what the problem is, in a few words)")
+    if title and not new:
+        raise WriteError("--title goes with new")
+    points = [_review_point(con, spec) for spec in a.points]
+    if len({(rv["id"], f["id"]) for rv, f in points}) != len(points):
+        raise WriteError("a point is named twice")
+    out, left = [], {}
+    target = None if new else issue_row(con, a.target)["code"]
+    for n, ((rv, f), spec) in enumerate(zip(points, a.points)):
+        if f["issue_id"] is None:
+            raise WriteError(f"{spec} is not matched yet; match it (ledger.py match)")
+        old = one(con, "SELECT id, code FROM issues WHERE id=?", (f["issue_id"],))
+        if target == old["code"]:
+            raise WriteError(f"{spec} is already matched to {old['code']}")
+        if target is None:  # new: one issue for every point named
+            target = open_issue_for(ctx, f, rv, title=title)[1]
+        mtype = a.type or ("new" if new else None)
+        match_finding(ctx, rv, f["point_id"], target, mtype, a.confidence or f["match_confidence"] or "likely",
+                      reason, (a.relations or "") if n == 0 else "")
+        ctx.x("""INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id, note)
+                 VALUES ('finding', ?, 'rematched', ?, ?, ?, ?, ?)""",
+              (f["id"], old["code"], target, actor, rv["id"], reason))
+        out.append(f"{rv['code']}:{f['point_id']}: {old['code']} -> {target} {mtype}")
+        left.setdefault(old["id"], (old["code"], []))[1].append(f)
+    for iid, (code, moved) in left.items():
+        iss = one(con, "SELECT status, current_state FROM issues WHERE id=?", (iid,))
+        rest = con.execute("SELECT count(*) FROM findings WHERE issue_id=?", (iid,)).fetchone()[0]
+        if not rest:
+            out.append(f"note: {code} has no points left; close it: ledger.py issue-status {code} duplicate|obsolete "
+                       f"--note '<why>' --resolution '<where its points went>'")
+        elif any(iss["current_state"] is not None and iss["current_state"] == f["before_state"] for f in moved):
+            out.append(f"note: {code}'s current state is still the text of a point that left it; set it: ledger.py "
+                       f"correct-issue {code} --current '<what it does now>' --reason '<why>' --actor <A->")
+    return out
+
+
+@_command("correct-location", "correct where a point is (path, lines or symbol) at the commit it cites; logs a "
+                              "location-corrected event with who and why",
+          "ledger.py correct-location R-0001:SEC-M1 --from [REPO:]PATH[:START[-END]][#SYMBOL] "
+          "--to [REPO:]PATH[:START[-END]][#SYMBOL] --reason TEXT --actor A-0001")
+def cmd_correct_location(ctx):
+    a, con = ctx.a, ctx.con
+    reason, actor = _correction_context(ctx, a.reason)
+    rv, f = _review_point(con, a.point)
+    spec = f"{rv['code']}:{f['point_id']}"
+    repos = _review_repos(con, rv["id"])
+    default_repo = next(iter(repos)) if len(repos) == 1 else None
+    try:
+        r1, p1, a1, b1, s1 = parse_location(_need(a.source, "--from (the location as recorded)"), set(repos),
+                                            default_repo)
+        r2, p2, a2, b2, s2 = parse_location(_need(a.to, "--to (the right location)"), set(repos), default_repo)
+    except ValueError as e:
+        raise WriteError(str(e))
+    if r1 != r2:
+        raise WriteError("a location stays in its repository; cite the point anew with report-finding")
+    repo = repos[r1]
+    locs = [l for l in rows(con, "SELECT * FROM finding_locations WHERE finding_id=? AND repository_id=? AND path=? "
+                                 "ORDER BY id", (f["id"], repo["id"], p1))
+            if (a1 is None or (l["line_start"] == a1 and (l["line_end"] or l["line_start"]) == b1))
+            and (s1 is None or l["symbol"] == s1)]
+    if not locs:
+        have = "; ".join(location_text(l["path"], l["line_start"], l["line_end"], l["symbol"], l["whole_file"])
+                         for l in rows(con, "SELECT * FROM finding_locations WHERE finding_id=? ORDER BY id", (f["id"],)))
+        raise WriteError(f"{spec} has no location {location_text(p1, a1, b1, s1, a1 is None and not s1)} "
+                         f"(it has: {have})")
+    if len(locs) > 1:
+        raise WriteError(f"{spec} has {len(locs)} locations at {p1}; give --from with its lines")
+    loc = locs[0]
+    new = cited_location(ctx.root, repo, loc["commit_sha"], p2, a2, b2, s2)
+    was = location_text(loc["path"], loc["line_start"], loc["line_end"], loc["symbol"], loc["whole_file"])
+    now = location_text(new["path"], new["line_start"], new["line_end"], new["symbol"], new["whole_file"])
+    if was == now:
+        raise WriteError(f"{spec}: the location is already {now}")
+    new["permalink"] = None
+    if repo["permalink_template"]:
+        link = permalink_for(repo["permalink_template"], loc["commit_sha"], p2,
+                             None if new["whole_file"] else new["line_start"],
+                             None if new["whole_file"] else new["line_end"])
+        new["permalink"] = link if link and SAFE_URL.match(link) else None
+    sets = {k: new[k] for k in ("path", "line_start", "line_end", "symbol", "blob_sha", "excerpt", "excerpt_sha256",
+                                "excerpt_redacted", "whole_file", "excerpt_status", "permalink")}
+    sets.update(source="commit", change_actor_id=actor, change_note=reason)
+    ctx.x(f"UPDATE finding_locations SET {', '.join(k + '=?' for k in sets)} WHERE id=?", (*sets.values(), loc["id"]))
+    return [f"{spec}: {was} -> {now}"]
+
+
+@_command("supersede-check", "correct a review's check of a known issue (its outcome, evidence or the point it "
+                             "cites); the old check stays in a check-corrected event with who and why",
+          "ledger.py supersede-check R-0001:ISS-0001 [--outcome OUTCOME] [--evidence TEXT] [--finding POINT|none] "
+          "--reason TEXT --actor A-0001")
+def cmd_supersede_check(ctx):
+    a, con = ctx.a, ctx.con
+    reason, actor = _correction_context(ctx, a.reason)
+    rv, code = _review_ref(con, a.check, "ISSUE")
+    iss = issue_row(con, code)
+    c = one(con, "SELECT * FROM review_issue_checks WHERE review_id=? AND issue_id=?", (rv["id"], iss["id"]))
+    if not c:
+        raise WriteError(f"{rv['code']} has no check of {iss['code']}")
+    outcome = a.outcome or c["outcome"]
+    if outcome not in CHECK_OUTCOMES:
+        raise WriteError(f"outcome {outcome!r} is not one of {', '.join(CHECK_OUTCOMES)}")
+    evidence = c["evidence"] if a.evidence is None else ((_text_arg(a.evidence, "--evidence") or "").strip() or None)
+    fid = c["finding_id"]
+    if a.finding is not None:
+        if a.finding.strip().lower() == "none":
+            fid = None
+        else:
+            fid = _review_point(con, f"{rv['code']}:{a.finding.strip()}")[1]["id"]
+
+    def point(i):
+        return con.execute("SELECT point_id FROM findings WHERE id=?", (i,)).fetchone()[0] if i else "none"
+    what = []
+    if outcome != c["outcome"]:
+        what.append(f"outcome {c['outcome']} -> {outcome}")
+    if evidence != c["evidence"]:
+        what.append("evidence")
+    if fid != c["finding_id"]:
+        what.append(f"finding {point(c['finding_id'])} -> {point(fid)}")
+    if not what:
+        raise WriteError(f"this changes nothing: {rv['code']}'s check of {iss['code']} already says that")
+    ctx.x("""UPDATE review_issue_checks SET outcome=?, evidence=?, finding_id=?, change_actor_id=?, change_note=?
+             WHERE review_id=? AND issue_id=?""", (outcome, evidence, fid, actor, reason, rv["id"], iss["id"]))
+    out = [f"{rv['code']}:{iss['code']}: check corrected ({', '.join(what)})"]
+    if outcome != c["outcome"]:
+        out.append(f"note: {iss['code']} stays {iss['status']}; move it with issue-status if the corrected outcome "
+                   f"changes it")
+    return out
+
+
+@_command("correct-issue", "correct an issue's current state or after-the-fix text, with who and why (logged)",
+          "ledger.py correct-issue ISS-0001 [--current TEXT] [--after TEXT] --reason TEXT --actor A-0001")
+def cmd_correct_issue(ctx):
+    a, con = ctx.a, ctx.con
+    reason, actor = _correction_context(ctx, a.reason)
+    iss = issue_row(con, a.issue)
+    sets, what = {}, []
+    for flag, col, label in (("current", "current_state", "current state"), ("after", "after_state", "after state")):
+        text = _text_arg(getattr(a, flag), f"--{flag}")
+        if text is None:
+            continue
+        text = _need(text, f"--{flag} (the corrected text)")
+        if text != iss[col]:
+            sets[col] = text
+            what.append(label)
+    if not sets:
+        raise WriteError(f"this changes nothing: give --current or --after with text {iss['code']} does not have yet")
+    sets.update(change_note=reason, change_actor_id=actor)
+    ctx.x(f"UPDATE issues SET {', '.join(k + '=?' for k in sets)} WHERE id=?", (*sets.values(), iss["id"]))
+    return [f"{iss['code']}: {' and '.join(what)} corrected"]
+
+
+def _gate_by_code(con, code):
+    """The gates row of a code like GATE-0001; WriteError when there is none."""
+    g = one(con, "SELECT * FROM gates WHERE code=?", (code,))
+    if not g:
+        raise WriteError(f"no such gate {code}")
+    return g
+
+
+@_command("withdraw-gate", "withdraw an open or answered gate nobody needs, with who and why (logged)",
+          "ledger.py withdraw-gate GATE-0001 --note TEXT --actor A-0001")
+def cmd_withdraw_gate(ctx):
+    a, con = ctx.a, ctx.con
+    note, actor = _correction_context(ctx, a.note, "--note")
+    g = _gate_by_code(con, a.gate)
+    if g["status"] not in ("open", "answered"):
+        raise WriteError(f"{g['code']} is {g['status']}; only an open or answered gate can be withdrawn")
+    ctx.x("UPDATE gates SET status='withdrawn', change_actor_id=?, change_note=? WHERE id=?", (actor, note, g["id"]))
+    return [f"{g['code']}: {g['status']} -> withdrawn"]
+
+
+@_command("reopen-gate", "reopen an answered or withdrawn gate so the owner answers again; the old answer stays in "
+                         "its answer-cleared event with who and why",
+          "ledger.py reopen-gate GATE-0001 --note TEXT --actor A-0001")
+def cmd_reopen_gate(ctx):
+    a, con = ctx.a, ctx.con
+    note, actor = _correction_context(ctx, a.note, "--note")
+    g = _gate_by_code(con, a.gate)
+    if g["status"] == "open":
+        raise WriteError(f"{g['code']} is open already")
+    if g["status"] == "applied":
+        raise WriteError(f"{g['code']} is applied: its answer was acted on; open a new gate to ask again")
+    ctx.x("""UPDATE gates SET status='open', answer_value=NULL, answer_text=NULL, answered_by=NULL, answered_via=NULL,
+             answered_by_actor_id=NULL, answered_at=NULL, change_actor_id=?, change_note=? WHERE id=?""",
+          (actor, note, g["id"]))
+    was = ": ".join(x for x in (g["answer_value"], g["answer_text"]) if x)
+    return [f"{g['code']}: {g['status']} -> open" + (f" (the answer was {was})" if was else "")]
+
+
+
 AUTO_RULES = ("same fingerprint", "same domain and sub", "same symbol")
 
 
@@ -15143,6 +15481,22 @@ def add_write_commands_131(p):
     s = p("redact"); s.add_argument("field", help="TABLE.COLUMN, e.g. findings.summary")
     s.add_argument("row", help="a row id, a code (ISS-0001), or R-0001:SEC-H1 for a finding")
     s.add_argument("--reason"); s.add_argument("--only", help="redact only this part of the text (the secret)")
+    s = p("rematch"); s.add_argument("points", nargs="+", metavar="POINT", help="R-0001:SEC-M1 (one or more)")
+    s.add_argument("target", metavar="ISSUE", help="the issue it belongs to (ISS-0001), or new")
+    s.add_argument("--type"); s.add_argument("--confidence", help="certain, likely or possible (default: as matched)")
+    s.add_argument("--title", help="with new: the new issue's title"); s.add_argument("--relations")
+    s.add_argument("--reason", help="why the point belongs there, in one plain sentence")
+    s = p("correct-location"); s.add_argument("point", help="R-0001:SEC-M1")
+    s.add_argument("--from", dest="source", metavar="LOCATION", help="the location as recorded")
+    s.add_argument("--to", metavar="LOCATION", help="the right location, at the same commit")
+    s.add_argument("--reason")
+    s = p("supersede-check"); s.add_argument("check", help="R-0001:ISS-0001 (the review and the issue it checked)")
+    s.add_argument("--outcome", help=", ".join(CHECK_OUTCOMES)); s.add_argument("--evidence", help="what the review saw")
+    s.add_argument("--finding", help="the point of the same review it cites, or none"); s.add_argument("--reason")
+    s = p("correct-issue"); s.add_argument("issue"); s.add_argument("--current", help="what the system does now")
+    s.add_argument("--after", help="what it does once fixed"); s.add_argument("--reason")
+    s = p("withdraw-gate"); s.add_argument("gate"); s.add_argument("--note", help="why nobody needs it")
+    s = p("reopen-gate"); s.add_argument("gate"); s.add_argument("--note", help="why the owner answers again")
 
 
 # ----- the reviewed text of a dirty working tree (D-14, used by fill_refs)

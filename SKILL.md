@@ -51,8 +51,8 @@ Every command has `--help`; `ledger.py schema` prints every table and column wit
   came through the viewer or hub is confirmed by the owner in chat before you act on it.
 - **Writes go through commands.** Each runs in one `BEGIN IMMEDIATE` transaction, stamps `--actor` (pass the
   manager's `A-` code to every write), prints its result only after it commits, and on a refusal prints one line and
-  exits 1 with nothing written: read it, fix the cause, run it again. Raw SQL is only for the corrections in
-  `references/recipes.md#correcting-the-ledger`.
+  exits 1 with nothing written: read it, fix the cause, run it again. Corrections are commands too, each with its
+  reason (`references/recipes.md#correcting-the-ledger`).
 - **One writer.** Only the manager writes, except: the viewer and `import-answers` write gate answers; an implementer
   writes its own steps (`step-status`, `add-commit`, `add-guard`, `report-finding`) under its own actor. Reviewers,
   verifiers, indexers, matchers and drafters read with `ledger.py query "SELECT ..."` (TSV or `--json`; refuses any
@@ -87,8 +87,8 @@ push tags (`git push origin review/R-0001`, then `ledger.py tag-review R-0001 --
   **Approvals block**: runs and findings need an approved review, which needs its applied `domain-approval` gate; a
   plan is approved only once its `plan-approval` gate is; a step cannot start or finish while a blocking gate is open.
 - **Absence is not a fix.** Only a `fixed` check (with evidence) or `issue-status ... fixed` moves an issue; only a
-  later review's `fixed` check makes it `verified`. **History is append-only**: events, checks and finding text never
-  change, nothing is deleted; correct with a new row or a status change that says why (`references/recipes.md#correcting-the-ledger`).
+  later review's `fixed` check makes it `verified`. **History is append-only**: events and finding text never change,
+  nothing is deleted; a correction says why (`references/recipes.md#correcting-the-ledger`).
 - **`check` fails** while a must-be-empty view has rows: `v_unmatched_findings`, `v_unchecked_known_issues`,
   `v_untraceable_refs`, `v_uncovered_findings`, `v_coverage_problems`, `v_unplanned_discoveries`, `v_history_gaps`,
   `v_match_problems`, `v_off_plan_coverage`, `v_done_steps_open_issues`, `v_closed_without_reason`,
@@ -154,7 +154,7 @@ separate review or plan documents: the report and the narrative live in the ledg
   then `ledger.py gates`; `gates`, `check` and `progress-page` say when a published page's answers were last imported.
   In chat: `ledger.py answer-gate GATE-0001 --value approve --text '<their words>'` (refused once the gate is not open).
 - **Act, then close**: `ledger.py apply-gate GATE-0001 --note '<what you did>'` (a `decision` gate also records the
-  decision; to withdraw or re-ask: `references/recipes.md#withdraw-or-change-a-gate`).
+  decision). `withdraw-gate` or, to let the owner change an answer, `reopen-gate` (`--note '<why>'`).
 
 ## Step 0: Draft the design goals
 

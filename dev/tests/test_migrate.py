@@ -83,6 +83,120 @@ class Embedding(unittest.TestCase):
         self.assertEqual(con.execute("SELECT count(*) FROM a").fetchone()[0], 2)
 
 
+# Lookup tables every ledger holds exactly as a fresh init seeds them.
+LOOKUPS = ("enum_labels", "ledger_checks", "issue_statuses", "severities", "match_types", "relation_types",
+           "gate_kinds", "goal_statuses")
+
+
+def rows_of(db, table):
+    con = sqlite3.connect(str(db))
+    try:
+        cols = [r[1] for r in con.execute(f'PRAGMA table_info("{table}")')]
+        return cols, sorted(con.execute(f'SELECT * FROM "{table}"').fetchall(), key=repr)
+    finally:
+        con.close()
+
+
+class EveryRelease(unittest.TestCase):
+    """A ledger of each released schema (dev/tests/data/ledger-v<N>.sql, a row in every table) upgrades to the
+    shipped one, and the released migration files stay as they shipped (dev/tests/data/migrations.sha256)."""
+
+    def test_migrate_from_every_released_schema(self):
+        """test_migrate_from_every_version: for N in 1..SHIPPED-1 the fixture has a row in every table of schema N,
+        migrates to the shipped schema, keeps every row, has the objects and lookups of a fresh init, and passes
+        verify_schema and check."""
+        ledger_py = fixtures.built_ledger_path()
+        mod = fixtures.load_ledger_module(ledger_py)
+        fresh = init_fresh(ledger_py)
+        fresh_counts = M.counts(fresh)
+        self.assertEqual(list(M.RELEASED), list(range(1, M.SHIPPED)))
+        for n in M.RELEASED:
+            with self.subTest(schema=n):
+                self.assertTrue(M.FIXTURE(n).exists(), f"no fixture for released schema {n}: "
+                                                      f"python3 -m dev.tests._migrate_helpers --write-fixture {n}")
+                project, db = M.restore(n)
+                self.assertEqual(M.meta(db)["schema_version"], str(n))
+                before = M.counts(db)
+                self.assertEqual([t for t, c in before.items() if c == 0], [], "a table of the fixture has no row")
+                ids = {t: rows_of(db, t) for t in before}
+                p = run_ledger("--root", project, "migrate", ledger_py=ledger_py)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertIn(f"from schema {n} to {M.SHIPPED}", p.stdout)
+                self.assertEqual(M.objects(db), M.objects(fresh), "the migrated schema differs from a fresh init")
+                after = M.counts(db)
+                for table, count in before.items():
+                    if table in ("meta", "schema_migrations"):
+                        continue
+                    if fresh_counts.get(table):   # a seeded table: later migrations may add rows
+                        self.assertGreaterEqual(after[table], count, table)
+                    else:
+                        self.assertEqual(after[table], count, f"rows of {table} changed")
+                    cols, old = ids[table]
+                    if "id" in cols:
+                        kept = {r[0] for r in sqlite3.connect(str(db)).execute(f'SELECT id FROM "{table}"')}
+                        self.assertLessEqual({r[cols.index("id")] for r in old}, kept, f"rows of {table} lost")
+                for table in LOOKUPS:
+                    self.assertEqual(rows_of(db, table), rows_of(fresh, table), f"{table} differs from a fresh init")
+                con = sqlite3.connect(str(db))
+                try:
+                    self.assertEqual(mod.verify_schema(con), [])
+                    self.assertEqual([r[0] for r in con.execute("SELECT version FROM schema_migrations "
+                                                                 "ORDER BY version")], list(range(1, M.SHIPPED + 1)))
+                finally:
+                    con.close()
+                p = run_ledger("--root", project, "check", ledger_py=ledger_py)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+
+    def test_released_migrations_unchanged(self):
+        """test_applied_migrations_unchanged: every listed migration's sha256 matches, the list is the first files of
+        references/migrations in order, and a one-byte edit of 0006-lookups.sql in a copy fails this check and
+        dev/build.py."""
+        listed = M.migration_hashes()
+        files = sorted(f.name for f in (fixtures.REPO_ROOT / "references" / "migrations").glob("*.sql"))
+        self.assertEqual([name for name, _ in listed], files[:len(listed)])
+        self.assertGreaterEqual(len(listed), 21)
+        for name, digest in listed:
+            self.assertEqual(M.sha256(fixtures.REPO_ROOT / "references" / "migrations" / name), digest,
+                             f"{name} changed after its release; put the change in a new migration")
+        build = fixtures.load_build_module()
+        root = M.copy_sources()
+        (root / "dev" / "tests" / "data").mkdir(parents=True)
+        (root / "dev" / "tests" / "data" / "migrations.sha256").write_bytes(M.MIGRATION_HASHES.read_bytes())
+        build.build(root)   # the copy builds as it is
+        f = root / "references" / "migrations" / "0006-lookups.sql"
+        data = bytearray(f.read_bytes())
+        at = data.index(b"\n--", data.index(b"\n") + 1) + 4   # one letter of a comment after the description line
+        data[at] = data[at] ^ 0x20
+        f.write_bytes(bytes(data))
+        self.assertNotEqual(M.sha256(f), dict(listed)["0006-lookups.sql"])
+        with self.assertRaises(build.BuildError) as cm:
+            build.build(root)
+        self.assertIn("0006-lookups.sql", str(cm.exception))
+        self.assertIn("released", str(cm.exception))
+
+    def test_v16_fixture_needs_no_git(self):
+        """The schema-16 ledger the FromV16 tests start from is a frozen file: restoring it runs no git."""
+        import subprocess
+        from unittest import mock
+        real = subprocess.run
+
+        def no_git(cmd, *a, **kw):
+            if cmd and str(cmd[0]).endswith("git"):
+                raise AssertionError(f"git ran: {cmd}")
+            return real(cmd, *a, **kw)
+        with mock.patch("subprocess.run", no_git):
+            project, db = M.restore_v16()
+        con = sqlite3.connect(str(db))
+        try:
+            self.assertEqual(con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0], "16")
+            self.assertGreater(con.execute("SELECT count(*) FROM sqlite_master WHERE type='trigger'").fetchone()[0], 100)
+        finally:
+            con.close()
+        p = run_ledger("--root", project, "migrate", env={**os.environ, "PATH": str(fixtures.temp_dir("no-git-"))})
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("0017-step-order", p.stdout)
+
+
 class Migrate(unittest.TestCase):
     def assertMatchesFresh(self, db, ledger_py, before_counts):
         mod = fixtures.load_ledger_module(ledger_py)

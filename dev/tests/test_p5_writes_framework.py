@@ -206,15 +206,16 @@ class MainTest(unittest.TestCase):
 
 class MigrationTest(unittest.TestCase):
     def test_migrate_7_to_8_adds_source_and_next_codes(self):
-        """The demo ledger of the oldest schema migrates through 7 to 8: every existing reference gets source
-        'commit', v_next_codes is there, and the result matches the shipped schema."""
+        """The schema-7 fixture migrates to 8 and on: every existing reference gets source 'commit', v_next_codes
+        is there, and the result matches the shipped schema."""
         from dev.tests import _migrate_helpers as M
-        project_dir, db = M.restore_v1()
+        project_dir, db = M.restore(7)
         refs = sqlite3.connect(str(db)).execute("SELECT count(*) FROM finding_locations").fetchone()[0]
         self.assertGreater(refs, 0)
         ledger_py = new_ledger().ledger_py
         p = fixtures.run_ledger("--root", project_dir, "migrate", ledger_py=ledger_py)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("from schema 7", p.stdout)
         self.assertIn("0008-write-commands", p.stdout)
         mod = fixtures.load_ledger_module(ledger_py)
         c = sqlite3.connect(str(db))

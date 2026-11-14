@@ -222,9 +222,10 @@ class Leads(unittest.TestCase):
     def test_schema_upgrade_from_19(self):
         """A ledger of the previous schema gains the two tables, the check and the labels on migrate."""
         from dev.tests import _migrate_helpers as M
-        project_dir, db = M.restore_v1()
+        project_dir, db = M.restore(19)
         p = fixtures.run_ledger("--root", project_dir, "migrate")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("from schema 19", p.stdout)
         self.assertIn("0020-tool-runs", p.stdout)
         con = sqlite3.connect(str(db))
         try:

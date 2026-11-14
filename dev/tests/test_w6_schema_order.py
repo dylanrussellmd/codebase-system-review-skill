@@ -6,7 +6,6 @@ higher number) that must run before an earlier-numbered one.
 """
 import shutil
 import sqlite3
-import subprocess
 import unittest
 
 from dev.tests import fixtures
@@ -109,40 +108,11 @@ class StepOrder(unittest.TestCase):
         self.assertEqual([line.split("|")[1].strip() for line in steps], ["2", "3", "1"])
 
 
-V16 = "c06a6e6"
-
-
-def v16_ledger_py():
-    """ledger.py built from the sources at commit c06a6e6 (schema 16), or None when git cannot give them."""
-    root = fixtures.temp_dir("v16-")
-    paths = ["SKILL.md", "dev/core.py", "dev/build.py", "dev/page.html", "references/schema.sql",
-             "references/migrations"]
-    try:
-        tar = subprocess.run(["git", "-C", str(fixtures.REPO_ROOT), "archive", V16, *paths], capture_output=True,
-                             check=True).stdout
-        subprocess.run(["tar", "-x", "-C", str(root)], input=tar, check=True, capture_output=True)
-    except (OSError, subprocess.CalledProcessError):
-        return None
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("ledger_build_v16", str(root / "dev" / "build.py"))
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    (root / "scripts").mkdir(exist_ok=True)
-    out = root / "scripts" / "ledger.py"
-    out.write_bytes(mod.build(root).encode("utf-8"))
-    return out
-
-
 class FromV16(unittest.TestCase):
     def test_migration_from_v16(self):
-        old = v16_ledger_py()
-        if old is None:
-            self.skipTest(f"environment: git cannot give the sources at {V16}")
-        project = fixtures.temp_dir("v16-proj-") / "proj"
-        project.mkdir()
-        p = fixtures.run_ledger("--root", project, "init", ledger_py=old)
-        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        db = project / ".code-review" / "ledger.sqlite"
+        """A ledger made by init of the schema-16 tool (dev/tests/data/ledger-v16-init.sql) keeps its own step order
+        rule until migrate, then takes schema 17's."""
+        project, db = M.restore_v16()
         con = sqlite3.connect(str(db))
         con.execute("PRAGMA foreign_keys = ON")
         self.assertEqual(con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0], "16")

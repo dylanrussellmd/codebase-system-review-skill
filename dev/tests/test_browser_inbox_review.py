@@ -95,7 +95,7 @@ class Inbox(browser.ViewerTestCase):
                          (0, 0, 0))
         self.assertEqual(c5.locator("p.note").inner_text(), "Answer this one in the chat with the agent.")
         # an answer cannot be changed once sent, and the form says so beside Send
-        self.assertEqual(c1.locator(".tools .note").inner_text(), "You can't change an answer once it is sent.")
+        self.assertEqual(c1.locator(".tools .note").inner_text(), "Wrong answer? Tell the agent; it can reopen the question.")
 
     test_gate_without_options_or_text_shows_chat_hint = test_page_gate_form_shape
 

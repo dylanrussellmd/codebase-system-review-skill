@@ -207,7 +207,8 @@ contains three double quotes in a row or ends with a backslash or a double quote
 ## Changing the schema
 
 A schema change ships as a numbered migration, never as an edit alone. `migrate` upgrades a ledger from any schema
-since 1 (frozen in `dev/tests/data/schema-v1.sql`):
+since 1. `dev/tests/data/` holds a ledger of each released schema with a row in every table (`ledger-v1.sql`,
+`ledger-v2.sql` and on), and `test_migrate_from_every_released_schema` upgrades each one:
 
 1. Add `references/migrations/NNNN-<slug>.sql` (the next number; lowercase slug). Its first line is
    `-- <description>`. It holds only what changes tables, indexes and data, from schema NNNN-1 to NNNN. Views and
@@ -218,11 +219,15 @@ since 1 (frozen in `dev/tests/data/schema-v1.sql`):
 2. Edit `references/schema.sql` to the new end state, and in the same change set its header line to `schema version
    NNNN`, the meta seed to `'NNNN'`, and add `(NNNN, '<description>')` to the `schema_migrations` seed. The build
    refuses if any of these disagrees with the highest migration (`SCHEMA_VERSION` in ledger.py is that number).
-3. Add a test that restores the frozen v1 ledger (`dev/tests/_migrate_helpers.py`), runs `migrate`, and checks the
-   result against a fresh `init` (`dev/tests/test_migrate.py` shows how); then rebuild with `python3 dev/build.py`.
+3. Add a test that restores the fixture of the schema before it (`M.restore(N)`, `dev/tests/_migrate_helpers.py`),
+   runs `migrate`, and checks what the migration does; a new table gets a row in `FILL`. Then rebuild with
+   `python3 dev/build.py`.
 4. Bump `metadata:` `version:` in SKILL.md's frontmatter and add a line to CHANGELOG.md.
+5. On release, freeze the schema it ships: `python3 -m dev.tests._migrate_helpers --write-fixture NNNN` writes
+   `ledger-vNNNN.sql`, and the migration's `sha256sum` line goes at the end of `dev/tests/data/migrations.sha256`.
 
-A migration file stays as it is once any ledger has run it. `migrate` refuses a ledger newer than the
+A migration file stays as it is once it is released: the build refuses when a file `migrations.sha256` lists has
+changed. `migrate` refuses a ledger newer than the
 tool, backs the ledger up with SQLite's backup API to `ledger.sqlite.bak-v<old version>` (never overwriting an earlier
 backup), applies every pending step in one `BEGIN IMMEDIATE` transaction, records each in `schema_migrations`, sets
 `meta.schema_version` and `PRAGMA user_version`, and rolls everything back (removing the backup, the ledger

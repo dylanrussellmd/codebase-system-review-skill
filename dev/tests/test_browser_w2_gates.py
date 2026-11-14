@@ -188,12 +188,12 @@ class Gates(browser.ViewerTestCase):
             self.assertEqual(page.count(".card.gate"), 3)
             # the badge follows on any page, and a hidden window does not ask
             page.hash("#/plans")
-            self.write("UPDATE gates SET status='withdrawn' WHERE code='GATE-0003'")
+            self.write("UPDATE gates SET status='withdrawn', change_actor_id=(SELECT min(id) FROM actors), change_note='not needed' WHERE code='GATE-0003'")
             page.page.wait_for_timeout(2100)
             page.after(lambda: page.js("() => { document.dispatchEvent(new Event('visibilitychange')); }"))
             self.assertEqual(page.text(".tabs .badge"), "2")
         finally:
-            self.write("UPDATE gates SET status='withdrawn' WHERE code='GATE-0003' AND status='open'")
+            self.write("UPDATE gates SET status='withdrawn', change_actor_id=(SELECT min(id) FROM actors), change_note='not needed' WHERE code='GATE-0003' AND status='open'")
 
     def test_page_tabs_badge(self):
         page = self.open("#/issues")

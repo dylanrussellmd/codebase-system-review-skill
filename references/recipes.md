@@ -204,19 +204,45 @@ A document the owner keeps elsewhere and asks to link is an artifact too:
 
 ## Correcting the ledger
 
-History is never deleted; every correction is a new row or a change with its reason. The skill uses hand-written SQL
-only in these blocks.
+History is never deleted. A correction changes the row with who made it and why (`--actor`, `--reason` or `--note`,
+both required), and its event keeps the old value; a correction that changes nothing is refused. The skill uses
+hand-written SQL only in the blocks of this section.
 
 ### Re-match a finding
 
-Point it at the right issue; the ledger recounts both issues and logs an `unlinked` event on the old one.
+Point it at the right issue; the ledger recounts both issues and logs `rematched` on the finding and `unlinked` on
+the old issue.
 
-```sql
-BEGIN IMMEDIATE;
-UPDATE findings SET issue_id = (SELECT id FROM issues WHERE code = 'ISS-0003'), match_type = 'still-present',
-       match_confidence = 'likely', match_rationale = 'same hardcoded limit, matched to ISS-0004 by mistake'
- WHERE review_id = (SELECT id FROM reviews WHERE code = 'R-0002') AND point_id = 'SEC-M1';
-COMMIT;
+```sh
+ledger.py rematch R-0002:SEC-M1 ISS-0003 --type still-present --reason 'same admin check, matched to ISS-0004 by mistake' --actor A-0002
+```
+
+Several points that belong to one problem no issue holds yet go to one new issue:
+`ledger.py rematch R-0002:SEC-M1 R-0002:SEC-M2 new --title '<the problem>' --reason '<why>' --actor A-0002`
+(`--relations related-to:ISS-0001` links it). `rematch` says when the old issue has no points left (close it with
+`issue-status`) or still shows a moved point's text as its current state:
+
+```sh
+ledger.py correct-issue ISS-0004 --current 'The code compare uses ==.' --reason 'SEC-M1 moved to ISS-0003' --actor A-0002
+```
+
+### Correct a location
+
+A location cites the wrong file, lines or symbol at its commit. `--from` names it as recorded, `--to` the right one;
+the excerpt is read again from the same commit.
+
+```sh
+ledger.py correct-location R-0002:SPEC-M1 --from src/requests.py:2-4#can_request --to src/requests.py:2-3#can_request --reason 'the limit is on lines 2-3' --actor A-0002
+```
+
+### Correct a review's check
+
+`supersede-check` replaces a check's outcome, evidence or the point it cites (`--finding none` for none); the
+`check-corrected` event keeps the old check. The issue's status stays: move it with `issue-status` when the new
+outcome changes it.
+
+```sh
+ledger.py supersede-check R-0002:ISS-0003 --outcome still-present --evidence 'admins still skip the weekend limit' --reason 'the reviewer did look' --actor A-0002
 ```
 
 ### Undo an automatic regression
@@ -258,19 +284,13 @@ ledger.py answer-gate GATE-0004 --value ruff --value mypy --text 'not Vale yet'
 
 ### Withdraw or change a gate
 
-A gate nobody needs is withdrawn (only an open or answered one). To ask again, open a new gate; or reopen
-an answered one by clearing both answer columns (the cleared answer stays in `events`).
+A gate nobody needs is withdrawn (only an open or answered one). To ask again, open a new gate; to let the owner
+answer an answered or withdrawn gate again, reopen it (the old answer stays in its `answer-cleared` event).
 
-```sql
-BEGIN IMMEDIATE;
-UPDATE gates SET status = 'withdrawn',
-       change_actor_id = (SELECT id FROM actors WHERE kind = 'manager' ORDER BY id DESC LIMIT 1)
- WHERE code = 'GATE-0001' AND status IN ('open', 'answered');
-COMMIT;
+```sh
+ledger.py withdraw-gate GATE-0001 --note 'the owner settled it in chat' --actor A-0002
+ledger.py reopen-gate GATE-0004 --note 'the owner meant to allow Vale' --actor A-0002
 ```
-
-Check that it changed one row (`ledger.py gates`). To reopen instead:
-`UPDATE gates SET status = 'open', answer_value = NULL, answer_text = NULL WHERE code = 'GATE-0002' AND status = 'answered';`
 
 ### A review started by mistake
 
@@ -307,8 +327,8 @@ Add the known issue to its report's `known.tsv` (`not-checked` if nobody looked)
 
 #### `v_untraceable_refs`
 
-Run `tag-review` and `fill-refs`. A symbol they could not place needs lines: a new point with the right location,
-or `report-finding` for a discovery.
+Run `tag-review` and `fill-refs`. A location that cites the wrong path, a folder or lines past the end of the
+file: `correct-location` with the right path and lines at the same commit.
 
 #### `v_uncovered_findings`
 
@@ -348,7 +368,9 @@ Add the right relation, and close or reopen the issue with a note.
 
 #### `v_check_finding_owner`
 
-Record the check again in the review its finding belongs to.
+Point the check at its own issue's point, or at none when the other point is only evidence:
+`ledger.py supersede-check R-0002:ISS-0001 --finding none --evidence '<what the review saw, naming the point>'
+--reason '<why>' --actor A-0002`.
 
 #### `v_unguarded_fixes`
 

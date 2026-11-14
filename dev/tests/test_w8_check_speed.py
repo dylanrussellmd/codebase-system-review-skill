@@ -194,7 +194,7 @@ class CheckViews(unittest.TestCase):
 
     def test_schema_upgrade_from_20(self):
         from dev.tests import _migrate_helpers as M
-        project_dir, db = M.restore_v1()
+        project_dir, db = M.restore(20)
         p = fixtures.run_ledger("--root", project_dir, "migrate")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertIn("0021-check-speed", p.stdout)

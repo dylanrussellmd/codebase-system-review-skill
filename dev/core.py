@@ -18,6 +18,7 @@ Files:        dump, restore, merge, progress-page, import-answers, set-report, s
 Reviews:      new-review, review-status, add-repo, add-actor, add-domain, review-domain, add-run, finish-run,
               set-verdict, set-doc-url, add-requirement, add-metric, add-artifact, record-test-run, redact
 Points:       import-findings, import-checks, load-index, match, verify, report-finding, issue-status
+Corrections:  rematch, correct-location, supersede-check, correct-issue, withdraw-gate, reopen-gate
 Owner:        open-gate, answer-gate, apply-gate, interview-ask, interview-answer, propose-goal, approve-goals,
               reject-goal, link-step-goals
 Ideas:        propose-feature, feature-gate, feature-status, features
@@ -1980,7 +1981,7 @@ CHECK_ACTIONS = {
     "v_done_steps_open_issues": "The agent marks the issues of a finished step fixed, or notes why one stays open.",
     "v_closed_without_reason": "The agent records why the issue was accepted or declined.",
     "v_relation_problems": "The agent records the link between the two issues once, in one direction.",
-    "v_check_finding_owner": "The agent records the check again in the review its point belongs to.",
+    "v_check_finding_owner": "The agent points the check at its own issue's point, or at none.",
     "v_unguarded_fixes": "The agent records a test that guards each fix listed.",
     "v_artifacts_outside_ledger": "The agent copies the file into the ledger's folder and records it there.",
     "v_unresolved_conflicts": "The agent judges each pair of steps with resolve-conflict before the plan is approved.",
@@ -5936,6 +5937,244 @@ def cmd_match(ctx):
                           a.relations or "")]
 
 
+# ----- corrections: rematch, correct-location, supersede-check, correct-issue, withdraw-gate, reopen-gate
+#
+# History is never deleted: each correction changes the row in place with who and why, and one event keeps the old
+# value (references/recipes.md#correcting-the-ledger). Each command refuses a missing --reason/--note or --actor and
+# a correction that changes nothing.
+
+def _correction_context(ctx, text, flag="--reason"):
+    """(reason, actor id) of a correction: both are required."""
+    reason = _need(_text_arg(text, flag), f"{flag} (why the correction is right)")
+    if ctx.actor_id is None:
+        raise WriteError("give --actor (who makes the correction, A-0001)")
+    return reason, ctx.actor_id
+
+
+def _review_ref(con, spec, what):
+    """(review row, the part after the colon) of 'R-0001:<what>'."""
+    code, sep, rest = (spec or "").partition(":")
+    if not sep or not REVIEW_CODE.fullmatch(code) or not rest.strip():
+        raise WriteError(f"{spec!r} is not REVIEW:{what} (R-0001:{'SEC-M1' if what == 'POINT' else 'ISS-0001'})")
+    return review_row(con, code), rest.strip()
+
+
+def _review_point(con, spec):
+    """(review row, findings row) of 'R-0001:SEC-M1'."""
+    rv, point = _review_ref(con, spec, "POINT")
+    f = one(con, "SELECT * FROM findings WHERE review_id=? AND point_id=?", (rv["id"], point))
+    if not f:
+        raise WriteError(f"{rv['code']} has no point {point}")
+    return rv, f
+
+
+def location_text(path, a, b, symbol, whole):
+    """path[:start[-end]][#symbol], as the location-corrected event writes it."""
+    lines = "" if whole or a is None else f":{a}" + ("" if (b or a) == a else f"-{b}")
+    return f"{path}{lines}" + (f"#{symbol}" if symbol else "")
+
+
+@_command("rematch", "move matched points to the issue they belong to (an ISS- code, or new with --title); logs a "
+                     "rematched event on each with who and why",
+          f"ledger.py rematch R-0001:SEC-M1 [R-0001:SEC-M2 ...] ISS-0002|new --reason TEXT --actor A-0001 "
+          f"[--type {MATCH_TYPES_HELP}] [--confidence certain|likely|possible] [--title TEXT] "
+          f"[--relations 'related-to:ISS-0003']")
+def cmd_rematch(ctx):
+    a, con = ctx.a, ctx.con
+    reason, actor = _correction_context(ctx, a.reason)
+    new = a.target.lower() == "new"
+    title = (a.title or "").strip()
+    if new and not title:
+        raise WriteError("a new issue needs --title (what the problem is, in a few words)")
+    if title and not new:
+        raise WriteError("--title goes with new")
+    points = [_review_point(con, spec) for spec in a.points]
+    if len({(rv["id"], f["id"]) for rv, f in points}) != len(points):
+        raise WriteError("a point is named twice")
+    out, left = [], {}
+    target = None if new else issue_row(con, a.target)["code"]
+    for n, ((rv, f), spec) in enumerate(zip(points, a.points)):
+        if f["issue_id"] is None:
+            raise WriteError(f"{spec} is not matched yet; match it (ledger.py match)")
+        old = one(con, "SELECT id, code FROM issues WHERE id=?", (f["issue_id"],))
+        if target == old["code"]:
+            raise WriteError(f"{spec} is already matched to {old['code']}")
+        if target is None:  # new: one issue for every point named
+            target = open_issue_for(ctx, f, rv, title=title)[1]
+        mtype = a.type or ("new" if new else None)
+        match_finding(ctx, rv, f["point_id"], target, mtype, a.confidence or f["match_confidence"] or "likely",
+                      reason, (a.relations or "") if n == 0 else "")
+        ctx.x("""INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, review_id, note)
+                 VALUES ('finding', ?, 'rematched', ?, ?, ?, ?, ?)""",
+              (f["id"], old["code"], target, actor, rv["id"], reason))
+        out.append(f"{rv['code']}:{f['point_id']}: {old['code']} -> {target} {mtype}")
+        left.setdefault(old["id"], (old["code"], []))[1].append(f)
+    for iid, (code, moved) in left.items():
+        iss = one(con, "SELECT status, current_state FROM issues WHERE id=?", (iid,))
+        rest = con.execute("SELECT count(*) FROM findings WHERE issue_id=?", (iid,)).fetchone()[0]
+        if not rest:
+            out.append(f"note: {code} has no points left; close it: ledger.py issue-status {code} duplicate|obsolete "
+                       f"--note '<why>' --resolution '<where its points went>'")
+        elif any(iss["current_state"] is not None and iss["current_state"] == f["before_state"] for f in moved):
+            out.append(f"note: {code}'s current state is still the text of a point that left it; set it: ledger.py "
+                       f"correct-issue {code} --current '<what it does now>' --reason '<why>' --actor <A->")
+    return out
+
+
+@_command("correct-location", "correct where a point is (path, lines or symbol) at the commit it cites; logs a "
+                              "location-corrected event with who and why",
+          "ledger.py correct-location R-0001:SEC-M1 --from [REPO:]PATH[:START[-END]][#SYMBOL] "
+          "--to [REPO:]PATH[:START[-END]][#SYMBOL] --reason TEXT --actor A-0001")
+def cmd_correct_location(ctx):
+    a, con = ctx.a, ctx.con
+    reason, actor = _correction_context(ctx, a.reason)
+    rv, f = _review_point(con, a.point)
+    spec = f"{rv['code']}:{f['point_id']}"
+    repos = _review_repos(con, rv["id"])
+    default_repo = next(iter(repos)) if len(repos) == 1 else None
+    try:
+        r1, p1, a1, b1, s1 = parse_location(_need(a.source, "--from (the location as recorded)"), set(repos),
+                                            default_repo)
+        r2, p2, a2, b2, s2 = parse_location(_need(a.to, "--to (the right location)"), set(repos), default_repo)
+    except ValueError as e:
+        raise WriteError(str(e))
+    if r1 != r2:
+        raise WriteError("a location stays in its repository; cite the point anew with report-finding")
+    repo = repos[r1]
+    locs = [l for l in rows(con, "SELECT * FROM finding_locations WHERE finding_id=? AND repository_id=? AND path=? "
+                                 "ORDER BY id", (f["id"], repo["id"], p1))
+            if (a1 is None or (l["line_start"] == a1 and (l["line_end"] or l["line_start"]) == b1))
+            and (s1 is None or l["symbol"] == s1)]
+    if not locs:
+        have = "; ".join(location_text(l["path"], l["line_start"], l["line_end"], l["symbol"], l["whole_file"])
+                         for l in rows(con, "SELECT * FROM finding_locations WHERE finding_id=? ORDER BY id", (f["id"],)))
+        raise WriteError(f"{spec} has no location {location_text(p1, a1, b1, s1, a1 is None and not s1)} "
+                         f"(it has: {have})")
+    if len(locs) > 1:
+        raise WriteError(f"{spec} has {len(locs)} locations at {p1}; give --from with its lines")
+    loc = locs[0]
+    new = cited_location(ctx.root, repo, loc["commit_sha"], p2, a2, b2, s2)
+    was = location_text(loc["path"], loc["line_start"], loc["line_end"], loc["symbol"], loc["whole_file"])
+    now = location_text(new["path"], new["line_start"], new["line_end"], new["symbol"], new["whole_file"])
+    if was == now:
+        raise WriteError(f"{spec}: the location is already {now}")
+    new["permalink"] = None
+    if repo["permalink_template"]:
+        link = permalink_for(repo["permalink_template"], loc["commit_sha"], p2,
+                             None if new["whole_file"] else new["line_start"],
+                             None if new["whole_file"] else new["line_end"])
+        new["permalink"] = link if link and SAFE_URL.match(link) else None
+    sets = {k: new[k] for k in ("path", "line_start", "line_end", "symbol", "blob_sha", "excerpt", "excerpt_sha256",
+                                "excerpt_redacted", "whole_file", "excerpt_status", "permalink")}
+    sets.update(source="commit", change_actor_id=actor, change_note=reason)
+    ctx.x(f"UPDATE finding_locations SET {', '.join(k + '=?' for k in sets)} WHERE id=?", (*sets.values(), loc["id"]))
+    return [f"{spec}: {was} -> {now}"]
+
+
+@_command("supersede-check", "correct a review's check of a known issue (its outcome, evidence or the point it "
+                             "cites); the old check stays in a check-corrected event with who and why",
+          "ledger.py supersede-check R-0001:ISS-0001 [--outcome OUTCOME] [--evidence TEXT] [--finding POINT|none] "
+          "--reason TEXT --actor A-0001")
+def cmd_supersede_check(ctx):
+    a, con = ctx.a, ctx.con
+    reason, actor = _correction_context(ctx, a.reason)
+    rv, code = _review_ref(con, a.check, "ISSUE")
+    iss = issue_row(con, code)
+    c = one(con, "SELECT * FROM review_issue_checks WHERE review_id=? AND issue_id=?", (rv["id"], iss["id"]))
+    if not c:
+        raise WriteError(f"{rv['code']} has no check of {iss['code']}")
+    outcome = a.outcome or c["outcome"]
+    if outcome not in CHECK_OUTCOMES:
+        raise WriteError(f"outcome {outcome!r} is not one of {', '.join(CHECK_OUTCOMES)}")
+    evidence = c["evidence"] if a.evidence is None else ((_text_arg(a.evidence, "--evidence") or "").strip() or None)
+    fid = c["finding_id"]
+    if a.finding is not None:
+        if a.finding.strip().lower() == "none":
+            fid = None
+        else:
+            fid = _review_point(con, f"{rv['code']}:{a.finding.strip()}")[1]["id"]
+
+    def point(i):
+        return con.execute("SELECT point_id FROM findings WHERE id=?", (i,)).fetchone()[0] if i else "none"
+    what = []
+    if outcome != c["outcome"]:
+        what.append(f"outcome {c['outcome']} -> {outcome}")
+    if evidence != c["evidence"]:
+        what.append("evidence")
+    if fid != c["finding_id"]:
+        what.append(f"finding {point(c['finding_id'])} -> {point(fid)}")
+    if not what:
+        raise WriteError(f"this changes nothing: {rv['code']}'s check of {iss['code']} already says that")
+    ctx.x("""UPDATE review_issue_checks SET outcome=?, evidence=?, finding_id=?, change_actor_id=?, change_note=?
+             WHERE review_id=? AND issue_id=?""", (outcome, evidence, fid, actor, reason, rv["id"], iss["id"]))
+    out = [f"{rv['code']}:{iss['code']}: check corrected ({', '.join(what)})"]
+    if outcome != c["outcome"]:
+        out.append(f"note: {iss['code']} stays {iss['status']}; move it with issue-status if the corrected outcome "
+                   f"changes it")
+    return out
+
+
+@_command("correct-issue", "correct an issue's current state or after-the-fix text, with who and why (logged)",
+          "ledger.py correct-issue ISS-0001 [--current TEXT] [--after TEXT] --reason TEXT --actor A-0001")
+def cmd_correct_issue(ctx):
+    a, con = ctx.a, ctx.con
+    reason, actor = _correction_context(ctx, a.reason)
+    iss = issue_row(con, a.issue)
+    sets, what = {}, []
+    for flag, col, label in (("current", "current_state", "current state"), ("after", "after_state", "after state")):
+        text = _text_arg(getattr(a, flag), f"--{flag}")
+        if text is None:
+            continue
+        text = _need(text, f"--{flag} (the corrected text)")
+        if text != iss[col]:
+            sets[col] = text
+            what.append(label)
+    if not sets:
+        raise WriteError(f"this changes nothing: give --current or --after with text {iss['code']} does not have yet")
+    sets.update(change_note=reason, change_actor_id=actor)
+    ctx.x(f"UPDATE issues SET {', '.join(k + '=?' for k in sets)} WHERE id=?", (*sets.values(), iss["id"]))
+    return [f"{iss['code']}: {' and '.join(what)} corrected"]
+
+
+def _gate_by_code(con, code):
+    """The gates row of a code like GATE-0001; WriteError when there is none."""
+    g = one(con, "SELECT * FROM gates WHERE code=?", (code,))
+    if not g:
+        raise WriteError(f"no such gate {code}")
+    return g
+
+
+@_command("withdraw-gate", "withdraw an open or answered gate nobody needs, with who and why (logged)",
+          "ledger.py withdraw-gate GATE-0001 --note TEXT --actor A-0001")
+def cmd_withdraw_gate(ctx):
+    a, con = ctx.a, ctx.con
+    note, actor = _correction_context(ctx, a.note, "--note")
+    g = _gate_by_code(con, a.gate)
+    if g["status"] not in ("open", "answered"):
+        raise WriteError(f"{g['code']} is {g['status']}; only an open or answered gate can be withdrawn")
+    ctx.x("UPDATE gates SET status='withdrawn', change_actor_id=?, change_note=? WHERE id=?", (actor, note, g["id"]))
+    return [f"{g['code']}: {g['status']} -> withdrawn"]
+
+
+@_command("reopen-gate", "reopen an answered or withdrawn gate so the owner answers again; the old answer stays in "
+                         "its answer-cleared event with who and why",
+          "ledger.py reopen-gate GATE-0001 --note TEXT --actor A-0001")
+def cmd_reopen_gate(ctx):
+    a, con = ctx.a, ctx.con
+    note, actor = _correction_context(ctx, a.note, "--note")
+    g = _gate_by_code(con, a.gate)
+    if g["status"] == "open":
+        raise WriteError(f"{g['code']} is open already")
+    if g["status"] == "applied":
+        raise WriteError(f"{g['code']} is applied: its answer was acted on; open a new gate to ask again")
+    ctx.x("""UPDATE gates SET status='open', answer_value=NULL, answer_text=NULL, answered_by=NULL, answered_via=NULL,
+             answered_by_actor_id=NULL, answered_at=NULL, change_actor_id=?, change_note=? WHERE id=?""",
+          (actor, note, g["id"]))
+    was = ": ".join(x for x in (g["answer_value"], g["answer_text"]) if x)
+    return [f"{g['code']}: {g['status']} -> open" + (f" (the answer was {was})" if was else "")]
+
+
+
 AUTO_RULES = ("same fingerprint", "same domain and sub", "same symbol")
 
 
@@ -7106,6 +7345,22 @@ def add_write_commands_131(p):
     s = p("redact"); s.add_argument("field", help="TABLE.COLUMN, e.g. findings.summary")
     s.add_argument("row", help="a row id, a code (ISS-0001), or R-0001:SEC-H1 for a finding")
     s.add_argument("--reason"); s.add_argument("--only", help="redact only this part of the text (the secret)")
+    s = p("rematch"); s.add_argument("points", nargs="+", metavar="POINT", help="R-0001:SEC-M1 (one or more)")
+    s.add_argument("target", metavar="ISSUE", help="the issue it belongs to (ISS-0001), or new")
+    s.add_argument("--type"); s.add_argument("--confidence", help="certain, likely or possible (default: as matched)")
+    s.add_argument("--title", help="with new: the new issue's title"); s.add_argument("--relations")
+    s.add_argument("--reason", help="why the point belongs there, in one plain sentence")
+    s = p("correct-location"); s.add_argument("point", help="R-0001:SEC-M1")
+    s.add_argument("--from", dest="source", metavar="LOCATION", help="the location as recorded")
+    s.add_argument("--to", metavar="LOCATION", help="the right location, at the same commit")
+    s.add_argument("--reason")
+    s = p("supersede-check"); s.add_argument("check", help="R-0001:ISS-0001 (the review and the issue it checked)")
+    s.add_argument("--outcome", help=", ".join(CHECK_OUTCOMES)); s.add_argument("--evidence", help="what the review saw")
+    s.add_argument("--finding", help="the point of the same review it cites, or none"); s.add_argument("--reason")
+    s = p("correct-issue"); s.add_argument("issue"); s.add_argument("--current", help="what the system does now")
+    s.add_argument("--after", help="what it does once fixed"); s.add_argument("--reason")
+    s = p("withdraw-gate"); s.add_argument("gate"); s.add_argument("--note", help="why nobody needs it")
+    s = p("reopen-gate"); s.add_argument("gate"); s.add_argument("--note", help="why the owner answers again")
 
 
 # ----- the reviewed text of a dirty working tree (D-14, used by fill_refs)

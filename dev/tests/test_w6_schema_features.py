@@ -257,13 +257,8 @@ class Proposals(unittest.TestCase):
 
 class FromV16(unittest.TestCase):
     def test_migration_seeds_features(self):
-        from dev.tests.test_w6_schema_order import v16_ledger_py
-        old = v16_ledger_py()
-        if old is None:
-            self.skipTest("environment: git cannot give the schema 16 sources")
-        project_dir = fixtures.temp_dir("v16-feat-") / "proj"
-        project_dir.mkdir()
-        self.assertEqual(fixtures.run_ledger("--root", project_dir, "init", ledger_py=old).returncode, 0)
+        from dev.tests import _migrate_helpers as M
+        project_dir, _ = M.restore_v16()
         p = fixtures.run_ledger("--root", project_dir, "migrate")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertIn("0019-feature-proposals", p.stdout)

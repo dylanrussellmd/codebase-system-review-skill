@@ -11,7 +11,7 @@ from dev.tests import _migrate_helpers as M
 
 class Migrate8To9(unittest.TestCase):
     def test_migrate_keeps_goals_as_approved_whole_project_goals(self):
-        project_dir, db = M.restore_v1()
+        project_dir, db = M.restore(8)
         before = sqlite3.connect(str(db))
         goals = before.execute("SELECT code, text, adopted_at FROM design_goals ORDER BY code").fetchall()
         before.close()
@@ -19,6 +19,7 @@ class Migrate8To9(unittest.TestCase):
         ledger_py = fixtures.built_ledger_path()
         p = fixtures.run_ledger("--root", project_dir, "migrate", ledger_py=ledger_py)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("from schema 8", p.stdout)
         self.assertIn("0009-interview-goals", p.stdout)
         mod = fixtures.load_ledger_module(ledger_py)
         c = sqlite3.connect(str(db))
