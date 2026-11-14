@@ -131,4 +131,4 @@ jobs:
       - name: Advisories for the pinned versions
         run: |
           python3 dev/pin_manifests.py "$RUNNER_TEMP/pins"
-          osv-scanner scan source --no-call-analysis=go -r "$RUNNER_TEMP/pins"
+          osv-scanner scan source --config=dev/osv-scanner.toml --no-call-analysis=go -r "$RUNNER_TEMP/pins"

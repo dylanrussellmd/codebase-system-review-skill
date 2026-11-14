@@ -1,0 +1,33 @@
+# Advisories the tools job accepts until a fixed release exists. Each entry expires, so CI fails again and the pin
+# is looked at afresh. semgrep 1.185.0 (the newest release) requires mcp==1.29.0 and opentelemetry-api~=1.37.0;
+# the review runs `semgrep scan` only, never its MCP server.
+
+[[IgnoredVulns]]
+id = "GHSA-5h93-6whr-6q8j"
+ignoreUntil = 2027-01-15
+reason = "mcp 1.29.0, pinned by semgrep 1.185.0; fixed in mcp 1.30.0"
+
+[[IgnoredVulns]]
+id = "GHSA-84m7-p3x7-pcfv"
+ignoreUntil = 2027-01-15
+reason = "mcp 1.29.0, pinned by semgrep 1.185.0; fixed in mcp 1.30.0"
+
+[[IgnoredVulns]]
+id = "GHSA-rwrf-2pqf-9j8j"
+ignoreUntil = 2027-01-15
+reason = "mcp 1.29.0, pinned by semgrep 1.185.0; fixed in mcp 1.30.0"
+
+[[IgnoredVulns]]
+id = "GHSA-w4fh-qvv9-3v23"
+ignoreUntil = 2027-01-15
+reason = "mcp 1.29.0, pinned by semgrep 1.185.0; fixed in mcp 1.30.0"
+
+[[IgnoredVulns]]
+id = "GHSA-mf5v-w3w3-f6cg"
+ignoreUntil = 2027-01-15
+reason = "opentelemetry-api 1.37.0, pinned by semgrep 1.185.0 (~=1.37.0); fixed in 1.45.2"
+
+[[IgnoredVulns]]
+id = "GHSA-xcq7-p3pf-p88h"
+ignoreUntil = 2027-01-15
+reason = "opentelemetry-api 1.37.0, pinned by semgrep 1.185.0 (~=1.37.0); fixed in 1.45.1"

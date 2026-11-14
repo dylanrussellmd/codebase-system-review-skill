@@ -1,5 +1,6 @@
 """Write the versions references/tools.lock pins as manifests OSV-Scanner reads, so CI's tools job can look up
-advisories for the tools themselves (their top-level packages, not what each one bundles).
+advisories for the tools and, for PyPI pins, the packages each one requires (OSV-Scanner resolves those).
+Advisories accepted until a fix exists are in dev/osv-scanner.toml.
 
     python3 dev/pin_manifests.py FOLDER    writes package-lock.json (npm), requirements.txt (PyPI), go.mod (Go)
                                            and Cargo.lock (crates.io) into FOLDER

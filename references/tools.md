@@ -265,7 +265,7 @@ small local API), `buf.jsonl` (1.75.0), `graphql-inspector.txt` (7.0.2), `squawk
 (2.0.0), `i18n-lint.json` (ESLint 10.14.0 with eslint-plugin-i18next 6.1.5), `pg-explain.json` (PostgreSQL 16.15).
 `oasdiff-documented.json` and `hurl-documented.xml` are written from the documented formats: neither oasdiff
 (the Go module proxy refused it here) nor Hurl (it needs a newer Rust) could be installed, so both adapters and
-the pins of oasdiff 1.30.0 and Mailpit 1.30.2 are not verified. Mailpit was not run either: its test serves the
+the pins of oasdiff 1.30.0 and Mailpit 1.30.6 are not verified. Mailpit was not run either: its test serves the
 API as Mailpit's documentation describes it. Written from the documented format: those whose names end in `-documented`
 (`cobertura-methods-documented.xml`, since coverage.py writes no methods; `osv-documented.json`: the proxy here refused the advisory database download, so OSV-Scanner's `--online` path is
 not verified).
