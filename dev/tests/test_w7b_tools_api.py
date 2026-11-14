@@ -124,7 +124,7 @@ class Schemathesis(unittest.TestCase):
         self.assertIn("--url {target}", run["command"])
         self.assertEqual(L.count("tool_results"), 5)
 
-    @unittest.skipUnless(shutil.which("schemathesis"), "Schemathesis is not installed")
+    @unittest.skipUnless(shutil.which("schemathesis"), "environment: Schemathesis is not installed")
     def test_schemathesis_real(self):
         url = serve(self, Demo)
         repo, L, sha = tool_project(self, files={"openapi.yaml": SPEC})
@@ -234,7 +234,7 @@ class ApiDiffs(unittest.TestCase):
         self.assertEqual([g[1:] for g in leads(L)], [("buf.FIELD_NO_DELETE", "proto/user.proto", 3, "error"),
                                                      ("buf.FIELD_SAME_TYPE", "proto/user.proto", 4, "error")])
 
-    @unittest.skipUnless(shutil.which("buf"), "Buf is not installed")
+    @unittest.skipUnless(shutil.which("buf"), "environment: Buf is not installed")
     def test_buf_real(self):
         old = 'syntax = "proto3";\npackage demo.v1;\nmessage User {\n  int64 id = 1;\n  string email = 2;\n}\n'
         new = 'syntax = "proto3";\npackage demo.v1;\nmessage User {\n  string id = 1;\n}\n'
@@ -259,7 +259,7 @@ class ApiDiffs(unittest.TestCase):
             ("graphql-inspector.breaking", "error", "Field email was removed from object type User"),
             ("graphql-inspector.safe", "note", "Field nickname was added to object type User")])
 
-    @unittest.skipUnless(shutil.which("graphql-inspector"), "GraphQL Inspector is not installed")
+    @unittest.skipUnless(shutil.which("graphql-inspector"), "environment: GraphQL Inspector is not installed")
     def test_graphql_inspector_real(self):
         old = ("type Query {\n  user(id: ID!): User\n  users: [User!]!\n}\n\ntype User {\n  id: ID!\n  email: String\n"
                "  name: String\n}\n")
@@ -295,7 +295,7 @@ class Database(unittest.TestCase):
         self.assertIn("use `concurrently`", L.scalar(
             "SELECT message FROM tool_results WHERE rule='squawk.require-concurrent-index-creation'"))
 
-    @unittest.skipUnless(shutil.which("squawk"), "Squawk is not installed")
+    @unittest.skipUnless(shutil.which("squawk"), "environment: Squawk is not installed")
     def test_squawk_real(self):
         repo, L, sha = tool_project(self, files=MIGRATIONS)
         ok(L, "tool-run", "squawk", "--review", "R-0001", "--unpinned", "--actor", "A-0001")
@@ -371,7 +371,7 @@ class Database(unittest.TestCase):
         self.assertNotIn("u@127", L.scalar("SELECT command FROM tool_runs"))
 
     @unittest.skipUnless(os.environ.get("LEDGER_TEST_POSTGRES") and shutil.which("psql"),
-                         "set LEDGER_TEST_POSTGRES to a PostgreSQL server address to run EXPLAIN for real")
+                         "environment: set LEDGER_TEST_POSTGRES to a PostgreSQL server address to run EXPLAIN for real")
     def test_pg_explain_real(self):
         repo, L, sha = tool_project(self, files=MIGRATIONS)
         ok(L, "tool-run", "pg-explain", "--review", "R-0001", "--target", os.environ["LEDGER_TEST_POSTGRES"],
@@ -412,7 +412,7 @@ class Performance(unittest.TestCase):
         self.assertEqual(L.scalar("SELECT status FROM tool_runs"), "ran")
         self.assertEqual(L.count("tool_results"), 1)
 
-    @unittest.skipUnless(shutil.which("hyperfine"), "hyperfine is not installed")
+    @unittest.skipUnless(shutil.which("hyperfine"), "environment: hyperfine is not installed")
     def test_hyperfine_real(self):
         repo, L, sha = tool_project(self, files=BUDGETS)
         ok(L, "tool-run", "hyperfine", "--review", "R-0001", "--unpinned", "--actor", "A-0001")
@@ -496,7 +496,7 @@ class Translation(unittest.TestCase):
 
     def test_i18n_lint_real(self):
         if not fixtures.load_ledger_module()._i18n_version():
-            self.skipTest("ESLint with eslint-plugin-i18next beside it is not installed")
+            self.skipTest("environment: ESLint with eslint-plugin-i18next beside it is not installed")
         banner = (DATA / "i18n-lint.json")  # recorded from this component
         component = ("import { useTranslation } from 'react-i18next';\n\nexport function Banner({ count }) {\n"
                      "  const { t } = useTranslation();\n  return (\n"

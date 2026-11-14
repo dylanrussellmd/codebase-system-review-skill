@@ -106,7 +106,7 @@ class Migrate(unittest.TestCase):
         self.assertEqual(meta["written_by_tool"], mod.TOOL_VERSION)
         self.assertEqual(meta["schema_hash"], mod.shipped_schema_hash())
 
-    @unittest.skipIf(os.name == "nt", "POSIX permissions")
+    @unittest.skipIf(os.name == "nt", "environment: POSIX permissions")
     def test_migrate_backup_is_private(self):
         """The .bak-v<N> copy holds the whole ledger, so it is 0600 like the ledger, and init makes an older,
         world-readable backup private too."""

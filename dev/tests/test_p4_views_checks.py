@@ -8,7 +8,7 @@ import re
 import time
 import unittest
 
-from dev.tests import fixtures, scale
+from dev.tests import fixtures, helpers, scale
 from dev.tests.fixtures import Ledger, seed_demo, slow, temp_dir
 
 
@@ -173,7 +173,7 @@ class Speed(unittest.TestCase):
         p = scale.check(info)
         took = time.perf_counter() - t0
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        self.assertLess(took, 0.6 + 0.4, f"check took {took:.2f} s on the 1x ledger")  # 0.6 s plus process start
+        helpers.assert_within(self, took, 0.6 + 0.4, "check on the 1x ledger")  # 0.6 s plus process start
 
 
 if __name__ == "__main__":

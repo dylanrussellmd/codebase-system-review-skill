@@ -66,7 +66,7 @@ class PlanLook(browser.ViewerTestCase):
 
     def test_show_more_paging(self):
         page = self.open("#/plan/P-0002")
-        page.after(lambda: page.page.fill("#app input[type=search]", "long step"))
+        page.page.fill("#app input[type=search]", "long step")   # filtered in the page: no fetch
         page.page.wait_for_selector("#app .steps button.btn.ghost")
         self.assertEqual(page.text("#app .steps button.btn.ghost"), "Show 20 more")
 

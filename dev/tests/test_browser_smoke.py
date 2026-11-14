@@ -90,7 +90,7 @@ class HarnessSkips(unittest.TestCase):
         p = subprocess.run([sys.executable, "-c", code], cwd=str(fixtures.REPO_ROOT), capture_output=True, text=True,
                            timeout=60, env=fixtures.git_env())
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertIn("SKIP browser tests skipped: Playwright is not installed", p.stdout)
+        self.assertIn("SKIP environment: browser tests skipped: Playwright is not installed", p.stdout)
 
     def test_browser_tests_skip_cleanly_without_chrome(self):
         code = ("import sys, unittest\n"
@@ -113,7 +113,7 @@ class HarnessSkips(unittest.TestCase):
         p = subprocess.run([sys.executable, "-c", code], cwd=str(fixtures.REPO_ROOT), capture_output=True, text=True,
                            timeout=60, env=fixtures.git_env())
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertIn("SKIP browser tests skipped: no browser could be launched (Playwright Chromium)", p.stdout)
+        self.assertIn("SKIP environment: browser tests skipped: no browser could be launched (Playwright Chromium)", p.stdout)
 
     def test_browser_tests_are_off_unless_switched_on(self):
         code = ("import os, unittest; os.environ.pop('LEDGER_BROWSER_TESTS', None)\n"

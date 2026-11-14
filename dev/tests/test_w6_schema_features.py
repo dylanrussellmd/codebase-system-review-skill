@@ -260,7 +260,7 @@ class FromV16(unittest.TestCase):
         from dev.tests.test_w6_schema_order import v16_ledger_py
         old = v16_ledger_py()
         if old is None:
-            self.skipTest("git cannot give the schema 16 sources")
+            self.skipTest("environment: git cannot give the schema 16 sources")
         project_dir = fixtures.temp_dir("v16-feat-") / "proj"
         project_dir.mkdir()
         self.assertEqual(fixtures.run_ledger("--root", project_dir, "init", ledger_py=old).returncode, 0)

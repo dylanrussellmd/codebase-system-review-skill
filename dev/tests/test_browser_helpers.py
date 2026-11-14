@@ -5,6 +5,7 @@ Characterization tests: they pin what the page does today. Where today's behavio
 carries a '# characterization: ISS-xxxx' comment, so the step that fixes it changes that assertion on purpose.
 Skipped cleanly when Playwright or a browser is missing (see dev/tests/browser.py).
 """
+import time
 import unittest
 
 from dev.tests import browser, fixtures
@@ -14,6 +15,14 @@ XSS = '<img src=x onerror="window.__xss=(window.__xss||0)+1">'
 
 class Helpers(browser.ViewerTestCase):
     """Page globals (h, put, add, kv, copyBtn, progressBar) called directly in the loaded page."""
+
+    def test_after_fails_on_timeout(self):
+        page = self.open("#/")
+        t = time.perf_counter()
+        with self.assertRaises(AssertionError) as e:
+            page.after(lambda: None, timeout=300)   # an action that starts no fetch
+        self.assertLess(time.perf_counter() - t, 2.0)
+        self.assertIn("fetch", str(e.exception))
 
     def test_page_h_text_not_html(self):
         page = self.open("#/")
@@ -166,7 +175,7 @@ class Helpers(browser.ViewerTestCase):
         self.assertEqual(page.text(".card:has(h2:text('Fix plans')) a"), "P-0001 · Fix plan for R-0001")
         self.assertEqual(page.count(".status.err"), 0)          # every check is 0: no failing-checks line
         # A check row with n = 0 does not navigate.
-        page.after(page.page.locator(".card:has(h2:text('Housekeeping for the agent')) tbody tr").first.click, timeout=300)
+        page.without_fetch(page.page.locator(".card:has(h2:text('Housekeeping for the agent')) tbody tr").first.click)
         self.assertEqual(page.location_hash(), "#/")
         # A review row does.
         page.after(page.page.locator(".card:has(h2:text('Latest reviews')) tbody tr").first.click)

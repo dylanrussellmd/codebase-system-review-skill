@@ -5,6 +5,7 @@ test_skill_md_commands_exist   every `ledger.py <command>` SKILL.md names is a c
 test_documented_size_is_the_measured_one  SKILL.md, README.md and recipes.md state the measured size per 1,000 findings
 test_ledger_size_per_finding   (slow) the 1x ledger and its dump are within 10% of the documented size
 """
+import fnmatch
 import re
 import shlex
 import shutil
@@ -43,23 +44,53 @@ def section_commands(section):
     return out
 
 
-def copy_repo(dest):
+def gitignore_matcher(root):
+    """A test of a relative path's parts against root/.gitignore: blank lines and comments skipped; 'name/' matches a
+    folder at any depth, a pattern with an inner or leading '/' is anchored at root, the rest match any one part.
+    Negations ('!') are not supported; the repository's .gitignore has none."""
+    path = Path(root) / ".gitignore"
+    lines = path.read_text(encoding="utf-8").splitlines() if path.is_file() else []
+    rules = []
+    for line in lines:
+        pat = line.strip()
+        if not pat or pat.startswith("#"):
+            continue
+        if pat.startswith("!"):
+            raise ValueError(f"{path}: negated pattern {pat!r} is not supported")
+        folder = pat.endswith("/")
+        pat = pat.rstrip("/")
+        anchored = "/" in pat
+        rules.append((pat.lstrip("/"), folder, anchored))
+
+    def ignored(parts):
+        for pat, folder, anchored in rules:
+            last = len(parts) - 1 if folder else len(parts)  # a folder pattern never matches the file itself
+            for i in range(last):
+                if fnmatch.fnmatchcase("/".join(parts[:i + 1]) if anchored else parts[i], pat):
+                    return True
+        return False
+    return ignored
+
+
+def copy_repo(dest, src=REPO):
     """A fresh copy of the repository's files (what a clone of the working tree would hold: tracked and untracked
     files, minus anything ignored such as .code-review/ and __pycache__/)."""
-    p = subprocess.run(["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"], cwd=str(REPO),
+    src = Path(src)
+    p = subprocess.run(["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"], cwd=str(src),
                        capture_output=True, env=fixtures.git_env())
     if p.returncode == 0:
         names = [n for n in p.stdout.decode("utf-8").split("\0") if n]
-    else:  # not a git checkout: copy everything except the ledger and caches
-        names = [str(f.relative_to(REPO)) for f in REPO.rglob("*")
-                 if f.is_file() and not ({".git", ".code-review", "__pycache__"} & set(f.relative_to(REPO).parts))]
+    else:  # not a git checkout: copy everything except .git and what .gitignore lists
+        ignored = gitignore_matcher(src)
+        names = [f.relative_to(src).as_posix() for f in src.rglob("*")
+                 if f.is_file() and ".git" not in f.relative_to(src).parts and not ignored(f.relative_to(src).parts)]
     for n in names:
-        src = REPO / n
-        if not src.is_file():  # listed but deleted in the working tree
+        f = src / n
+        if not f.is_file():  # listed but deleted in the working tree
             continue
         d = dest / n
         d.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(str(src), str(d))
+        shutil.copy2(str(f), str(d))
     return dest
 
 
@@ -80,6 +111,42 @@ def skill_md_commands():
             for m in re.finditer(r"ledger\.py((?:\s+--\S+(?:\s+(?!-)\S+)?)*)\s+([a-z][a-z0-9-]*)", span):
                 found.append((no, m.group(2)))
     return found
+
+
+class CopyRepo(unittest.TestCase):
+    """copy_repo in a copy without .git (a Download-ZIP copy): what .gitignore lists stays out."""
+
+    def non_git_source(self):
+        src = fixtures.temp_dir("copy-src-") / "src"
+        for name, data in {".gitignore": "# comment\n__pycache__/\n*.pyc\n.code-review/\ndist/\n/top.log\n",
+                           "a.txt": "a", "dist/x.zip": "zip", "sub/dist/y.zip": "zip", "sub/b.pyc": "pyc",
+                           "sub/c.py": "c", "top.log": "log", "sub/top.log": "kept"}.items():
+            (src / name).parent.mkdir(parents=True, exist_ok=True)
+            (src / name).write_text(data, encoding="utf-8")
+        return src
+
+    def test_copy_repo_without_git_skips_ignored(self):
+        src = self.non_git_source()
+        self.assertNotEqual(subprocess.run(["git", "rev-parse"], cwd=str(src), capture_output=True,
+                                           env=fixtures.git_env()).returncode, 0, "the source must not be in git")
+        dest = copy_repo(fixtures.temp_dir("copy-dest-") / "dest", src=src)
+        got = sorted(f.relative_to(dest).as_posix() for f in dest.rglob("*") if f.is_file())
+        self.assertEqual(got, [".gitignore", "a.txt", "sub/c.py", "sub/top.log"])
+
+    def test_release_runs_in_a_non_git_copy_after_release(self):
+        # A Download-ZIP copy in which dev/release.py has already made dist/: the copy of it holds no dist/,
+        # so the release tests (test_w5_catalog_release.Bundle) find exactly their own bundle.
+        from dev.tests import test_w5_catalog_release as rel
+        first = copy_repo(fixtures.temp_dir("zip-copy-") / rel.NAME)
+        shutil.rmtree(str(first / ".git"), ignore_errors=True)
+        p = rel.release(first)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertTrue(list((first / "dist").glob("*.zip")))
+        second = copy_repo(fixtures.temp_dir("zip-copy2-") / rel.NAME, src=first)
+        self.assertFalse((second / "dist").exists())
+        p = rel.release(second)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(len(list((second / "dist").glob(f"{rel.NAME}-*.zip"))), 1)
 
 
 class ReadmeDeveloping(unittest.TestCase):

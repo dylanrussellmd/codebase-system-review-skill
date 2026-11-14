@@ -207,7 +207,7 @@ class Odiff(unittest.TestCase):
         self.assertEqual((m[("screenshots_compared", "all")], m[("screenshots_new", "all")],
                           m[("screenshots_gone", "all")]), (3, 1, 1))
 
-    @unittest.skipUnless(shutil.which("odiff"), "odiff is not installed")
+    @unittest.skipUnless(shutil.which("odiff"), "environment: odiff is not installed")
     def test_odiff_real(self):
         repo, L, sha = tool_project(self)
         self.screenshots(L, "R-0001", {"a.png": png(8, 8, (255, 0, 0))})
@@ -286,7 +286,7 @@ class Stylelint(unittest.TestCase):
         out = ok(L, "tool-run", "stylelint", "--review", "R-0001", "--actor", "A-0001", env=env)
         self.assertIn("plain CSS files", out[0])
 
-    @unittest.skipUnless(shutil.which("stylelint"), "Stylelint is not installed")
+    @unittest.skipUnless(shutil.which("stylelint"), "environment: Stylelint is not installed")
     def test_stylelint_matches_the_recording(self):
         repo, L, sha = tool_project(self, files=TOKENS)
         ok(L, "tool-run", "stylelint", "--review", "R-0001", "--unpinned", "--actor", "A-0001")
@@ -310,14 +310,14 @@ class UiAuditAxe(unittest.TestCase):
         mod = fixtures.load_ledger_module()
         found = mod.axe_script(Path.cwd())
         if found is None:
-            self.skipTest("axe-core is not installed (LEDGER_AXE)")
+            self.skipTest("environment: axe-core is not installed (LEDGER_AXE)")
         repo, L, sha = tool_project(self)
         page = L.dir / "planted.html"
         page.write_text(AXE_PAGE, encoding="utf-8")
         env = fixtures.git_env({"LEDGER_AXE": str(found)})
         p = L.run("ui-audit", page, "--json", env=env, timeout=180)
         if p.returncode == 2:
-            self.skipTest(p.stderr.strip())
+            self.skipTest("environment: " + p.stderr.strip())
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         axe = json.loads(p.stdout)["pages"][0]["axe"]
         self.assertTrue(axe["available"])

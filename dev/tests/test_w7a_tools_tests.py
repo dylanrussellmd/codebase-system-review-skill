@@ -126,12 +126,12 @@ class TestRuns(unittest.TestCase):
         self.assertIn("not cut", run["note"])
         self.assertEqual(L.scalar("SELECT notes FROM test_runs ORDER BY id DESC LIMIT 1").count("fallback"), 1)
 
-    @unittest.skipUnless(sys.platform.startswith("linux"), "unshare is Linux only")
+    @unittest.skipUnless(sys.platform.startswith("linux"), "environment: unshare is Linux only")
     def test_network_off_with_unshare(self):
         repo, L, sha = self.suite_project()
         mod = fixtures.load_ledger_module()
         if not mod.network_off_prefix():
-            self.skipTest("unshare -rn is not allowed here")
+            self.skipTest("environment: unshare -rn is not allowed here")
         ok(L, "test-runs", "--review", "R-0001", "--command", f"{sys.executable} tests/run.py {{junit}}",
            "--variants", "network-off", "--actor", "A-0001")
         L.commit()

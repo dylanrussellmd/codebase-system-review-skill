@@ -44,7 +44,7 @@ class Imports(unittest.TestCase):
         self.assertEqual(unused_imports("from x import y as z\n__all__ = ['z']\n"), [])
 
 
-@unittest.skipUnless(shutil.which("git") and (ROOT / ".git").exists(), "needs a git checkout of this repository")
+@unittest.skipUnless(shutil.which("git") and (ROOT / ".git").exists(), "environment: needs a git checkout of this repository")
 class RepoHygiene(unittest.TestCase):
     def test_repo_ignores_review_dir(self):
         # The committed .gitignore must ignore the ledger folder by itself (this checkout's .git/info/exclude may

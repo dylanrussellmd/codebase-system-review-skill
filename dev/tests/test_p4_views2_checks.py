@@ -621,7 +621,8 @@ class QuickCheck(Base):
             views = time.perf_counter() - t
         finally:
             con.close()
-        self.assertLess(views, 1.0, f"the check views took {views:.2f} s at 10x")
+        from dev.tests import helpers
+        helpers.assert_within(self, views, 1.0, "the check views at 10x")
 
 if __name__ == "__main__":
     unittest.main()

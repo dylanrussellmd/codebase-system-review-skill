@@ -178,7 +178,7 @@ class UiCommands(unittest.TestCase):
         p = L.run("ui-capture", page, "--review", "R-0001", "--widths", "390,1280", "--themes", "light,dark",
                   "--actor", "A-0001", timeout=180)
         if p.returncode == 2:
-            self.skipTest(p.stderr.strip())
+            self.skipTest("environment: " + p.stderr.strip())
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         shots = sorted(f.name for f in (L.dir / "reviews" / "R-0001" / "ui").iterdir())
         self.assertEqual(shots, ["planted-html-1280-dark.png", "planted-html-1280-light.png",

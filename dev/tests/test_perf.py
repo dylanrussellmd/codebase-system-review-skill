@@ -6,6 +6,8 @@ fast. Run them with:
     LEDGER_SLOW_TESTS=1 python3 -m unittest dev.tests.test_perf -v
 
 test_scale_generator_small         (fast) a small generated ledger passes check: the generator matches the schema
+test_scale_build_many_reviews      (fast) the G-20 shape (15 reviews x 300 findings) builds and passes check, and its
+                                   dates are the same whatever the clock says
 test_large_ledger_checks_clean     the 1x ledger (10,000 findings, 600-step plan) passes check, all five views at 0
 test_insert_throughput_budget      2,000 findings with 1-3 locations, one transaction per report: < 0.5 s to load and
                                    < 0.8 s to match (best of three runs, so a busy machine does not fail it); the
@@ -14,10 +16,14 @@ test_insert_throughput_budget      2,000 findings with 1-3 locations, one transa
 test_perf_ledger_builds            the 10x ledger builds and passes check
 test_baseline_measurements         the baseline measures gzip ratios on real prose and git growth per ledger commit
 """
+import os
 import sqlite3
+import sys
+import time
 import unittest
+from unittest import mock
 
-from dev.tests import fixtures, scale
+from dev.tests import fixtures, helpers, scale
 from dev.tests.fixtures import slow
 
 INSERT_BUDGET_S = 0.5
@@ -48,6 +54,25 @@ class ScaleGenerator(unittest.TestCase):
         self.assertEqual(info["counts"]["steps"], 30)
         self.assert_clean(info)
 
+    def test_scale_build_many_reviews(self):
+        info = scale.build(fixtures.temp_dir("scale-") / "g20", **scale.G20)
+        self.assertEqual(info["counts"]["findings"], 15 * 300)
+        self.assert_clean(info)
+        small = dict(reviews=3, files=10, findings=20, steps=10)
+        dates = []
+        for shift in (0, 5 * 365 * 86400):  # today, and five years on
+            real = time.time
+            with mock.patch("time.time", lambda: real() + shift):
+                b = scale.build(fixtures.temp_dir("scale-") / "clock", **small)
+            con = sqlite3.connect(str(b["db"]))
+            try:
+                dates.append(con.execute("SELECT code, started_at, approved_at FROM reviews ORDER BY id").fetchall()
+                             + con.execute("SELECT code, created_at FROM gates ORDER BY id").fetchall())
+            finally:
+                con.close()
+        self.assertEqual(dates[0], dates[1])
+        self.assertEqual([r[1][:10] for r in dates[0][:3]], ["2025-01-01", "2025-01-08", "2025-01-15"])
+
     @slow
     def test_large_ledger_checks_clean(self):
         info = scale.build(fixtures.temp_dir("scale-") / "x1", scale=1)
@@ -70,10 +95,10 @@ class ScaleGenerator(unittest.TestCase):
             match = t["match_new_issue"]["s"] + t["match_existing_issue"]["s"]
             best_insert = ins if best_insert is None else min(best_insert, ins)
             best_match = match if best_match is None else min(best_match, match)
-            if best_insert < INSERT_BUDGET_S and best_match < MATCH_BUDGET_S:
+            if best_insert < helpers.budget(INSERT_BUDGET_S) and best_match < helpers.budget(MATCH_BUDGET_S):
                 break
-        self.assertLess(best_insert, INSERT_BUDGET_S, f"loading 2,000 findings took {best_insert:.3f} s")
-        self.assertLess(best_match, MATCH_BUDGET_S, f"matching 2,000 findings took {best_match:.3f} s")
+        helpers.assert_within(self, best_insert, INSERT_BUDGET_S, "loading 2,000 findings")
+        helpers.assert_within(self, best_match, MATCH_BUDGET_S, "matching 2,000 findings")
 
     @slow
     def test_perf_ledger_builds(self):
@@ -97,6 +122,41 @@ class ScaleGenerator(unittest.TestCase):
         g = raw["x1"]["git_growth"]
         self.assertEqual(len(g["loose_kib_per_commit"]), 5)
         self.assertTrue(all(k > 0 for k in g["loose_kib_per_commit"]))
+
+
+class MachineBudgets(unittest.TestCase):
+    """Every speed budget is a multiple of a reference workload's time on the baseline machine, so a slower or busy
+    machine gets budgets in proportion and a real slowdown in the code still fails."""
+
+    def test_budget_scales_by_the_reference(self):
+        base = helpers.BASELINE_REFERENCE_S
+        with mock.patch.object(helpers, "_factor", None), \
+                mock.patch.object(helpers, "reference_seconds", lambda: 2 * base):
+            self.assertAlmostEqual(helpers.machine_factor(), 2.0)
+            self.assertAlmostEqual(helpers.budget(0.5), 1.0)
+            with self.assertRaises(AssertionError) as e:
+                helpers.assert_within(self, 1.2, 0.5, "the thing")
+        self.assertIn("x2.00", str(e.exception))
+        with mock.patch.object(helpers, "_factor", None), \
+                mock.patch.object(helpers, "reference_seconds", lambda: base / 3):
+            self.assertEqual(helpers.machine_factor(), 1.0)   # a faster machine keeps the budgets as written
+
+    @slow
+    def test_budgets_scale_with_machine(self):
+        """At half speed (one CPU shared with a busy loop) the 1x budgets pass, and the plan route, slow until the
+        plan-page performance fix (PERF-H1), is still an expected failure."""
+        if not helpers.can_slow_down():
+            self.skipTest("environment: no CPU affinity on this machine")
+        env = dict(fixtures.git_env(), LEDGER_SLOW_TESTS="1")
+        env.pop("LEDGER_BROWSER_TESTS", None)
+        p = helpers.run_slowed([sys.executable, "-m", "unittest", "-v",
+                                "dev.tests.test_p4_views_checks.Speed.test_check_budget_1x",
+                                "dev.tests.test_w2_perf.RouteBudgets.test_review_route_budget_1x",
+                                "dev.tests.test_w2_perf.RouteBudgets.test_plan_route_budget_1x",
+                                "dev.tests.test_w2_perf.EveryRouteBudget.test_check_and_dump_budget_1x"],
+                               cwd=str(fixtures.REPO_ROOT), env=env, capture_output=True, text=True, timeout=1200)
+        self.assertEqual(p.returncode, 0, p.stderr[-3000:])
+        self.assertRegex(p.stderr, r"test_plan_route_budget_1x .*\.\.\. expected failure")
 
 
 if __name__ == "__main__":

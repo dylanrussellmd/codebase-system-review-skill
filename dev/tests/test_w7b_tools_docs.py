@@ -58,7 +58,7 @@ class Vale(unittest.TestCase):
         self.assertTrue(run["rules_sha256"])
         self.assertEqual(L.count("tool_results"), 27)
 
-    @unittest.skipUnless(shutil.which("vale"), "Vale is not installed")
+    @unittest.skipUnless(shutil.which("vale"), "environment: Vale is not installed")
     def test_vale_matches_the_recording(self):
         """With Vale installed, the shipped rules give the recorded alerts on the samples again."""
         repo, L, sha = tool_project(self, files=sample_files())
@@ -113,7 +113,7 @@ class Lychee(unittest.TestCase):
         ok(L, "tool-run", "lychee", "--review", "R-0001", "--unpinned", "--online", "--actor", "A-0001", env=env)
         self.assertNotIn("--offline", L.one("SELECT command FROM tool_runs WHERE id=2")["command"])
 
-    @unittest.skipUnless(shutil.which("lychee"), "lychee is not installed")
+    @unittest.skipUnless(shutil.which("lychee"), "environment: lychee is not installed")
     def test_lychee_matches_the_recording(self):
         repo, L, sha = tool_project(self, files=LYCHEE_FILES)
         ok(L, "tool-run", "lychee", "--review", "R-0001", "--unpinned", "--actor", "A-0001")

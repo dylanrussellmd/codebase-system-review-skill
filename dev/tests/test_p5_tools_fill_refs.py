@@ -13,6 +13,7 @@ import time
 import unittest
 from unittest import mock
 
+from dev.tests import helpers
 from dev.tests._core_helpers import NUMBERED, numbered, project, quiet, ref
 from dev.tests.fixtures import slow
 
@@ -79,7 +80,7 @@ class FillRefsBatch(unittest.TestCase):
         self.assertEqual(failed, 0, out[-500:])
         self.assertIn(f"filled {n} references", out)
         self.assertLessEqual(len(pc.git_calls()), 2, pc.git_calls()[:5])
-        self.assertLess(took, budget, f"fill-refs of {n} references took {took:.2f} s")
+        helpers.assert_within(self, took, budget, f"fill-refs of {n} references")
         self.assertEqual(L.scalar("SELECT count(*) FROM finding_locations WHERE excerpt IS NULL OR blob_sha IS NULL "
                                   "OR permalink IS NULL"), 0)
         return took

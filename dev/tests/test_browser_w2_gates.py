@@ -274,6 +274,12 @@ class HubGates(unittest.TestCase):
         self.assertEqual(hint.locator("p.note").inner_text(), "Answer this one in the chat with the agent.")
         self.assertIn("Decisions", p.contents("#app h2.sec"))
         p.page.locator(".card.gate .refline a", has_text="Decision D-0001").click()
+        # the page moves focus after it handles the hash change: wait for that, not for a fixed settle
+        try:
+            p.page.wait_for_function("() => document.activeElement && document.activeElement.id === 'decision-D-0001'",
+                                     timeout=5000, polling=20)
+        except browser.PlaywrightError:
+            pass   # the assertion below names where focus is
         p.settle()
         self.assertEqual(p.location_hash(), "#decisions-D-0001")
         self.assertEqual(p.js("document.activeElement.id"), "decision-D-0001")

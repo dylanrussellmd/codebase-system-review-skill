@@ -60,7 +60,7 @@ class RulePacks(unittest.TestCase):
         """Each rule matches its invalid samples and none of its valid ones (ast-grep's own test runner)."""
         exe = shutil.which("ast-grep") or os.environ.get("LEDGER_AST_GREP")
         if not exe:
-            self.skipTest("ast-grep is not installed (pip install ast-grep-cli)")
+            self.skipTest("environment: ast-grep is not installed (pip install ast-grep-cli)")
         p = subprocess.run([exe, "test", "-c", str(PACKS / "sgconfig.yml"), "--skip-snapshot-tests"],
                            capture_output=True, text=True, timeout=120, cwd=str(PACKS))
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)

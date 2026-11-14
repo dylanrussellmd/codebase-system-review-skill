@@ -54,6 +54,11 @@ SHIPPED_LEDGER = REPO_ROOT / "scripts" / "ledger.py"
 SLOW = os.environ.get("LEDGER_SLOW_TESTS") == "1"
 
 
+# The reason of every skip that depends on the machine (a tool not on PATH, a platform, an address, a browser) starts
+# with this; the suite's summary counts them (dev/tests/__init__.py).
+ENVIRONMENT = "environment: "
+
+
 def slow(test):
     """Skip a test unless LEDGER_SLOW_TESTS=1 (keeps the default suite under a minute)."""
     import unittest

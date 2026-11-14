@@ -386,7 +386,7 @@ class Stress(browser.ViewerTestCase):
             page.page.mouse.down()
             page.page.mouse.move(box["x"] + 120, box["y"] + 16, steps=4)
             page.page.mouse.up()
-        page.after(drag, timeout=300)
+        page.without_fetch(drag)
         self.assertNotEqual(page.js("String(getSelection())"), "")
         self.assertEqual(page.location_hash(), "#/reviews")
         page.js("getSelection().removeAllRanges()")

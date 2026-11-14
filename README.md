@@ -182,8 +182,19 @@ run ends. Skipped by default:
 - browser tests: `LEDGER_BROWSER_TESTS=1`, with Playwright and Chrome or Chromium
   (`pip install playwright && python3 -m playwright install chromium`).
 
-CI (`.github/workflows/ci.yml`) runs `python3 dev/build.py --check` and the suite on Python 3.9 and 3.12 for every
-push and pull request, and the slow and browser tests in their own jobs.
+A test that needs what the machine lacks (a tool on PATH, IPv6, an address besides loopback, a browser) skips with a
+reason that starts `environment:`, and the run lists those tests after its result line. Tool tests that check only
+how a tool is called and read run against stand-ins in `dev/tests` and never skip.
+
+CI (`.github/workflows/ci.yml`) runs on every push and pull request:
+
+- `python3 dev/build.py --check`;
+- the suite on Python 3.9 and 3.12;
+- the suite with `LEDGER_BROWSER_TESTS=1`, Playwright and Chromium installed;
+- the suite with `LEDGER_SLOW_TESTS=1 LEDGER_BROWSER_TESTS=1`: scale builds, speed budgets and page budgets.
+
+Speed budgets are written for the baseline machine and scaled to the one running them: `dev/tests/helpers.py` times
+a reference workload and multiplies each budget by how much slower this machine runs it.
 
 Shared test builders (scratch repositories, ledgers, the demo data, a viewer server) are in `dev/tests/fixtures.py`,
 measuring helpers in `dev/tests/helpers.py`, baseline numbers in `dev/tests/perf_baseline.json`.

@@ -21,6 +21,7 @@ Deterministic: the same arguments give the same rows (random.Random(seed)); git 
 Standard library only; Python 3.9+.
 """
 import argparse
+import datetime
 import gzip
 import hashlib
 import json
@@ -81,9 +82,18 @@ class Prose:
         return " ".join(out)
 
 
+# The shape of design goal G-20's budgets: 15 reviews of 300 findings each.
+G20 = {"reviews": 15, "findings": 300}
+
+
+# Review k starts on FIRST_DAY + 7k days: fixed and in the past, so no review starts after the clock's "now" that
+# completes it, and the rows are the same on any day.
+FIRST_DAY = datetime.date(2025, 1, 1)
+
+
 def _ts(day, sec=0):
-    return (f"2026-{1 + day // 28:02d}-{1 + day % 28:02d}T{(sec // 3600) % 24:02d}:{(sec // 60) % 60:02d}:"
-            f"{sec % 60:02d}.000Z")
+    d = FIRST_DAY + datetime.timedelta(days=day)
+    return f"{d.isoformat()}T{(sec // 3600) % 24:02d}:{(sec // 60) % 60:02d}:{sec % 60:02d}.000Z"
 
 
 class _Timer:
@@ -208,7 +218,7 @@ def build(proj, scale=1, reviews=5, files=300, reports=None, ledger_py=None, see
     review_ids = []
     for k in range(R):
         sha, files_at = snaps[k]
-        day = k * 40
+        day = k * 7
         x("BEGIN")
         x("INSERT INTO actors(kind,name,model,harness) VALUES ('manager','Review manager','model-x','harness-x')")
         mgr = lastid()

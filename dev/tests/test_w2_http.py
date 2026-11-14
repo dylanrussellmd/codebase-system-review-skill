@@ -124,7 +124,7 @@ class Http(unittest.TestCase):
         finally:
             probe.close()
         if not mine or mine.startswith("127."):
-            self.skipTest("this machine has no address besides loopback")
+            self.skipTest("environment: this machine has no address besides loopback")
         with self.assertRaises(OSError):
             socket.create_connection((mine, self.srv.port), timeout=1).close()
 
@@ -137,7 +137,7 @@ class Http(unittest.TestCase):
         finally:
             srv.server_close()
 
-    @unittest.skipUnless(ipv6_loopback(), "this machine has no IPv6 loopback")
+    @unittest.skipUnless(ipv6_loopback(), "environment: this machine has no IPv6 loopback")
     def test_ipv6_loopback_served(self):
         self.assertIn(f"http://[::1]:{self.srv.port}/#k=", self.srv.printed)
         c = http.client.HTTPConnection("::1", self.srv.port, timeout=5)

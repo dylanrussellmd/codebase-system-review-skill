@@ -16,8 +16,10 @@ environment without them, the hub is the file hub.html, and the owner's answer t
 JSON file through import-answers.
 
 By default each command runs in this process through the built tool's main() (the same parsing and code as the CLI,
-about 5 seconds in all); LEDGER_SLOW_TESTS=1 runs every one as its own `python3 ledger.py --root ...` process (about
-20 seconds). LEDGER_PY_UNDER_TEST=/path/to/ledger.py runs it against another build.
+about 6 seconds in all, budget 20 s); LEDGER_SLOW_TESTS=1 runs every one as its own `python3 ledger.py --root ...`
+process (about 60 seconds, a quarter second of start-up per command; budget 120 s). Both budgets are for the
+baseline machine and scale with this one (helpers.budget). LEDGER_PY_UNDER_TEST=/path/to/ledger.py runs it against
+another build.
 """
 import contextlib
 import io
@@ -29,7 +31,7 @@ import time
 import unittest
 from unittest import mock
 
-from dev.tests import fixtures
+from dev.tests import fixtures, helpers
 
 LEDGER_PY = os.environ.get("LEDGER_PY_UNDER_TEST") or None
 # Any harness and any model (plan P-0001 step 144): names no command knows, so nothing may depend on them.
@@ -618,7 +620,8 @@ class Walkthrough(unittest.TestCase):
         self.assertEqual(self.query("SELECT count(*) FROM plans WHERE page_url IS NOT NULL"), [[0]])
         # Everything the walkthrough wrote is inside the excluded .code-review/: the repository is untouched.
         self.assertEqual(self.repo.git("status", "--porcelain"), "")
-        self.assertLess(time.monotonic() - started, 60, "the walkthrough got slow; see the module docstring")
+        helpers.assert_within(self, time.monotonic() - started, 120 if fixtures.SLOW else 20,
+                              "the walkthrough got slow (see the module docstring):")
 
     def test_plan_commands_listed(self):
         # was test_current_no_plan_command (step 104): plans are created and moved by commands now (step 131)
@@ -629,6 +632,48 @@ class Walkthrough(unittest.TestCase):
                   "finish-run", "verify", "record-test-run", "add-commit", "add-guard", "confirm-guard",
                   "set-verdict", "add-metric", "add-artifact", "redact"):
             self.assertIn(c, listed)
+
+SLEEPY = """
+import sys, time, unittest
+from dev.tests import test_walkthrough as w
+real = w.Walkthrough.run_cmd
+slept = []
+def run_cmd(self, *args, **kw):
+    if not slept:
+        slept.append(1)
+        time.sleep(30)
+    return real(self, *args, **kw)
+w.Walkthrough.run_cmd = run_cmd
+r = unittest.TextTestRunner(verbosity=2).run(unittest.TestLoader().loadTestsFromName(
+    "dev.tests.test_walkthrough.Walkthrough.test_skill_walkthrough_script"))
+sys.exit(0 if r.wasSuccessful() else 1)
+"""
+
+
+class WalkthroughBudget(unittest.TestCase):
+    """The walkthrough's time budget scales with the machine (helpers.budget) and still catches a real stall."""
+
+    def child(self, argv, slowed=False):
+        env = fixtures.git_env()
+        env.pop("LEDGER_SLOW_TESTS", None)   # the in-process walkthrough and its budget
+        run = helpers.run_slowed if slowed else subprocess.run
+        return run([sys.executable, *argv], cwd=str(fixtures.REPO_ROOT), env=env, capture_output=True, text=True,
+                   timeout=600)
+
+    @fixtures.slow
+    def test_walkthrough_passes_at_half_speed(self):
+        if not helpers.can_slow_down():
+            self.skipTest("environment: no CPU affinity on this machine")
+        p = self.child(["-m", "unittest", "dev.tests.test_walkthrough.Walkthrough.test_skill_walkthrough_script"],
+                       slowed=True)
+        self.assertEqual(p.returncode, 0, p.stderr[-3000:])
+
+    @fixtures.slow
+    def test_walkthrough_fails_with_a_30s_stall(self):
+        p = self.child(["-c", SLEEPY])
+        self.assertEqual(p.returncode, 1, p.stderr[-3000:])
+        self.assertIn("the walkthrough got slow", p.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

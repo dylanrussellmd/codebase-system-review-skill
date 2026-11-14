@@ -216,7 +216,7 @@ class TokenOutOfPage(Base):
             self.assertEqual(srv.get("/api/overview").status, 200)
 
 
-@unittest.skipUnless(hasattr(__import__("os"), "umask"), "POSIX permissions only")
+@unittest.skipUnless(hasattr(__import__("os"), "umask"), "environment: POSIX permissions only")
 class LedgerFilesPrivate(unittest.TestCase):
     def test_serve_sets_private_umask(self):
         import os

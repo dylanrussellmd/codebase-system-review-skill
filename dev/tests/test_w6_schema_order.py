@@ -137,7 +137,7 @@ class FromV16(unittest.TestCase):
     def test_migration_from_v16(self):
         old = v16_ledger_py()
         if old is None:
-            self.skipTest(f"git cannot give the sources at {V16}")
+            self.skipTest(f"environment: git cannot give the sources at {V16}")
         project = fixtures.temp_dir("v16-proj-") / "proj"
         project.mkdir()
         p = fixtures.run_ledger("--root", project, "init", ledger_py=old)

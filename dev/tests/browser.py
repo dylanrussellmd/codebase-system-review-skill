@@ -136,7 +136,7 @@ def require_browser():
         raise unittest.SkipTest("browser tests skipped: set LEDGER_BROWSER_TESTS=1 to run them")
     b = get_browser()
     if b is None:
-        raise unittest.SkipTest(f"browser tests skipped: {_state['reason']}")
+        raise unittest.SkipTest(f"environment: browser tests skipped: {_state['reason']}")
     return b
 
 
@@ -192,13 +192,26 @@ class ViewerPage:
 
     def after(self, action, timeout=3000):
         """Run action() (a click or key press that should navigate or load), wait until it has started a fetch, then
-        settle. Without the wait, settle() could return before the router's hashchange handler has run."""
+        settle. Without the wait, settle() could return before the router's hashchange handler has run. Fails when
+        no fetch starts within timeout ms: for an action that loads nothing, call settle() instead."""
         before = self.js("window.__fetches")
         action()
         try:
             self.page.wait_for_function("n => window.__fetches > n", arg=before, timeout=timeout)
         except PlaywrightError:
-            pass
+            raise AssertionError(f"no fetch started within {timeout} ms of the action (window.__fetches stayed at "
+                                 f"{before}; the page is at {self.location_hash() or 'no hash'})") from None
+        return self.settle()
+
+    def without_fetch(self, action, wait_ms=300):
+        """Run action() (one that should neither navigate nor load), give the page wait_ms to react, fail if a fetch
+        started, then settle."""
+        before = self.js("window.__fetches")
+        action()
+        self.page.wait_for_timeout(wait_ms)
+        now = self.js("window.__fetches")
+        if now != before:
+            raise AssertionError(f"the action started {now - before} fetch(es); the page is at {self.location_hash()}")
         return self.settle()
 
     def settle(self, quiet_ms=40, timeout=8000):

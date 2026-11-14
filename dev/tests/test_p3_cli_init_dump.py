@@ -9,11 +9,14 @@ no .gitignore there.
 """
 import contextlib
 import io
+import os
 import sqlite3
 import subprocess
 import sys
 import threading
+import time
 import unittest
+from unittest import mock
 
 from dev.tests import fixtures
 from dev.tests import _migrate_helpers as M
@@ -211,29 +214,51 @@ class AtomicDump(unittest.TestCase):
         rid = L.review("R-0001")
         L.commit()
         stop = threading.Event()
+        commits, errors = [0], []
 
         def writer():
             con = L.connect()
-            n = 0
-            while not stop.is_set() and n < 2000:
-                cur = con.execute("INSERT INTO findings(review_id, point_id, severity, kind, domain_code, summary) "
-                                  "VALUES (?, ?, 'M', 'defect', 'spec', 's')", (rid, f"W-{n}"))
-                con.execute("INSERT INTO finding_locations(finding_id, repository_id, path) VALUES (?, ?, 'a.py')",
-                            (cur.lastrowid, L.default_repository()))
-                con.commit()
-                n += 1
-            con.close()
+            try:
+                n = 0
+                while not stop.is_set() and n < 100000:
+                    cur = con.execute("INSERT INTO findings(review_id, point_id, severity, kind, domain_code, sub, "
+                                      "summary) VALUES (?, ?, 'M', 'defect', 'spec', ?, 's')", (rid, f"W-{n}", f"w-{n}"))
+                    con.execute("INSERT INTO finding_locations(finding_id, repository_id, path) VALUES (?, ?, 'a.py')",
+                                (cur.lastrowid, repo))
+                    con.commit()
+                    n += 1
+                    commits[0] = n
+                    time.sleep(0.005)   # a steady writer, not a flood: the ledger stays small
+            except Exception as e:  # noqa: BLE001  the test fails with it below
+                errors.append(e)
+            finally:
+                con.close()
 
-        L.default_repository()
+        repo = L.default_repository()
+        L.review_repository(rid, fixtures.DEFAULT_COMMIT, repository_id=repo)
         L.commit()
         t = threading.Thread(target=writer)
         t.start()
+        real_fsync = os.fsync
+
+        def fsync_after_a_commit(fd):
+            """The dump's snapshot is open here: wait for the writer to commit once more before the file is done."""
+            want = commits[0] + 1
+            deadline = time.monotonic() + 10
+            while commits[0] < want and not errors and time.monotonic() < deadline:
+                time.sleep(0.002)
+            during.append(commits[0] >= want)
+            return real_fsync(fd)
+
         try:
             for _ in range(3):
+                during = []
                 con = L.module.connect(L.db)
-                with contextlib.redirect_stdout(io.StringIO()):
+                with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(os, "fsync", fsync_after_a_commit):
                     L.module.dump(con, L.db)
                 con.close()
+                self.assertEqual(errors, [], "the writer thread failed")
+                self.assertEqual(during, [True], "the writer made no commit while the dump ran")
                 mem = sqlite3.connect(":memory:")
                 mem.executescript((L.dir / "ledger.sql").read_text(encoding="utf-8"))
                 self.assertEqual(mem.execute("PRAGMA foreign_key_check").fetchall(), [])
@@ -243,6 +268,7 @@ class AtomicDump(unittest.TestCase):
         finally:
             stop.set()
             t.join()
+        self.assertEqual(errors, [], "the writer thread failed")
 
     def test_dump_refuses_foreign_sql(self):
         d = fresh_project()

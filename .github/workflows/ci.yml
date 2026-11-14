@@ -1,5 +1,11 @@
 # Checks every push and pull request: the shipped scripts/ledger.py matches its sources, and the test suite passes.
-# The main jobs use the standard library only. Browser tests (Playwright) and slow scale tests run in their own jobs.
+#   build-check    dev/build.py --check
+#   tests          the whole suite on Python 3.9 and 3.12, standard library only (gated tests skip)
+#   browser-tests  the whole suite with LEDGER_BROWSER_TESTS=1, Playwright and Chromium installed
+#   slow-tests     the whole suite with LEDGER_SLOW_TESTS=1 and LEDGER_BROWSER_TESTS=1: scale builds, speed budgets
+#                  (scaled to the runner by dev/tests/helpers.budget) and the browser page budgets
+# Gated tests are chosen by their marker, never by file name: dev/tests/test_suite.py checks that every test a
+# LEDGER_*_TESTS variable switches on is reached by one of these jobs.
 name: ci
 
 on:
@@ -49,16 +55,22 @@ jobs:
       - name: Browser tests
         env:
           LEDGER_BROWSER_TESTS: "1"
-        run: python3 -m unittest discover -s dev/tests -t . -p "test_browser_*.py" -v
+        run: python3 -m unittest discover -s dev/tests -t . -v
 
   slow-tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Scale and performance tests
+      - name: Install Playwright and Chromium (test-only; the tool itself needs nothing)
+        run: |
+          python3 -m pip install playwright
+          python3 -m playwright install --with-deps chromium
+      - name: Scale, speed-budget and browser page-budget tests
         env:
           LEDGER_SLOW_TESTS: "1"
-        run: python3 -m unittest dev.tests.test_perf -v
+          LEDGER_BROWSER_TESTS: "1"
+        run: python3 -m unittest discover -s dev/tests -t . -v

@@ -15,7 +15,7 @@ import sqlite3
 import time
 import unittest
 
-from dev.tests import browser, fixtures, scale
+from dev.tests import browser, fixtures, helpers, scale
 from dev.tests import test_routes as tr
 from dev.tests.fixtures import Ledger, ServerThread, seed_demo, slow
 
@@ -115,11 +115,11 @@ class LinksInBrowser(browser.ViewerTestCase):
 
     SECTION = "h2:text('Links between issues made in this review') + div"
 
-    def check_show_more(self, page):
+    def check_show_more(self, page, fetches=True):
         self.assertEqual(page.count(self.SECTION + " tbody tr"), 200)
         button = page.page.locator(self.SECTION + " button")
         self.assertEqual(button.inner_text(), f"Show more ({LINKS - 200} left)")
-        page.after(button.click)
+        (page.after if fetches else page.without_fetch)(button.click)   # the hub has its data already
         self.assertEqual(page.count(self.SECTION + " tbody tr"), LINKS)
         self.assertEqual(page.count(self.SECTION + " button"), 0)
 
@@ -129,7 +129,7 @@ class LinksInBrowser(browser.ViewerTestCase):
         self._pages.append(hub)
         hub.page.goto(self.hub.as_uri() + "#review-R-0003")
         hub.settle()
-        self.check_show_more(hub)
+        self.check_show_more(hub, fetches=False)
 
     def test_double_slash_address_draws(self):
         page = self.new_page(token=None)
@@ -158,7 +158,7 @@ class Budget10x(unittest.TestCase):
             page.goto("#/review/" + biggest)
             took = time.perf_counter() - t
             best = took if best is None else min(best, took)
-        self.assertLess(best, 1.5)
+        helpers.assert_within(self, best, 1.5, f"the review page of {biggest} at 10x")
         self.assertLess(page.js("document.querySelectorAll('*').length"), 10_000)
         self.assertEqual(page.page_errors, [])
 
