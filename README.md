@@ -85,7 +85,9 @@ what is committed: nothing, only `ledger.sql`, or only `ledger.sqlite` (about 10
 Each project keeps a copy of the tool at `.code-review/ledger.py`. Review a pull request that changes that copy or the
 ledger's schema like any other code change. `ledger.py check` fails when the ledger's tables, views or triggers differ
 from the shipped schema. Agents run the skill's own `scripts/ledger.py`, and the project copy only right after `init`
-refreshed it; `init` prints the sha256 of the copy it wrote, to compare with the skill's.
+refreshed it; `init` prints the sha256 of the copy it wrote, to compare with the skill's. Every file the tool writes
+goes through a temp file of its own beside it; it writes nothing through a symbolic link at the file, at
+`.code-review/` or at a folder in it, and refuses the command instead.
 
 The ledger runs in SQLite's WAL mode (`init` sets it; `migrate` switches an existing ledger once), so the viewer's
 reads never block the agent's writes. While it is open, `ledger.sqlite-wal` and `ledger.sqlite-shm` sit beside it

@@ -91,8 +91,8 @@ class TestRuns(unittest.TestCase):
         env = fixtures.git_env({"W7A_COUNTER": str(counter)})
         seed = order_seed()
         out = ok(L, "test-runs", "--review", "R-0001", "--command", f"{sys.executable} tests/run.py {{junit}}",
-                 "--repeat", "2", "--seed", str(seed), "--variants", "repeat,random-order,clock", "--actor", "A-0001",
-                 env=env)
+                 "--repeat", "2", "--seed", str(seed), "--variants", "repeat,random-order,clock", "--trusted",
+                 "--env", "W7A_COUNTER", "--actor", "A-0001", env=env)
         text = "\n".join(out)
         self.assertIn(f"seed {seed}", text)
         L.commit()
@@ -113,7 +113,7 @@ class TestRuns(unittest.TestCase):
         self.assertIn("Pacific/Kiritimati", notes)
         # the same seed gives the same order: a rerun of the random-order variant finds the same lead
         ok(L, "test-runs", "--review", "R-0001", "--command", f"{sys.executable} tests/run.py {{junit}}",
-           "--seed", str(seed), "--variants", "random-order", "--actor", "A-0001")
+           "--seed", str(seed), "--variants", "random-order", "--trusted", "--actor", "A-0001")
         L.commit()
         self.assertEqual(L.count("tool_results", "rule='test-runs.order-dependent'"), 2)
 
@@ -121,7 +121,7 @@ class TestRuns(unittest.TestCase):
         repo, L, sha = self.suite_project()
         env = env_with(bare=True)
         out = ok(L, "test-runs", "--review", "R-0001", "--command", f"{sys.executable} tests/run.py {{junit}}",
-                 "--variants", "network-off", "--actor", "A-0001", env=env)
+                 "--variants", "network-off", "--trusted", "--actor", "A-0001", env=env)
         self.assertIn("network off: 6 passed", "\n".join(out))
         self.assertIn("not cut", "\n".join(out))
         L.commit()
@@ -136,8 +136,11 @@ class TestRuns(unittest.TestCase):
         mod = fixtures.load_ledger_module()
         if not mod.network_off_prefix():
             self.skipTest("environment: host policy: " + "unshare -rn is not allowed here (user namespaces are off)")
+        out = ok(L, "test-runs", "--review", "R-0001", "--command", f"{sys.executable} tests/run.py {{junit}}",
+                 "--variants", "network-off", "--trusted", "--actor", "A-0001")
+        self.assertIn("network off: left out", "\n".join(out))
         ok(L, "test-runs", "--review", "R-0001", "--command", f"{sys.executable} tests/run.py {{junit}}",
-           "--variants", "network-off", "--actor", "A-0001")
+           "--variants", "network-off", "--trusted", "--online", "--actor", "A-0001")
         L.commit()
         run = L.one("SELECT * FROM tool_runs WHERE command LIKE 'network-off%'")
         self.assertIn("unshare -rn", run["command"])
@@ -177,7 +180,7 @@ class TestRuns(unittest.TestCase):
                     words = (d / "cmdline").read_bytes().split(b"\0")
                 except OSError:
                     continue
-                if b"archive" in words and str(repo.path).encode() in words:
+                if (b"archive" in words or b"cat-file" in words) and str(repo.path).encode() in words:
                     found.append(int(d.name))
             return found
 
@@ -192,7 +195,7 @@ class TestRuns(unittest.TestCase):
         try:
             p = subprocess.run([sys.executable, str(driver), str(L.ledger_py), "--root", str(L.root), "test-runs",
                                 "--review", "R-0001", "--command", f"{sys.executable} tests/run.py {{junit}}",
-                                "--actor", "A-0001"], capture_output=True, text=True, timeout=10,
+                                "--trusted", "--actor", "A-0001"], capture_output=True, text=True, timeout=10,
                                env=fixtures.git_env())
         except subprocess.TimeoutExpired:
             self.fail(f"test-runs hung for {time.monotonic() - started:.0f} s after the export failed")
@@ -209,6 +212,25 @@ class TestRuns(unittest.TestCase):
             con.close()
         self.assertEqual(archives(), [])
         self.assertEqual(L.count("test_runs"), 0)
+
+    def test_export_ignores_export_attributes(self):
+        """The commit's .gitattributes cannot hide a file from the export or rewrite its text; the run says it has
+        export attributes."""
+        files = {".gitattributes": "secret.py export-ignore\nver.txt export-subst\n", "secret.py": "KEY = 1\n",
+                 "ver.txt": "$Format:%H$\n", "README.md": "# Demo\n", "sub/.gitattributes": "* export-ignore\n",
+                 "sub/x.py": "x = 1\n"}
+        repo, L, sha = tool_project(self, files=files)
+        mod = fixtures.load_ledger_module()
+        into = fixtures.temp_dir("w7a-export-")
+        notes = mod._export_commit(repo.path, sha, into)
+        self.assertEqual((into / "secret.py").read_text(), "KEY = 1\n")
+        self.assertEqual((into / "ver.txt").read_text(), "$Format:%H$\n")
+        self.assertEqual((into / "sub" / "x.py").read_text(), "x = 1\n")
+        self.assertEqual((into / ".gitattributes").read_text(), files[".gitattributes"])
+        self.assertTrue(any("export-ignore" in n and "export-subst" in n for n in notes), notes)
+        ok(L, "tool-run", "doc-references", "--review", "R-0001", "--actor", "A-0001")
+        L.commit()
+        self.assertIn("export-ignore", L.scalar("SELECT note FROM tool_runs") or "")
 
     def test_clock_instants_come_from_zoneinfo(self):
         mod = fixtures.load_ledger_module()

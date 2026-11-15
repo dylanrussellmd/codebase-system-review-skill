@@ -176,7 +176,7 @@ class SnapshotTest(unittest.TestCase):
         self.assertIn("R-0001", p.stdout)
 
     def test_fill_refs_dirty_repo_uses_reviewed_text(self):
-        repo, L, sha = project(self)
+        repo, L, sha = project(self, files={"src/app.py": APP, "src/other.py": APP})
         repo.write("src/app.py", APP.replace("line 2\n", "B2-UNCOMMITTED\n"))
         ok(L, "snapshot", "R-0001")
         rid, run = L.id_of("reviews", "R-0001"), L.scalar("SELECT id FROM reviewer_runs")
@@ -186,13 +186,53 @@ class SnapshotTest(unittest.TestCase):
         row = L.one("SELECT excerpt, source, commit_sha FROM finding_locations")
         self.assertEqual(row, {"excerpt": "B2-UNCOMMITTED", "source": "working-tree", "commit_sha": sha})
         self.assertTrue((L.dir / "patches" / "R-0001-demo.patch").exists())
-        # a file the working tree did not change is read from the commit
+        # a file the snapshot's patch does not touch is read from the commit
         fid2 = L.finding(rid, "SPEC-M2", reviewer_run_id=run)
-        L.location(fid2, "src/app.py", 1, 1)
-        repo.write("src/app.py", APP)
+        L.location(fid2, "src/other.py", 1, 1)
         ok(L, "fill-refs", "R-0001")
         self.assertEqual(L.one("SELECT excerpt, source FROM finding_locations WHERE finding_id=?", (fid2,)),
                          {"excerpt": "line 1", "source": "commit"})
+
+    def test_fill_refs_dirty_uses_snapshot_text(self):
+        """The excerpt is the text the snapshot saved, not the working tree as it is when fill-refs runs; a patch
+        that no longer applies is refused, naming the file."""
+        repo, L, sha = project(self)
+        repo.write("src/app.py", APP.replace("line 2\n", "B2-UNCOMMITTED\n"))
+        ok(L, "snapshot", "R-0001")
+        repo.write("src/app.py", APP.replace("line 2\n", "B2-LATER\n"))
+        rid, run = L.id_of("reviews", "R-0001"), L.scalar("SELECT id FROM reviewer_runs")
+        fid = L.finding(rid, "SPEC-M1", reviewer_run_id=run)
+        L.location(fid, "src/app.py", 2, 2)
+        ok(L, "fill-refs", "R-0001")
+        self.assertEqual(L.one("SELECT excerpt, source FROM finding_locations"),
+                         {"excerpt": "B2-UNCOMMITTED", "source": "working-tree"})
+        patch = L.dir / "patches" / "R-0001-demo.patch"
+        patch.write_bytes(patch.read_bytes().replace(b" line 3\n", b" line 33\n"))
+        fid2 = L.finding(rid, "SPEC-M2", reviewer_run_id=run)
+        L.location(fid2, "src/app.py", 1, 1)
+        p = L.run("fill-refs", "R-0001")
+        self.assertEqual(p.returncode, 1, p.stdout)
+        self.assertIn("src/app.py", p.stdout)
+        self.assertIn("no longer applies", p.stdout)
+        L.commit()
+        self.assertIsNone(L.scalar("SELECT excerpt FROM finding_locations WHERE finding_id=?", (fid2,)))
+
+    def test_snapshot_ignores_bytecode_caches(self):
+        """Caches a test run leaves (__pycache__, .pyc, .pytest_cache) do not make a clean commit dirty."""
+        repo, L, sha = project(self)
+        repo.write("src/__pycache__/app.cpython-313.pyc", "\x00compiled")
+        repo.write(".pytest_cache/v/cache/lastfailed", "{}")
+        repo.write("tools/old.pyc", "\x00")
+        ok(L, "snapshot", "R-0001")
+        L.commit()
+        self.assertEqual(L.one("SELECT is_dirty, dirty_patch_path FROM review_repositories"),
+                         {"is_dirty": 0, "dirty_patch_path": None})
+        self.assertFalse((L.dir / "patches" / "R-0001-demo.patch").exists())
+        repo.write("src/new.py", "x = 1\n")
+        ok(L, "snapshot", "R-0001")
+        L.commit()
+        self.assertEqual(L.scalar("SELECT is_dirty FROM review_repositories"), 1)
+        self.assertNotIn(b"__pycache__", (L.dir / "patches" / "R-0001-demo.patch").read_bytes())
 
     def test_snapshot_refuses_moving_a_review_with_findings(self):
         repo, L, sha = project(self)

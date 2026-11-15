@@ -1,12 +1,14 @@
 # Implementer brief (template)
 
-Copy this into the brief of every agent that implements plan steps, and fill in the parts in angle brackets.
+Copy this into the brief of every agent that implements plan steps, and fill in the parts in angle brackets. Write
+each `ledger.py X` out as `python3 <skill folder>/scripts/ledger.py --root <project root> X`: the skill's own copy,
+run from the project root, never the project's copy in `.code-review/`.
 
 ## Read first
-- The owner's approved design goals: `python3 .code-review/ledger.py goals` (or `goals --domain <D>` for your steps'
-  domains). Work to them, and read them from the ledger rather than from memory or this brief.
+- The owner's approved design goals: `ledger.py goals` (or `goals --domain <D>` for your steps' domains). Work to
+  them, and read them from the ledger rather than from memory or this brief.
 - Your steps: <how to print each step's change, proof, dependencies and the points it closes, e.g.
-  `python3 .code-review/ledger.py query --readonly "SELECT ... FROM v_step_issues WHERE step = N"`>.
+  `ledger.py query "SELECT ... FROM v_step_issues WHERE step = N"`>.
 - The files you own: <files>. Other agents are editing other files at the same time; change only yours.
 
 ## Rules
@@ -19,9 +21,10 @@ You write to the ledger only what belongs to your own steps, with `step-status`,
 `report-finding`, each under your own actor (`--actor <your A- code>`). Read everything else with `query`; the manager
 writes the rest (issue statuses, gates, the plan).
 
-- Start: `python3 .code-review/ledger.py step-status <step> doing --note "<what you start>" --actor <your A- code>`.
-- Finish: `step-status <step> done --note "<for the owner, in plain sentences: what a person sees or what is refused
-  once the step is in, anything that turned out different from the plan>" --commit <sha> --guard <test path>::<test name>`
+- Start: `ledger.py step-status <step> doing --note "<what you start>" --actor <your A- code>`.
+- Finish: `ledger.py step-status <step> done --note "<why: what changed>" --progress-note "<for the owner, in plain
+  sentences: what a person sees or what is refused once the step is in, anything that turned out different from the
+  plan>" --commit <sha> --guard <test path>::<test name> --actor <your A- code>`
   (`ISS-0001=<test path>::<test name>` when the step closes several issues). The tool runs each guard test with the
   step's changes undone and at its commit, and refuses one that does not fail, then pass. Notes follow
   `references/writing.md`: <its rules,
@@ -33,7 +36,7 @@ writes the rest (issue statuses, gates, the plan).
 ## Defects you discover that the plan does not cover (mandatory)
 Never leave a new defect in a note, a comment or your final reply. Record it the moment you find it:
 
-    python3 .code-review/ledger.py report-finding --step <the step you were on> --severity H|M|L|T \
+    ledger.py report-finding --step <the step you were on> --severity H|M|L|T \
         --domain <domain code> --where '<path>:<start>-<end>#<symbol>' --summary '<one sentence>' \
         --before '<what the code does now>' --fix '<the concrete fix>' --test '<test name: what it asserts>' \
         [--commit <commit>] [--issue ISS-0001 | --new-issue] [--into-step N | --new-step '<title>' | --gate] \

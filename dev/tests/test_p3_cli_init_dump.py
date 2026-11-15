@@ -10,6 +10,7 @@ no .gitignore there.
 import contextlib
 import io
 import os
+import stat
 import sqlite3
 import subprocess
 import sys
@@ -206,7 +207,7 @@ class AtomicDump(unittest.TestCase):
         self.assertNotIn("Traceback", p.stderr)
         self.assertIn("dump: could not write", p.stderr)
         self.assertEqual(self.sql().read_bytes(), before)
-        self.assertFalse(self.sql().with_name("ledger.sql.tmp").exists())
+        self.assertEqual([f.name for f in self.sql().parent.iterdir() if f.name.startswith("ledger.sql.")], [])
 
     def test_dump_consistent_under_writer(self):
         L = Ledger()
@@ -242,7 +243,10 @@ class AtomicDump(unittest.TestCase):
         real_fsync = os.fsync
 
         def fsync_after_a_commit(fd):
-            """The dump's snapshot is open here: wait for the writer to commit once more before the file is done."""
+            """The dump's snapshot is open here: wait for the writer to commit once more before the file is done.
+            The folder's fsync after the rename passes straight through."""
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                return real_fsync(fd)
             want = commits[0] + 1
             deadline = time.monotonic() + 10
             while commits[0] < want and not errors and time.monotonic() < deadline:

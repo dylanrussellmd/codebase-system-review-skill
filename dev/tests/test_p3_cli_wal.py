@@ -1,6 +1,7 @@
 """WAL journal mode, the checkpoint in dump, short write transactions (plan P-0001 step 39, the CLI half) and the
 final-answer trigger on gates (step 38, DB-H5's schema part).
 """
+import os
 import sqlite3
 import threading
 import time
@@ -79,6 +80,112 @@ class Wal(unittest.TestCase):
         self.assertIn(b"filled 300 references", out)
         self.assertTrue(waits, "fill-refs finished before any concurrent write was tried")
         self.assertLess(max(waits), 1.0, waits)
+
+
+class AtomicWrites(unittest.TestCase):
+    """Every file the tool writes goes through a temp file of its own: no planted link is followed and two writers
+    never share one."""
+
+    def test_write_atomic_refuses_symlinked_tmp(self):
+        L = Ledger(real_init=True)
+        self.addCleanup(L.close)
+        fixtures.seed_demo(L)
+        L.commit()
+        away = fixtures.temp_dir("planted-")
+        planted = {}
+        for name in ("ledger.sql", "hub.html", "ledger.py", ".gitignore", ".gitattributes"):
+            victim = away / f"{name}.victim"
+            victim.write_text("keep\n")
+            link = L.dir / f"{name}.tmp"
+            os.symlink(str(victim), str(link))
+            planted[link] = victim
+        for cmd in (("init",), ("dump",), ("progress-page",)):
+            p = L.run(*cmd)
+            self.assertEqual(p.returncode, 0, f"{cmd}: {p.stdout}{p.stderr}")
+        for link, victim in planted.items():
+            self.assertTrue(link.is_symlink(), link)
+            self.assertEqual(victim.read_text(), "keep\n", victim)
+        # a planted link at a target or at the reviews folder is refused, and nothing is written through it
+        hub = L.dir / "hub.html"
+        hub.unlink()
+        os.symlink(str(away / "hub.html.victim"), str(hub))
+        p = L.run("progress-page")
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertIn("link", p.stderr)
+        self.assertEqual((away / "hub.html.victim").read_text(), "keep\n")
+        outside = fixtures.temp_dir("planted-reviews-")
+        if (L.dir / "reviews").exists():
+            os.rename(str(L.dir / "reviews"), str(away / "reviews-was"))
+        os.symlink(str(outside), str(L.dir / "reviews"))
+        lcov = away / "cov.lcov"
+        lcov.write_text("SF:src/app.py\nDA:1,1\nend_of_record\n")
+        p = L.run("tool-run", "coverage", "--review", "R-0001", "--from", str(lcov), "--actor", "A-0001")
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertEqual(list(outside.rglob("*")), [])
+
+    def test_write_atomic_concurrent_writers(self):
+        mod = fixtures.load_ledger_module()
+        target = fixtures.temp_dir("atomic-") / "out.bin"
+        contents = [bytes([65 + n]) * 3_000_000 for n in range(2)]
+        errors, start = [], threading.Barrier(2)
+
+        def write(data):
+            start.wait()
+            for _ in range(15):
+                try:
+                    mod.write_atomic(target, data)
+                except OSError as e:
+                    errors.append(e)
+        threads = [threading.Thread(target=write, args=(c,)) for c in contents]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        self.assertIn(target.read_bytes(), contents)
+        self.assertEqual(sorted(p.name for p in target.parent.iterdir()), ["out.bin"])
+
+    def test_concurrent_dumps_each_complete(self):
+        """Two dumps at once, with a commit between their snapshots, both succeed and leave one whole dump."""
+        L = Ledger(real_init=True)
+        self.addCleanup(L.close)
+        fixtures.seed_demo(L)
+        L.con.executemany("INSERT INTO actors(kind, name) VALUES ('owner', ?)", [(f"bulk {n}",) for n in range(20000)])
+        L.commit()  # big enough that the two dumps overlap
+        mod = fixtures.load_ledger_module()
+        out = L.db.with_suffix(".sql")
+        for round_ in range(3):
+            with self.subTest(round=round_):
+                cons = [sqlite3.connect(str(L.db), check_same_thread=False) for _ in range(2)]
+                writer = sqlite3.connect(str(L.db))
+                exits, start = [], threading.Barrier(3)
+
+                def run(con):
+                    start.wait()
+                    try:
+                        mod.dump(con, L.db)
+                    except SystemExit as e:
+                        exits.append(str(e))
+                threads = [threading.Thread(target=run, args=(c,)) for c in cons]
+                for t in threads:
+                    t.start()
+                start.wait()
+                writer.execute("INSERT INTO actors(kind, name) VALUES ('owner', ?)", (f"written during {round_}",))
+                writer.commit()
+                for t in threads:
+                    t.join()
+                writer.close()
+                for c in cons:
+                    c.close()
+                self.assertEqual(exits, [])
+                got = out.read_text(encoding="utf-8")
+                self.assertTrue(got.endswith("COMMIT;\n"), got[-200:])
+                fresh = sqlite3.connect(":memory:")
+                fresh.executescript(got.split("\n", 1)[1])
+                self.assertIn(fresh.execute("SELECT count(*) FROM actors WHERE name LIKE 'written during%'")
+                              .fetchone()[0], (round_, round_ + 1))
+                fresh.close()
+                self.assertEqual([p.name for p in L.dir.iterdir() if p.name.startswith("ledger.sql.")], [])
 
 
 class GateAnswerFinal(unittest.TestCase):

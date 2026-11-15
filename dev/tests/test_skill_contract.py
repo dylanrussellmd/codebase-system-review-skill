@@ -549,5 +549,51 @@ class OwnerRules(unittest.TestCase):
         self.assertIn("never record a path in a scratch folder", " ".join(recipe.split()))
 
 
+PROJECT_COPY = re.compile(r"python3\s+\.code-review/ledger\.py|`\.code-review/ledger\.py\s[^`]*`")
+
+
+class SkillCopy(unittest.TestCase):
+    """Every command the skill gives an agent runs the skill's own ledger.py, never the project's copy."""
+
+    def test_no_text_runs_the_project_copy(self):
+        shipped = [*doc_files(), REPO / "README.md", REPO / "dev" / "core.py", REPO / "dev" / "page.html"]
+        found = [f"{f.relative_to(REPO)}:{n}" for f in shipped
+                 for n, line in enumerate(f.read_text(encoding="utf-8").split("\n"), 1) if PROJECT_COPY.search(line)]
+        self.assertEqual(found, [])
+        with Ledger(temp_dir("copy-")) as L:
+            L.commit()
+            self.assertIsNone(PROJECT_COPY.search((L.root / ".code-review" / ".gitattributes").read_text()))
+
+    def test_implementer_brief_matches_skill(self):
+        text = (REFS / "implementer-brief.md").read_text(encoding="utf-8")
+        flat = " ".join(text.split())
+        self.assertIsNone(PROJECT_COPY.search(text))
+        self.assertIn("`python3 <skill folder>/scripts/ledger.py --root <project root> X`", flat)
+        names, flags = Tool.get()
+        problems = []
+        for span in code_spans(text):
+            for cmd, rest in ledger_commands(span):
+                problems += [f"{cmd} {f}" for f in re.findall(r"(?<![\w-])(--[a-z][a-z-]*)", rest)
+                             if cmd in flags and f not in flags[cmd]]
+        self.assertEqual(problems, [])
+        done = next(s for s in code_spans(text) if re.search(r"step-status <step> done", s))
+        self.assertIn("--progress-note", done)
+        self.assertIn("--note", done)
+
+    def test_step9_issue_status_owner(self):
+        """SKILL.md Step 9 and the implementer brief name the manager as the one who moves issue statuses."""
+        s9 = " ".join(section(skill_text(), "Step 9").split())
+        self.assertIn("you, the manager, move each issue it closes", s9)
+        self.assertNotRegex(s9, r"implementer[^.]*runs `?issue-status")
+        brief = " ".join((REFS / "implementer-brief.md").read_text(encoding="utf-8").split())
+        self.assertIn("the manager writes the rest (issue statuses", brief)
+
+    def test_skill_says_commands_run_from_root(self):
+        """Relative file arguments are read from the current folder, so SKILL.md says where commands run."""
+        text = " ".join(skill_text().split())
+        self.assertIn("run from the project root (relative file paths are read from the current folder)", text)
+        self.assertNotIn("means, from anywhere,", text)
+
+
 if __name__ == "__main__":
     unittest.main()

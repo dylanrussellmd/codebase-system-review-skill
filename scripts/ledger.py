@@ -39,7 +39,7 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote
 
 TOOL_VERSION = "1.12.0"  # stamped by dev/build.py from `metadata: version:` in SKILL.md's frontmatter
-TOOL_HASH = "9a324b7b333f14a55978c2a620c85812e8043bfd1e17b87ef3b835f3874ee09f"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
+TOOL_HASH = "aae9abeab535cec97b8ab49fd506643d14795452a2f5bb47e027d9086be079ac"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
 # Placeholders: dev/build.py puts references/schema.sql, dev/page.html and references/migrations/*.sql in their
 # place when it writes scripts/ledger.py. dev/core.py itself is never run as the tool.
 SCHEMA = r"""-- =====================================================================
@@ -8767,11 +8767,62 @@ def looks_like_tool(path):
     return any(l.startswith(TOOL_SIGNATURE) for l in head)
 
 
-def write_atomic(path, data, mode=0o600):
-    """Write bytes to path through path.tmp + fsync + os.replace, so path is either the old or the new content."""
-    tmp = path.with_name(path.name + ".tmp")
+def planted_link(path):
+    """The first of path and the folders it is in, up to the nearest .code-review folder (else up to its own
+    folder), that is a symbolic link; None when there is none. A repository can commit such a link to make a write
+    land outside the project."""
+    path = Path(path).absolute()
+    chain = [path, *path.parents]
+    stop = next((i for i, p in enumerate(chain) if p.name == ".code-review"), 1)
+    return next((p for p in chain[:stop + 1] if p.is_symlink()), None)
+
+
+def refuse_links(path):
+    """OSError when planted_link(path) finds a link."""
+    link = planted_link(path)
+    if link is not None:
+        raise OSError(f"{link} is a symbolic link; ledger.py writes nothing through a link")
+
+
+def make_folder(folder, mode=0o777):
+    """mkdir -p, refused (OSError) when the folder or one it is in is a planted link (refuse_links)."""
+    refuse_links(folder)
+    Path(folder).mkdir(mode=mode, parents=True, exist_ok=True)
+
+
+def _fsync_folder(folder):
+    """Make a rename in folder durable; a platform that cannot open a folder is left as it is."""
     try:
-        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+        fd = os.open(str(folder), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def private_temp(path, mode=0o600):
+    """(fd, temp path) of a new file beside path, this writer's own (tempfile.mkstemp: created, never opened
+    through a link), with mode. Refuses (refuse_links) a path or folder that is a planted link."""
+    refuse_links(path)
+    fd, name = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    try:
+        os.chmod(name, mode)
+    except OSError:
+        pass
+    return fd, Path(name)
+
+
+def write_atomic(path, data, mode=0o600):
+    """Write bytes to path through a temp file of this writer's own (private_temp), fsync, os.replace and an fsync
+    of the folder, so path holds the old content or one writer's new content whole. A failure removes only this
+    writer's temp file."""
+    path = Path(path)
+    fd, tmp = private_temp(path, mode)
+    try:
         with open(fd, "wb") as f:
             f.write(data)
             f.flush()
@@ -8783,6 +8834,7 @@ def write_atomic(path, data, mode=0o600):
         except OSError:
             pass
         raise
+    _fsync_folder(path.parent)
 
 
 def make_private(path, mode=0o600):
@@ -8823,7 +8875,7 @@ def build_ledger(root, db):
     tmp = db.with_name(db.name + ".tmp")
     side = [tmp.with_name(tmp.name + s) for s in ("", "-journal", "-wal", "-shm")]
     for p in side:
-        if p.exists():
+        if os.path.lexists(str(p)):  # a planted link too: SQLite would create the file it points to
             p.unlink()
     con = None
     try:
@@ -8929,6 +8981,10 @@ def _init(root, db, force, copy_tool, gitignore):
         sys.exit(f"{home} is not a ledger.py made by this tool; left it unchanged. Choose another folder for the "
                  f"ledger.")
     copy = plan_tool_copy(home, force) if copy_tool else None  # may exit, before anything is written
+    link = planted_link(db)
+    if link is not None:
+        sys.exit(f"init: {link} is a symbolic link; ledger.py writes nothing through a link (move it aside, or give "
+                 f"the ledger's real folder with CODE_REVIEW_DIR)")
     fresh = not db.exists()
     if not fresh:
         require_ledger(db)
@@ -9698,6 +9754,7 @@ def fill_refs(root, con, review_code=None):
     failed = 0
     updates = []  # every git read happens first; the writes then go in one short transaction (DB-M8)
     readers = {}  # one BlobReader per repository folder
+    patched = {}  # reviewed_bytes' cache
     todo = [r[0] for r in con.execute(sql, args).fetchall()]
     if not todo:
         print("already complete: filled 0 references, 0 could not be read from git")
@@ -9726,7 +9783,10 @@ def fill_refs(root, con, review_code=None):
                     failed += left
                     break
                 print(f"{where}: {e}"); failed += 1; continue
-            seen = working_tree_bytes(root, con, loc, data)  # a dirty review: the text its reviewers saw (D-14)
+            try:
+                seen = reviewed_bytes(root, con, loc, data, patched)  # a dirty review: the text it saw (D-14)
+            except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+                print(f"{where}: {_one_line(e)}"); failed += 1; continue
             if seen is not None and loc["excerpt"] is None:
                 data = seen
             try:
@@ -10052,8 +10112,8 @@ DUMP_HEADER = "-- ledger.py dump: a text copy of the ledger for diffs; rebuild w
 
 
 def dump(con, db):
-    """Write <db>.sql: one consistent snapshot (a read transaction around iterdump), written to <db>.sql.tmp,
-    fsynced and renamed over the old dump, so a failed dump leaves the previous one intact. A WAL ledger is
+    """Write <db>.sql: one consistent snapshot (a read transaction around iterdump), written to a temp file of this
+    run's own (private_temp), fsynced and renamed over the old dump, so the file always holds one whole dump. A WAL ledger is
     checkpointed first so the .sqlite file itself holds every commit. Refuses to overwrite a .sql file that this
     command did not write (its first line is not DUMP_HEADER, nor iterdump's own first line, which older dumps had)."""
     out = db.with_suffix(".sql")
@@ -10067,13 +10127,13 @@ def dump(con, db):
         con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     except sqlite3.Error:
         pass  # a reader elsewhere: the dump below is still complete
-    tmp = out.with_name(out.name + ".tmp")
     if con.in_transaction:
         con.commit()
     con.execute("BEGIN")
+    tmp = None
     try:
         con.execute("SELECT count(*) FROM sqlite_master").fetchone()  # the snapshot starts here
-        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        fd, tmp = private_temp(out)
         with open(fd, "w", encoding="utf-8", newline="\n") as f:
             f.write(DUMP_HEADER + "\n")
             for line in con.iterdump():
@@ -10081,12 +10141,14 @@ def dump(con, db):
             f.flush()
             os.fsync(f.fileno())
         os.replace(str(tmp), str(out))
+        _fsync_folder(out.parent)
     except OSError as e:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-        sys.exit(f"dump: could not write {out} ({e}); the previous dump is unchanged")
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        sys.exit(f"dump: could not write {out} ({e}); it holds the previous whole dump, or one another run wrote")
     finally:
         con.rollback()
     print(f"wrote {out}")
@@ -11916,15 +11978,23 @@ def last_answers_import(con):
         return None
 
 
-def import_reminder(con):
+def running_copy():
+    """The absolute path of the ledger.py that is running, for the commands it prints."""
+    return str(Path(sys.argv[0] if sys.argv and sys.argv[0].endswith(".py") else __file__).resolve())
+
+
+def import_reminder(con, root=None):
     """The line gates, check and progress-page print while a published page may hold answers not yet imported, or
-    None when the review records no published page."""
+    None when the review records no published page. The command it gives runs this copy (running_copy) on root."""
     page = published_page(con)
     if not page:
         return None
     last = last_answers_import(con)
+    where = f" --root {shlex.quote(str(Path(root).resolve()))}" if root else ""
     return (f"note: the owner may have answered on the published page {page['url']} (answers last imported: "
-            f"{last or 'never'}). Export its answer store and run: python3 .code-review/ledger.py import-answers FILE")
+            f"{last or 'never'}). Save its answers to a file (the page's database collection `answers`, or the "
+            f"answers.json its Download your answers link gives) and run: python3 {shlex.quote(running_copy())}"
+            f"{where} import-answers FILE")
 
 
 def record_answers_import(con, source, recorded, skipped, refused):
@@ -11980,7 +12050,7 @@ def import_answers(db, source):
 # ---------------------------------------------------------------- restore and merge
 
 GITATTRIBUTES = ("# ledger.sqlite is a SQLite file: git must not diff or line-merge it. After a merge conflict keep one\n"
-                 "# side and bring the other in with: python3 .code-review/ledger.py merge OTHER.sqlite\n"
+                 "# side and bring the other in with the skill's copy of ledger.py: ledger.py merge OTHER.sqlite\n"
                  "ledger.sqlite binary -diff -merge\nledger.sql -merge\n")
 
 
@@ -12318,8 +12388,8 @@ def add_tool_parsers(sub):
     s = sub.add_parser("query", help="run one read-only SELECT on the ledger and print TSV (or --json)",
                        description='Run one SELECT (or WITH ... SELECT) through the viewer\'s read-only path and print '
                                    'the rows as TSV with a header line, or JSON. Writes, ATTACH and PRAGMAs are '
-                                   'refused. Example: python3 .code-review/ledger.py query "SELECT code, title FROM '
-                                   'issues WHERE status=\'open\'". Without ledger.py: python3 -c "import sqlite3; '
+                                   'refused. Example: ledger.py query "SELECT code, title FROM '
+                                   'issues WHERE status=\'open\'" (the skill\'s copy, with --root). Without ledger.py: python3 -c "import sqlite3; '
                                    'print(sqlite3.connect(\'file:.code-review/ledger.sqlite?mode=ro\', uri=True)'
                                    '.execute(\'SELECT ...\').fetchall())"')
     s.add_argument("sql")
@@ -12384,8 +12454,12 @@ def tool_command(a, root, db):
                 return 1
             if a.out:
                 out = Path(a.out)
-                out.parent.mkdir(parents=True, exist_ok=True)
-                write_atomic(out, terminal_safe(text).encode("utf-8"), 0o644)  # read with cat as often as viewed
+                try:
+                    make_folder(out.parent)
+                    write_atomic(out, terminal_safe(text).encode("utf-8"), 0o644)  # read with cat as often as viewed
+                except OSError as e:
+                    print(f"progress-md: could not write {out} ({e})", file=sys.stderr)
+                    return 1
                 print(f"wrote {out}")
             else:
                 sys.stdout.write(text)
@@ -12393,7 +12467,7 @@ def tool_command(a, root, db):
         if a.plan and not one(con, "SELECT 1 x FROM plans WHERE code=?", (a.plan,)):
             print(f"progress-page: no plan {a.plan}", file=sys.stderr)
             return 1
-        reminder = import_reminder(con)
+        reminder = import_reminder(con, root)
     finally:
         con.close()
     try:
@@ -12402,7 +12476,11 @@ def tool_command(a, root, db):
         print(e, file=sys.stderr)
         return 1
     out = Path(a.out) if a.out else db.parent / "hub.html"
-    write_atomic(out, page.encode("utf-8"))
+    try:
+        write_atomic(out, page.encode("utf-8"))
+    except OSError as e:
+        print(f"progress-page: could not write {out} ({e})", file=sys.stderr)
+        return 1
     print(f"wrote {out} ({len(page.encode('utf-8')) / 1e6:.2f} MB, {n} views, no outside requests)")
     if reminder:
         print(reminder)
@@ -12711,11 +12789,16 @@ def _exclude_spec(d, db):
     return [".", f":(exclude){rel.as_posix()}"] if str(rel) != "." else ["."]
 
 
+CACHE_SPEC = (":(exclude,glob)**/__pycache__/**", ":(exclude,glob)**/*.pyc", ":(exclude,glob)**/.pytest_cache/**")
+# what a test run leaves behind and no reviewer cites: snapshot leaves it out of the working tree's differences
+
+
 def snapshot_repository(root, db, review_code, repo, commit=None):
     """What review_repositories records for one repository: the full commit (HEAD unless commit is given), branch,
     commit time (UTC) and subject; for HEAD also whether the working tree differs from it, ignoring the ledger's own
-    folder, and the patch of every difference (git diff HEAD, staged and unstaged, plus each untracked file not
-    ignored). Returns (fields, patch bytes or None)."""
+    folder and the caches CACHE_SPEC names (the dirty note says when some were left out), and the patch of every
+    difference (git diff HEAD, staged and unstaged, plus each untracked file not ignored). Returns (fields, patch
+    bytes or None)."""
     d = repo_dir(root, repo["path"], bool(repo["allow_outside_root"]))
     try:
         git(d, "rev-parse", "--git-dir")
@@ -12733,7 +12816,7 @@ def snapshot_repository(root, db, review_code, repo, commit=None):
               "is_dirty": 0, "dirty_note": None, "dirty_patch_path": None}
     if sha != head:
         return fields, None
-    spec = _exclude_spec(d, db)
+    spec = [*_exclude_spec(d, db), *CACHE_SPEC]
     status = git(d, "status", "--porcelain", "--untracked-files=all", "--", *spec).decode("utf-8", "replace")
     if not status.strip():
         return fields, None
@@ -12748,8 +12831,11 @@ def snapshot_repository(root, db, review_code, repo, commit=None):
                              f"{r.stderr.decode('utf-8', 'replace').strip()}")
         patch += r.stdout
     changed = len([l for l in status.splitlines() if not l.startswith("??")])
+    caches = git(d, "status", "--porcelain", "--untracked-files=all", "--", *_exclude_spec(d, db)) \
+        .decode("utf-8", "replace").count("\n") - status.count("\n")
     fields.update(is_dirty=1, dirty_note=f"{changed} changed and {len(untracked)} untracked files differ from "
-                                         f"{sha[:10]}")
+                                         f"{sha[:10]}" + ("; test caches (__pycache__, .pyc, .pytest_cache) left out"
+                                                          if caches > 0 else ""))
     return fields, patch
 
 
@@ -12758,11 +12844,18 @@ def _write_patch(ctx, review_code, repo, patch):
     only) and return its path. The patch is written beside it as .patch.new and moved into place once the command is
     committed, so a refused command leaves the recorded patch as it was."""
     folder = Path(ctx.db).parent / "patches"
-    folder.mkdir(mode=0o700, exist_ok=True)
+    try:
+        make_folder(folder, 0o700)
+    except OSError as e:
+        raise WriteError(f"cannot keep the patch in {folder}: {e}")
     make_private(folder, 0o700)
     path = folder / f"{review_code}-{re.sub(r'[^A-Za-z0-9._-]', '_', repo['name'])}.patch"
     pending = path.with_name(path.name + ".new")
-    write_atomic(pending, patch, 0o600)
+    try:
+        refuse_links(path)
+        write_atomic(pending, patch, 0o600)
+    except OSError as e:
+        raise WriteError(f"cannot keep the patch in {folder}: {e}")
     ctx.files.append(pending)
 
     def put_in_place():
@@ -16257,6 +16350,17 @@ def add_write_commands(sub):
     add_write_commands_131(p)
 
 
+def add_code_options(s):
+    """--trusted, --container and --env: how a command the repository chooses may run (_code_isolation)."""
+    s.add_argument("--trusted", action="store_true",
+                   help="the owner trusts this code: run the repository's commands on this machine")
+    s.add_argument("--container", metavar="PREFIX",
+                   help="run the repository's commands under this prefix, e.g. 'podman run --rm --network=none "
+                        "-v {work}:{work} -w {checkout} IMAGE' ({work}: the run's folder, {checkout}: the export)")
+    s.add_argument("--env", action="append", metavar="NAME",
+                   help="pass this environment variable too (repeatable); the rest are PATH, HOME and LANG")
+
+
 def add_write_commands_131(p):
     """The subparsers of the step 131-132 writes (new-plan ... redact); p is add_write_commands' maker."""
     s = p("tool-run"); s.add_argument("tool", help="the tool or import format (references/tools.md, How a tool is "
@@ -16274,6 +16378,7 @@ def add_write_commands_131(p):
                                     "only this machine unless --online")
     s.add_argument("--seed", type=int, help="the seed of a tool that generates cases (default: from the commit)")
     s.add_argument("--note")
+    add_code_options(s)
     s = p("dismiss-lead"); s.add_argument("leads", nargs="+", metavar="LEAD", help="the leads (LD-0001)")
     s.add_argument("--reason", help="why it is not a finding")
     s = p("test-runs"); s.add_argument("--review", required=True)
@@ -16284,6 +16389,8 @@ def add_write_commands_131(p):
     s.add_argument("--repeat", type=int, default=3, help="how many repeated runs (default 3)")
     s.add_argument("--seed", type=int, help="the random-order seed (default: from the commit)")
     s.add_argument("--repo"); s.add_argument("--domain", help="whose reviewer gets the leads (default test-quality)")
+    s.add_argument("--online", action="store_true", help="with --trusted: leave the network on for every run")
+    add_code_options(s)
     s = p("cite-lead"); s.add_argument("lead", help="the lead (LD-0001)")
     s.add_argument("finding", help="the finding that covers it (R-0001:SEC-H3)")
     s = p("resolve-conflict"); s.add_argument("plan", help="the plan (P-0001)")
@@ -16381,29 +16488,55 @@ def add_write_commands_131(p):
     s = p("reopen-gate"); s.add_argument("gate"); s.add_argument("--note", help="why the owner answers again")
 
 
-# ----- the reviewed text of a dirty working tree (D-14, used by fill_refs)
+# ----- the reviewed text of a dirty review: the commit and the snapshot's patch (D-14, used by fill_refs)
 
-def working_tree_bytes(root, con, loc, committed):
-    """The file's bytes in the working tree when the location's review recorded that repository dirty (is_dirty) at
-    the location's commit and the file there differs from the commit; else None (read the commit). The reviewers
-    saw the working tree, so its text is what the excerpt should hold (finding_locations.source 'working-tree')."""
+def _glob_escape(path):
+    """A path as a literal git wildmatch pattern (for git apply --include)."""
+    return re.sub(r"([\\*?\[\]])", r"\\\1", path)
+
+
+def reviewed_bytes(root, con, loc, committed, cache):
+    """The file's bytes as the location's review saw them when it recorded that repository dirty (is_dirty) at the
+    location's commit: the commit's file with the snapshot's saved patch applied (finding_locations.source
+    'working-tree'). None when the review was clean or the patch does not touch the file (read the commit).
+    RuntimeError, naming the file, when the patch is missing or no longer applies. cache keeps each patch's file
+    list and each result for one fill-refs run."""
     try:
-        rr = con.execute("""SELECT rr.is_dirty, rr.commit_sha FROM finding_locations fl JOIN findings f ON f.id = fl.finding_id
+        rr = con.execute("""SELECT rr.is_dirty, rr.commit_sha, rr.dirty_patch_path FROM finding_locations fl
+                            JOIN findings f ON f.id = fl.finding_id
                             JOIN review_repositories rr ON rr.review_id = f.review_id
                              AND rr.repository_id = fl.repository_id WHERE fl.id=?""", (loc["id"],)).fetchone()
     except sqlite3.Error:
         return None
-    if not rr or not rr[0] or rr[1] != loc["commit_sha"]:
+    if not rr or not rr[0] or rr[1] != loc["commit_sha"] or not rr[2]:
         return None
-    try:
-        d = repo_dir(root, loc["repo_path"], bool(loc.get("allow_outside_root")))
-        f = (d / loc["path"]).resolve()
-        if d.resolve() not in f.parents or not f.is_file():
-            return None
-        data = f.read_bytes()
-    except (OSError, RuntimeError):
+    patch = Path(rr[2]) if Path(rr[2]).is_absolute() else Path(root) / rr[2]
+    if not patch.is_file():
+        raise RuntimeError(f"the snapshot's patch {rr[2]} is missing, so the reviewed text of {loc['path']} is "
+                           f"unknown")
+    key = str(patch.resolve())
+    if key not in cache:
+        with tempfile.TemporaryDirectory(prefix="ledger-apply-") as tmp:
+            r = subprocess.run(["git", "apply", "--numstat", "-z", key], cwd=tmp, capture_output=True,
+                               timeout=GIT_TIMEOUT, stdin=subprocess.DEVNULL)
+        if r.returncode != 0:
+            raise RuntimeError(f"the snapshot's patch {rr[2]} cannot be read: {_one_line(r.stderr.decode('utf-8', 'replace'))}")
+        cache[key] = {f.split(b"\t", 2)[-1].decode("utf-8", "surrogateescape")
+                      for f in r.stdout.split(b"\0") if f.count(b"\t") >= 2}
+    if loc["path"] not in cache[key]:
         return None
-    return data if data != committed else None
+    if (key, loc["path"]) not in cache:
+        with tempfile.TemporaryDirectory(prefix="ledger-apply-") as tmp:
+            f = Path(tmp) / loc["path"]
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_bytes(committed)
+            r = subprocess.run(["git", "apply", f"--include={_glob_escape(loc['path'])}", key], cwd=tmp,
+                               capture_output=True, timeout=GIT_TIMEOUT, stdin=subprocess.DEVNULL)
+            if r.returncode != 0:
+                raise RuntimeError(f"the snapshot's patch {rr[2]} no longer applies to {loc['path']} at "
+                                   f"{loc['commit_sha'][:10]}: {_one_line(r.stderr.decode('utf-8', 'replace'))}")
+            cache[(key, loc["path"])] = f.read_bytes() if f.is_file() else b""
+    return cache[(key, loc["path"])]
 
 
 # ---------------------------------------------------------------- the review tools (plan P-0001 steps 133-143)
@@ -17800,8 +17933,11 @@ def _write_inside_ledger(db, target, text):
     out = Path(target).expanduser().resolve()
     if folder not in out.parents:
         raise WriteError(f"--out {target} is not inside the ledger's folder {folder}")
-    out.parent.mkdir(parents=True, exist_ok=True)
-    write_atomic(out, text.encode("utf-8"), 0o644)
+    try:
+        make_folder(out.parent)
+        write_atomic(out, text.encode("utf-8"), 0o644)
+    except OSError as e:
+        raise WriteError(f"could not write {out} ({e})")
     return out
 
 
@@ -18497,7 +18633,6 @@ REVIEW_ARG_HELP = {  # the review tools' arguments that need the same words ever
 # and the same output gives the same rows, so two runs at one commit agree (G-09). references/tools.md, "How a tool
 # is wired in", is the interface for adding a tool: an adapter in TOOL_ADAPTERS, a pin, a recorded sample, a test.
 
-import tarfile
 import tempfile
 import time
 import xml.etree.ElementTree as ElementTree
@@ -18536,14 +18671,18 @@ class ToolAdapter:
     locate    locate() -> the installed version ('' unknown, None absent), for a tool found otherwise than by
               `binary --version` (a script library, a CLI that prints no version)
     import_note  for an import-only adapter: where the file to import comes from
+    runs_code True when the tool runs commands the repository chooses (hyperfine's budgets): tool-run refuses it
+              without --trusted or --container, and gives it CODE_ENV and --env names only (_code_isolation)
     """
     def __init__(self, name, *, fmt, parse, domain=None, binary=None, argv=None, version_args=("--version",),
                  stdout=False, ok_exits=(0,), store=None, run=None, install="", fallback="", online="no",
-                 source="checkout", env=None, step=218, lock_key=None, locate=None, import_note=None):
+                 source="checkout", env=None, step=218, lock_key=None, locate=None, import_note=None,
+                 runs_code=False):
         self.name, self.fmt, self.parse, self.domain, self.binary, self.argv = name, fmt, parse, domain, binary, argv
         self.version_args, self.stdout, self.ok_exits, self.store, self.run = version_args, stdout, ok_exits, store, run
         self.install, self.fallback, self.online, self.source, self.step = install, fallback, online, source, step
         self.env, self.lock_key, self.locate, self.import_note = env, lock_key or name, locate, import_note
+        self.runs_code = runs_code
         self.service = False   # True: a service reached at --target, run whether or not its binary is on PATH
 
 
@@ -18560,6 +18699,8 @@ class ToolCall:
         self.placeholders = {}  # path -> placeholder, so the recorded command holds no temporary path
         self.notes = []  # what the adapter left out and why, for the run's note
         self.cleanup = []  # callables run once the tool has ended (they remove what holds secrets)
+        self.prefix, self.shown_prefix = [], []  # what the command runs under (unshare -rn, a container)
+        self.code_env = None  # the whole environment of a runs-code tool (_code_env); None: _tool_env
 
 
 TOOL_ADAPTERS = {}
@@ -19118,8 +19259,11 @@ def _fetch_once(url, target):
         raise WriteError(f"cannot fetch {url}: {_one_line(e)}")
     if not data.strip():
         raise WriteError(f"{url} returned nothing")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    write_atomic(target, data, 0o644)
+    try:
+        make_folder(target.parent)
+        write_atomic(target, data, 0o644)
+    except OSError as e:
+        raise WriteError(f"could not keep {url} in {target} ({e})")
     return target
 
 
@@ -19354,6 +19498,43 @@ def clock_instants():
     return out
 
 
+CODE_ENV = ("PATH", "HOME", "LANG")   # the variables a command the repository chooses gets, with the --env names
+
+
+def _code_env(a):
+    """The environment of a command the repository chooses: CODE_ENV and the owner's --env names, from this one."""
+    names = [*CODE_ENV, *(getattr(a, "env", None) or [])]
+    bad = next((n for n in names if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", n)), None)
+    if bad:
+        raise WriteError(f"--env {bad}: not a variable name")
+    return {n: os.environ[n] for n in names if n in os.environ}
+
+
+def _code_isolation(a, what):
+    """(prefix, shown prefix, note) for a command the repository chooses. --container PREFIX runs it under that
+    command ({work}: the run's temporary folder, {checkout}: the export, left for the caller to fill); --trusted
+    runs it here, with the network off where unshare -rn works unless --online. Without either: WriteError."""
+    if getattr(a, "container", None):
+        words = shlex.split(a.container)
+        if not words:
+            raise WriteError("--container: give the command that runs the tool in a container")
+        return words, words, f"in a container ({a.container})"
+    if not getattr(a, "trusted", False):
+        raise WriteError(f"{what} runs commands the repository chooses: give --container 'PREFIX' to run them in a "
+                         f"container, or --trusted when the owner trusts this code on this machine; nothing was run")
+    if getattr(a, "online", False):
+        return [], [], "--trusted: run on this machine with the network (--online)"
+    prefix = network_off_prefix()
+    if prefix:
+        return prefix, [Path(prefix[0]).name, *prefix[1:]], "--trusted: run on this machine, network off (unshare -rn)"
+    return [], [], "--trusted: run on this machine; the network was not cut (unshare -rn is not available here)"
+
+
+def _fill_prefix(words, tmp, work):
+    """The --container words with {work} and {checkout} filled in."""
+    return [w.replace("{work}", str(tmp)).replace("{checkout}", str(work)) for w in words]
+
+
 def network_off_prefix():
     """['unshare', '-rn'] when this machine lets an unprivileged process drop its network (Linux), else None."""
     exe = shutil.which("unshare") if sys.platform.startswith("linux") else None
@@ -19426,7 +19607,7 @@ def _test_run_plan(a, seed):
                        "off and shifted clocks; newly failing tests become leads",
           "ledger.py test-runs --review R-0001 --command 'CMD writing JUnit XML to {junit}' [--random-command CMD] "
           "[--variants repeat,random-order,network-off,clock] [--repeat 3] [--seed N] [--repo NAME] [--domain D] "
-          "[--actor A-0001]")
+          "(--trusted [--online] | --container PREFIX) [--env NAME] [--actor A-0001]")
 def cmd_test_runs(ctx):
     a, con = ctx.a, ctx.con
     rv = review_row(con, a.review)
@@ -19440,24 +19621,37 @@ def cmd_test_runs(ctx):
     domain = _domain_or_none(con, a.domain or "test-quality", "--domain")
     repo, sha = _review_repo(con, rv, a.repo)
     seed = a.seed if a.seed is not None else int(sha[:8], 16) % 1000000
+    box, box_shown, box_note = _code_isolation(a, "test-runs")
+    code_env = _code_env(a)
     plan = _test_run_plan(a, seed)
+    out = []
+    if box and not a.container:  # every run already has the network off
+        plan = [r for r in plan if r[0] != "network-off"]
+        if any(v.strip() == "network-off" for v in (a.variants or ",".join(TEST_VARIANTS)).split(",")):
+            out.append("network off: left out, every run has the network off (--online leaves it on)")
     d = repo_dir(ctx.root, repo["path"], bool(repo["allow_outside_root"]))
     tmp = Path(tempfile.mkdtemp(prefix="ledger-tests-"))
-    out, base, reported, total = [], None, set(), 0
+    base, reported, total = None, set(), 0
     try:
         for k, (variant, label, extra, prefix, note, fallback) in enumerate(plan):
             work = tmp / f"checkout-{k}"
             work.mkdir()
-            _export_commit(d, sha, work)
+            exported = _export_commit(d, sha, work)
             junit = tmp / f"junit-{k}.xml"
             template = a.random_command if variant == "random-order" and a.random_command else command
             words = [w.replace("{junit}", str(junit)).replace("{seed}", str(seed)) for w in shlex.split(template)]
-            shown = (" ".join(shlex.quote(w) for w in [Path(prefix[0]).name, *prefix[1:]]) + " " if prefix else "") \
+            named = [Path(prefix[0]).name, *prefix[1:]] if prefix else []
+            if a.container:  # the variant's own prefix runs inside the container, found on its PATH
+                prefix = [*_fill_prefix(box, tmp, work), *named]
+            else:
+                prefix = [*box, *prefix]
+            shown = (" ".join(shlex.quote(w) for w in [*box_shown, *named]) + " " if box_shown or named else "") \
                 + template.replace("{seed}", str(seed))
+            note = "; ".join([note, box_note, *exported])
             started = time.monotonic()
             try:
                 p = subprocess.run([*prefix, *words], cwd=str(work), capture_output=True, timeout=TOOL_SECONDS,
-                                   stdin=subprocess.DEVNULL, env={**os.environ, **extra})
+                                   stdin=subprocess.DEVNULL, env={**code_env, **extra})
                 code = p.returncode
             except OSError as e:
                 raise WriteError(f"cannot run {words[0]}: {e.strerror or e}")
@@ -20683,11 +20877,33 @@ def _hurl_away(text, target):
     return None
 
 
+HURL_REROUTE = ("location", "location-trusted", "proxy", "connect-to", "resolve", "unix-socket")  # [Options] keys
+HURL_OPTION = re.compile(r"^[ \t]*([a-z][a-z0-9.-]*)[ \t]*:")
+
+
+def _hurl_rerouted(text):
+    """(line, option) of the first [Options] key in a .hurl file that can send a request to another host than its
+    URL names (HURL_REROUTE); None when there is none."""
+    inside = False
+    for n, line in enumerate(text.splitlines(), 1):
+        head = line.strip()
+        if re.match(r"\[[A-Za-z]+\]$", head):
+            inside = head == "[Options]"
+        elif HURL_REQUEST.match(line):
+            inside = False
+        elif inside:
+            m = HURL_OPTION.match(line)
+            if m and m.group(1) in HURL_REROUTE:
+                return n, m.group(1)
+    return None
+
+
 def _hurl_argv(call):
     """Hurl's command: the generated access matrix and the project's own .hurl files, JUnit to {out}. Only the
     variables the owner's matrix names in its headers are given to hurl, from the environment, through an owner-only
-    secrets file removed after the run. A project file with a request to another host than --target is left out
-    (noted on the run) unless --online."""
+    secrets file removed after the run. A project file with a request to another host than --target, or an
+    [Options] key that can reroute one (HURL_REROUTE), is left out (noted on the run) unless --online. Files the
+    requests read or write stay inside the export (--file-root)."""
     needs(call, "hurl")
     url = _target(call, "base URL of the running API")
     matrix = {}
@@ -20712,6 +20928,11 @@ def _hurl_argv(call):
             call.notes.append(f"left out {f}:{away[0]}: its request to {away[1]} is not to --target (--online "
                               f"allows it)")
             continue
+        rerouted = None if call.online else _hurl_rerouted(export_text(call.work, f))
+        if rerouted:
+            call.notes.append(f"left out {f}:{rerouted[0]}: its option {rerouted[1]} can send requests to another "
+                              f"host (--online allows it)")
+            continue
         files.append(str(Path(call.work) / f))
     call.placeholders[str(folder)] = "{matrix}"
     headers = [str(v) for role in (matrix.get("roles") or {}).values() if isinstance(role, dict)
@@ -20728,8 +20949,8 @@ def _hurl_argv(call):
             out.write("".join(f"{n}={os.environ[n]}\n" for n in given))
         call.placeholders[str(f)] = "{secrets}"
         secrets = ["--secrets-file", str(f)]
-    return ["hurl", "--test", "--no-color", "--variable", f"base={url}", *secrets, "--report-junit", str(call.out),
-            *files]
+    return ["hurl", "--test", "--no-color", "--file-root", str(call.work), "--variable", f"base={url}", *secrets,
+            "--report-junit", str(call.out), *files]
 
 
 def parse_hurl(data, call):
@@ -21165,12 +21386,18 @@ def psql_refusal(text):
     return None
 
 
+PG_SERVER_ROLES = ("pg_execute_server_program", "pg_read_server_files", "pg_write_server_files")
+PG_POWERFUL_ROLE = ("SELECT rolsuper" + "".join(f" OR pg_has_role(current_user, '{r}', 'USAGE')" for r in PG_SERVER_ROLES)
+                    + " FROM pg_roles WHERE rolname = current_user")  # 'f' for a role that stays inside its databases
+
+
 def pg_explain(call):
     """PostgreSQL EXPLAIN on a throwaway database: created on --target's server, given the commit's .sql files, each
     query's generic plan (GENERIC_PLAN, PostgreSQL 16 or later) explained with sequential scans off (so a Seq Scan
     means no index fits), then dropped. Repository SQL reaches psql only as -c arguments, one statement each, which
     psql sends to the server as they are (never through its meta-command parser); a file or query holding a
-    backslash at line start or after a semicolon is recorded under failed and not run."""
+    backslash at line start or after a semicolon is recorded under failed and not run. A --target role that is a
+    superuser or holds a PG_SERVER_ROLES role is skipped before any database is created."""
     needs(call, "pg-explain")
     url = _target(call, "postgresql:// address of a PostgreSQL server where a throwaway database may be created")
     exe = shutil.which("psql") or "psql"
@@ -21184,6 +21411,11 @@ def pg_explain(call):
                            stdin=subprocess.DEVNULL, capture_output=True, timeout=EXPLAIN_SECONDS,
                            env=_tool_env(False))
         return p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
+    code, out, err = psql(url, PG_POWERFUL_ROLE)
+    if code != 0 or out.strip() != "f":
+        raise ToolSkip("the --target role is a superuser or may run programs or read or write files on the server "
+                       f"({', '.join(PG_SERVER_ROLES)}), so a schema file could act outside the database; give a "
+                       f"role without them{': ' + _one_line(err)[:200] if code else ''}")
     code, _, err = psql(url, f'CREATE DATABASE "{name}"')
     if code != 0:
         call.stderr = err
@@ -21295,7 +21527,7 @@ def parse_hyperfine(data, call):
 
 
 tool_adapter("hyperfine", fmt="json", parse=parse_hyperfine, domain="performance", binary="hyperfine",
-             argv=_hyperfine_argv,
+             argv=_hyperfine_argv, runs_code=True,
              install="cargo install hyperfine@<pinned>, or the release binary from github.com/sharkdp/hyperfine (or "
                      "mise install)",
              fallback="time each budget's command a few times with `time` and give the spread; mark it 'measured "
@@ -21545,48 +21777,102 @@ tool_adapter("pseudo-locale", fmt="json", parse=parse_pseudo_locale, domain="loc
                       "what overflows", step=224)
 
 
+class _Bounded:
+    """A reader that stops after `size` bytes of `raw`: one blob of `git cat-file --batch`."""
+    def __init__(self, raw, size):
+        self.raw, self.left = raw, size
+
+    def read(self, n=-1):
+        """Up to n bytes (all that is left when n is negative); OSError when git ends before the blob does."""
+        n = self.left if n is None or n < 0 else min(n, self.left)
+        data = self.raw.read(n) if n else b""
+        if n and not data:
+            raise OSError("git cat-file ended in the middle of a file")
+        self.left -= len(data)
+        return data
+
+
 def _export_commit(repo_dir, sha, into):
-    """Write the files of a commit into an empty folder with `git archive` (no symlink is followed out of it). Any
-    failure, or an export that takes longer than EXPORT_SECONDS, kills git first and raises WriteError."""
-    p = subprocess.Popen(["git", "-C", str(repo_dir), "archive", "--format=tar", sha], stdout=subprocess.PIPE,
-                         stderr=subprocess.PIPE)
+    """Write the regular files of a commit into an empty folder as git stores them, from `git ls-tree` and
+    `git cat-file --batch`: no .gitattributes can leave a file out (export-ignore) or rewrite it (export-subst,
+    filters, line endings), and no symlink or submodule is followed. Returns notes for the run: the .gitattributes
+    files that set export attributes. Any failure, or an export that takes longer than EXPORT_SECONDS, kills git
+    first and raises WriteError."""
+    try:
+        listing = subprocess.run(["git", "-C", str(repo_dir), "ls-tree", "-r", "-z", "--full-tree", sha],
+                                 capture_output=True, timeout=EXPORT_SECONDS, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        raise WriteError(f"exporting commit {sha[:12]} took longer than {EXPORT_SECONDS} s")
+    except OSError as e:
+        raise WriteError(f"cannot export commit {sha[:12]}: {_one_line(e)}")
+    if listing.returncode != 0:
+        raise WriteError(f"git ls-tree {sha[:12]} failed: {listing.stderr.decode('utf-8', 'replace').strip()}")
+    base = Path(into).resolve()
+    blobs = []  # (object id, target, executable, path)
+    for entry in listing.stdout.split(b"\0"):
+        head, _, name = entry.partition(b"\t")
+        fields = head.split()
+        if len(fields) != 3 or fields[1] != b"blob" or fields[0] not in (b"100644", b"100755"):
+            continue  # symlinks (120000) and submodules (commit) are left out: a tool reads regular files
+        rel = name.decode("utf-8", "surrogateescape")
+        target = (base / rel).resolve()
+        if rel.startswith("/") or ".." in Path(rel).parts or base not in (target, *target.parents):
+            continue
+        blobs.append((fields[2], target, fields[0] == b"100755", rel))
+    p = subprocess.Popen(["git", "-C", str(repo_dir), "cat-file", "--batch"], stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     late = threading.Event()
 
     def stop():
         late.set()
         p.kill()
+
+    def feed():
+        try:
+            for oid, *_ in blobs:
+                p.stdin.write(oid + b"\n")
+            p.stdin.close()
+        except (OSError, ValueError):
+            pass  # git was stopped; the reader reports why
     timer = threading.Timer(EXPORT_SECONDS, stop)
     timer.daemon = True
     timer.start()
-    base = Path(into).resolve()
+    writer = threading.Thread(target=feed, daemon=True)
+    writer.start()
+    marked = []
     try:
         try:
-            with tarfile.open(fileobj=p.stdout, mode="r|") as tar:
-                for m in tar:
-                    target = (base / m.name).resolve()
-                    if m.name.startswith("/") or ".." in Path(m.name).parts or base not in (target, *target.parents):
-                        continue
-                    if m.isdir():
-                        target.mkdir(parents=True, exist_ok=True)
-                    elif m.isfile():
-                        target.parent.mkdir(parents=True, exist_ok=True)
-                        src = tar.extractfile(m)
-                        with open(target, "wb") as f:
-                            shutil.copyfileobj(src, f)
-                        if m.mode & 0o111:
-                            target.chmod(0o755)
-                    # symlinks and other members are left out: a tool reads the commit's regular files
+            for oid, target, executable, rel in blobs:
+                header = p.stdout.readline().split()
+                if len(header) != 3 or header[0] != oid:
+                    raise OSError(f"git cat-file gave {b' '.join(header).decode('utf-8', 'replace') or 'nothing'} "
+                                  f"for {rel}")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with open(target, "wb") as f:
+                    shutil.copyfileobj(_Bounded(p.stdout, int(header[2])), f)
+                p.stdout.read(1)  # the newline after each object
+                if executable:
+                    target.chmod(0o755)
+                if Path(rel).name == ".gitattributes":
+                    text = target.read_text(encoding="utf-8", errors="replace")
+                    kinds = [k for k in ("export-ignore", "export-subst") if re.search(rf"(?<![-\w]){k}\b", text)]
+                    if kinds:
+                        marked.append(f"{rel} sets {' and '.join(kinds)}")
         except BaseException as e:
             p.kill()  # first: git blocks on a full pipe, so its stderr never ends while it lives
             try:
                 p.communicate(timeout=GIT_EXIT_SECONDS)
-            except subprocess.TimeoutExpired:
-                pass
+            except (subprocess.TimeoutExpired, ValueError):
+                try:
+                    p.wait(GIT_EXIT_SECONDS)
+                except subprocess.TimeoutExpired:
+                    pass
             if not isinstance(e, Exception):
                 raise
             if late.is_set():
                 raise WriteError(f"exporting commit {sha[:12]} took longer than {EXPORT_SECONDS} s") from e
             raise WriteError(f"cannot export commit {sha[:12]}: {_one_line(e)}") from e
+        writer.join(GIT_EXIT_SECONDS)
         try:
             err = p.communicate(timeout=GIT_EXIT_SECONDS)[1] or b""
         except subprocess.TimeoutExpired:
@@ -21596,12 +21882,16 @@ def _export_commit(repo_dir, sha, into):
         if late.is_set():
             raise WriteError(f"exporting commit {sha[:12]} took longer than {EXPORT_SECONDS} s")
         if p.returncode != 0:
-            raise WriteError(f"git archive {sha[:12]} failed: {err.decode('utf-8', 'replace').strip()}")
+            raise WriteError(f"git cat-file {sha[:12]} failed: {err.decode('utf-8', 'replace').strip()}")
     finally:
         timer.cancel()
-        for f in (p.stdout, p.stderr):
-            if f:
-                f.close()
+        for f in (p.stdin, p.stdout, p.stderr):
+            try:
+                if f:
+                    f.close()
+            except OSError:
+                pass
+    return [f"exported as stored, export attributes not applied: {'; '.join(marked)}"] if marked else []
 
 
 def _tool_env(online):
@@ -21642,10 +21932,18 @@ def _run_adapter(ad, call):
         command = _command_text(res[2], call) if len(res) > 2 else f"(built in) {ad.name}"
         return res[0], res[1], command, int((time.monotonic() - started) * 1000)
     argv = ad.argv(call)
+    if ad.runs_code:  # refused here, once argv found something to run: a tool with nothing to run is skipped
+        prefix, shown, note = _code_isolation(call.a, f"tool-run {ad.name}")
+        tmp = Path(call.out).parent
+        call.prefix, call.shown_prefix = _fill_prefix(prefix, tmp, call.work), _fill_prefix(shown, tmp, call.work)
+        call.placeholders[str(tmp)] = "{work}"
+        call.code_env = _code_env(call.a)
+        call.notes.append(note)
     exe = shutil.which(argv[0])
-    p = subprocess.run([exe or argv[0], *argv[1:]], cwd=str(call.work or call.repo_dir), capture_output=True,
-                       timeout=TOOL_SECONDS, stdin=subprocess.DEVNULL,
-                       env={**_tool_env(call.online), **(ad.env(call) if ad.env else {})})
+    env = _tool_env(call.online) if call.code_env is None else dict(call.code_env)
+    p = subprocess.run([*call.prefix, exe or argv[0], *argv[1:]], cwd=str(call.work or call.repo_dir),
+                       capture_output=True, timeout=TOOL_SECONDS, stdin=subprocess.DEVNULL,
+                       env={**env, **(ad.env(call) if ad.env else {})})
     ms = int((time.monotonic() - started) * 1000)
     if ad.stdout:
         data = p.stdout
@@ -21657,7 +21955,7 @@ def _run_adapter(ad, call):
     if len(data) > TOOL_OUTPUT_BYTES:
         raise WriteError(f"{ad.name} wrote {len(data)} bytes, more than {TOOL_OUTPUT_BYTES} can be imported")
     call.stderr = p.stderr.decode("utf-8", "replace")
-    return p.returncode, data, _command_text(argv, call), ms
+    return p.returncode, data, _command_text([*call.shown_prefix, *argv], call), ms
 
 
 def _fingerprinted(tool, leads):
@@ -21692,10 +21990,16 @@ def record_tool_run(ctx, rv, repo, sha, tool, *, status, domain, fmt=None, data=
     out_path = sha256 = None
     if data is not None:
         kept = store(data) if store else data
-        folder = Path(ctx.db).parent.resolve() / "reviews" / rv["code"] / "tools"
-        folder.mkdir(parents=True, exist_ok=True)
+        folder = Path(ctx.db).parent.absolute() / "reviews" / rv["code"] / "tools"
+        try:
+            make_folder(folder)
+        except OSError as e:
+            raise WriteError(f"cannot keep the output in {folder}: {e}")
         target = folder / f"{run_no:04d}-{tool}.{FORMAT_SUFFIX.get(fmt, 'out')}"
-        write_atomic(target, kept)
+        try:
+            write_atomic(target, kept)
+        except OSError as e:
+            raise WriteError(f"cannot keep the output in {target}: {e}")
         ctx.files.append(str(target))
         sha256 = hashlib.sha256(kept).hexdigest()
         try:
@@ -21814,6 +22118,9 @@ def cmd_tool_run(ctx):
     if ad.argv is None and ad.run is None:
         raise WriteError(f"{ad.name} is an import format: give --from FILE" + (f" ({ad.import_note})"
                                                                              if ad.import_note else ""))
+    if not ad.runs_code and (a.trusted or a.container or a.env):
+        raise WriteError(f"{ad.name} runs no command the repository chooses: --trusted, --container and --env do "
+                         f"not apply")
     version = None
     if (ad.binary or ad.locate) and not ad.service:
         version = tool_version(ad)
@@ -21828,13 +22135,14 @@ def cmd_tool_run(ctx):
     d = repo_dir(ctx.root, repo["path"], bool(repo["allow_outside_root"]))
     tmp = Path(tempfile.mkdtemp(prefix="ledger-tool-"))
     try:
-        work = None
+        work, exported = None, []
         if ad.source == "checkout":
             work = tmp / "checkout"
             work.mkdir()
-            _export_commit(d, sha, work)
+            exported = _export_commit(d, sha, work)
         call = ToolCall(work=work, out=tmp / f"out.{FORMAT_SUFFIX.get(ad.fmt, 'out')}", repo_dir=d, commit=sha,
                         rules=rules, online=a.online, ledger_dir=ledger_dir, a=a, root=ctx.root, con=con, review=rv)
+        call.notes.extend(exported)
         try:
             code, data, command, ms = _run_adapter(ad, call)
         except ToolSkip as e:
@@ -21872,7 +22180,7 @@ def cmd_tool_run(ctx):
 cmd_tool_run.cli = ("run a picked tool on the reviewed commit (or import what it wrote) and record its results as "
                     "leads", "ledger.py tool-run TOOL --review R-0001 [--domain D] [--repo NAME] [--from FILE] "
                              "[--rules FILE] [--target URL] [--seed N] [--online] [--unpinned] [--note TEXT] "
-                             "[--actor A-0001]")
+                             "[--trusted | --container PREFIX] [--env NAME] [--actor A-0001]")
 WRITE_COMMANDS["tool-run"] = cmd_tool_run
 
 
@@ -22282,8 +22590,8 @@ def _main():
             bad += check_git_refs(root, con, quiet=a.quiet)
             bad += check_patches(root, con, quiet=a.quiet)
             bad += check_guard_refs(root, con, quiet=a.quiet)
-            if import_reminder(con):
-                print(import_reminder(con))
+            if import_reminder(con, root):
+                print(import_reminder(con, root))
         except sqlite3.DatabaseError as e:  # a damaged file stops a later read: what was found is printed already
             print(f"check: stopped, the ledger file is damaged ({_one_line(e)})")
             sys.exit(1)
@@ -22312,8 +22620,8 @@ def _main():
                      f"excerpt)")
     elif a.cmd == "gates":
         print_gates(con)
-        if import_reminder(con):
-            print(import_reminder(con))
+        if import_reminder(con, root):
+            print(import_reminder(con, root))
     elif a.cmd == "dump":
         dump(con, db)
 

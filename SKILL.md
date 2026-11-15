@@ -39,7 +39,7 @@ skill at `scripts/ledger.py`. `<skill folder>` is the folder the harness gives w
 | Claude Code | "Base directory for this skill: <dir>" before SKILL.md |
 | others | the path it reports for the loaded skill (else ask the owner) |
 
-In this file `ledger.py X` means, from anywhere, `python3 <skill folder>/scripts/ledger.py --root <project root> X`.
+In this file `ledger.py X` means `python3 <skill folder>/scripts/ledger.py --root <project root> X`, run from the project root (relative file paths are read from the current folder).
 Every command has `--help`; `ledger.py schema` prints every table and column with comments.
 
 - **Trust.** Run the skill's own copy. `init` copies it to `.code-review/ledger.py` for the owner's viewer; run that
@@ -265,8 +265,8 @@ ledger.py review-status R-0001 running --note 'reviewers started' --actor A-0002
 ```
 
 `snapshot` re-records the commits. Run each picked tool that applies (`references/tools.md#how-a-tool-is-wired-in`):
-`ledger.py tool-run <tool> --review R-0001`, and `ledger.py test-runs` for the suites; each lead is cited by a
-finding or `dismiss-lead`. Launch one subagent per approved scope with the subagent tool, all at once (without one,
+`ledger.py tool-run <tool> --review R-0001`, and `ledger.py test-runs` for the suites (it and `hyperfine` run the
+project's code: `--trusted` on the owner's word, else `--container 'PREFIX'`); each lead is cited by a finding or `dismiss-lead`. Launch one subagent per approved scope with the subagent tool, all at once (without one,
 run the scopes yourself in turn), each with its generated prompt: brief, scope, its domain's approved goals, the line
 `ledger.py goals --domain <D>`, known issues, tool leads, checklist, report file. For `ui` and `walkthroughs`: `ledger.py ui-capture <pages> --review R-0001`, `ledger.py ui-audit <pages>`, on demo or anonymized data, never real people's (`references/environment.md#rendered-pages`).
 
@@ -342,7 +342,7 @@ Brief every implementer with `references/implementer-brief.md` (it runs `ledger.
 `--role 'implementer of steps 4-9'`); it writes only its own steps, under its own actor. Move the plan to
 `in-progress` at the first step and `complete` when every step is done or dropped (`plan-status`). For every step:
 
-- **Start:** `ledger.py step-status 12 doing --note '...'`; each issue it closes `issue-status ISS-0001 in-progress`
+- **Start:** `ledger.py step-status 12 doing --note '...'` (an implementer runs its own); you, the manager, move each issue it closes: `issue-status ISS-0001 in-progress`
   (`v_step_issues`). **Proof first:** a test that fails without the fix (`record-test-run --purpose before-fix --step 12`).
 - **Discoveries (mandatory):** a defect found while fixing, by you or an implementer, is reported at once, before the
   batch is committed, with `report-finding` (below; add `--issue ISS-0001` or `--new-issue`, and `--into-step N`,

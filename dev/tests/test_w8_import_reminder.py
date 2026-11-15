@@ -10,6 +10,7 @@ test_skill_says_when_to_import                    SKILL.md says to import at the
 import json
 import re
 import unittest
+from pathlib import Path
 
 from dev.tests import fixtures
 
@@ -45,12 +46,24 @@ class ImportReminder(unittest.TestCase):
                 out = ok(L, *cmd)
                 self.assertIn(f"{NOTE} {URL} (answers last imported: never)", out)
                 self.assertIn("import-answers FILE", out)
+                self.assertNotIn(".code-review/ledger.py", out)
         answers = L.root / "answers.json"
         answers.write_text("[]", encoding="utf-8")
         p = L.run("import-answers", str(answers))
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         at = L.scalar("SELECT at FROM events WHERE event = 'answers-imported'")
         self.assertIn(f"(answers last imported: {at})", ok(L, "gates"))
+
+    def test_import_reminder_names_running_copy(self):
+        """The reminder runs the copy that printed it, on this project, and says where the answers come from."""
+        L = published(self)
+        L.run("add-artifact", "progress-page", "--plan", "P-0001", "--url", URL)
+        out = ok(L, "gates")
+        line = next(l for l in out.splitlines() if l.startswith(NOTE))
+        self.assertIn(f"python3 {Path(L.ledger_py).resolve()} --root {Path(L.root).resolve()} import-answers FILE",
+                      line)
+        self.assertIn("Download your answers", line)
+        self.assertIn("`answers`", line)
 
     def test_import_answers_records_event(self):
         L = published(self)

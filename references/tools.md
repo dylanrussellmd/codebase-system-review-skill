@@ -81,7 +81,7 @@ The three researchers agree on one design:
 
 - **One generic command, with presets per domain.** It looks the tool up in a table shipped with the skill (command
   line, version command, output format, parser, domain, fallback, whether it goes online, whether it runs project
-  code), runs it on an export of the recorded commit (`git worktree add --detach` or `git archive` into a temporary
+  code), runs it on an export of the recorded commit (its files as git stores them, in a temporary
   folder, so results match the ledger's commit and no tool writes into the repository), and keeps the raw output in
   the review's folder.
 - **Every run recorded.** Tool, version, command, exit code, duration, rules hash, database date and the output's
@@ -95,7 +95,11 @@ The three researchers agree on one design:
   for timings and sizes, so the trends between reviews hold them.
 - **Pinned and offline by default.** Versions pinned in a file shipped with the skill (with download hashes). A tool
   marked online runs in its offline mode where it has one; the rest wait for an owner decision recorded once. A tool
-  marked runs code runs in a container on code the owner does not fully trust, or is skipped with a note.
+  marked runs code (`hyperfine`, `test-runs`) runs only with the owner's word: `--container 'PREFIX'` runs the
+  command under that prefix (`{work}` is the run's folder, `{checkout}` the export), and `--trusted` runs it on this
+  machine with the network off (`unshare -rn`, unless `--online`). Without either it is refused and nothing is
+  written. Its environment is `PATH`, `HOME`, `LANG` and each `--env NAME`; the run's note says which way it ran
+  and whether the network was cut.
 
 `ledger.py tool-run` is that command, `tool_runs` and `tool_results` hold the runs and their leads, and
 `v_unaddressed_tool_results` is the check; the next section is how a tool is added to it.
@@ -111,8 +115,10 @@ ledger.py dismiss-lead LD-0001 [LD-0002 ...] --reason '<why it is not a finding>
 ledger.py cite-lead LD-0001 R-0001:SEC-H3
 ```
 
-- **Where it runs.** On an export of the review's commit (`git archive` into a temporary folder, regular files
-  only), with that folder as the working directory and `.` as the target, so reported paths are already relative.
+- **Where it runs.** On an export of the review's commit (`git ls-tree` and `git cat-file --batch` into a temporary
+  folder, regular files only, as git stores them: `.gitattributes` cannot leave a file out with `export-ignore` or
+  rewrite it with `export-subst`; the run's note names a `.gitattributes` that sets either), with that folder as the
+  working directory and `.` as the target, so reported paths are already relative.
   History tools (gitleaks, git-history) read the repository itself, up to the reviewed commit. Nothing is written
   into the repository.
 - **What is recorded.** One `tool_runs` row per run: tool, version printed, version pinned, the command with
@@ -152,16 +158,18 @@ ledger.py cite-lead LD-0001 R-0001:SEC-H3
 - **Coverage.** `tool-run coverage --from <file>` reads the project's own LCOV or Cobertura file (Cobertura when it
   starts with `<`): line and branch coverage per file and overall, per function its calls (LCOV) or line coverage
   (Cobertura), and a lead for each file no test reaches.
-- **Test runs.** `ledger.py test-runs --review R-0001 --command '<command writing JUnit XML to {junit}>'` runs the
-  suite on a fresh export for each run: the baseline, `--repeat` more times (default 3), in random order (seed
-  `--seed`, default from the commit, given as `{seed}` in `--random-command` and as `LEDGER_TEST_SEED` and
+- **Test runs.** `ledger.py test-runs --review R-0001 --command '<command writing JUnit XML to {junit}>' --trusted`
+  (or `--container 'PREFIX'`, as for every runs-code tool) runs the suite on a fresh export for each run: the
+  baseline, `--repeat` more times (default 3), in random order (seed `--seed`, default from the commit, given as `{seed}` in `--random-command` and as `LEDGER_TEST_SEED` and
   `PYTHONHASHSEED`), with the network off (`unshare -rn` on Linux; elsewhere every proxy variable points at a closed
   port, recorded as the fallback) and at four clocks: the end of a leap day in Pacific/Kiritimati, the end of a year
   in America/St_Johns, and the minute before the 2027 daylight-saving changes in America/New_York and Europe/Berlin
   (from zoneinfo), each with `TZ` set and the time set by `faketime` when it is installed (not verified: faketime could not be
   installed where this was built). Each run is a `test_runs`
-  row and a `tool_runs` row; a test that fails in a variant and passed in the baseline (or that flips between
-  repeats) is a lead `test-runs.flaky`, `.order-dependent`, `.network` or `.clock`, once per test per invocation.
+  row and a `tool_runs` row. When `--trusted` already cuts the network for every run, the network-off run is left
+  out. In a container, `unshare` and `faketime` must be on the image's PATH. A test that fails in a variant and
+  passed in the baseline (or that flips between repeats) is a lead `test-runs.flaky`, `.order-dependent`,
+  `.network` or `.clock`, once per test per invocation.
 - **Documentation.** `vale` runs a copy of `references/vale/` without its `Packages` line (so nothing is fetched);
   a `PlainUI` alert goes to `ui`, one in a user guide to `docs-user`. `lychee` checks local links and anchors with
   `--offline --include-fragments` (web links only with `--online`); a broken link or anchor is a lead at its line.
@@ -198,8 +206,10 @@ ledger.py cite-lead LD-0001 R-0001:SEC-H3
   `allowed` is below 400, `denied` 401 to 403, no expectation means no 5xx), plus the project's own `.hurl` files.
   A `{{name}}` in a matrix header comes from the environment variable of that name, through an owner-only
   `--secrets-file` removed after the run; it is never on the command line or recorded. A project `.hurl` file gets
-  no other variable, and one with a request to a host other than `--target`'s is left out (named in the run's note)
-  unless `--online`.
+  no other variable. One with a request to a host other than `--target`'s, or with an `[Options]` key that can
+  send requests elsewhere (`location`, `location-trusted`, `proxy`, `connect-to`, `resolve`, `unix-socket`), is left
+  out and named in the run's note, unless `--online`. Files a request reads or writes stay in the export
+  (`--file-root`).
   `mailpit` reads every message Mailpit caught (`--target`, default `http://127.0.0.1:8025`) after the walkthroughs:
   a lead for each one sent twice, without a plain-text part, a subject or a recipient; only sizes and hashes of the
   bodies are kept. It needs no binary on PATH: Mailpit may run in a container.
@@ -215,7 +225,9 @@ ledger.py cite-lead LD-0001 R-0001:SEC-H3
   a throwaway database on the server at `--target`, applies the files, explains each query's generic plan with
   sequential scans off (a `Seq Scan` left means no index fits), and drops the database. psql gets each statement
   as a `-c` argument, which it sends to the server as it is; a file or query with a backslash at line start or
-  after a semicolon (a psql meta-command) is recorded under `failed` and not run.
+  after a semicolon (a psql meta-command) is recorded under `failed` and not run. The `--target` role must not be a
+  superuser or hold `pg_execute_server_program`, `pg_read_server_files` or `pg_write_server_files`; such a role is
+  skipped before any database is created. A role with CREATEDB and nothing more is enough.
 - **Budgets and translations.** `hyperfine` times the commands of the project's `budgets.json`
   (`{"budgets": [{"name": "build", "command": "...", "max_ms": 500, "runs": 10}]}`); the mean and spread of each are
   metrics measured, not counted, and a mean over its budget is a lead. `i18n-lint` runs ESLint with one rule,

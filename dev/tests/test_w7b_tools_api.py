@@ -244,6 +244,25 @@ class Hurl(unittest.TestCase):
         L, got = self.run_dumping(files, extra=["--online"])
         self.assertTrue(any(a.endswith("away.hurl") for a in got["argv"]), got["argv"])
 
+    def test_hurl_refuses_redirect_options_offline(self):
+        files = {"openapi.yaml": SPEC, "tests/ok.hurl": "GET {{base}}/api/users\n[Options]\nretry: 2\nHTTP 200\n",
+                 "tests/follow.hurl": "GET {{base}}/api/users\n[Options]\nlocation: true\nHTTP 200\n",
+                 "tests/proxy.hurl": "GET {{base}}/api/users\nAccept: */*\n[Options]\nverbose: true\n"
+                                     "proxy: collect.example:8080\nHTTP 200\n"}
+        L, got = self.run_dumping(files)
+        argv = got["argv"]
+        self.assertTrue(any(a.endswith("ok.hurl") for a in argv), argv)
+        self.assertFalse(any(a.endswith(("follow.hurl", "proxy.hurl")) for a in argv), argv)
+        export = next(a for a in argv if a.endswith("ok.hurl"))[:-len("/tests/ok.hurl")]
+        self.assertEqual(argv[argv.index("--file-root") + 1], export)
+        L.commit()
+        note = L.scalar("SELECT note FROM tool_runs") or ""
+        self.assertIn("tests/follow.hurl:3", note)
+        self.assertIn("location", note)
+        self.assertIn("tests/proxy.hurl:5", note)
+        L, got = self.run_dumping(files, extra=["--online"])
+        self.assertTrue(any(a.endswith("follow.hurl") for a in got["argv"]), got["argv"])
+
 
 SPEC_V2 = SPEC.replace("""  /api/users/{id}:
     get:
@@ -430,12 +449,14 @@ class Database(unittest.TestCase):
             f"    plans = {json.dumps({q['sql']: q['plan'] for q in plan})!r}\n"
             "    q = cmd.split('GENERIC_PLAN) ', 1)[1].replace('$1', '%s')\n"
             "    print(json.dumps(json.loads(plans)[q]))\n"
-            "elif 'server_version' in cmd:\n    print('16.15')\n")
+            "elif 'server_version' in cmd:\n    print('16.15')\n"
+            "elif 'rolsuper' in cmd:\n    print('f')\n")
         repo, L, sha = tool_project(self, files=MIGRATIONS)
         env = env_with(shim("psql", script))
         ok(L, "tool-run", "pg-explain", "--review", "R-0001", "--target", "postgresql://u@127.0.0.1:5432/app",
            "--actor", "A-0001", env=env)
         calls = [json.loads(line) for line in log.read_text().splitlines()]
+        self.assertIn("rolsuper", calls.pop(0)[2][0])
         self.assertTrue(calls[0][1][-1].startswith('CREATE DATABASE "ledger_explain_'), calls[0])
         self.assertTrue(calls[-1][1][-1].startswith('DROP DATABASE IF EXISTS "ledger_explain_'), calls[-1])
         self.assertEqual(calls[0][0], "postgresql://u@127.0.0.1:5432/app")
@@ -461,7 +482,8 @@ class Database(unittest.TestCase):
             "        m = re.search(r'(?:^|;)\\s*\\\\!(.*)', line)\n"
             "        if m and (t.lstrip().startswith('\\\\') or '-f' in args):\n"
             "            subprocess.run(m.group(1), shell=True)\n"
-            "if any('server_version' in t for t in texts):\n    print('16.15')\n")
+            "if any('server_version' in t for t in texts):\n    print('16.15')\n"
+            "if any('rolsuper' in t for t in texts):\n    print('f')\n")
         files = {**MIGRATIONS, "migrations/0003_shell.sql": f"CREATE TABLE t (a INT);\n\\! touch {x}\n",
                  "migrations/0004_inline.sql": f"CREATE TABLE u (b INT); \\! touch {y}\n"}
         repo, L, sha = tool_project(self, files=files)
@@ -477,6 +499,27 @@ class Database(unittest.TestCase):
         self.assertIn("line 2", failed["migrations/0003_shell.sql"])
         self.assertIn("line 1", failed["migrations/0004_inline.sql"])
         self.assertIn("migrations/0001_init.sql", doc["applied"])
+
+    def test_pg_explain_refuses_superuser_role(self):
+        """A role that could run commands or read and write files on the server gets no schema file."""
+        for powers in ("super", "pg_execute_server_program"):
+            with self.subTest(powers=powers):
+                log = fixtures.temp_dir("w7b-psql-") / "log.txt"
+                script = VERSION % "psql (PostgreSQL) 16.15" + (
+                    "import json\nargs = sys.argv\nsql = [args[i + 1] for i, a in enumerate(args) if a == '-c']\n"
+                    f"open({str(log)!r}, 'a').write(json.dumps(sql) + '\\n')\n"
+                    f"if any('rolsuper' in c for c in sql):\n    print('t')\n")
+                repo, L, sha = tool_project(self, files=MIGRATIONS)
+                out = ok(L, "tool-run", "pg-explain", "--review", "R-0001", "--target",
+                         "postgresql://postgres@127.0.0.1:5432/app", "--actor", "A-0001",
+                         env=env_with(shim("psql", script)))
+                sent = [c for line in log.read_text().splitlines() for c in json.loads(line)]
+                self.assertFalse(any("CREATE" in c for c in sent), sent)
+                self.assertTrue(any(powers in c for c in sent), sent)
+                L.commit()
+                self.assertEqual(L.scalar("SELECT status FROM tool_runs"), "skipped")
+                self.assertIn("superuser", L.scalar("SELECT fallback FROM tool_runs") or "")
+                self.assertIn("superuser", out[0])
 
     @unittest.skipUnless(os.environ.get("LEDGER_TEST_POSTGRES") and shutil.which("psql"),
                          "environment: set LEDGER_TEST_POSTGRES to a PostgreSQL server address to run EXPLAIN for real")
@@ -515,15 +558,75 @@ class Performance(unittest.TestCase):
             "out = args[args.index('--export-json') + 1]\n"
             f"open(out, 'w').write(open({str(DATA / 'hyperfine.json')!r}).read())\n")
         repo, L, sha = tool_project(self, files=BUDGETS)
-        ok(L, "tool-run", "hyperfine", "--review", "R-0001", "--actor", "A-0001",
+        ok(L, "tool-run", "hyperfine", "--review", "R-0001", "--trusted", "--actor", "A-0001",
            env=env_with(shim("hyperfine", script)))
         self.assertEqual(L.scalar("SELECT status FROM tool_runs"), "ran")
         self.assertEqual(L.count("tool_results"), 1)
 
+    def test_runs_code_tools_refuse_without_trust(self):
+        """hyperfine and test-runs run commands the repository chooses: without --trusted or --container they write
+        nothing."""
+        script = VERSION % "hyperfine 2.0.0" + "raise SystemExit('ran')\n"
+        repo, L, sha = tool_project(self, files={**BUDGETS, "tests/run.py": "raise SystemExit('ran')\n"})
+        env = env_with(shim("hyperfine", script))
+        for args in (["tool-run", "hyperfine"], ["test-runs", "--command", "python3 tests/run.py {junit}"]):
+            with self.subTest(args[0]):
+                p = L.run(*args, "--review", "R-0001", "--actor", "A-0001", env=env)
+                self.assertEqual(p.returncode, 1, p.stdout)
+                self.assertIn("--trusted", p.stderr)
+                self.assertIn("--container", p.stderr)
+                L.commit()
+                self.assertEqual(L.count("tool_runs") + L.count("test_runs"), 0)
+
+    def test_runs_code_env_is_minimal(self):
+        """A run with --trusted sees PATH, HOME, LANG and the --env names, nothing else, with the network off where
+        unshare -rn works; a --container prefix wraps the command."""
+        made = fixtures.temp_dir("w7b-env-")
+        dump = made / "env.json"
+        script = VERSION % "hyperfine 2.0.0" + (
+            f"import json, os\njson.dump(dict(os.environ), open({str(dump)!r}, 'w'))\n"
+            "args = sys.argv\nout = args[args.index('--export-json') + 1]\n"
+            f"open(out, 'w').write(open({str(DATA / 'hyperfine.json')!r}).read())\n")
+        repo, L, sha = tool_project(self, files=BUDGETS)
+        env = env_with(shim("hyperfine", script))
+        env.update({"W7B_SECRET": "s3cret", "W7B_WANTED": "yes", "LANG": "C.UTF-8"})
+        ok(L, "tool-run", "hyperfine", "--review", "R-0001", "--trusted", "--env", "W7B_WANTED", "--actor", "A-0001",
+           env=env)
+        seen = json.loads(dump.read_text())
+        self.assertNotIn("W7B_SECRET", seen)
+        self.assertEqual(seen.get("W7B_WANTED"), "yes")
+        self.assertLessEqual(set(seen) - {"PATH", "HOME", "LANG", "W7B_WANTED"}, {"PWD", "SHLVL", "_", "LC_CTYPE"})
+        L.commit()
+        run = L.one("SELECT command, note FROM tool_runs")
+        self.assertIn("--trusted", run["note"])
+        isolated = fixtures.load_ledger_module().network_off_prefix() is not None
+        self.assertIn("network off" if isolated else "network was not cut", run["note"])
+        if isolated:
+            self.assertTrue(run["command"].startswith("unshare -rn hyperfine"), run["command"])
+        ok(L, "tool-run", "hyperfine", "--review", "R-0001", "--container", "env W7B_BOXED=1", "--actor", "A-0001",
+           env=env)
+        self.assertEqual(json.loads(dump.read_text()).get("W7B_BOXED"), "1")
+        L.commit()
+        run = L.one("SELECT command, note FROM tool_runs ORDER BY id DESC LIMIT 1")
+        self.assertTrue(run["command"].startswith("env W7B_BOXED=1 hyperfine"), run["command"])
+        self.assertIn("container", run["note"])
+        # test-runs: the same rule for the suite's command
+        tests = made / "seen.json"
+        runner = ("import json, os, sys\n"
+                  f"json.dump(dict(os.environ), open({str(tests)!r}, 'w'))\n"
+                  "open(sys.argv[1], 'w').write('<testsuite tests=\"1\"><testcase classname=\"t\" name=\"a\"/>"
+                  "</testsuite>')\n")
+        repo, L, sha = tool_project(self, files={"tests/run.py": runner})
+        ok(L, "test-runs", "--review", "R-0001", "--command", "python3 tests/run.py {junit}", "--variants", "repeat",
+           "--repeat", "1", "--trusted", "--actor", "A-0001", env=env)
+        self.assertNotIn("W7B_SECRET", json.loads(tests.read_text()))
+        L.commit()
+        self.assertIn("--trusted", L.scalar("SELECT note FROM tool_runs LIMIT 1"))
+
     @unittest.skipUnless(shutil.which("hyperfine"), "environment: hyperfine is not installed")
     def test_hyperfine_real(self):
         repo, L, sha = tool_project(self, files=BUDGETS)
-        ok(L, "tool-run", "hyperfine", "--review", "R-0001", "--unpinned", "--actor", "A-0001")
+        ok(L, "tool-run", "hyperfine", "--review", "R-0001", "--unpinned", "--trusted", "--actor", "A-0001")
         L.commit()
         self.assertEqual({r["scope"] for r in L.all("SELECT scope FROM metrics WHERE name='time_mean_ms'")},
                          {"fast", "slow"})
