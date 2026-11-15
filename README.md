@@ -4,14 +4,15 @@ A skill for a managed, multi-reviewer code review, with a per-project SQLite led
 copy is https://github.com/dylanrussellmd/codebase-system-review-skill (MIT licence, `LICENSE`; changes in
 `CHANGELOG.md`).
 
-    codebase-system-review/          the installed skill: exactly these four
+    codebase-system-review/          the installed skill
     ├── SKILL.md                     the instructions the agent follows (read in full on every use)
     ├── README.md, LICENSE
     ├── scripts/ledger.py            ledger tool and viewer (Python 3.9+, no dependencies; built, never edited)
     └── references/                  read when SKILL.md says: environment.md, domains.md, brief.md, indexing.md,
                                      fix-plan.md, recipes.md, implementer-brief.md, writing.md, determinism.md,
-                                     tools.md and tools.jsonl (tools a review could run), formats/, vale/,
-                                     migrations/, schema.sql (the schema's source of truth, built into ledger.py)
+                                     tools.md and tools.jsonl (tools a review could run), tools.lock (their
+                                     versions), rules/ (ast-grep packs), formats/, vale/, migrations/,
+                                     schema.sql (the schema's source of truth, built into ledger.py)
 
     dev/                             in the repository only, not in the bundle
     ├── core.py, page.html           the sources of scripts/ledger.py
@@ -74,13 +75,14 @@ names and connector names. Anyone who can read the file can read all of it; in a
 
 ## Where the ledger lives
 
-In `<project root>/.code-review/` (owner-only: the folder 0700, the files 0600): the ledger, the copy of the tool, the
-dump, the hub page, saved patches and each review's brief, reports and indexes. The owner decides at the first review
+In `<project root>/.code-review/` (owner-only: the folder 0700, the files 0600): the ledger, the copy of the tool,
+`.gitignore` and `.gitattributes` (both written by `init`), the dump, the hub page, saved patches and each review's
+brief, reports and indexes. The owner decides at the first review
 what is committed: nothing, only `ledger.sql`, or only `ledger.sqlite` (about 10 MB of ledger and 7 MB of dump per
 1,000 findings). Until then the agent lists `.code-review/` in `.git/info/exclude` and commits nothing. Review tags
 (`review/R-0001`) stay local unless that decision says to push them. `CODE_REVIEW_DIR=/some/folder` on each command
-(or `--db FILE`) writes nothing inside the repository; set it per command, never in a shell profile. This repository keeps its own ledger out (decision D-0001:
-`.code-review/` is in `.gitignore`).
+(or `--db FILE`) writes nothing inside the repository; set it per command, never in a shell profile. This repository keeps its own ledger on the owner's machine,
+never in git (`.code-review/` is in `.gitignore`); the owner shares a dump when someone needs it.
 
 Each project keeps a copy of the tool at `.code-review/ledger.py`. Review a pull request that changes that copy or the
 ledger's schema like any other code change. `ledger.py check` fails when the ledger's tables, views or triggers differ
@@ -240,9 +242,9 @@ tool, backs the ledger up with SQLite's backup API to `ledger.sqlite.bak-v<old v
 backup), applies every pending step in one `BEGIN IMMEDIATE` transaction, records each in `schema_migrations`, sets
 `meta.schema_version` and `PRAGMA user_version`, and rolls everything back (removing the backup, the ledger
 byte-identical) if a step fails, a foreign key breaks, or the result differs from a fresh build of
-`references/schema.sql`. `check` reports any table, index, view or trigger that differs from the shipped schema;
-`serve`, `gates`, `fill-refs` and `tag-review` refuse to run on such a ledger, and `init` restores the shipped views
-and triggers.
+`references/schema.sql`. `check` reports any table, index, view or trigger that differs from the shipped schema.
+Every other command that reads the ledger refuses to run on such a ledger, except `query`, `show` and `dump`, which
+still read it for diagnosis; `init` restores the shipped views and triggers.
 
 ## Contributing
 

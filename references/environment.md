@@ -62,16 +62,17 @@ ledger.py ui-audit http://127.0.0.1:3000/ http://127.0.0.1:3000/settings
   `.code-review/reviews/R-0001/ui/` and records the files on the review. A page is an http(s) address, a local HTML
   file (`hub.html#/inbox` opens one of its routes), or a route of the ledger's own viewer (`'#/issues'`).
 - For viewer routes the command serves the ledger itself, read-only, with a fresh key, for that run only. To use a
-  running `ledger.py serve` instead, give `--base http://127.0.0.1:8765/` and put its key in `LEDGER_VIEWER_KEY`;
-  never put `#k=` in an address, which is refused. Files are named by route (`issues-390-light.png`) and only their
+  running `ledger.py serve` instead, give `--base http://127.0.0.1:8765/` and put its key (`serve --print-url` or
+  `--no-open` prints it) in `LEDGER_VIEWER_KEY`; never put `#k=` in an address, which is refused. Files are named by route (`issues-390-light.png`) and only their
   owner can read them. A page that draws the viewer's error page, or pages that all give the same image, fail with
   one line, and nothing is recorded.
 - Capture on demo or anonymized data: a screenshot keeps whatever the page showed.
 - `ui-audit` reports, per page, at the same widths and themes: texts below the required contrast (4.5:1, or 3:1 for large text), images, fields,
   buttons and links with no name, every colour, font size and spacing value in use with its count, page weight and
   layout shift (`--json` for the same as data). Lighthouse scores are added only when Lighthouse is installed, and
-  axe-core's violations only when axe-core is (`LEDGER_AXE=<folder>`, the project's `node_modules`, or
-  `npm install -g axe-core`); `ledger.py tool-run axe --review R-0001 --from <the --json file>` makes them leads.
+  axe-core's violations only when the pinned axe-core is (`LEDGER_AXE=<folder>`, mise's install, or
+  `npm install -g axe-core`); neither is ever taken from the project's `node_modules`.
+  `ledger.py tool-run axe --review R-0001 --from <the --json file>` makes them leads.
 - Both load only the pages given: requests to any other host are stopped. The owner starts the system under review;
   never point either command at a production address without the owner's word.
 

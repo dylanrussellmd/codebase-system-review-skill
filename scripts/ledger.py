@@ -5,7 +5,8 @@ what is waiting on the owner. Standard library only (Python 3.9+; tested on 3.9.
 It carries its schema, its migrations and the viewer page inside it (dev/build.py puts them in).
 
     python3 ledger.py init [--force]     create .code-review/ledger.sqlite here (or check and refresh it), copy this
-                                         ledger.py beside it (never over a newer copy unless --force), write .gitignore
+                                         ledger.py beside it (never over a newer copy unless --force), write
+                                         .gitignore and .gitattributes
     python3 ledger.py migrate            upgrade an older ledger to this schema (keeps a .bak-v<N> copy)
     python3 ledger.py serve [--port N]   open the local viewer (127.0.0.1 only)
     python3 ledger.py check [--full]     integrity + must-be-empty checks
@@ -31,7 +32,7 @@ Tools:        tool-run, test-runs, dismiss-lead, cite-lead
 Options: --root DIR (project root; default: the nearest folder upward with a ledger, else the
 top of the current git repository, else the current directory), --db FILE, --version.
 """
-import argparse, ast, hashlib, json, os, re, secrets, shlex, sqlite3, subprocess, sys, threading
+import argparse, ast, errno, hashlib, json, os, re, secrets, shlex, sqlite3, subprocess, sys, threading
 import webbrowser
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -39,11 +40,11 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote
 
 TOOL_VERSION = "1.12.0"  # stamped by dev/build.py from `metadata: version:` in SKILL.md's frontmatter
-TOOL_HASH = "aae9abeab535cec97b8ab49fd506643d14795452a2f5bb47e027d9086be079ac"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
+TOOL_HASH = "9a95a6edf44ac4e84a4362fe6cb5bcffaf269ce768d287fd28d594ad917ba886"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
 # Placeholders: dev/build.py puts references/schema.sql, dev/page.html and references/migrations/*.sql in their
 # place when it writes scripts/ledger.py. dev/core.py itself is never run as the tool.
 SCHEMA = r"""-- =====================================================================
--- Code review ledger — schema version 23
+-- Code review ledger — schema version 24
 -- One SQLite file per project: <project root>/.code-review/ledger.sqlite
 -- Every connection must run:  PRAGMA foreign_keys = ON;
 -- Times are UTC ISO-8601 text with milliseconds (strftime('%Y-%m-%dT%H:%M:%fZ','now')); the tr_time_*
@@ -592,8 +593,8 @@ CREATE TABLE finding_locations (
                                             -- e.g. https://github.com/o/r/blob/<sha>/<path>#L10-L20
   role           TEXT NOT NULL DEFAULT 'primary' CHECK (role IN ('primary','also','test','doc','config')),
   excerpt_redacted INTEGER NOT NULL DEFAULT 0 CHECK (excerpt_redacted IN (0,1)),
-                                            -- 1 = fill-refs masked secret-looking values in excerpt as [redacted];
-                                            -- excerpt_sha256 is still the hash of the real lines
+                                            -- 1 = fill-refs or redact masked values in excerpt as [redacted];
+                                            -- excerpt_sha256 is then the hash of the masked lines
   whole_file     INTEGER NOT NULL DEFAULT 0 CHECK (whole_file IN (0,1)),
                                             -- 1 = the point is about the whole file (location form repo:path, no
                                             -- lines, no symbol); fill-refs sets it with lines 1..n
@@ -1214,11 +1215,12 @@ CREATE TABLE artifacts (
 -- themselves timestamped records written once, and a tool result's disposition carries its own actor and time; step_commits, guard_tests, decision_issues, plan_reviews and phases are plan
 -- and evidence links whose rows are their own record; the rest are setup and configuration (who, which
 -- repositories, the catalogs and word lists, requirements, the schema's own bookkeeping), whose
--- changes do not drive an issue's history.
+-- changes do not drive an issue's history. redact logs a change to such a row against the ledger itself
+-- (entity_type 'ledger', entity_id 0).
 CREATE TABLE events (
   id          INTEGER PRIMARY KEY,
   entity_type TEXT NOT NULL CHECK (entity_type IN ('review','issue','step','plan','decision','finding','gate',
-                                                   'relation','check','step-finding','goal','question')),
+                                                   'relation','check','step-finding','goal','question','ledger')),
   entity_id   INTEGER NOT NULL,
   event       TEXT NOT NULL,              -- status-changed, severity-changed, opened, seen, linked, note ...
   from_value  TEXT,
@@ -4380,7 +4382,8 @@ INSERT INTO enum_labels(enum, value, label, position) VALUES
  ('entity_type','plan','Plan',4), ('entity_type','decision','Decision',5), ('entity_type','finding','Finding',6),
  ('entity_type','gate','Question for you',7), ('entity_type','relation','Relation',8), ('entity_type','check','Review check',9),
  ('entity_type','step-finding','Step coverage',10),
- ('entity_type','goal','Design goal',11), ('entity_type','question','Interview question',12);
+ ('entity_type','goal','Design goal',11), ('entity_type','question','Interview question',12),
+ ('entity_type','ledger','Ledger',13);
 
 -- The checks `ledger.py check` runs (see ledger_checks).
 INSERT OR IGNORE INTO ledger_checks(view, label, tier, position) VALUES
@@ -4605,7 +4608,7 @@ INSERT INTO enum_labels(enum, value, label, position) VALUES
  ('tool_output_format','json','JSON',5), ('tool_output_format','jsonl','JSON lines',6),
  ('tool_result_level','error','Error',1), ('tool_result_level','warning','Warning',2),
  ('tool_result_level','note','Note',3), ('tool_result_level','none','No level',4);
-INSERT INTO meta(key, value) VALUES ('schema_version','23');
+INSERT INTO meta(key, value) VALUES ('schema_version','24');
 INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger schema'),
   (2, 'url, path, hash and code checks; repositories.allow_outside_root; finding_locations.excerpt_redacted'),
   (3, 'integrity rules: codes, hashes, checks, append-only history, owner actor on gate answers'),
@@ -4628,7 +4631,8 @@ INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger s
   (20, 'tool_runs and tool_results: the picked tools'' runs at the reviewed commit, and their results as leads'),
   (21, 'indexes for check''s views, which read them instead of every row; the answers-imported event'),
   (22, 'correction commands: who corrects a gate, a location or a check, and why'),
-  (23, 'measured guard tests: guard_tests.measured_at and measured_commit_sha; v_unproven_steps; the guard-dropped and guard-renamed events');
+  (23, 'measured guard tests: guard_tests.measured_at and measured_commit_sha; v_unproven_steps; the guard-dropped and guard-renamed events'),
+  (24, 'events take the entity type ''ledger'': a redaction of a row that belongs to no other entity');
 """
 PAGE = r"""<!doctype html>
 <html lang="en">
@@ -8243,6 +8247,40 @@ INSERT INTO ledger_checks(view, label, tier, position) VALUES
 INSERT INTO enum_labels(enum, value, label, position) VALUES
  ('event','guard-dropped','A guard test was dropped',35),
  ('event','guard-renamed','A guard test was renamed',36);
+-- migration: 0024-ledger-events.sql
+-- events take the entity type 'ledger': a redaction of a row that belongs to no other entity
+-- Plan P-0002 step 35 (SECL-M7). redact logs every redaction as an event; a row of a table such as repositories or
+-- requirements, which belongs to no review, issue or other entity, is logged against the ledger itself
+-- (entity_type 'ledger', entity_id 0). The events table is rebuilt with the wider rule and its rows kept; migrate
+-- re-creates its triggers with the shipped schema.
+
+CREATE TABLE events_new (
+  id          INTEGER PRIMARY KEY,
+  entity_type TEXT NOT NULL CHECK (entity_type IN ('review','issue','step','plan','decision','finding','gate',
+                                                   'relation','check','step-finding','goal','question','ledger')),
+  entity_id   INTEGER NOT NULL,
+  event       TEXT NOT NULL,              -- status-changed, severity-changed, opened, seen, linked, note ...
+  from_value  TEXT,
+  to_value    TEXT,
+  actor_id    INTEGER REFERENCES actors(id),
+  review_id   INTEGER REFERENCES reviews(id),
+  step_id     INTEGER REFERENCES steps(id),
+  commit_sha  TEXT CHECK (commit_sha IS NULL OR ((length(commit_sha) = 40 OR length(commit_sha) = 64) AND commit_sha NOT GLOB '*[^0-9a-f]*')),
+  note        TEXT,
+  at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+INSERT INTO events_new(id, entity_type, entity_id, event, from_value, to_value, actor_id, review_id, step_id, commit_sha, note, at)
+  SELECT id, entity_type, entity_id, event, from_value, to_value, actor_id, review_id, step_id, commit_sha, note, at FROM events;
+DROP TABLE events;
+ALTER TABLE events_new RENAME TO events;
+CREATE INDEX ix_events_entity        ON events(entity_type, entity_id, at);
+CREATE INDEX ix_events_history       ON events(entity_type, entity_id, id, event, to_value)
+  WHERE event IN ('opened','status-changed');
+CREATE INDEX ix_fk_events_actor_id                   ON events(actor_id);
+CREATE INDEX ix_fk_events_review_id                  ON events(review_id);
+CREATE INDEX ix_fk_events_step_id                    ON events(step_id);
+
+INSERT INTO enum_labels(enum, value, label, position) VALUES ('entity_type','ledger','Ledger',13);
 """
 
 
@@ -8870,16 +8908,16 @@ def require_ledger(db):
 
 
 def build_ledger(root, db):
-    """Create db atomically: the whole schema and the meta rows are built in db.tmp inside one transaction, then
-    renamed into place. On any failure nothing is left behind and init can simply run again."""
-    tmp = db.with_name(db.name + ".tmp")
+    """Build a new ledger: the whole schema and the meta rows in one transaction, in WAL mode, in a temp file of this
+    run's own beside db (tempfile.mkstemp), then hard-linked to db, which fails when db exists. True when this run
+    made db; False when another run made it first. On a failure the temp file is removed and init exits 1."""
+    fd, name = tempfile.mkstemp(dir=str(db.parent), prefix=db.name + ".", suffix=".tmp")  # created owner-only
+    os.close(fd)  # SQLite opens an empty file as a new database
+    tmp = Path(name)
     side = [tmp.with_name(tmp.name + s) for s in ("", "-journal", "-wal", "-shm")]
-    for p in side:
-        if os.path.lexists(str(p)):  # a planted link too: SQLite would create the file it points to
-            p.unlink()
     con = None
     try:
-        con = connect(tmp, create=True)  # created owner-only: init runs under umask 077
+        con = connect(tmp)
         con.isolation_level = None
         con.execute("BEGIN")
         for stmt in split_sql(SCHEMA):
@@ -8889,9 +8927,26 @@ def build_ledger(root, db):
         con.execute("INSERT OR REPLACE INTO meta(key,value) VALUES ('ledger_location',?)", (str(db.parent),))
         stamp_meta(con, created_by=TOOL_VERSION)
         con.execute("COMMIT")
+        con.execute("PRAGMA journal_mode = WAL")  # kept in the file; closing removes the temp -wal and -shm
         con.close()
         con = None
-        os.replace(str(tmp), str(db))
+        try:
+            os.link(str(tmp), str(db))
+            made = True
+        except FileExistsError:
+            made = False
+        except OSError as e:  # a filesystem without hard links
+            if e.errno not in (errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP, errno.EMLINK):
+                raise
+            made = not db.exists()
+            if made:
+                os.replace(str(tmp), str(db))
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        _fsync_folder(db.parent)
+        return made
     except (sqlite3.Error, OSError, ValueError) as e:
         if con is not None:
             try:
@@ -8972,7 +9027,7 @@ def _init(root, db, force, copy_tool, gitignore):
     folder (owner-only); copy this ledger.py and print its sha256; then either build a new ledger in WAL mode, or,
     for an existing one, refuse a file that is not a ledger or has another schema version, restore the shipped
     views and triggers, refuse any other difference from the shipped schema, and record where the ledger is; make
-    the ledger's files owner-only; write or repair .gitignore."""
+    the ledger's files owner-only; write or repair .gitignore and .gitattributes."""
     problem = sqlite_problem()
     if problem:  # before anything is written
         sys.exit(f"init: {problem}")
@@ -9007,9 +9062,10 @@ def _init(root, db, force, copy_tool, gitignore):
             print(note)
         # the hash lets the owner compare the project's copy with the skill's (sha256sum scripts/ledger.py)
         print(f"copied ledger.py to {home} (sha256 {hashlib.sha256(tool).hexdigest()})")
+    if fresh and not build_ledger(root, db):
+        fresh = False  # another init made it first: attach to that one
+        require_ledger(db)
     if fresh:
-        build_ledger(root, db)
-        set_wal(db)
         optimize_db(db)
         print(f"created {db}")
         print(f"ledger at {db} (created)")
@@ -9634,6 +9690,13 @@ SECRET_PATTERNS = [
 ]
 
 
+def fits_redacted(excerpt, real):
+    """True when real is excerpt with each [redacted] standing for any text within its line (an excerpt that
+    redact or fill-refs masked)."""
+    pattern = "[^\n]*".join(re.escape(part) for part in excerpt.rstrip("\n").split(REDACTED))
+    return re.fullmatch(pattern, real) is not None
+
+
 def mask_secrets(text):
     """(text with secret-looking values replaced by [redacted], whether anything was masked)."""
     out = text
@@ -9680,8 +9743,10 @@ def source(root, con, loc_id, context=SOURCE_CONTEXT):
         out["source"] = "git"
         if loc["excerpt"] is not None and a:
             real = "\n".join(text[a - 1:b])
-            if loc.get("excerpt_redacted"):  # the excerpt is masked; its hash is of the real lines
-                out["excerpt_matches"] = hashlib.sha256(real.encode()).hexdigest() == loc["excerpt_sha256"]
+            if loc.get("excerpt_redacted"):  # the excerpt is masked, and its hash is of the masked lines
+                masked = mask_secrets(real)[0]
+                out["excerpt_matches"] = (hashlib.sha256(masked.encode()).hexdigest() == loc["excerpt_sha256"]
+                                          or fits_redacted(loc["excerpt"], real))
             else:
                 out["excerpt_matches"] = real == loc["excerpt"].rstrip("\n")
     except Exception as e:  # history rewritten, repo missing, or not a git checkout
@@ -9824,7 +9889,7 @@ def fill_refs(root, con, review_code=None):
                     cut = whole and b - a + 1 > WHOLE_FILE_EXCERPT_LINES
                     excerpt = "\n".join(lines[a - 1:(a - 1 + WHOLE_FILE_EXCERPT_LINES) if cut else b])
                     shown, masked = mask_secrets(excerpt)
-                    upd.update(excerpt=shown, excerpt_sha256=hashlib.sha256(excerpt.encode()).hexdigest(),
+                    upd.update(excerpt=shown, excerpt_sha256=hashlib.sha256(shown.encode()).hexdigest(),
                                excerpt_redacted=1 if masked else 0)
                     if cut:
                         upd["excerpt_status"] = "truncated"
@@ -11646,11 +11711,28 @@ def _ipv6_loopback_server(port, handler):
 OPEN_BROWSER_AFTER = 0.5  # seconds after the address is printed, so the server is answering when the page asks
 
 
-def serve(root, db, port, open_browser):
+def write_launch_file(db, url):
+    """A new owner-only HTML file beside the ledger that sends the browser on to url (the keyed address), so the
+    browser's command line holds only this file's path. Returns its path; OSError when it cannot be written."""
+    refuse_links(db.parent / "viewer-launch.html")
+    fd, name = tempfile.mkstemp(dir=str(db.parent), prefix="viewer-launch.", suffix=".html")
+    os.chmod(name, 0o600)
+    page = ('<!doctype html><meta charset="utf-8"><meta name="referrer" content="no-referrer"><title>Ledger viewer'
+            f'</title><meta http-equiv="refresh" content="0; url={url}">'
+            f'<script>location.replace({json.dumps(url)})</script>\n')
+    with open(fd, "w", encoding="utf-8") as f:
+        f.write(page)
+    return Path(name)
+
+
+def serve(root, db, port, open_browser, print_url=False):
     """Run the viewer until Ctrl+C, on 127.0.0.1 and, where the machine has it, on [::1]. The launch URL carries
     the token in its #k= fragment (never sent to the server, read by the page into sessionStorage and removed
-    from the address bar). A port in use is one line and exit 2. The umask is set to 077 first, so any
-    file the viewer's connections create beside the ledger (-journal, -wal, -shm) is owner-only."""
+    from the address bar). The browser is given a launch file (write_launch_file) instead of that URL, and the URL
+    is printed only without a browser to open (--no-open) or with print_url, so neither the browser's command line
+    nor a transcript of serve's output holds the key. The launch file is removed when serve stops. A port in use
+    is one line and exit 2. The umask is set to 077 first, so any file the viewer's connections create beside the
+    ledger (-journal, -wal, -shm) is owner-only."""
     import os
     if hasattr(os, "umask"):
         os.umask(0o077)
@@ -11663,19 +11745,37 @@ def serve(root, db, port, open_browser):
         else:
             print(f"serve: cannot listen on 127.0.0.1:{port}: {e.strerror or e}", file=sys.stderr)
         sys.exit(2)
-    url = f"http://127.0.0.1:{srv.server_address[1]}/#k={token}"
-    more = "".join(f"  also at http://{a}/#k={token}" for a in srv.addresses[1:])
-    print(f"Ledger viewer for {db} at {url}{more}  (Ctrl+C to stop)", flush=True)
+    base = f"http://127.0.0.1:{srv.server_address[1]}/"
+    url = f"{base}#k={token}"
+    launch = None
+    if open_browser:
+        try:
+            launch = write_launch_file(db, url)
+        except OSError as e:
+            print(f"serve: cannot write the launch file beside {db} ({e}); opening no browser", file=sys.stderr)
+            open_browser, print_url = False, True
+    if print_url or not open_browser:
+        more = "".join(f"  also at http://{a}/#k={token}" for a in srv.addresses[1:])
+        print(f"Ledger viewer for {db} at {url}{more}  (Ctrl+C to stop)", flush=True)
+    else:
+        print(f"Ledger viewer for {db} at {base}, opened in your browser  (Ctrl+C to stop)", flush=True)
+
     def open_it():
         try:
-            opened = webbrowser.open(url)
+            opened = webbrowser.open(launch.as_uri())
         except Exception:  # a machine with no browser at all
             opened = False
         if not opened:
-            print("No browser could be opened from here; open the address above in your browser.", flush=True)
+            print(f"No browser could be opened from here; open {launch} in your browser.", flush=True)
 
     if open_browser:
         threading.Timer(OPEN_BROWSER_AFTER, open_it).start()
+    if threading.current_thread() is threading.main_thread():
+        import signal
+
+        def stop(signum, frame):  # a terminated serve still removes its launch file
+            raise KeyboardInterrupt
+        signal.signal(signal.SIGTERM, stop)
     for other in srv.also:
         threading.Thread(target=other.serve_forever, daemon=True).start()
     try:
@@ -11687,6 +11787,11 @@ def serve(root, db, port, open_browser):
             other.shutdown()
             other.server_close()
         CACHE.close()
+        if launch is not None:
+            try:
+                launch.unlink()
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------- owner queue, query, progress, hub, answers
@@ -12629,7 +12734,7 @@ class WriteContext:
         self.con, self.root, self.db, self.a = con, root, db, a
         self.actor_id = None
         self.files = []  # files written by the command, removed again if it fails
-        self.after = []  # callables run once the transaction is committed (redact: checkpoint the WAL)
+        self.after = []  # callables run after COMMIT; one that returns a line makes the command print it and exit 1
 
     def x(self, sql, args=()):
         """Run one statement on the command's connection."""
@@ -12688,14 +12793,19 @@ def run_write_command(con, root, db, a, handler=None):
     if not ok:
         print(f"{a.cmd}: {msg}; nothing was written", file=sys.stderr)
         return 1
+    problems = []
     for f in ctx.after:
         try:
-            f()
-        except sqlite3.Error:
-            pass
+            problem = f()
+        except sqlite3.Error as e:
+            problem = _one_line(e)
+        if problem:
+            problems.append(problem)
     for line in lines:
         print(line)
-    return 0
+    for problem in problems:
+        print(f"{a.cmd}: written, but {problem}", file=sys.stderr)
+    return 1 if problems else 0
 
 
 def _command(name, help, usage, read=False):
@@ -14789,7 +14899,7 @@ def cited_location(root, repo, commit, spec_path, a, b, sym):
     cut = out["whole_file"] and b - a + 1 > WHOLE_FILE_EXCERPT_LINES
     excerpt = "\n".join(lines[a - 1:(a - 1 + WHOLE_FILE_EXCERPT_LINES) if cut else b])
     shown, masked = mask_secrets(excerpt)
-    out.update(excerpt=shown, excerpt_sha256=hashlib.sha256(excerpt.encode()).hexdigest(),
+    out.update(excerpt=shown, excerpt_sha256=hashlib.sha256(shown.encode()).hexdigest(),
                excerpt_redacted=1 if masked else 0, excerpt_status="truncated" if cut else None)
     return out
 
@@ -16110,7 +16220,7 @@ def _redactable(con, table, column, info):
 
 
 @_command("redact", "replace a secret in the ledger's text with [redacted], everywhere it was copied, and log why",
-          "ledger.py redact TABLE.COLUMN ROW --reason TEXT [--only 'the secret part'] [--actor A-0001]   "
+          "ledger.py redact TABLE.COLUMN ROW --reason TEXT [--only 'the secret part' | --only @-] [--actor A-0001]   "
           "(ROW: an id, a code like ISS-0001, or R-0001:SEC-H1 for a finding)")
 def cmd_redact(ctx):
     a, con = ctx.a, ctx.con
@@ -16132,6 +16242,11 @@ def cmd_redact(ctx):
     value = con.execute(f'SELECT "{column}" FROM "{table}" WHERE rowid=?', (rowid,)).fetchone()[0]
     if not isinstance(value, str) or not value.strip():
         raise WriteError(f"{table}.{column} of {a.row} is empty; nothing to redact")
+    if a.only == "@-":  # from standard input, so the secret is not on the command line
+        a.only = sys.stdin.read()
+        a.only = a.only[:-2] if a.only.endswith("\r\n") else a.only[:-1] if a.only.endswith("\n") else a.only
+        if not a.only:
+            raise WriteError("--only @- read nothing from standard input")
     secret = value if a.only is None else a.only
     if a.only is not None and a.only not in value:
         raise WriteError(f"the text given with --only is not in {table}.{column} of {a.row}")
@@ -16150,11 +16265,17 @@ def cmd_redact(ctx):
     # and recreated from their own text in this one transaction, so the shipped schema is back before COMMIT
     triggers = rows(con, "SELECT name, sql FROM sqlite_master WHERE type='trigger' AND tbl_name IN (%s) ORDER BY name"
                     % ",".join("?" for _ in hits), list(hits))
+    con.execute("PRAGMA secure_delete = ON")  # before the updates: the old text is zeroed, not just unlinked
     for tr in triggers:
         ctx.x(f'DROP TRIGGER "{tr["name"]}"')
     for t, cells in hits.items():
         for c, rid in cells:
             ctx.x(f'UPDATE "{t}" SET "{c}" = replace("{c}", ?, ?) WHERE rowid=?', (secret, REDACTED, rid))
+    for c, rid in hits.get("finding_locations", []):
+        if c == "excerpt":  # its hash is of the redacted lines, so it never confirms a guess of the secret
+            shown = con.execute("SELECT excerpt FROM finding_locations WHERE rowid=?", (rid,)).fetchone()[0]
+            ctx.x("UPDATE finding_locations SET excerpt_sha256=?, excerpt_redacted=1 WHERE rowid=?",
+                  (hashlib.sha256(shown.encode()).hexdigest(), rid))
     for tr in triggers:
         ctx.x(tr["sql"])
     entity = REDACT_ENTITIES.get(table)
@@ -16168,12 +16289,13 @@ def cmd_redact(ctx):
         eid = rowid
     else:
         for col, ent in (("finding_id", "finding"), ("issue_id", "issue"), ("step_id", "step"),
-                         ("review_id", "review"), ("first_review_id", "review"), ("plan_id", "plan")):
+                         ("question_id", "question"), ("review_id", "review"), ("first_review_id", "review"),
+                         ("plan_id", "plan")):
             if row.get(col) is not None:
                 entity, eid = ent, row[col]
                 break
         else:
-            raise WriteError(f"{table} rows have no history entry to log a redaction against")
+            entity, eid = "ledger", 0  # a row of no entity (repositories, requirements, actors): the ledger itself
     copies = sum(len(v) for v in hits.values()) - 1
     where = ", ".join(f"{t} ({len(v)})" for t, v in sorted(hits.items()))
     ctx.x("""INSERT INTO events(entity_type, entity_id, event, to_value, note, actor_id, review_id)
@@ -16181,13 +16303,111 @@ def cmd_redact(ctx):
           (entity, eid, f"{table}.{column}",
            f"{table}.{column} of {a.row} redacted{' in part' if a.only is not None else ''}, with {copies} copies "
            f"(cells by table: {where}): {reason}", ctx.actor_id, review_id))
-    con.execute("PRAGMA secure_delete = ON")
-    ctx.after.append(lambda: con.execute("PRAGMA wal_checkpoint(TRUNCATE)"))
+    ctx.after.append(lambda: scrub_ledger(con, Path(ctx.db), secret))
     out = [f"redacted {table}.{column} of {a.row} and {copies} copies: {where}"]
-    if Path(ctx.db).with_suffix(".sql").exists():
-        out.append("run `ledger.py dump` now: the old ledger.sql still holds the text")
+    db = Path(ctx.db)
+    left = files_holding(ctx.root, con, db, secret)
+    dump_file = db.with_suffix(".sql")
+    if dump_file in left:
+        out.append(f"run `ledger.py dump` now: {dump_file.name} still holds the text")
+    others = [p for p in left if p != dump_file]
+    if others:
+        out.append("these files still hold the text; delete them or remove it from each: "
+                   + ", ".join(_shown_path(p, db.parent, ctx.root) for p in others))
+    for (url,) in con.execute("SELECT DISTINCT url FROM artifacts WHERE kind='progress-page' AND url IS NOT NULL "
+                              "ORDER BY url"):
+        out.append(f"republish the progress page at {url}: the published copy still holds the text")
     out.append("a secret that reached git (a commit, a pushed dump) stays in its history: rotate it")
     return out
+
+
+def _file_holds(path, needle):
+    """True when the bytes of path hold needle; read in 1 MiB pieces."""
+    tail = b""
+    with open(path, "rb") as f:
+        while True:
+            piece = f.read(1 << 20)
+            if not piece:
+                return False
+            if needle in tail + piece:
+                return True
+            tail = piece[-(len(needle) - 1):] if len(needle) > 1 else b""
+
+
+def files_holding(root, con, db, secret):
+    """Every file in the ledger's folder (backups, ledger.sql, hub.html, briefs, prompts, reports, tool outputs,
+    patches), and every artifact file the ledger lists by path, that holds secret. The ledger's own files are left
+    out (scrub_ledger reads those) and so are links."""
+    own = {db.name + s for s in ("", "-wal", "-shm", "-journal")}
+    paths = []
+    for folder, dirs, names in os.walk(str(db.parent)):
+        dirs.sort()
+        for name in sorted(names):
+            if not (Path(folder) == db.parent and name in own):
+                paths.append(Path(folder) / name)
+    for (path,) in con.execute("SELECT DISTINCT path FROM artifacts WHERE path IS NOT NULL ORDER BY path"):
+        p = Path(root) / path
+        if p not in paths and db.parent not in p.parents:
+            paths.append(p)
+    needle, found = secret.encode(), []
+    for p in paths:
+        try:
+            if not p.is_symlink() and p.is_file() and _file_holds(p, needle):
+                found.append(p)
+        except OSError:
+            pass
+    return found
+
+
+def _shown_path(path, folder, root):
+    """path relative to the ledger's folder when it is in it, else to the project root."""
+    for base in (folder, Path(root)):
+        try:
+            return path.relative_to(base).as_posix()
+        except ValueError:
+            pass
+    return str(path)
+
+
+SCRUB_WAIT_MS = 1000  # how long redact's checkpoint waits for a reader to finish
+
+
+def scrub_ledger(con, db, secret):
+    """After redact's COMMIT: VACUUM, so no free space keeps an old copy of the text, checkpoint the WAL into db and
+    empty it, then look for the text in the bytes of db and its -wal and -journal files. None when no copy is left,
+    else the line to print. secure_delete is on, so the cells redact changed are zeroed even when VACUUM cannot
+    run; a reader that holds an older snapshot keeps the checkpoint from writing the new pages."""
+    try:
+        con.execute(f"PRAGMA busy_timeout = {BUSY_SECONDS * 1000}")
+        con.execute("PRAGMA secure_delete = ON")
+        con.execute("VACUUM")
+    except sqlite3.Error as e:
+        line = f"import sqlite3; sqlite3.connect({str(db)!r}).execute('VACUUM')"
+        return (f"could not rewrite {db.name} ({_one_line(e)}), so older copies of the text may stay in its free "
+                f"space; once no other command is writing, run: python3 -c {shlex.quote(line)}; then `ledger.py dump`")
+    try:
+        con.execute(f"PRAGMA busy_timeout = {SCRUB_WAIT_MS}")
+        busy, frames, done = con.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    except sqlite3.Error:
+        busy, frames, done = 1, 0, 0
+    finally:
+        con.execute(f"PRAGMA busy_timeout = {BUSY_SECONDS * 1000}")
+    if busy or done != frames:
+        return (f"the old text stays in {db.name} until the viewer and other readers of the ledger close; close "
+                f"them, then run `ledger.py dump`, which writes the redacted pages into the file")
+    left = []
+    for f in (db, db.with_name(db.name + "-wal"), db.with_name(db.name + "-journal")):
+        try:
+            if secret.encode() in f.read_bytes():
+                left.append(f.name)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            return f"could not read {f} to look for the old text ({e})"
+    if left:
+        return (f"the old text is still in the bytes of {', '.join(left)}, in a cell redact does not change (not "
+                f"text); find it with `ledger.py query`")
+    return None
 
 
 # The help of an argument of a write command, by its name, or by (command, name) where the same name means
@@ -16469,7 +16689,8 @@ def add_write_commands_131(p):
     s.add_argument("--path", help="where the file is now, in the ledger's folder"); s.add_argument("--reason")
     s = p("redact"); s.add_argument("field", help="TABLE.COLUMN, e.g. findings.summary")
     s.add_argument("row", help="a row id, a code (ISS-0001), or R-0001:SEC-H1 for a finding")
-    s.add_argument("--reason"); s.add_argument("--only", help="redact only this part of the text (the secret)")
+    s.add_argument("--reason")
+    s.add_argument("--only", help="redact only this part of the text (the secret); @- reads it from standard input")
     s = p("rematch"); s.add_argument("points", nargs="+", metavar="POINT", help="R-0001:SEC-M1 (one or more)")
     s.add_argument("target", metavar="ISSUE", help="the issue it belongs to (ISS-0001), or new")
     s.add_argument("--type"); s.add_argument("--confidence", help="certain, likely or possible (default: as matched)")
@@ -16650,10 +16871,18 @@ def browser_path():
     return None
 
 
+def lighthouse_binary(root):
+    """Lighthouse on PATH, outside the reviewed project (root), or None. The project's node_modules is never used."""
+    found = shutil.which("lighthouse")
+    if not found:
+        return None
+    inside = Path(root).resolve()
+    return None if inside == Path(found).resolve() or inside in Path(found).resolve().parents else found
+
+
 def lighthouse_installed(root):
-    """True when `npx --no-install lighthouse` would find Lighthouse: on PATH or in the project's node_modules."""
-    return bool(shutil.which("npx")) and bool(
-        shutil.which("lighthouse") or (Path(root) / "node_modules" / ".bin" / "lighthouse").exists())
+    """True when Lighthouse is installed outside the reviewed project (lighthouse_binary)."""
+    return lighthouse_binary(root) is not None
 
 
 def _jsonc(text):
@@ -17222,9 +17451,10 @@ def _lighthouse(url, root):
     if browser_path():
         env.setdefault("CHROME_PATH", browser_path())
     try:
-        p = subprocess.run(["npx", "--no-install", "lighthouse", url, "--quiet", "--output=json",
-                            "--output-path=stdout", "--chrome-flags=--headless=new"], capture_output=True,
-                           timeout=LIGHTHOUSE_SECONDS, env=env, stdin=subprocess.DEVNULL, cwd=str(root))
+        with tempfile.TemporaryDirectory() as neutral:  # never the project root: nothing of the project runs
+            p = subprocess.run([lighthouse_binary(root) or "lighthouse", url, "--quiet", "--output=json",
+                                "--output-path=stdout", "--chrome-flags=--headless=new"], capture_output=True,
+                               timeout=LIGHTHOUSE_SECONDS, env=env, stdin=subprocess.DEVNULL, cwd=neutral)
         cats = json.loads(p.stdout.decode("utf-8", "replace"))["categories"]
     except (OSError, subprocess.SubprocessError, ValueError, KeyError):
         return {"available": True, "note": "Lighthouse ran and gave no result for this page"}
@@ -20289,31 +20519,64 @@ def _npm_binary_version(binary, package):
 _GLOBAL_NODE_MODULES = []
 
 
-def axe_script(root=None):
-    """axe.min.js: LEDGER_AXE (the file or its folder), the project's node_modules, or npm's global folder; None."""
-    named = os.environ.get("LEDGER_AXE")
-    cands = [Path(named) / "axe.min.js" if named and Path(named).is_dir() else Path(named)] if named else []
-    if root:
-        cands.append(Path(root) / "node_modules" / "axe-core" / "axe.min.js")
-    if not named:
-        if not _GLOBAL_NODE_MODULES:
-            npm = shutil.which("npm")
-            g = ""
-            if npm:
-                try:
-                    g = subprocess.run([npm, "root", "-g"], capture_output=True, timeout=PROBE_SECONDS,
+def _mise_installs(package):
+    """The folders mise installed npm `package` into: the version tools.lock pins, or, with no lock beside this
+    ledger.py, every installed version, newest first."""
+    data = os.environ.get("MISE_DATA_DIR") or str(Path(os.environ.get("XDG_DATA_HOME") or
+                                                        Path.home() / ".local" / "share") / "mise")
+    base = Path(data) / "installs" / ("npm-" + package.replace("/", "-").lstrip("@"))
+    pin = read_tools_lock().get(package)
+    if pin:
+        return [base / pin]
+    try:
+        return sorted((d for d in base.iterdir() if d.is_dir()), key=lambda d: parse_version(d.name) or (),
+                      reverse=True)
+    except OSError:
+        return []
+
+
+def _npm_global_root():
+    """npm's global node_modules folder, asked once from a neutral folder (a project's .npmrc could move it)."""
+    if not _GLOBAL_NODE_MODULES:
+        npm, g = shutil.which("npm"), ""
+        if npm:
+            try:
+                with tempfile.TemporaryDirectory() as neutral:
+                    g = subprocess.run([npm, "root", "-g"], capture_output=True, timeout=PROBE_SECONDS, cwd=neutral,
                                        stdin=subprocess.DEVNULL).stdout.decode("utf-8", "replace").strip()
-                except (OSError, subprocess.SubprocessError):
-                    g = ""
-            _GLOBAL_NODE_MODULES.append(g)
-        if _GLOBAL_NODE_MODULES[0]:
-            cands.append(Path(_GLOBAL_NODE_MODULES[0]) / "axe-core" / "axe.min.js")
-    return next((c for c in cands if c.is_file()), None)
+            except (OSError, subprocess.SubprocessError):
+                g = ""
+        _GLOBAL_NODE_MODULES.append(g)
+    return _GLOBAL_NODE_MODULES[0]
+
+
+def axe_script(root=None):
+    """axe.min.js from the pinned install only: LEDGER_AXE (the file or its folder), mise's install of the version
+    tools.lock pins, or npm's global folder; None when there is none. The reviewed project's node_modules is never
+    used: its axe.min.js would run inside ui-audit's browser. root is the project; a copy inside it is refused."""
+    named = os.environ.get("LEDGER_AXE")
+    if named:
+        cands = [Path(named) / "axe.min.js" if Path(named).is_dir() else Path(named)]
+    else:
+        cands = [d / sub / "axe-core" / "axe.min.js" for d in _mise_installs("axe-core")
+                 for sub in ("lib/node_modules", "node_modules")]
+        if _npm_global_root():
+            cands.append(Path(_npm_global_root()) / "axe-core" / "axe.min.js")
+    inside = Path(root).resolve() if root else None
+    for c in cands:
+        if c.is_file() and not (inside and not named and inside in c.resolve().parents):
+            return c
+    return None
+
+
+AXE_MISSING = ("axe-core is not installed (npm install -g axe-core@{pin}, or LEDGER_AXE=<folder holding "
+               "axe.min.js>; a copy in the project's node_modules is never used); contrast and names were measured "
+               "without it")
 
 
 def axe_version():
     """locate() for axe-core: the version of the axe.min.js ui-audit would use."""
-    found = axe_script(Path.cwd())
+    found = axe_script()
     return None if found is None else (_npm_package_version(found, "axe-core") or "")
 
 
@@ -20321,8 +20584,7 @@ def ui_axe(page, root):
     """axe-core's violations on a loaded page, or why it did not run."""
     found = axe_script(root)
     if found is None:
-        return {"available": False, "note": "axe-core not found (npm install -g axe-core, or LEDGER_AXE=<its folder>);"
-                                            " contrast and names were measured without it"}
+        return {"available": False, "note": AXE_MISSING.format(pin=read_tools_lock().get("axe-core", "<pinned>"))}
     page.add_script_tag(path=str(found))
     return dict(page.evaluate(AXE_RUN_SCRIPT, AXE_NODES), available=True)
 
@@ -22327,7 +22589,8 @@ def _add_review_tool_parsers(sub):
                                    "images, fields, buttons and links without a name, every colour, font size and "
                                    "spacing value in use, page weight and layout shift. Lighthouse scores are "
                                    "added only when Lighthouse is already installed, axe-core's violations when "
-                                   "axe-core is (LEDGER_AXE, node_modules or npm's global folder; import them with "
+                                   "axe-core is (LEDGER_AXE, mise's pinned install or npm's global folder, never "
+                                   "the project's node_modules; import them with "
                                    "tool-run axe --from). Without Playwright it prints the install line and exits 2.")
     s.add_argument("targets", nargs="+", metavar="page")
     s.add_argument("--widths", "--width", dest="widths", default="390,1280")
@@ -22494,13 +22757,14 @@ def _main():
     ap.add_argument("--version", action="version", version=f"ledger.py {TOOL_VERSION} (schema {SCHEMA_VERSION})")
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("init", help="create the ledger in .code-review/ (or check and refresh an existing one), copy "
-                                    "this ledger.py beside it and write its .gitignore")
+                                    "this ledger.py beside it and write its .gitignore and .gitattributes")
     s.add_argument("--force", action="store_true",
                    help="replace the project's .code-review/ledger.py even when it is newer than this copy")
     sub.add_parser("migrate", help="upgrade an older ledger to this schema (keeps a .bak-v<N> copy)")
     s = sub.add_parser("serve", help="open the local viewer (127.0.0.1 only; Ctrl+C stops it)")
     s.add_argument("--port", type=int, default=8765, help="the port to listen on (default 8765)")
-    s.add_argument("--no-open", action="store_true", help="print the address without opening a browser")
+    s.add_argument("--no-open", action="store_true", help="print the keyed address without opening a browser")
+    s.add_argument("--print-url", action="store_true", help="print the keyed address as well as opening the browser")
     s = sub.add_parser("check", help="the ledger's integrity and must-be-empty checks; exit 1 when one fails")
     s.add_argument("--full", action="store_true",
                    help="run the full PRAGMA integrity_check instead of quick_check, and foreign_key_check")
@@ -22579,7 +22843,7 @@ def _main():
     if writes:
         sys.exit(run_write_command(con, root, db, a))
     if a.cmd == "serve":
-        con.close(); serve(root, db, a.port, not a.no_open)
+        con.close(); serve(root, db, a.port, not a.no_open, a.print_url)
     elif a.cmd == "check":
         was = con.execute("SELECT value FROM meta WHERE key='ledger_location'").fetchone()
         if was and was[0] != str(db.parent):

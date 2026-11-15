@@ -1,7 +1,8 @@
 """Secret-looking values in cited lines are masked in fill-refs excerpts (plan P-0001 step 51, SEC-M7).
 
 The excerpt keeps the line's shape with the value replaced by [redacted]; excerpt_redacted is 1; excerpt_sha256 is
-still the hash of the real lines, so show's excerpt check keeps working.
+the hash of the masked lines, so it never confirms a guessed secret. show masks the real lines before it compares
+their hash.
 """
 import hashlib
 import unittest
@@ -39,14 +40,23 @@ class MaskSecrets(unittest.TestCase):
                 self.assertNotIn("ghp_aaaa", r["excerpt"])
                 self.assertNotIn("MIIEow", r["excerpt"])
                 self.assertEqual(r["excerpt_redacted"], 1)
-                self.assertEqual(r["excerpt_sha256"], hashlib.sha256(real.encode()).hexdigest())
+                self.assertEqual(r["excerpt_sha256"], hashlib.sha256(r["excerpt"].encode()).hexdigest())
                 self.assertEqual(len(r["excerpt"].split("\n")), b - a + 1, "masking must keep the line count")
         settings = L.scalar("SELECT excerpt FROM finding_locations WHERE id=?", (ids[0],))
         self.assertEqual(settings, 'DEBUG = True\nAPI_KEY = "[redacted]"\nNAME = "demo"')
-        # show compares the real lines with the stored hash, so the masked excerpt still "matches".
+        # show masks the real lines before it compares their hash, so the masked excerpt still matches.
         s, _ = quiet(L.module.source, L.root, L.con, ids[0])
         self.assertTrue(s["excerpt_matches"])
         self.assertTrue(s["excerpt_redacted"])
+
+    def test_redacted_excerpt_hash_not_of_secret(self):
+        L, sha, rid, _ = project(FILES, test=self)
+        lid = ref(L, rid, "src/settings.py", 1, 3)
+        failed, out = quiet(L.module.fill_refs, L.root, L.con, None)
+        self.assertEqual(failed, 0, out)
+        stored = L.scalar("SELECT excerpt_sha256 FROM finding_locations WHERE id=?", (lid,))
+        real = "\n".join(FILES["src/settings.py"].splitlines()[0:3])
+        self.assertNotEqual(stored, hashlib.sha256(real.encode()).hexdigest())
 
     def test_fill_refs_plain_line_unmasked(self):
         L, sha, rid, _ = project(FILES, test=self)

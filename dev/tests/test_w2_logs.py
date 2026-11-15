@@ -5,9 +5,12 @@ import io
 import re
 import socket
 import sqlite3
+import stat
 import threading
 import time
 import unittest
+from pathlib import Path
+from urllib.parse import unquote
 
 from dev.tests import fixtures
 from dev.tests.fixtures import Ledger, ServerThread, seed_demo
@@ -92,7 +95,7 @@ class RequestLog(unittest.TestCase):
 
 
 class Serve(unittest.TestCase):
-    def serve_in_thread(self, L, open_browser, opened):
+    def serve_in_thread(self, L, open_browser, opened, **kw):
         """Run serve() of a private module copy with webbrowser.open recorded; returns (printed lines, stop)."""
         mod = fixtures.load_ledger_module(fresh=True)
         captured, printed = [], []
@@ -105,7 +108,7 @@ class Serve(unittest.TestCase):
         mod.ThreadingHTTPServer = Capturing
         mod.print = lambda *a, **k: printed.append(" ".join(map(str, a)))
         mod.webbrowser.open = opened
-        t = threading.Thread(target=lambda: mod.serve(L.root, L.db, 0, open_browser), daemon=True)
+        t = threading.Thread(target=lambda: mod.serve(L.root, L.db, 0, open_browser, **kw), daemon=True)
         t.start()
         deadline = time.time() + 5
         while (not captured or not printed) and time.time() < deadline:
@@ -139,13 +142,62 @@ class Serve(unittest.TestCase):
             time.sleep(0.02)
         stop()
         self.assertEqual(len(calls), 1)
-        self.assertIn("#k=", calls[0])
-        self.assertEqual(printed[1], "No browser could be opened from here; open the address above in your browser.")
+        self.assertTrue(calls[0].startswith("file://"), calls[0])
+        self.assertRegex(printed[1], r"^No browser could be opened from here; open /\S+/viewer-launch\.\S+\.html in "
+                                     r"your browser\.$")
         # a browser that did open: nothing more is said
         printed, stop = self.serve_in_thread(L, True, lambda url: True)
         time.sleep(0.8)
         stop()
         self.assertEqual(len(printed), 1)
+
+    def test_serve_does_not_put_key_in_argv(self):
+        L = Ledger()
+        self.addCleanup(L.close)
+        calls, seen = [], []
+
+        def opened(url):
+            calls.append(url)
+            path = Path(unquote(url[len("file://"):])) if url.startswith("file://") else None
+            seen.append(path.read_text(encoding="utf-8") if path and path.exists() else "")
+            return True
+
+        printed, stop = self.serve_in_thread(L, True, opened)
+        deadline = time.time() + 5
+        while not calls and time.time() < deadline:
+            time.sleep(0.02)
+        stop()
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("#k=", calls[0])
+        self.assertTrue(calls[0].startswith("file://"), calls[0])
+        self.assertRegex(seen[0], r"http://127\.0\.0\.1:\d+/#k=[A-Za-z0-9_\-]{32,}")
+        self.assertNotIn("#k=", " ".join(printed))
+        for open_browser, flag in ((True, {"print_url": True}), (False, {})):
+            printed, stop = self.serve_in_thread(L, open_browser, lambda url: True, **flag)
+            time.sleep(0.3)
+            stop()
+            self.assertIn("#k=", " ".join(printed), (open_browser, flag))
+
+    def test_launch_file_private(self):
+        L = Ledger()
+        self.addCleanup(L.close)
+        calls, modes = [], []
+
+        def opened(url):
+            path = Path(unquote(url[len("file://"):]))
+            calls.append(path)
+            modes.append(stat.S_IMODE(path.stat().st_mode))
+            return True
+
+        printed, stop = self.serve_in_thread(L, True, opened)
+        deadline = time.time() + 5
+        while not calls and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].parent, L.db.parent)
+        self.assertEqual(modes, [0o600])
+        stop()
+        self.assertFalse(calls[0].exists(), "the launch file is removed when serve stops")
 
     def test_serve_port_in_use_message(self):
         L = Ledger()

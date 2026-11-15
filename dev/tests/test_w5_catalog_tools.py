@@ -72,6 +72,7 @@ class ToolCatalog(unittest.TestCase):
         if "npx" in called:
             called.discard("npx")
             called |= set(re.findall(r'"npx", "--no-install", "([a-z]+)"', core))
+        called |= set(re.findall(r'(?m)^def ([a-z]+)_binary\(', core))  # run by the path it resolves
         if "from playwright" in core:
             called.add("playwright")
         self.assertTrue({"git", "lighthouse", "playwright"} <= called, called)
@@ -82,7 +83,7 @@ class ToolCatalog(unittest.TestCase):
                 row = next((r for r in rows if tool in r[0].lower()), None)
                 self.assertIsNotNone(row, f"{tool} is called by ledger.py but not listed")
                 self.assertGreater(len(row[2]), 10, f"{tool} has no fallback")
-        self.assertIn("npx --no-install lighthouse", block)
+        self.assertIn("`lighthouse` on PATH, never the project's", block)
 
     def test_tables_match_jsonl(self):
         secs = sections(TOOLS_MD.read_text(encoding="utf-8"))

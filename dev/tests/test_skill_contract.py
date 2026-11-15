@@ -6,7 +6,10 @@ Words come from a fresh ledger (the lookup tables and enum_labels, the single so
 flags from the built ledger.py's --help, so the lint follows the tool rather than a copy of its lists.
 """
 import re
+import sqlite3
+import sys
 import unittest
+from pathlib import Path
 
 from dev.tests import fixtures
 from dev.tests.fixtures import Ledger, run_ledger, temp_dir
@@ -148,6 +151,88 @@ class Commands(unittest.TestCase):
                     for flag in re.findall(r"(?<![\w'=-])(--[a-z][a-z-]*)", rest):
                         if flag not in flags[cmd]:
                             problems.append(f"{f.name}: `{span}` gives {cmd} the flag {flag}, which it does not take")
+        self.assertEqual(problems, [])
+
+    def test_skill_examples_accepted(self):
+        """Each full example command in SKILL.md (arguments given; no [optional] parts or trailing ...) passes its
+        command's argument checks on the demo ledger: argparse takes it, and a write command's handler, run and rolled
+        back, does not refuse one of its arguments."""
+        import argparse
+        import contextlib
+        import io
+        import shlex
+        from unittest import mock
+        text = skill_text()
+        examples = re.findall(r"`(ledger\.py [^`]+)`", text)
+        for block in re.findall(r"```(?:sh)?\n(.*?)```", text, re.S):
+            examples += [l.strip() for l in block.splitlines() if l.strip().startswith("ledger.py ")]
+        values = {"address": "https://example.com/page", "url": "https://example.com/r.git", "URL":
+                  "https://example.com/pull/1", "sha": "a" * 40, "full sha": "a" * 40, "model id": "m1",
+                  "pages": "index.html", "tool": "gitleaks", "D": "security", "code": "security", "kind": "decision",
+                  "name": "second", "path": ".", "new file": "/tmp/never-written.sqlite", "file": "report.md"}
+        full = []
+        for ex in dict.fromkeys(examples):
+            argv = shlex.split(re.sub(r"<([^<>]+)>", lambda m: values.get(m.group(1), m.group(1)), ex))[1:]
+            if len(argv) < 2 or argv[0].startswith("-") or "[" in ex or argv[-1] == "...":
+                continue
+            full.append((ex, argv))
+        self.assertIn("ledger.py add-artifact progress-page --review R-0001 --url <address>", [e for e, _ in full])
+        mod = fixtures.load_ledger_module(fresh=True)
+        L = Ledger()
+        self.addCleanup(L.close)
+        fixtures.seed_demo(L)
+        fixtures.finish_demo(L)
+        L.commit()
+
+        class Parsed(Exception):
+            pass
+
+        def parse(ap, args=None, namespace=None):
+            got = argparse.ArgumentParser.parse_known_args(ap, args, namespace)
+            if got[1]:
+                ap.error("unrecognized arguments: " + " ".join(got[1]))
+            raise Parsed(got[0])
+
+        # an argument refusal names the argument; a refusal about the ledger's rows or state is not one
+        refusal = re.compile(r"\bgive --|^--[a-z-]+ (must|needs)|^[a-z_-]+ '[^']*' is not one of|needs --|name the field")
+        dry_run = {"add-artifact", "open-gate", "answer-gate", "apply-gate", "add-requirement", "review-domain",
+                   "review-status", "verify", "match", "set-verdict", "new-plan", "step-status", "add-commit",
+                   "add-actor", "add-repo", "new-review", "interview-ask", "interview-answer", "propose-goal",
+                   "approve-goals", "add-run", "finish-run", "report-finding", "issue-status"}
+        problems = []
+        for ex, argv in full:
+            with self.subTest(example=ex):
+                err = io.StringIO()
+                with mock.patch.object(sys, "argv", ["ledger.py", "--root", str(L.root), *argv]), \
+                        mock.patch.object(argparse.ArgumentParser, "parse_args", parse), \
+                        contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                    try:
+                        mod.main()
+                        a = None
+                    except Parsed as p:
+                        a = p.args[0]
+                    except SystemExit:
+                        problems.append(f"`{ex}`: {err.getvalue().strip().splitlines()[-1:]}")
+                        continue
+                if a is None or a.cmd not in dry_run or a.cmd not in mod.WRITE_COMMANDS:
+                    continue
+                con = mod.connect(L.db)
+                con.isolation_level = None
+                ctx = mod.WriteContext(con, L.root, L.db, a)
+                con.execute("BEGIN IMMEDIATE")
+                try:
+                    ctx.actor_id = mod.resolve_actor(con, getattr(a, "actor", None))
+                    mod.WRITE_COMMANDS[a.cmd](ctx)
+                except (mod.WriteError, mod.GateRefused) as e:
+                    if refusal.search(str(e)):
+                        problems.append(f"`{ex}`: {e}")
+                except sqlite3.Error:
+                    pass
+                finally:
+                    con.execute("ROLLBACK")
+                    con.close()
+                    for f in ctx.files:
+                        Path(f).unlink(missing_ok=True)
         self.assertEqual(problems, [])
 
     def test_skill_uses_the_write_commands(self):

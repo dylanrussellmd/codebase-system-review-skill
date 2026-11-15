@@ -6,6 +6,7 @@ import sys
 import time
 import subprocess
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from dev.tests import fixtures
@@ -211,8 +212,10 @@ class Serve(unittest.TestCase):
         L.commit()
         m = fixtures.load_ledger_module(fresh=True)
         calls = []
-        m.serve = lambda root, db, port, open_browser: calls.append((root, db, port, open_browser))
-        for argv, want in ((["serve"], (8765, True)), (["serve", "--port", "9123", "--no-open"], (9123, False))):
+        m.serve = lambda root, db, port, open_browser, print_url: calls.append((root, db, port, open_browser,
+                                                                                print_url))
+        for argv, want in ((["serve"], (8765, True, False)), (["serve", "--port", "9123", "--no-open"], (9123, False, False)),
+                           (["serve", "--print-url"], (8765, True, True))):
             with mock.patch.object(sys, "argv", ["ledger.py", "--root", str(L.root), *argv]):
                 m.main()
             self.assertEqual(calls[-1], (L.root, L.db, *want))
@@ -222,7 +225,8 @@ class Serve(unittest.TestCase):
         marker = shim / "opened.txt"
         (shim / "sitecustomize.py").write_text(
             "import webbrowser\n"
-            f"def _open(url, *a, **k):\n    open({str(marker)!r}, 'a').write(url + '\\n'); return True\n"
+            f"def _open(url, *a, **k):\n    open({str(marker)!r}, 'a').write(url + '\\n' + "
+            f"open(url[7:]).read()); return True\n"
             "webbrowser.open = _open\n")
         env = fixtures.git_env({"PYTHONPATH": str(shim), "BROWSER": "true"})
 
@@ -251,10 +255,13 @@ class Serve(unittest.TestCase):
         self.assertIn(f"at http://127.0.0.1:{port}/", out)
         self.assertFalse(marker.exists(), "--no-open must not open a browser")
         port, out = run_serve()  # control: without --no-open the shim sees the call
-        # step 42: the browser opens the launch URL, whose #k= fragment carries the token; serve printed the same URL
-        opened = marker.read_text()
-        self.assertRegex(opened, r"^http://127\.0\.0\.1:%d/#k=[A-Za-z0-9_\-]{32,}\n$" % port)
-        self.assertIn(opened.strip(), out)
+        # the browser opens a launch file that forwards to the keyed URL; neither its argv nor serve's output holds
+        # the key, and the file is gone once serve stops
+        launch, page = marker.read_text().split("\n", 1)
+        self.assertRegex(launch, r"^file:///\S+/\.code-review/viewer-launch\.\S+\.html$")
+        self.assertRegex(page, r"http://127\.0\.0\.1:%d/#k=[A-Za-z0-9_\-]{32,}" % port)
+        self.assertNotIn("#k=", out)
+        self.assertFalse(Path(launch[7:]).exists(), "serve removes the launch file when it stops")
 
 
 class Show(unittest.TestCase):

@@ -11,6 +11,7 @@ import unittest
 import zlib
 import struct
 from pathlib import Path
+from unittest import mock
 
 from dev.tests import browser, fixtures
 from dev.tests._w7a_tools_helpers import (DATA, assert_matches_recording, env_with, leads, ok, shared_project,
@@ -93,6 +94,77 @@ class Axe(unittest.TestCase):
         env["LEDGER_AXE"] = str(folder / "missing")
         tools = {t["tool"]: t for t in json.loads(L.run_ok("env", "--json", env=env).stdout)["tools"]}
         self.assertIsNone(tools["axe"]["installed"])
+
+    def test_ui_audit_ignores_project_node_modules(self):
+        """A stand-in axe.min.js or lighthouse in the reviewed project's node_modules never runs."""
+        mod = fixtures.load_ledger_module(fresh=True)
+        work = fixtures.temp_dir("w7b-planted-")
+        root = work / "proj"
+        planted = root / "node_modules" / "axe-core" / "axe.min.js"
+        planted.parent.mkdir(parents=True)
+        planted.write_text("window.planted = true;\n")
+        (root / "node_modules" / ".bin").mkdir()
+        (root / "node_modules" / ".bin" / "lighthouse").write_text("#!/bin/sh\necho planted\n")
+        mise = work / "mise"
+        mise.mkdir()
+
+        class Page:
+            def __init__(self):
+                self.scripts = []
+
+            def add_script_tag(self, path):
+                self.scripts.append(path)
+
+            def evaluate(self, *args):
+                return {"violations": [], "version": "4.14.0"}
+
+        def pinned(folder):
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / "axe.min.js").write_text("window.axe = {};\n")
+            return folder / "axe.min.js"
+
+        env = {k: v for k, v in os.environ.items() if k != "LEDGER_AXE"}
+        env["MISE_DATA_DIR"] = str(mise)
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(mod, "_GLOBAL_NODE_MODULES", [""]):
+            with self.subTest("none pinned"):
+                self.assertIsNone(mod.axe_script(root))
+                page = Page()
+                got = mod.ui_axe(page, root)
+                self.assertEqual(page.scripts, [])
+                self.assertFalse(got["available"])
+                self.assertIn("not installed", got["note"])
+                self.assertIn("npm install -g axe-core@", got["note"])
+            with self.subTest("pinned by LEDGER_AXE"):
+                own = pinned(work / "own" / "axe-core")
+                with mock.patch.dict(os.environ, {"LEDGER_AXE": str(own.parent)}):
+                    page = Page()
+                    self.assertTrue(mod.ui_axe(page, root)["available"])
+                    self.assertEqual(page.scripts, [str(own)])
+            with self.subTest("npm's global folder"):
+                glob = pinned(work / "global" / "axe-core")
+                with mock.patch.object(mod, "_GLOBAL_NODE_MODULES", [str(glob.parent.parent)]):
+                    self.assertEqual(mod.axe_script(root), glob)
+            with self.subTest("mise's install of the pinned version"):
+                version = mod.read_tools_lock().get("axe-core", "4.14.0")
+                got = pinned(mise / "installs" / "npm-axe-core" / version / "lib" / "node_modules" / "axe-core")
+                self.assertEqual(mod.axe_script(root), got)
+        which = {"npx": "/usr/bin/npx"}
+        with mock.patch.object(mod.shutil, "which", lambda name, *a, **k: which.get(name)):
+            self.assertFalse(mod.lighthouse_installed(root))
+        seen = []
+
+        class Done:
+            stdout = b'{"categories": {}}'
+
+        which["lighthouse"] = str(work / "global" / "bin" / "lighthouse")
+        with mock.patch.object(mod.shutil, "which", lambda name, *a, **k: which.get(name)), \
+                mock.patch.object(mod.subprocess, "run", lambda argv, **kw: seen.append((argv, kw)) or Done()):
+            mod._lighthouse("http://127.0.0.1:5/#/issues", root)
+        self.assertTrue(seen)
+        argv, kw = seen[0]
+        cwd = Path(kw.get("cwd") or Path.cwd()).resolve()
+        self.assertFalse(cwd == root.resolve() or root.resolve() in cwd.parents, cwd)
+        self.assertNotIn(str(root / "node_modules"), " ".join(argv))
 
 
 # The stylesheet wallace.json and impeccable.json were recorded from: Impeccable reads it inside the page.

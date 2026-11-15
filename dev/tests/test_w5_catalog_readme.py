@@ -44,6 +44,24 @@ class Readme(unittest.TestCase):
             with self.subTest(path=rel):
                 self.assertTrue((REPO / rel).exists(), f"README names {rel}, which does not exist")
 
+    def test_readme_tree_matches_bundle(self):
+        """Every top-level entry of the release zip, and of its references/, is named in README's bundle tree."""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("release_for_readme", str(REPO / "dev" / "release.py"))
+        release = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(release)
+        text = readme()
+        tree = text[text.index("    codebase-system-review/"):text.index("    dev/ ")]
+        names = set()
+        for rel, _ in release.entries(REPO):
+            parts = rel.split("/")
+            names.add("references/" if parts[0] == "references" else rel)
+            if parts[0] == "references" and len(parts) > 1:
+                names.add(parts[1] + ("/" if len(parts) > 2 else ""))
+        for name in sorted(names):
+            with self.subTest(entry=name):
+                self.assertRegex(tree, r"(?<![\w.-])%s(?![\w-])" % re.escape(name))
+
     def test_readme_sections(self):
         text = readme()
         for heading in ("## Install", "## What the ledger stores", "## Where the ledger lives", "## Maintaining a ledger",

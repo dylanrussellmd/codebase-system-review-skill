@@ -28,7 +28,7 @@ cell that says "not verified" is unconfirmed.
 | Python 3.9+ with SQLite | `ledger.py` itself | none: nothing runs without it |
 | Playwright (Python package) | `ui-capture`, `ui-audit` | the owner saves screenshots at phone and desktop width; review from the source and write "rendered result not seen" (environment.md, Rendered pages) |
 | Chrome, Chromium or Edge | the browser Playwright drives (`LEDGER_CHROME` names one) | `python3 -m playwright install chromium`, or the Playwright fallback above |
-| Lighthouse (npx --no-install lighthouse) | category scores in `ui-audit`, only when installed; never downloaded | `ui-audit`'s own contrast, names, weight and layout-shift numbers |
+| Lighthouse (`lighthouse` on PATH, never the project's) | category scores in `ui-audit`, only when installed; never downloaded | `ui-audit`'s own contrast, names, weight and layout-shift numbers |
 | Vale (optional, `tool-run vale`) | the writing standard on a project's docs and UI text (writing.md) | the reviewer reads for the phrases in `vale/styles/Plain/*.yml` |
 
 `ledger.py env` reports which of these this machine has.
@@ -180,11 +180,11 @@ ledger.py cite-lead LD-0001 R-0001:SEC-H3
   enumeration values the SQL files create and the routes the code defines (names with an underscore or in
   camelCase, and route paths: a single plain word could be ordinary text), then finds them in what users see: page
   and template text and labelling attributes, client-script strings that read as words, locale files.
-- **Pages and styles.** `ui-audit` runs axe-core on every page when it finds `axe.min.js` (`LEDGER_AXE`, the
-  project's `node_modules/axe-core/`, or npm's global folder): its `--json` holds each page's violations, and
-  `tool-run axe --from` that file makes them leads (critical and serious are errors). `wallace` reads every
-  stylesheet of the commit as one: the distinct colours, font sizes, families, line heights, z-indexes, shadows and
-  radii are metrics, and a category over its limit is a lead. `impeccable detect --json` flags the generic
+- **Pages and styles.** `ui-audit` runs axe-core on every page when it finds the pinned `axe.min.js`
+  (`LEDGER_AXE`, mise's install, or npm's global folder; never the project's `node_modules`): its `--json` holds
+  each page's violations, and `tool-run axe --from` that file makes them leads (critical and serious are errors).
+  `wallace` reads every stylesheet of the commit as one: the distinct colours, font sizes, families, line heights,
+  z-indexes, shadows and radii are metrics, and a category over its limit is a lead. `impeccable detect --json` flags the generic
   generated look (its `slop` category is counted) and low contrast in the files; it honours the project's own
   config and `DESIGN.md`, and `DO_NOT_TRACK` keeps its usage data off. `odiff` compares each PNG screenshot recorded
   on the review with the one of the same name on the review it follows up (`new-review --previous`), with

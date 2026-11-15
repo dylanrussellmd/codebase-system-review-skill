@@ -1,8 +1,8 @@
 """Atomic, recoverable init and dump, and a custom --db that leaves project files alone (plan P-0001 steps 48, 49
 and 50).
 
-init copies ledger.py first (via a temp file and os.replace), builds the schema in ledger.sqlite.tmp inside one
-transaction and renames it into place, refuses an incomplete or foreign ledger with one line, and repairs a damaged
+init copies ledger.py first (via a temp file and os.replace), builds the schema in a temp file of its own inside
+one transaction and links it into place, refuses an incomplete or foreign ledger with one line, and repairs a damaged
 .gitignore. dump reads one snapshot (a read transaction), writes <db>.sql.tmp, fsyncs and renames it, and refuses to
 overwrite a .sql file it did not write. With --db outside a .code-review folder, init copies no ledger.py and writes
 no .gitignore there.
@@ -87,7 +87,7 @@ class AtomicInit(unittest.TestCase):
             mod.SCHEMA = good
         self.assertIn("no_such_table", str(cm.exception.code))
         self.assertFalse(db.exists())
-        self.assertFalse(db.with_name("ledger.sqlite.tmp").exists())
+        self.assertEqual([x.name for x in db.parent.glob("ledger.sqlite*")], [])
         with contextlib.redirect_stdout(io.StringIO()):
             mod.init(d, db)
         self.assertEqual(ledger_names(db), shipped_names())
@@ -138,6 +138,49 @@ class AtomicInit(unittest.TestCase):
         gi.write_text("my-notes.txt\n")
         run_ledger("--root", d, "init")
         self.assertEqual(gi.read_text(), "my-notes.txt\n" + GITIGNORE)
+
+    def test_concurrent_inits_build_one_ledger(self):
+        """Two inits on a new project, each held after building its schema until the other has built its own."""
+        mod = fixtures.load_ledger_module(fresh=True)
+        d = fresh_project()
+        db = d / ".code-review" / "ledger.sqlite"
+        both = threading.Barrier(2, timeout=10)
+        held = set()
+        stamp = mod.stamp_meta
+
+        def held_stamp(con, **kw):
+            me = threading.get_ident()
+            if me not in held:
+                held.add(me)
+                try:
+                    both.wait()
+                except threading.BrokenBarrierError:
+                    pass
+            return stamp(con, **kw)
+
+        codes = []
+
+        def run():
+            try:
+                mod.init(d, db)
+                codes.append(0)
+            except SystemExit as e:
+                codes.append(e.code)
+
+        out = io.StringIO()
+        with mock.patch.object(mod, "stamp_meta", held_stamp), contextlib.redirect_stdout(out):
+            runs = [threading.Thread(target=run) for _ in range(2)]
+            for t in runs:
+                t.start()
+            for t in runs:
+                t.join(60)
+        self.assertEqual(codes, [0, 0], out.getvalue())
+        self.assertEqual(out.getvalue().count("(created)"), 1, out.getvalue())
+        self.assertEqual(out.getvalue().count("(attached to existing)"), 1, out.getvalue())
+        self.assertEqual(M.meta(db)["schema_version"], str(mod.SCHEMA_VERSION))
+        self.assertEqual(ledger_names(db), shipped_names())
+        self.assertEqual(sorted(x.name for x in (d / ".code-review").iterdir()),
+                         [".gitattributes", ".gitignore", "ledger.py", "ledger.sqlite"])
 
     def test_init_is_idempotent(self):
         d = fresh_project()

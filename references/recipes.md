@@ -341,7 +341,13 @@ ledger.py redact findings.summary R-0001:SEC-H1 --only '<the secret value>' --re
 ledger.py dump
 ```
 
-Delete every older copy that still holds it (`ledger.sql` copies, `ledger.sqlite.bak*`). Tell the owner to rotate
+`--only @-` reads the secret from standard input instead, which keeps it off the command line and out of the shell
+history: pipe the secret into `ledger.py redact findings.summary R-0001:SEC-H1 --only @- --reason 'an API key'`.
+
+redact then rewrites `ledger.sqlite` (VACUUM) and checks that no byte of the text is left in it. While the viewer
+or another reader has the ledger open, the old text stays in the file: redact exits 1 and says to close them and run
+`dump`. It names every other file that still holds the text (backups, `ledger.sql`, `hub.html`, briefs, prompts,
+reports, tool outputs, patches) and the published progress page to republish; delete or edit each file. Tell the owner to rotate
 the secret: one that reached git stays in its history until the history is rewritten.
 
 ## When something goes wrong

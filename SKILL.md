@@ -56,7 +56,7 @@ Every command has `--help`; `ledger.py schema` prints every table and column wit
 - **One writer.** Only the manager writes, except: the viewer and `import-answers` write gate answers; an implementer
   writes its own steps (`step-status`, `add-commit`, `add-guard`, `report-finding`) under its own actor. Reviewers,
   verifiers, indexers, matchers and drafters read with `ledger.py query "SELECT ..."` (TSV or `--json`; refuses any
-  write; its `--help` gives a plain `sqlite3` line) and hand back files. Also read: `ledger.py gates` (the owner's
+  write; its `--help` gives a line that needs only Python) and hand back files. Also read: `ledger.py gates` (the owner's
   queue), `ledger.py check` (exit 1 on a problem), `ledger.py show 12` (location 12's lines at their commit).
 - **Versions.** `ledger.py --version`. `init` refreshes an older project copy (keeping `ledger.py.bak`; a newer one
   needs `--force`); a ledger with an older schema is read-only until `ledger.py migrate` (keeps a backup).
@@ -144,8 +144,8 @@ separate review or plan documents: the report and the narrative live in the ledg
 
 - **Publish** after every review step and fix batch: `ledger.py progress-page [P-0001]` writes `.code-review/hub.html`
   (self-contained); give the owner that file, or the viewer `ledger.py serve [--no-open] [--port N]` (127.0.0.1 only,
-  takes answers; from another machine `ssh -L 8765:127.0.0.1:8765 host`, same port both ends). Publishing it elsewhere
-  is optional, always to the same address (`ledger.py add-artifact progress-page --url`).
+  takes answers; from another machine `ssh -L 8765:127.0.0.1:8765 host`). Never copy its `#k=` key into a prompt, the
+  ledger or a report. Publishing it elsewhere is optional, always to one address: `ledger.py add-artifact progress-page --review R-0001 --url <address>`.
 - **Ask** with `ledger.py open-gate <kind> --title '...' --question '...' --context @file`, one `--option value=label`
   per choice (`--multi --preselect a,b`: any number, the recommended ones ticked), linked by `--review`, `--plan`, `--step` or `--issue`; say in chat what you asked (with the harness's
   question tool, when it has one) and that the owner can answer in the hub or in chat.
@@ -293,7 +293,7 @@ Every point of every report goes into the ledger, not only the summary's: `ledge
 - **5b. Check** each index: counts against the report's own totals, a spot check of a few sections; send gaps back to the indexer, never guess.
 - **5c. Load**, one report per command, all or nothing:
   `ledger.py load-index R-0001 security-1 points.tsv known.tsv --trace trace.tsv --actor A-0002`. Record what the
-  reports measured (`ledger.py add-metric`, `record-test-run`) and each index (`ledger.py add-artifact index`). Then
+  reports measured (`ledger.py add-metric`, `record-test-run`) and each index (`ledger.py add-artifact index --path <file> --review R-0001`). Then
   `ledger.py tag-review R-0001` and `ledger.py fill-refs R-0001`; each exits 1 when something was left undone.
 - **5d. Match** every finding: first `ledger.py match R-0001 --auto --actor A-0002` (what the data decides), then the
   rest by the table above and `references/indexing.md#matching`. At scale give it to read-only matchers by domain

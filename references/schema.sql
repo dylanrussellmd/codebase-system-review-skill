@@ -1,5 +1,5 @@
 -- =====================================================================
--- Code review ledger — schema version 23
+-- Code review ledger — schema version 24
 -- One SQLite file per project: <project root>/.code-review/ledger.sqlite
 -- Every connection must run:  PRAGMA foreign_keys = ON;
 -- Times are UTC ISO-8601 text with milliseconds (strftime('%Y-%m-%dT%H:%M:%fZ','now')); the tr_time_*
@@ -548,8 +548,8 @@ CREATE TABLE finding_locations (
                                             -- e.g. https://github.com/o/r/blob/<sha>/<path>#L10-L20
   role           TEXT NOT NULL DEFAULT 'primary' CHECK (role IN ('primary','also','test','doc','config')),
   excerpt_redacted INTEGER NOT NULL DEFAULT 0 CHECK (excerpt_redacted IN (0,1)),
-                                            -- 1 = fill-refs masked secret-looking values in excerpt as [redacted];
-                                            -- excerpt_sha256 is still the hash of the real lines
+                                            -- 1 = fill-refs or redact masked values in excerpt as [redacted];
+                                            -- excerpt_sha256 is then the hash of the masked lines
   whole_file     INTEGER NOT NULL DEFAULT 0 CHECK (whole_file IN (0,1)),
                                             -- 1 = the point is about the whole file (location form repo:path, no
                                             -- lines, no symbol); fill-refs sets it with lines 1..n
@@ -1170,11 +1170,12 @@ CREATE TABLE artifacts (
 -- themselves timestamped records written once, and a tool result's disposition carries its own actor and time; step_commits, guard_tests, decision_issues, plan_reviews and phases are plan
 -- and evidence links whose rows are their own record; the rest are setup and configuration (who, which
 -- repositories, the catalogs and word lists, requirements, the schema's own bookkeeping), whose
--- changes do not drive an issue's history.
+-- changes do not drive an issue's history. redact logs a change to such a row against the ledger itself
+-- (entity_type 'ledger', entity_id 0).
 CREATE TABLE events (
   id          INTEGER PRIMARY KEY,
   entity_type TEXT NOT NULL CHECK (entity_type IN ('review','issue','step','plan','decision','finding','gate',
-                                                   'relation','check','step-finding','goal','question')),
+                                                   'relation','check','step-finding','goal','question','ledger')),
   entity_id   INTEGER NOT NULL,
   event       TEXT NOT NULL,              -- status-changed, severity-changed, opened, seen, linked, note ...
   from_value  TEXT,
@@ -4336,7 +4337,8 @@ INSERT INTO enum_labels(enum, value, label, position) VALUES
  ('entity_type','plan','Plan',4), ('entity_type','decision','Decision',5), ('entity_type','finding','Finding',6),
  ('entity_type','gate','Question for you',7), ('entity_type','relation','Relation',8), ('entity_type','check','Review check',9),
  ('entity_type','step-finding','Step coverage',10),
- ('entity_type','goal','Design goal',11), ('entity_type','question','Interview question',12);
+ ('entity_type','goal','Design goal',11), ('entity_type','question','Interview question',12),
+ ('entity_type','ledger','Ledger',13);
 
 -- The checks `ledger.py check` runs (see ledger_checks).
 INSERT OR IGNORE INTO ledger_checks(view, label, tier, position) VALUES
@@ -4561,7 +4563,7 @@ INSERT INTO enum_labels(enum, value, label, position) VALUES
  ('tool_output_format','json','JSON',5), ('tool_output_format','jsonl','JSON lines',6),
  ('tool_result_level','error','Error',1), ('tool_result_level','warning','Warning',2),
  ('tool_result_level','note','Note',3), ('tool_result_level','none','No level',4);
-INSERT INTO meta(key, value) VALUES ('schema_version','23');
+INSERT INTO meta(key, value) VALUES ('schema_version','24');
 INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger schema'),
   (2, 'url, path, hash and code checks; repositories.allow_outside_root; finding_locations.excerpt_redacted'),
   (3, 'integrity rules: codes, hashes, checks, append-only history, owner actor on gate answers'),
@@ -4584,4 +4586,5 @@ INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger s
   (20, 'tool_runs and tool_results: the picked tools'' runs at the reviewed commit, and their results as leads'),
   (21, 'indexes for check''s views, which read them instead of every row; the answers-imported event'),
   (22, 'correction commands: who corrects a gate, a location or a check, and why'),
-  (23, 'measured guard tests: guard_tests.measured_at and measured_commit_sha; v_unproven_steps; the guard-dropped and guard-renamed events');
+  (23, 'measured guard tests: guard_tests.measured_at and measured_commit_sha; v_unproven_steps; the guard-dropped and guard-renamed events'),
+  (24, 'events take the entity type ''ledger'': a redaction of a row that belongs to no other entity');

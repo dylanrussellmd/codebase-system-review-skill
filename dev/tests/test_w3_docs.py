@@ -103,6 +103,23 @@ class Help(unittest.TestCase):
         bare = [a.dest for a in self.ap._actions if not a.help and a.dest not in ("help", "cmd")]
         self.assertEqual(bare, [])
 
+    def test_init_help_names_its_files(self):
+        """init's help and the module docstring name every file init writes in a new ledger folder."""
+        project = fixtures.temp_dir("w3-init-") / "proj"
+        project.mkdir()
+        p = fixtures.run_ledger("--root", project, "init")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        made = sorted(f.name for f in (project / ".code-review").iterdir())
+        self.assertIn(".gitattributes", made)
+        helps = {c.dest: c.help for c in self.sub._choices_actions}
+        doc = self.mod.__doc__
+        usage = doc[doc.index("ledger.py init"):doc.index("ledger.py migrate")]
+        for name in made:
+            word = "ledger" if name == "ledger.sqlite" else name
+            with self.subTest(file=name):
+                self.assertIn(word, helps["init"])
+                self.assertIn(word, " ".join(usage.split()))
+
 
 class PageDocs(unittest.TestCase):
     HEADER = PAGE[PAGE.index('"use strict";'):PAGE.index("let TOKEN")]
