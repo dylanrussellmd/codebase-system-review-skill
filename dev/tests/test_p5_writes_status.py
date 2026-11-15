@@ -113,3 +113,38 @@ class ImportStepsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StaleDumpTest(unittest.TestCase):
+    def test_check_warns_on_stale_dump(self):
+        """A ledger written after its last dump (or never dumped) makes check warn and review-status handed-off and
+        plan-status complete refuse, naming dump; a fresh dump clears all three."""
+        repo, L, sha = project(self)
+        for st in ("verifying", "indexing", "consolidating"):
+            ok(L, "review-status", "R-0001", st, "--note", "n")
+        ok(L, "new-plan", "--title", "Plan", "--review", "R-0001")
+        ok(L, "plan-status", "P-0001", "awaiting-approval", "--note", "n")
+        gate = ok(L, "open-gate", "plan-approval", "--plan", "P-0001", "--title", "Approve", "--question", "Start?",
+                  "--option", "approve=Approve", "--option", "change=Change it")[0]
+        ok(L, "answer-gate", gate, "--value", "approve")
+        ok(L, "apply-gate", gate, "--note", "approved")
+        ok(L, "plan-status", "P-0001", "approved", "--note", "n")
+        ok(L, "plan-status", "P-0001", "in-progress", "--note", "n")
+        dump = L.db.with_suffix(".sql")
+        for state in ("missing", "older"):
+            with self.subTest(state=state):
+                if state == "older":
+                    ok(L, "dump")
+                    ok(L, "open-gate", "decision", "--title", "After the dump", "--question", "Which?", "--option",
+                       "a=A", "--option", "b=B", "--non-blocking")
+                p = L.run("check")
+                self.assertIn("dump", p.stdout + p.stderr)
+                self.assertIn(dump.name, p.stdout + p.stderr)
+                self.assertIn("dump", refused(self, L, "review-status", "R-0001", "handed-off", "--note", "n"))
+                self.assertIn("dump", refused(self, L, "plan-status", "P-0001", "complete", "--note", "n"))
+        ok(L, "dump")
+        p = L.run("check")
+        self.assertNotIn(dump.name, p.stdout + p.stderr)
+        ok(L, "review-status", "R-0001", "handed-off", "--note", "n")
+        ok(L, "dump")
+        ok(L, "plan-status", "P-0001", "complete", "--note", "no steps")

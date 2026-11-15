@@ -278,6 +278,14 @@ class Actors(IntegrityCase):
 class Transitions(IntegrityCase):
     """Step 79."""
 
+    def approval(self, **kw):
+        """An applied approval gate answered approve by an owner (domain-approval unless kind is given); returns the
+        owner's id, the approver an UPDATE to approved must name."""
+        owner = self.actor("owner")
+        self.L.gate(kind=kw.pop("kind", "domain-approval"), status="applied", answer_value="approve",
+                    answered_by_actor_id=owner, **kw)
+        return owner
+
     def test_review_status_transitions(self):
         rid = self.review(status="planning")
         self.raises("UPDATE reviews SET status='handed-off', approved_at=? WHERE id=?",
@@ -285,8 +293,9 @@ class Transitions(IntegrityCase):
         self.raises("UPDATE reviews SET status='running' WHERE id=?", (rid,), "")
         path = ("awaiting-approval", "planning", "awaiting-approval", "approved", "running", "verifying", "running",
                 "verifying", "indexing", "consolidating", "handed-off")
+        owner = self.approval(review_id=rid)
         for st in path:
-            extra = ", approved_at='2026-11-01T00:00:00.000Z'" if st == "approved" else ""
+            extra = f", approved_at='2026-11-01T00:00:00.000Z', approved_by_actor_id={owner}" if st == "approved" else ""
             self.x(f"UPDATE reviews SET status=?{extra} WHERE id=?", (st, rid))
         self.assertEqual(self.scalar("SELECT status FROM reviews WHERE id=?", (rid,)), "handed-off")
         with self.subTest("skipping ahead after approval is allowed; back past running is not"):
@@ -299,15 +308,18 @@ class Transitions(IntegrityCase):
 
     def test_review_cannot_run_before_approval(self):
         rid = self.review(status="awaiting-approval")
+        owner = self.actor("owner")
         gid = self.L.gate(kind="domain-approval", review_id=rid, options=[{"value": "approve", "label": "Approve"}])
         self.raises("UPDATE reviews SET status='approved', approved_at='2026-11-01T00:00:00.000Z' WHERE id=?", (rid,),
                     "domain-approval gate")
         self.raises("UPDATE reviews SET status='approved' WHERE id=?", (rid,), "")   # no approved_at
-        self.x("UPDATE gates SET status='answered', answer_value='approve' WHERE id=?", (gid,))
+        self.x("UPDATE gates SET status='answered', answer_value='approve', answered_by_actor_id=? WHERE id=?",
+               (owner, gid))
         self.raises("UPDATE reviews SET status='approved', approved_at='2026-11-01T00:00:00.000Z' WHERE id=?", (rid,),
                     "domain-approval gate")
         self.x("UPDATE gates SET status='applied', applied_note='Approved as listed.' WHERE id=?", (gid,))
-        self.x("UPDATE reviews SET status='approved', approved_at='2026-11-01T00:00:00.000Z' WHERE id=?", (rid,))
+        self.x("UPDATE reviews SET status='approved', approved_at='2026-11-01T00:00:00.000Z', approved_by_actor_id=? "
+               "WHERE id=?", (owner, rid))
 
     def test_findings_refused_before_approval(self):
         for status in ("planning", "awaiting-approval", "abandoned"):
@@ -323,23 +335,30 @@ class Transitions(IntegrityCase):
         actor = self.actor("reviewer")
         sql = "INSERT INTO reviewer_runs(review_id, domain_code, actor_id, label, scope) VALUES (?,?,?,?, 'all')"
         self.raises(sql, (rid, "spec", actor, "spec-A"), "approved review")
-        for st in ("awaiting-approval", "approved"):
-            self.x(f"UPDATE reviews SET status=?{', approved_at=?' if st == 'approved' else ''} WHERE id=?",
-                   (st, "2026-11-01T00:00:00.000Z", rid) if st == "approved" else (st, rid))
+        self.x("UPDATE reviews SET status='awaiting-approval' WHERE id=?", (rid,))
+        approve = ("UPDATE reviews SET status='approved', approved_at='2026-11-01T00:00:00.000Z', "
+                   "approved_by_actor_id=? WHERE id=?")
+        self.raises(approve, (None, rid), "domain-approval gate")   # no applied gate: no approval, no runs
+        self.raises(sql, (rid, "spec", actor, "spec-A"), "approved review")
+        owner = self.approval(review_id=rid)
+        self.x(approve, (owner, rid))
         self.x(sql, (rid, "spec", actor, "spec-A"))
         self.raises(sql, (rid, "security", actor, "sec-A"), "included")
 
     def test_plan_status_transitions(self):
         p = self.L.plan()
         self.raises("UPDATE plans SET status='in-progress' WHERE id=?", (p,), "a plan moves")
-        gid = self.L.gate(kind="plan-approval", plan_id=p, options=[{"value": "ok", "label": "OK"}])
+        owner = self.actor("owner")
+        gid = self.L.gate(kind="plan-approval", plan_id=p, options=[{"value": "approve", "label": "Approve"}])
         self.x("UPDATE plans SET status='awaiting-approval' WHERE id=?", (p,))
         self.raises("UPDATE plans SET status='approved', approved_at='2026-11-01T00:00:00.000Z' WHERE id=?", (p,),
                     "plan-approval gate")
-        self.x("UPDATE gates SET status='answered', answer_value='ok' WHERE id=?", (gid,))
+        self.x("UPDATE gates SET status='answered', answer_value='approve', answered_by_actor_id=? WHERE id=?",
+               (owner, gid))
         self.x("UPDATE gates SET status='applied', applied_note='Approved.' WHERE id=?", (gid,))
-        self.raises("UPDATE plans SET status='approved' WHERE id=?", (p,), "CHECK")
-        self.x("UPDATE plans SET status='approved', approved_at='2026-11-01T00:00:00.000Z' WHERE id=?", (p,))
+        self.raises("UPDATE plans SET status='approved', approved_by_actor_id=? WHERE id=?", (owner, p), "CHECK")
+        self.x("UPDATE plans SET status='approved', approved_at='2026-11-01T00:00:00.000Z', approved_by_actor_id=? "
+               "WHERE id=?", (owner, p))
         self.x("UPDATE plans SET status='in-progress' WHERE id=?", (p,))
         self.x("UPDATE plans SET status='abandoned' WHERE id=?", (p,))
         self.raises("UPDATE plans SET status='drafting' WHERE id=?", (p,), "change_note")

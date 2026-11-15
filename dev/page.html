@@ -129,9 +129,9 @@ nav.rail small{display:block;font-size:12px;opacity:.75}
 <div class="visually-hidden" id="live" role="status"></div>
 <script>
 "use strict";
-// The viewer page. `ledger.py serve` sends it as it is; `ledger.py progress-page` sends the same page with the
-// ledger's answers embedded before this script (window.LEDGER_SNAPSHOT: see STATIC). The viewer's key arrives in
-// the launch address (#k=...) and goes back with every request as X-Ledger-Token; the page holds no secret.
+// The viewer page. `ledger.py serve` sends it as it is; `ledger.py progress-page` writes the same page to a file
+// with every API answer embedded before this script (window.LEDGER_SNAPSHOT: see STATIC). The viewer's key goes
+// back with every request as X-Ledger-Token; the page holds no secret.
 //
 // Addresses (the part after #), the view that draws each, and what it asks the server (/api/...):
 //   #/                                   home      overview (every page), home, then checks
@@ -151,7 +151,7 @@ nav.rail small{display:block;font-size:12px;opacity:.75}
 //   #/explore, #/explore/<table>?offset= explore   tables, table/<name>, sql
 // Any view: source/<id> when a code reference is opened. An unknown address draws the home page.
 // The token arrives once, in the launch URL's fragment (#k=<token>, optionally followed by #/route); it is kept in
-// sessionStorage for this tab and removed from the address bar. The page itself carries no secret.
+// sessionStorage for this tab and removed from the address bar.
 let TOKEN = "";
 function takeToken(){
   const m = /^#k=([A-Za-z0-9_-]+)\/?(#.*)?$/.exec(location.hash);
@@ -169,7 +169,7 @@ let LABELS = {domains:{}, themes:{}}, OVERVIEW = null;
 // ---------- the shared copy
 // `ledger.py progress-page` writes this page as one file with every API answer embedded (window.LEDGER_SNAPSHOT).
 // STATIC is that data; in the viewer it is null. With it the page answers api() from the data, routes on hash names
-// a published page allows (#issue-ISS-0019), shows the How it works tab, and keeps the owner's gate answers for
+// a published page allows (#issue-ISS-0019) and keeps the owner's gate answers for
 // `ledger.py import-answers` (see ANSWER_STORES).
 const STATIC = (s => s && typeof s === "object" && s.responses ? s : null)(window.LEDGER_SNAPSHOT);
 let CUR_PATH = null;

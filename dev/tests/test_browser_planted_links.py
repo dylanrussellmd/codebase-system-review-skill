@@ -1,17 +1,16 @@
-"""Planted javascript: links in the viewer (plan P-0001 step 35: verification only; ISS-0080).
+"""Planted javascript: links in the viewer (ISS-0080).
 
-The viewer builds three links from ledger data without checking the scheme: finding_locations.permalink ("Open on
-the code host" in a reference's code panel), reviews.summary_doc_url ("Open the review document") and
-step_commits.pr_url ("pull request" in a step). The page's CSP has script-src 'unsafe-inline', which does not block
-javascript: URLs. This test plants a harmless payload in all three, clicks each link, and pins what happens today in
-Chrome: the link is drawn with the javascript: href, but because it opens with target=_blank rel=noopener, the click
-opens a new about:blank tab in which the payload does not run, and nothing runs in the viewer page. Firefox and
-WebKit (Safari) could not be checked here (Playwright could not download them), so this pins Chromium only.
+The viewer draws three links from ledger data: finding_locations.permalink ("Open on the code host" in a
+reference's code panel), reviews.summary_doc_url ("Open the review document") and step_commits.pr_url ("pull
+request" in a step). The schema refuses values that are not http(s), so the test plants them with PRAGMA
+ignore_check_constraints, as in an old or hand-edited ledger. It pins, in Chromium:
 
-Step 44 flipped the "link drawn with the javascript: href" assertions: the schema now refuses non-http(s) values in
-these columns (and in repositories.permalink_template), so the test plants them with PRAGMA ignore_check_constraints,
-as in a ledger made before schema 2 or edited by hand; the page's safeHref() shows such a value as plain text and
-never as an href. test_viewer_drops_non_http_links checks that on the review and plan pages.
+- the page's CSP (page_csp) allows its one inline script by sha256, so a javascript: URL clicked in the viewer's own
+  tab does not run (test_control_same_tab_javascript_link_blocked_by_viewer_csp);
+- safeHref() draws a planted value as plain text, never as an href, so a click opens no tab and runs nothing
+  (test_planted_javascript_links_are_not_links, and test_viewer_drops_non_http_links on the review and plan pages).
+
+Firefox and WebKit are not checked here.
 """
 import unittest
 

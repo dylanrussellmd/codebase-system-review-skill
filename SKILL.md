@@ -84,8 +84,8 @@ push tags (`git push origin review/R-0001`, then `ledger.py tag-review R-0001 --
 - **Every reference leads to the exact lines at a commit**: `repo:path:start-end#symbol` at the review's commit,
   never lines read from a file edited since; `tag-review` keeps each commit reachable, `fill-refs` copies the lines.
 - **Findings go in unmatched, then are matched** (`match`). **Status changes carry a reason** (`--note`).
-  **Approvals block**: runs and findings need an approved review, which needs its applied `domain-approval` gate; a
-  plan is approved only once its `plan-approval` gate is; a step cannot start or finish while a blocking gate is open.
+  **Approvals block**: runs and findings need an approved review, which needs its latest applied `domain-approval` gate answered `approve` (options `approve` and `change`); a
+  plan likewise needs its `plan-approval` gate; the approver is who answered; a step cannot start or finish while a blocking gate is open.
 - **Absence is not a fix.** Only a `fixed` check (with evidence) or `issue-status ... fixed` moves an issue; only a
   later review's `fixed` check makes it `verified`. **History is append-only**: events and finding text never change,
   nothing is deleted; a correction says why (`references/recipes.md#correcting-the-ledger`).
@@ -214,7 +214,7 @@ once; and that the review writes only `.code-review/` and local `review/R-0001` 
 
 ```
 ledger.py review-status R-0001 awaiting-approval --note 'domains proposed' --actor A-0002
-ledger.py open-gate domain-approval --review R-0001 --title 'Approve the review domains' --question 'Run these domains?' --context @.code-review/reviews/R-0001/proposal.md --option approve='Approve as listed' --option change='Add or remove domains' --actor A-0002
+ledger.py open-gate domain-approval --review R-0001 --title 'Approve the review domains' --question 'Run these domains?' --context @.code-review/reviews/R-0001/proposal.md --actor A-0002
 ledger.py progress-page
 ```
 
@@ -225,7 +225,7 @@ Record an answer given in chat (one given in the hub arrives with `import-answer
 ```
 ledger.py answer-gate GATE-0002 --value approve --text "<the owner's words>" --actor A-0002
 ledger.py apply-gate GATE-0002 --note 'approved as listed' --actor A-0002
-ledger.py review-status R-0001 approved --note 'the owner approved the domains (GATE-0002)' --approved-by A-0001 --actor A-0002
+ledger.py review-status R-0001 approved --note 'the owner approved the domains (GATE-0002)' --actor A-0002
 ```
 
 ### 2c. Interview the owner and agree the design goals
@@ -313,7 +313,7 @@ of a commit: `ledger.py compare-runs R-0001 R-0002 --record`; rerun each domain 
 
 ## Step 7: Hand off
 
-`ledger.py check` (must pass), `ledger.py dump`, `ledger.py review-status R-0001 handed-off --note '...'`, publish the
+`ledger.py check` (must pass), `ledger.py dump` and a copy of `ledger.sql` off this machine (`review-status` refuses handed-off while the dump is behind the ledger), `ledger.py review-status R-0001 handed-off --note '...'`, publish the
 hub, and open a `review-handoff` gate for anything the owner must decide. Tell the owner where the hub is, that tags
 are local, and that the code is unchanged; start no fixes unless asked. Given up: `review-status R-0001 abandoned --note '<why>'`.
 
@@ -334,7 +334,7 @@ first: phases, the drafter brief, merging, ordering rules, coverage.
   `ledger.py conflicts --plan P-0001`; judge each pair with `resolve-conflict` (`references/fix-plan.md#deconflict-the-steps-8c`).
 - **8d.** `ledger.py open-gate plan-approval --plan P-0001 ...`, `plan-status P-0001 awaiting-approval --note '...'`,
   publish the hub. Start nothing until the owner approves; then `apply-gate`,
-  `plan-status P-0001 approved --approved-by A-0001 --note '...'` and each issue `issue-status ISS-0001 planned`.
+  `plan-status P-0001 approved --note '...'` and each issue `issue-status ISS-0001 planned`.
 
 ## Step 9: Doing the work and keeping the owner informed
 
@@ -355,7 +355,7 @@ Brief every implementer with `references/implementer-brief.md` (it runs `ledger.
   what is refused, what turned out different and why, what to do on deploy) and its guard tests (`--guard`, or
   `add-guard`: each must fail with the step's changes undone and pass at its commit), and `issue-status ... fixed`.
 - **Blocked on the owner:** `step-status 12 waiting-owner --question '...'` and a gate of its `owner_need`'s kind.
-- **After each step or batch:** `ledger.py check`, `ledger.py dump`, `ledger.py progress-md P-0001` (to a file only if
+- **After each step or batch:** `ledger.py check`, `ledger.py dump` and a copy of `ledger.sql` off this machine (`CODE_REVIEW_DIR` on a backed-up folder, or the owner's copy; `plan-status` refuses complete while the dump is behind), `ledger.py progress-md P-0001` (to a file only if
   the ledger-location decision commits review data), publish the hub, tell the owner how many steps are done.
   `v_stale_steps` (in `gates`) lists steps whose issues are closed: mark each done or dropped with a note.
 

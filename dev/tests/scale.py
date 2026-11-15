@@ -199,6 +199,9 @@ def build(proj, scale=1, reviews=5, files=300, reports=None, ledger_py=None, see
     def lastid():
         return x("SELECT last_insert_rowid()").fetchone()[0]
 
+    def next_gate():
+        return f"GATE-{x('SELECT count(*) FROM gates').fetchone()[0] + 1:04d}"
+
     domains = [r[0] for r in x("SELECT code FROM domains ORDER BY rowid")]
     themes = [r[0] for r in x("SELECT code FROM themes ORDER BY rowid")]
 
@@ -228,6 +231,10 @@ def build(proj, scale=1, reviews=5, files=300, reports=None, ledger_py=None, see
            review_ids[-1] if review_ids else None, _ts(day)))
         rid = lastid()
         review_ids.append(rid)
+        # the owner's applied domain-approval gate, answered approve: the only way a review is approved
+        x("""INSERT INTO gates(code,kind,title,question,status,answer_value,answered_by_actor_id,applied_note,review_id,
+             opened_by_actor_id,created_at) VALUES (?,'domain-approval','Approve the domains','Run them?','applied',
+             'approve',?,'approved',?,?,?)""", (next_gate(), owner, rid, mgr, _ts(day, 30)))
         for st in ("awaiting-approval", "approved", "running", "verifying", "indexing"):
             # schema 3: a review past awaiting-approval has approved_at
             x("UPDATE reviews SET status=?, approved_at=CASE WHEN ?='approved' THEN ? ELSE approved_at END WHERE id=?",
@@ -406,7 +413,7 @@ def build(proj, scale=1, reviews=5, files=300, reports=None, ledger_py=None, see
             opts = json.dumps([{"value": f"o{v}", "label": text(4), "description": text(12)} for v in range(3)])
             x("""INSERT INTO gates(code,kind,title,question,context,options,review_id,issue_id,opened_by_actor_id,
                  created_at) VALUES (?,?,?,?,?,?,?,?,?,?)""",
-              (f"GATE-{k * gates_per_review + j + 1:04d}",
+              (next_gate(),
                rnd.choice(["decision", "accept-risk", "confirm-false-finding", "other", "domain-approval"]),
                text(6), text(25), text(80), opts, rid, rnd.choice(allids), mgr, _ts(day, j)))
             gid = lastid()
@@ -446,6 +453,9 @@ def _build_plan(con, rnd, text, review_ids, all_findings, n_steps, head_sha, T, 
 
     def lastid():
         return x("SELECT last_insert_rowid()").fetchone()[0]
+
+    def next_gate():
+        return f"GATE-{x('SELECT count(*) FROM gates').fetchone()[0] + 1:04d}"
 
     t0 = time.perf_counter()
     x("BEGIN")
@@ -500,6 +510,9 @@ def _build_plan(con, rnd, text, review_ids, all_findings, n_steps, head_sha, T, 
     nupd = 0
     x("BEGIN")
     x("UPDATE plans SET status='awaiting-approval' WHERE id=?", (plan_id,))
+    x("""INSERT INTO gates(code,kind,title,question,status,answer_value,answered_by_actor_id,applied_note,plan_id,
+         created_at) VALUES (?,'plan-approval','Approve the plan','Start?','applied','approve',?,'approved',?,?)""",
+      (next_gate(), owner, plan_id, _ts(0)))
     x("UPDATE plans SET status='approved', approved_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?", (plan_id,))
     x("UPDATE plans SET status='in-progress' WHERE id=?", (plan_id,))
     for sid in step_ids:

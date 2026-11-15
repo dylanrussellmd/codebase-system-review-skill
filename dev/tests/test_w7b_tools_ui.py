@@ -281,6 +281,7 @@ class Odiff(unittest.TestCase):
         out = ok(L, "tool-run", "odiff", "--review", "R-0001", "--unpinned", "--actor", "A-0001", env=env)
         self.assertIn("not run", out[0])
         self.assertIn("follows up no review", L.scalar("SELECT fallback FROM tool_runs"))
+        ok(L, "dump")
         ok(L, "review-status", "R-0001", "handed-off", "--note", "done", "--actor", "A-0001")
         ok(L, "new-review", "--title", "Second", "--scope", "full", "--previous", "R-0001", "--actor", "A-0001")
         self.screenshots(L, "R-0002", {"home-390-light.png": blue, "home-1280-light.png": red,
@@ -304,6 +305,7 @@ class Odiff(unittest.TestCase):
     def test_odiff_real(self):
         repo, L, sha = tool_project(self)
         self.screenshots(L, "R-0001", {"a.png": png(8, 8, (255, 0, 0))})
+        ok(L, "dump")
         ok(L, "review-status", "R-0001", "handed-off", "--note", "done", "--actor", "A-0001")
         ok(L, "new-review", "--title", "Second", "--scope", "full", "--previous", "R-0001", "--actor", "A-0001")
         self.screenshots(L, "R-0002", {"a.png": png(8, 8, (0, 0, 255))})

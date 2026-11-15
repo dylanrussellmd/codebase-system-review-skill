@@ -62,8 +62,9 @@ class CliOutputTest(unittest.TestCase):
 
     def test_query_tsv_and_json_are_safe(self):
         ok(self.L, "open-gate", "confirm", "--title", EVIL, "--question", "q?", "--actor", "A-0001")
-        self.assert_safe(self.L.run_ok("query", "SELECT title FROM gates"))
-        p = self.L.run_ok("query", "--json", "SELECT title FROM gates")
+        mine = "SELECT title FROM gates WHERE kind = 'confirm'"  # not the review's approval gate
+        self.assert_safe(self.L.run_ok("query", mine))
+        p = self.L.run_ok("query", "--json", mine)
         self.assertFalse(has_controls(p.stdout), p.stdout)
         self.assertEqual(json.loads(p.stdout)["rows"][0][0], EVIL)  # still valid JSON with the same value
 

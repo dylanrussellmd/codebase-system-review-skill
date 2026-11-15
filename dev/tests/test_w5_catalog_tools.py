@@ -90,7 +90,7 @@ class ToolCatalog(unittest.TestCase):
         rows = jsonl()
         for d in catalog_domains():
             with self.subTest(domain=d):
-                want = sorted(r["tool"].replace("`", "").replace("<", "&lt;").replace(">", "&gt;")
+                want = sorted(r["tool"].replace("`", "")
                               for r in rows if r["domain"] == d and r["rating"] in ("must-have", "strong"))
                 got = sorted(tool_name(r[0]) for r in table_rows(secs[d]))
                 self.assertEqual(got, want)
@@ -109,6 +109,33 @@ class ToolCatalog(unittest.TestCase):
                 self.assertIsInstance(r["sends_data"], bool)
                 self.assertIsInstance(r["runs_project_code"], bool)
         self.assertEqual(len({(r["domain"], r["tool"]) for r in rows}), len(rows), "one row per tool and domain")
+
+    def test_catalog_names_every_adapter(self):
+        """Every adapter of the built ledger.py's TOOL_ADAPTERS is a row of the tool-run table, and no row that runs
+        an adapter says it is proposed or still to build."""
+        text = TOOLS_MD.read_text(encoding="utf-8")
+        adapters = set(fixtures.load_ledger_module().TOOL_ADAPTERS)
+        head = "| Adapter | What it reads | Needs |"
+        self.assertIn(head, text)
+        block = text[text.index(head):].split("\n\n", 1)[0]
+        listed = {re.sub(r"`", "", r[0]) for r in table_rows(block)[1:]}
+        self.assertEqual(sorted(listed), sorted(adapters))
+        for line in text.split("\n"):
+            if not line.startswith("| "):
+                continue
+            for name in re.findall(r"tool-run ([a-z][a-z0-9-]*)", line):
+                with self.subTest(adapter=name, row=line[:80]):
+                    self.assertIn(name, adapters)
+                    self.assertNotIn("(proposed)", line)
+                    self.assertNotIn("to build into", line)
+        for tool in ("Doc-reference check", "Internal-name scan", "Knowledge concentration from git",
+                     "git log --numstat"):
+            row = next(l for l in text.split("\n") if l.startswith("| ") and tool in l.split("|")[1])
+            self.assertIn("tool-run ", row, tool)
+
+    def test_tools_md_has_no_html_entities(self):
+        text = TOOLS_MD.read_text(encoding="utf-8")
+        self.assertEqual(re.findall(r".{0,30}&(?:lt|gt|amp);.{0,30}", text), [])
 
     def test_shortlist_and_design(self):
         text = TOOLS_MD.read_text(encoding="utf-8")

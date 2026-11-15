@@ -45,7 +45,7 @@ class NewPlanTest(unittest.TestCase):
         with self.subTest("approved is refused before the plan-approval gate is applied"):
             self.assertIn("plan-approval gate", refused(self, L, "plan-status", "P-0001", "approved", "--note", "x"))
             gate = ok(L, "open-gate", "plan-approval", "--plan", "P-0001", "--title", "Approve", "--question",
-                      "Start?", "--option", "approve=Approve", "--actor", "A-0002")[0]
+                      "Start?", "--actor", "A-0002")[0]
             self.assertIn("plan-approval gate", refused(self, L, "plan-status", "P-0001", "approved", "--note", "x"))
             ok(L, "answer-gate", gate, "--value", "approve")
             self.assertIn("plan-approval gate", refused(self, L, "plan-status", "P-0001", "approved", "--note", "x"))
@@ -63,6 +63,7 @@ class NewPlanTest(unittest.TestCase):
             ok(L, "plan-status", "P-0001", "in-progress", "--note", "work started", "--actor", "A-0002")
             self.assertIn("step 1", refused(self, L, "plan-status", "P-0001", "complete", "--note", "x"))
             ok(L, "step-status", "1", "dropped", "--note", "not needed", "--plan", "P-0001")
+            ok(L, "dump")
             ok(L, "plan-status", "P-0001", "complete", "--note", "every step done", "--actor", "A-0002")
         with self.subTest("superseded names its successor"):
             ok(L, "new-plan", "--title", "Second plan", "--review", "R-0001")

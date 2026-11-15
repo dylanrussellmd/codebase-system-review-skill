@@ -53,10 +53,10 @@ class ReviewAndIssueTables(SchemaCase):
     def test_constraints_repositories(self):
         self.run_cases(
             "repositories", lambda n: {"name": f"repo{n}", "path": "."},
-            good=[("only a name", {"path": None}),
-                  ("all optional columns", {"remote_url": "https://example.invalid/r.git", "default_branch": "main",
+            good=[("all optional columns", {"remote_url": "https://example.invalid/r.git", "default_branch": "main",
                                             "permalink_template": "https://x/{sha}/{path}", "notes": "n"})],
-            bad=[("no name", {"name": None}, nn("repositories.name"))],
+            bad=[("no name", {"name": None}, nn("repositories.name")),
+                 ("no path", {"path": None}, nn("repositories.path"))],
             dup=[("same name", {"path": "other"}, uq("repositories.name"))])
 
     def test_constraints_actors(self):
@@ -318,15 +318,17 @@ class FindingPlanAndEventTables(SchemaCase):
         self.run_cases(
             "plans", lambda n: {"code": self.L._code("P-"), "title": "Plan"},
             # schema 3: approved, in-progress and complete need approved_at (ISS-0010)
-            good=each("status", ("drafting", "awaiting-approval", "superseded", "abandoned"))
+            good=each("status", ("drafting", "awaiting-approval", "abandoned"))
             + [(f"status={s}", {"status": s, "approved_at": "2026-11-01T00:00:00.000Z"})
                for s in ("approved", "in-progress", "complete")]
-            + [("superseded by a plan", {"superseded_by": self.plan})],
+            + [("superseded by a plan", {"status": "superseded", "superseded_by": self.plan})],
             bad=[("approved without approved_at", {"status": "approved"}, ck("status IN ('drafting'")),
                  ("code out of sequence", {"code": "P-9001"}, "sequential"),
                  ("status done", {"status": "done"}, ck("status")),
                  ("no title", {"title": None}, nn("plans.title")),
-                 ("unknown successor", {"superseded_by": 9999}, FK)],
+                 ("unknown successor", {"status": "superseded", "superseded_by": 9999}, FK),
+                 ("superseded without a successor", {"status": "superseded"}, ck("(status = 'superseded')")),
+                 ("a successor without superseded", {"superseded_by": self.plan}, ck("(status = 'superseded')"))],
             dup=[("same code", {"title": "Other"}, uq("plans.code"))])
 
     def test_constraints_plan_reviews(self):

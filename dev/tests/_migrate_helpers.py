@@ -292,6 +292,7 @@ def build_fixtures(upto=SHIPPED - 1):
     _, db = restore_v1(fixtures.temp_dir("fixtures-") / "proj")
     con = sqlite3.connect(str(db))
     con.isolation_level = None
+    con.create_function("sha256_hex", 1, mod.sha256_hex)  # as migrate gives it
     con.execute("PRAGMA foreign_keys = OFF")  # as migrate runs them (the table rebuilds need it); checked after each
     for t, n in con.execute("SELECT type, name FROM sqlite_master WHERE type IN ('view', 'trigger')").fetchall():
         con.execute(f'DROP {t.upper()} "{n}"')

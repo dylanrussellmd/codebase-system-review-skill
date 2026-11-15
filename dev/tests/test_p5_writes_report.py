@@ -76,8 +76,8 @@ class ReportFindingTest(unittest.TestCase):
     def test_report_finding_opens_gate_when_unplaceable(self):
         L = self.L
         out = ok(L, *self.report("--new-issue"))
-        self.assertIn("asked the owner in GATE-0001", out[-1])
-        g = L.one("SELECT kind, plan_id, issue_id, blocking, status FROM gates")
+        self.assertIn("asked the owner in GATE-0002", out[-1])  # GATE-0001 approved the review
+        g = L.one("SELECT kind, plan_id, issue_id, blocking, status FROM gates WHERE code='GATE-0002'")
         self.assertEqual(g, {"kind": "decision", "plan_id": self.plan, "issue_id": L.id_of("issues", "ISS-0002"),
                              "blocking": 0, "status": "open"})
         self.assertEqual([r["point_id"] for r in L.all("SELECT point_id FROM v_unplanned_discoveries")], ["FIX-1"])

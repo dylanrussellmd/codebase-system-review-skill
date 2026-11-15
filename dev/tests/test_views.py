@@ -258,7 +258,7 @@ class PlanAndQueueViews(SchemaCase):
         self.L.step(self.plan, self.ph, 2, findings=(open_f,))
         self.L.update("steps", s1, status="done")
         p2 = self.L.plan("P-0002", reviews=[self.r1])
-        self.L.update("plans", self.plan, superseded_by=p2)
+        self.L.update("plans", self.plan, status="superseded", superseded_by=p2, change_note="replaced")
         uncovered = lambda: [(r["plan"], r["point_id"]) for r in self.view("v_uncovered_findings")]
         self.assertEqual(uncovered(), [("P-0002", "SPEC-M2")])
         self.L.step(p2, self.L.phase(p2, 1), 1, findings=(open_f,))

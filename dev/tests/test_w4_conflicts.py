@@ -38,7 +38,7 @@ def planned(test, touches=True):
 
 def approve(L, expect_ok=True):
     gate = ok(L, "open-gate", "plan-approval", "--plan", "P-0001", "--title", "Approve", "--question", "Go?",
-              "--option", "approve=Yes", "--actor", "A-0001")[0]
+              "--actor", "A-0001")[0]
     ok(L, "add-actor", "owner", "the owner")
     ok(L, "answer-gate", gate, "--value", "approve", "--text", "yes", "--actor", "A-0001")
     ok(L, "apply-gate", gate, "--note", "approved", "--actor", "A-0001")

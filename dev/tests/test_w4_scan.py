@@ -6,7 +6,7 @@ import re
 import unittest
 
 from dev.tests import fixtures
-from dev.tests._p5_writes_helpers import new_ledger, ok, refused
+from dev.tests._p5_writes_helpers import approve, new_ledger, ok, refused
 
 REFS = fixtures.REPO_ROOT / "references"
 
@@ -130,7 +130,7 @@ class Scan(unittest.TestCase):
         L, _ = scanned(self, PLAIN)
         ok(L, "review-domain", "R-0001", "spec", "include", "--reason", "the rules")
         ok(L, "review-status", "R-0001", "awaiting-approval", "--note", "proposed")
-        ok(L, "review-status", "R-0001", "approved", "--note", "approved")
+        approve(L, "R-0001")
         out = L.run_ok("scan", "--review", "R-0001").stdout
         self.assertIn("R-0001 is approved: its domains are settled, nothing was recorded", out)
         self.assertEqual(set(domains(L)), {"spec"})

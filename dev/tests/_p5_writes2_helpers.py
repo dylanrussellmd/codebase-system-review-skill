@@ -11,7 +11,7 @@ import sys
 from unittest import mock
 
 from dev.tests import fixtures
-from dev.tests._p5_writes_helpers import APP, new_ledger
+from dev.tests._p5_writes_helpers import APP, approve, new_ledger
 
 
 def run(L, *args):
@@ -81,8 +81,7 @@ def project(test, *, approved=True):
     ok(L, "review-domain", "R-0001", "tests", "include", "--reason", "proposed for this review")
     if approved:
         ok(L, "review-status", "R-0001", "awaiting-approval", "--note", "domains proposed", "--actor", "A-0002")
-        ok(L, "review-status", "R-0001", "approved", "--note", "the owner approved the domains", "--approved-by",
-           "A-0001", "--actor", "A-0002")
+        approve(L, "R-0001", "domain-approval", "--actor", "A-0002")
         ok(L, "review-status", "R-0001", "running", "--note", "reviewers started", "--actor", "A-0002")
         ok(L, "add-run", "R-0001", "spec", "spec-A", "--scope", "all", "--model", "m1", "--status", "running",
            "--actor", "A-0002")

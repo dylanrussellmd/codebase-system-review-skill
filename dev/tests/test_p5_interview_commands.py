@@ -87,7 +87,7 @@ class InterviewTest(unittest.TestCase):
         L = interview_project(self)
         ok(L, "interview-ask", "--review", "R-0001", "--domain", "spec", "--why", "w", "Must it log?", "--gate")
         code = L.scalar("SELECT g.code FROM gates g JOIN interview_questions q ON q.gate_id=g.id")
-        self.assertEqual(code, "GATE-0001")
+        self.assertEqual(code, "GATE-0002")  # GATE-0001 approved the review
         mod = fixtures.load_ledger_module(L.ledger_py)
         self.assertEqual(mod.gate_answer_request(L.db, code, {"answer_text": "Every refusal, yes."}), {"ok": True})
         L.con.rollback()
@@ -217,13 +217,13 @@ class GoalsTest(unittest.TestCase):
         ok(L, "propose-goal", "--domain", "spec", "--from", "IQ-0001", "Inputs are JSON.", "--gate")
         ok(L, "propose-goal", "--from", "IQ-0002", "Runs from the README.", "--gate")
         L.commit()
-        gates = L.all("SELECT code, kind, status, context FROM gates")
-        self.assertEqual([(g["code"], g["kind"], g["status"]) for g in gates], [("GATE-0001", "confirm", "open")])
+        gates = L.all("SELECT code, kind, status, context FROM gates WHERE kind <> 'domain-approval'")
+        self.assertEqual([(g["code"], g["kind"], g["status"]) for g in gates], [("GATE-0002", "confirm", "open")])
         self.assertIn("G-01", gates[0]["context"])
         self.assertIn("Runs from the README.", gates[0]["context"])
-        self.assertEqual(L.scalar("SELECT count(*) FROM v_owner_queue WHERE ref='GATE-0001'"), 1)
+        self.assertEqual(L.scalar("SELECT count(*) FROM v_owner_queue WHERE ref='GATE-0002'"), 1)
         mod = fixtures.load_ledger_module(L.ledger_py)
-        self.assertEqual(mod.gate_answer_request(L.db, "GATE-0001", {"answer_value": "approve"}), {"ok": True})
+        self.assertEqual(mod.gate_answer_request(L.db, "GATE-0002", {"answer_value": "approve"}), {"ok": True})
         L.con.rollback()
         got = self.goals()
         owner = L.scalar("SELECT min(id) FROM actors WHERE kind='owner'")
@@ -235,7 +235,7 @@ class GoalsTest(unittest.TestCase):
             L.commit()
             self.assertEqual(L.scalar("SELECT count(*) FROM gates WHERE status='open'"), 1)
             p = L.root / "answers.json"
-            p.write_text(json.dumps([{"gate": "GATE-0002", "answer_value": "change",
+            p.write_text(json.dumps([{"gate": "GATE-0003", "answer_value": "change",
                                       "answer_text": "say a minute"}]), encoding="utf-8")
             L.run_ok("import-answers", str(p))
             self.assertEqual([g["status"] for g in self.goals("--all") if g["code"] == "G-03"], ["proposed"])
@@ -245,7 +245,7 @@ class GoalsTest(unittest.TestCase):
         ok(L, "propose-goal", "--domain", "spec", "--review", "R-0001", "Inputs are JSON.", "--gate")
         ok(L, "approve-goals", "G-01", "--actor", "A-0002")
         L.commit()
-        self.assertEqual(L.one("SELECT status, answer_value, answered_by_actor_id FROM gates"),
+        self.assertEqual(L.one("SELECT status, answer_value, answered_by_actor_id FROM gates WHERE kind='confirm'"),
                          {"status": "answered", "answer_value": "approve", "answered_by_actor_id": 2})
 
 

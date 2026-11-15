@@ -230,6 +230,30 @@ class LedgerEntityUpgrade(unittest.TestCase):
                          .fetchone()[0], "Ledger")
 
 
+class MaskedHashUpgrade(unittest.TestCase):
+    def test_old_masked_hashes_rewritten(self):
+        """A schema-24 row with a masked excerpt and the hash of its real lines has the hash of the masked excerpt
+        after migrate; an unmasked row keeps its hash."""
+        from dev.tests import _migrate_helpers as M
+        project_dir, db = M.restore(24)
+        real = "token = 'hunter22'\n"
+        masked = "token = '[REDACTED]'\n"
+        con = sqlite3.connect(str(db))
+        ids = [r[0] for r in con.execute("SELECT id FROM finding_locations ORDER BY id LIMIT 2")]
+        con.execute("UPDATE finding_locations SET excerpt=?, excerpt_sha256=?, excerpt_redacted=1 WHERE id=?",
+                    (masked, hashlib.sha256(real.encode()).hexdigest(), ids[0]))
+        kept = con.execute("SELECT excerpt_sha256 FROM finding_locations WHERE id=?", (ids[1],)).fetchone()[0]
+        con.commit()
+        con.close()
+        p = fixtures.run_ledger("--root", project_dir, "migrate")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        con = sqlite3.connect(str(db))
+        self.addCleanup(con.close)
+        got = dict(con.execute("SELECT id, excerpt_sha256 FROM finding_locations WHERE id IN (?, ?)", ids))
+        self.assertEqual(got[ids[0]], hashlib.sha256(masked.encode()).hexdigest())
+        self.assertEqual(got[ids[1]], kept)
+
+
 class RedactBytesTest(unittest.TestCase):
     """On a grown ledger (page splits, cells moved within pages) no byte of the redacted text is left in the files."""
 

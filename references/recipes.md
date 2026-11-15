@@ -160,16 +160,16 @@ ledger.py import-steps P-0002 steps.jsonl
 
 ### Move a plan's status
 
-`drafting`, `awaiting-approval`, `approved` (only once its `plan-approval` gate is applied), `in-progress` (at the
+`drafting`, `awaiting-approval`, `approved` (only once its `plan-approval` gate is applied with the answer `approve`), `in-progress` (at the
 first step), `complete` (every step done or dropped), `superseded` (with `--superseded-by P-0003`) or `abandoned`.
 Every change takes `--note`.
 
 ```sh
 ledger.py plan-status P-0002 awaiting-approval --note 'the steps are ready for the owner'
-ledger.py open-gate plan-approval --plan P-0002 --title 'Approve the fix plan' --question 'Start work in this order?' --option approve='Approve the plan' --option change='Change it first'
+ledger.py open-gate plan-approval --plan P-0002 --title 'Approve the fix plan' --question 'Start work in this order?'
 ledger.py answer-gate GATE-0003 --value approve --text 'Go ahead.'
 ledger.py apply-gate GATE-0003 --note 'plan approved; work starts with phase 1'
-ledger.py plan-status P-0002 approved --note 'the owner approved the plan (GATE-0003)' --approved-by A-0001
+ledger.py plan-status P-0002 approved --note 'the owner approved the plan (GATE-0003)'
 ledger.py issue-status ISS-0004 planned --note 'in P-0002 step 1'
 ```
 
@@ -460,6 +460,13 @@ dump; compare the two, and ask the owner before replacing the ledger.
 
 A table, view or trigger differs from the shipped schema. Open a gate, and do not run the project copy of `ledger.py`.
 
+#### A stale dump
+
+A warning: `ledger.sql` is missing, older than the ledger's last change, or not the dump the ledger last wrote.
+`review-status ... handed-off` and `plan-status ... complete` are refused until it is current. Run `ledger.py dump`
+and copy `ledger.sql` off this machine. If the ledger is lost or damaged, `ledger.py restore <the copy> --to
+<new file>` rebuilds it as of that dump; check it, and ask the owner before it replaces the ledger.
+
 ### Merge conflicts and backups
 
 After a git merge conflict on `ledger.sqlite` (only when the owner decided to commit it): keep this side, save the
@@ -471,6 +478,6 @@ other and merge it in; then dump.
     ledger.py dump
 
 `merge` prints codes it renumbered; text that mentions them (notes, tags) is not rewritten. Back up by running `dump`
-after each writing session, and copy `ledger.sqlite` before `migrate` or `merge` (both
-also keep their own backups). Expect about 10 MB of ledger and 7 MB of dump per 1,000 findings (measured at 10,000
+after each writing session and copying `ledger.sql` off this machine (`check` warns while it is behind the ledger),
+and copy `ledger.sqlite` before `migrate` or `merge` (both also keep their own backups). Expect about 10 MB of ledger and 7 MB of dump per 1,000 findings (measured at 10,000
 findings: 95 MB and 66 MB, about 9.5 KB of ledger per finding).

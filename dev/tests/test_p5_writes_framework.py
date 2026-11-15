@@ -9,7 +9,7 @@ import warnings
 from contextlib import redirect_stderr, redirect_stdout
 
 from dev.tests import fixtures
-from dev.tests._p5_writes_helpers import APP, counts, new_ledger, ok, project, refused
+from dev.tests._p5_writes_helpers import approve, APP, counts, new_ledger, ok, project, refused
 
 
 class WriteFrameworkTest(unittest.TestCase):
@@ -47,7 +47,7 @@ class WriteFrameworkTest(unittest.TestCase):
         err = refused(self, L, "add-run", "R-0001", "spec", "spec-A", "--scope", "all")
         self.assertIn("need the owner's approval", err)
         ok(L, "review-status", "R-0001", "awaiting-approval", "--note", "proposed")
-        ok(L, "review-status", "R-0001", "approved", "--note", "approved")
+        approve(L, "R-0001")
         err = refused(self, L, "add-run", "R-0001", "security", "sec-A", "--scope", "all")
         self.assertIn("did not include domain 'security'", err)
         after = counts(L, "reviewer_runs", "actors")

@@ -55,6 +55,7 @@ def follow_up(test, repo, L, files):
     for rel, text in files.items():
         repo.write(rel, text)
     repo.commit("second")
+    ok(L, "dump")
     ok(L, "review-status", "R-0001", "handed-off", "--note", "done", "--actor", "A-0001")
     ok(L, "new-review", "--title", "Second", "--scope", "full", "--previous", "R-0001", "--actor", "A-0001")
 

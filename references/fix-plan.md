@@ -103,8 +103,9 @@ approval (`report-finding --new-step`) is checked at once: its conflicts are a w
 Check every number and step range in the narrative against the ledger, then:
 
     ledger.py open-gate plan-approval --plan P-0001 --title 'Approve the fix plan' --question 'Start work in this order?' \
-        --option approve='Approve the plan' --option change='Change it first' --actor A-0002
+        --actor A-0002
 
 Move the plan to `awaiting-approval` (`ledger.py plan-status P-0001 awaiting-approval --note '...'`), publish the hub,
-and tell the owner the steps are in the hub's Fix plans. Start nothing until the owner approves; then `apply-gate`,
-`plan-status P-0001 approved --approved-by A-0001 --note '...'`, and each of its issues `issue-status ISS-0001 planned`.
+and tell the owner the steps are in the hub's Fix plans. The gate's options are `approve` and `change`. Start nothing
+until the owner answers `approve`; then `apply-gate`, `plan-status P-0001 approved --note '...'` (the approver is who
+answered), and each of its issues `issue-status ISS-0001 planned`.

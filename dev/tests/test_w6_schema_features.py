@@ -8,7 +8,7 @@ import sqlite3
 import unittest
 
 from dev.tests import fixtures
-from dev.tests._p5_writes_helpers import ok, refused, project, counts
+from dev.tests._p5_writes_helpers import approve, ok, refused, project, counts
 
 REFS = fixtures.REPO_ROOT / "references"
 
@@ -59,7 +59,7 @@ def with_goal(test, include=True):
     if include:
         ok(L, "review-domain", "R-0001", "features", "include", "--reason", "the owner approved goals")
     ok(L, "review-status", "R-0001", "awaiting-approval", "--note", "domains proposed")
-    ok(L, "review-status", "R-0001", "approved", "--note", "the owner approved the domains")
+    approve(L, "R-0001")
     ok(L, "review-status", "R-0001", "running", "--note", "reviewers started")
     return repo, L
 

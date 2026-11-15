@@ -78,8 +78,12 @@ class SchemaChecks(unittest.TestCase):
         for bad in ("../x", "/x", "a/../../x", "..", "a\\b", "-C", "a\x01b"):
             with self.subTest(path=bad):
                 self.refused(lambda: L.repository("bad", bad))
+        with self.subTest(path=None), self.assertRaises(sqlite3.IntegrityError) as cm:  # a repository has a path
+            L.repository("bad", None)
+        L.con.rollback()
+        self.assertIn("NOT NULL constraint failed: repositories.path", str(cm.exception))
         # '.' is the setup repository's own path: one repository per path (schema 3, plan step 64)
-        for good in ("", None, "sub", "sub/repo"):
+        for good in ("", "sub", "sub/repo"):
             with self.subTest(path=good):
                 self.accepted(lambda: L.repository("good", good))
         with self.assertRaises(sqlite3.IntegrityError) as cm:

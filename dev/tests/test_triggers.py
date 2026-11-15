@@ -272,7 +272,10 @@ class StepAndPlanTriggers(TriggerCase):
         pid = self.L.plan(updated_at=FIXED)
         actor = self.actor("owner")
         self.L.update("plans", pid, status="awaiting-approval")
-        self.L.update("plans", pid, status="approved", approved_at=FIXED, change_actor_id=actor)
+        self.L.gate(kind="plan-approval", plan_id=pid, status="applied", answer_value="approve",
+                    answered_by_actor_id=actor)
+        self.L.update("plans", pid, status="approved", approved_at=FIXED, approved_by_actor_id=actor,
+                      change_actor_id=actor)
         self.L.update("plans", pid, status="approved")
         ev = self.events("plan", pid, "status-changed")
         self.assertEqual([(e["event"], e["from_value"], e["to_value"]) for e in ev],

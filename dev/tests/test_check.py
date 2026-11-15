@@ -259,7 +259,7 @@ class CheckFunction(unittest.TestCase):
             offend(L, "v_unmatched_findings", count=7)
             n, out = self.run_check(L, quiet=True)
         self.assertEqual(n, 1)
-        lines = out.splitlines()
+        lines = [l for l in out.splitlines() if not l.startswith("  warning  ")]  # this ledger has no dump
         self.assertEqual(lines[0], "    7  Findings not matched to an issue  (v_unmatched_findings)")
         self.assertEqual(len(lines), 6)
         for l in lines[1:]:

@@ -43,7 +43,8 @@ class Init(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         # Step 48: the owner's lines first, then the tool's lines in order (the file is rewritten, not appended to).
         self.assertEqual(gi.read_text(), "my-notes.txt\n" + fixtures.load_ledger_module().GITIGNORE)
-        self.assertIn(f"repaired {gi}: added ledger.sqlite.tmp, ledger.sqlite.bak-v*, ledger.py.bak", p.stdout)
+        self.assertIn(f"repaired {gi}: added ledger.sqlite.bak-v*, ledger.sqlite.bak-merge*, ledger.py.bak, *.tmp, "
+                      "*.tmp-*, viewer-launch.*.html", p.stdout)
         p = run_ledger("--root", d, "init")
         self.assertNotIn("repaired", p.stdout)
 

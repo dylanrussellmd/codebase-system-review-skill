@@ -6,7 +6,7 @@ the same ledger make the same matches and print the same text."""
 import json
 import unittest
 
-from dev.tests._p5_writes_helpers import ok, project, refused, index_row
+from dev.tests._p5_writes_helpers import approve, ok, project, refused, index_row
 
 APP = "".join(f"line {n}\n" for n in range(1, 11)).replace("line 5\n", "def handler(request):\n") \
     .replace("line 8\n", "def parse(text):\n")
@@ -23,12 +23,13 @@ def second_review(L):
     ok(L, "review-status", "R-0001", "verifying", "--note", "n")
     ok(L, "review-status", "R-0001", "indexing", "--note", "n")
     ok(L, "review-status", "R-0001", "consolidating", "--note", "n")
+    ok(L, "dump")
     ok(L, "review-status", "R-0001", "handed-off", "--note", "n")
     ok(L, "new-review", "--title", "Second", "--scope", "second", "--previous", "R-0001", "--actor", "A-0001")
     ok(L, "review-domain", "R-0002", "spec", "include", "--reason", "again")
     ok(L, "review-domain", "R-0002", "tests", "include", "--reason", "again")
     ok(L, "review-status", "R-0002", "awaiting-approval", "--note", "n")
-    ok(L, "review-status", "R-0002", "approved", "--note", "n")
+    approve(L, "R-0002")
     ok(L, "review-status", "R-0002", "running", "--note", "n")
     ok(L, "add-run", "R-0002", "spec", "spec-B", "--scope", "all", "--model", "m1")
 

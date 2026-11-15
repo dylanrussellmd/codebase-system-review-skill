@@ -34,6 +34,18 @@ def refused(test, L, *args, **kw):
     return err[0]
 
 
+def approve(L, code, kind="domain-approval", *extra):
+    """Open the approval gate of a review (or, with kind plan-approval, a plan), answer it approve as the owner,
+    apply it, and approve: the only way a review or plan is approved."""
+    where = "--review" if kind == "domain-approval" else "--plan"
+    gate = ok(L, "open-gate", kind, where, code, "--title", "Approve", "--question", "Go ahead?", *extra)[0]
+    ok(L, "answer-gate", gate, "--value", "approve")
+    ok(L, "apply-gate", gate, "--note", "the owner approved", *extra)
+    status = "review-status" if kind == "domain-approval" else "plan-status"
+    ok(L, status, code, "approved", "--note", f"the owner approved ({gate})", *extra)
+    return gate
+
+
 def project(test, *, approved=True, files=None, earlier=()):
     """A git project with src/app.py committed, a ledger with repository 'demo', a manager A-0001 and review R-0001
     (approved and running, domain spec included, reviewer run spec-A) unless approved=False (planning). Each dict
@@ -55,7 +67,7 @@ def project(test, *, approved=True, files=None, earlier=()):
     ok(L, "review-domain", "R-0001", "tests", "include", "--reason", "proposed for this review")
     if approved:
         ok(L, "review-status", "R-0001", "awaiting-approval", "--note", "domains proposed")
-        ok(L, "review-status", "R-0001", "approved", "--note", "the owner approved the domains")
+        approve(L, "R-0001")
         ok(L, "review-status", "R-0001", "running", "--note", "reviewers started")
         ok(L, "add-run", "R-0001", "spec", "spec-A", "--scope", "all", "--model", "m1")
     return repo, L, sha

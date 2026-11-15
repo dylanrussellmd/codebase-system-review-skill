@@ -40,11 +40,11 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote
 
 TOOL_VERSION = "1.12.0"  # stamped by dev/build.py from `metadata: version:` in SKILL.md's frontmatter
-TOOL_HASH = "9a95a6edf44ac4e84a4362fe6cb5bcffaf269ce768d287fd28d594ad917ba886"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
+TOOL_HASH = "81448f280c94d37a90dfd8ce7a001091bab13f3e899b46d5eb2d4403d665cfc3"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
 # Placeholders: dev/build.py puts references/schema.sql, dev/page.html and references/migrations/*.sql in their
 # place when it writes scripts/ledger.py. dev/core.py itself is never run as the tool.
 SCHEMA = r"""-- =====================================================================
--- Code review ledger — schema version 24
+-- Code review ledger — schema version 25
 -- One SQLite file per project: <project root>/.code-review/ledger.sqlite
 -- Every connection must run:  PRAGMA foreign_keys = ON;
 -- Times are UTC ISO-8601 text with milliseconds (strftime('%Y-%m-%dT%H:%M:%fZ','now')); the tr_time_*
@@ -138,7 +138,9 @@ CREATE TABLE relation_types (
 CREATE TABLE gate_kinds (
   value    TEXT PRIMARY KEY,
   label    TEXT NOT NULL,
-  position INTEGER NOT NULL UNIQUE
+  position INTEGER NOT NULL UNIQUE,
+  options  TEXT CHECK (options IS NULL OR (json_valid(options) AND json_type(options) = 'array'))
+                                  -- the fixed options every gate of this kind has (open-gate uses them); NULL: any
 );
 
 -- The statuses a design goal can have.
@@ -173,7 +175,7 @@ CREATE TABLE enum_labels (
 CREATE TABLE repositories (
   id             INTEGER PRIMARY KEY,
   name           TEXT NOT NULL UNIQUE,   -- short name used in the brief
-  path           TEXT,                   -- relative to the project root, '.' for the root repo
+  path           TEXT NOT NULL DEFAULT '.',  -- relative to the project root, '.' for the root repo
   remote_url     TEXT,
   default_branch TEXT,
   permalink_template TEXT CHECK (permalink_template IS NULL OR permalink_template GLOB 'https://*'
@@ -187,7 +189,7 @@ CREATE TABLE repositories (
                                          -- start with ../. Otherwise ledger.py refuses to read outside the root.
   -- path: no leading -, no control characters; and unless allow_outside_root, relative (no leading /, no
   -- backslash) with no .. segment
-  CHECK (path IS NULL OR (path NOT GLOB '-*' AND (path NOT GLOB '*[' || char(1) || '-' || char(31) || char(127) || ']*')
+  CHECK ((path NOT GLOB '-*' AND (path NOT GLOB '*[' || char(1) || '-' || char(31) || char(127) || ']*')
          AND (allow_outside_root = 1 OR (path NOT GLOB '/*' AND path NOT GLOB '*\*' AND path <> '..'
               AND path NOT GLOB '../*' AND path NOT GLOB '*/../*' AND path NOT GLOB '*/..'))))
 );
@@ -249,7 +251,8 @@ CREATE TABLE domain_checks (
 );
 
 -- The topics a point can be filed under, whatever its domain.
--- A theme with retired_at set is not accepted for new findings; rows that already use it stay.
+-- A theme with retired_at set is not accepted for new findings or issues, nor set on an issue
+-- (tr_finding_theme_active, tr_issue_theme_active); rows that already use it stay.
 CREATE TABLE themes (
   code       TEXT PRIMARY KEY,           -- 'authorization', 'logging-audit' ...
   name       TEXT NOT NULL,
@@ -799,7 +802,8 @@ CREATE TABLE plans (
                                 OR approved_at IS NOT NULL),
   approved_by_actor_id INTEGER REFERENCES actors(id),
   approved_at          TEXT,
-  superseded_by        INTEGER REFERENCES plans(id),
+  superseded_by        INTEGER REFERENCES plans(id)   -- set exactly when status is superseded
+                         CHECK ((status = 'superseded') = (superseded_by IS NOT NULL)),
   doc_url              TEXT,
   page_url             TEXT,
   created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
@@ -1416,10 +1420,27 @@ CREATE TRIGGER tr_issue_code_fixed BEFORE UPDATE OF code ON issues WHEN OLD.code
   SELECT RAISE(ABORT, 'codes never change');
 END;
 
--- A retired domain takes no new issues.
+-- A retired domain or theme takes no new issues, and no issue moves into one.
 CREATE TRIGGER tr_issue_domain_active BEFORE INSERT ON issues
 WHEN EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL) BEGIN
   SELECT RAISE(ABORT, 'that domain is retired; use a current one');
+END;
+-- An issue moved to a retired domain is refused, as on INSERT.
+CREATE TRIGGER tr_issue_domain_active_upd BEFORE UPDATE OF domain_code ON issues
+WHEN OLD.domain_code IS NOT NEW.domain_code
+ AND EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL) BEGIN
+  SELECT RAISE(ABORT, 'that domain is retired; use a current one');
+END;
+-- A retired theme takes no new issues.
+CREATE TRIGGER tr_issue_theme_active BEFORE INSERT ON issues
+WHEN EXISTS (SELECT 1 FROM themes WHERE code = NEW.theme_code AND retired_at IS NOT NULL) BEGIN
+  SELECT RAISE(ABORT, 'that theme is retired; use a current one');
+END;
+-- An issue moved to a retired theme is refused, as on INSERT.
+CREATE TRIGGER tr_issue_theme_active_upd BEFORE UPDATE OF theme_code ON issues
+WHEN OLD.theme_code IS NOT NEW.theme_code
+ AND EXISTS (SELECT 1 FROM themes WHERE code = NEW.theme_code AND retired_at IS NOT NULL) BEGIN
+  SELECT RAISE(ABORT, 'that theme is retired; use a current one');
 END;
 
 -- Logs 'opened'. The INSERT may carry change_actor_id, change_step_id, change_commit_sha and change_note: they go
@@ -1599,10 +1620,16 @@ WHEN NEW.reviewer_run_id IS NOT NULL
   SELECT RAISE(ABORT, 'the reviewer run belongs to another review');
 END;
 
--- A retired domain takes no new findings.
+-- A retired domain or theme takes no new findings (a finding's domain and theme never change:
+-- tr_finding_immutable).
 CREATE TRIGGER tr_finding_domain_active BEFORE INSERT ON findings
 WHEN EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL) BEGIN
   SELECT RAISE(ABORT, 'that domain is retired; use a current one');
+END;
+-- A retired theme takes no new findings.
+CREATE TRIGGER tr_finding_theme_active BEFORE INSERT ON findings
+WHEN EXISTS (SELECT 1 FROM themes WHERE code = NEW.theme_code AND retired_at IS NOT NULL) BEGIN
+  SELECT RAISE(ABORT, 'that theme is retired; use a current one');
 END;
 
 -- Severity T means a missing test, nothing else (a finding's severity and kind never change after insert).
@@ -1842,9 +1869,24 @@ CREATE TRIGGER tr_relation_created AFTER INSERT ON issue_relations BEGIN
           NEW.established_by_actor_id, NEW.established_in_review_id, NEW.rationale);
 END;
 
--- Recording that an active issue is a duplicate of (or merged into) another closes it as duplicate.
+-- Recording that an active issue is a duplicate of (or merged into) another closes it as duplicate, whether the
+-- relation is inserted with that type or updated to it.
 CREATE TRIGGER tr_relation_closes_duplicate AFTER INSERT ON issue_relations
 WHEN NEW.relation IN (SELECT value FROM relation_types WHERE closes = 1) BEGIN
+  UPDATE issues SET
+    status = 'duplicate',
+    resolution = COALESCE(resolution, NEW.relation || ' ' || (SELECT code FROM issues WHERE id = NEW.to_issue_id)),
+    change_actor_id = NEW.established_by_actor_id,
+    change_review_id = NEW.established_in_review_id,
+    change_step_id = NULL,
+    change_commit_sha = NULL,
+    change_note = NEW.relation || ' ' || (SELECT code FROM issues WHERE id = NEW.to_issue_id) || ': ' || NEW.rationale
+  WHERE id = NEW.from_issue_id AND status IN (SELECT value FROM issue_statuses WHERE active = 1);
+END;
+-- A relation updated to duplicate-of or merged-into closes the source issue, as on INSERT.
+CREATE TRIGGER tr_relation_closes_duplicate_upd AFTER UPDATE OF relation ON issue_relations
+WHEN NEW.relation IN (SELECT value FROM relation_types WHERE closes = 1)
+ AND OLD.relation NOT IN (SELECT value FROM relation_types WHERE closes = 1) BEGIN
   UPDATE issues SET
     status = 'duplicate',
     resolution = COALESCE(resolution, NEW.relation || ' ' || (SELECT code FROM issues WHERE id = NEW.to_issue_id)),
@@ -2031,6 +2073,16 @@ WHEN OLD.status IS NOT NEW.status BEGIN
   WHERE OLD.status = 'awaiting-approval' AND NEW.status <> 'abandoned'
     AND EXISTS (SELECT 1 FROM gates g WHERE g.review_id = NEW.id AND g.kind = 'domain-approval'
                   AND g.status IN ('open','answered'));
+  -- Approval comes from the owner: the latest applied domain-approval gate answered approve, and the approver is
+  -- the person who answered it.
+  SELECT RAISE(ABORT, 'a review is approved only after its domain-approval gate is applied with the answer approve')
+  WHERE OLD.status = 'awaiting-approval' AND NEW.status = 'approved'
+    AND (SELECT answer_value FROM gates WHERE review_id = NEW.id AND kind = 'domain-approval' AND status = 'applied'
+         ORDER BY id DESC LIMIT 1) IS NOT 'approve';
+  SELECT RAISE(ABORT, 'the approver (approved_by_actor_id) is who answered the approval gate')
+  WHERE OLD.status = 'awaiting-approval' AND NEW.status = 'approved'
+    AND NEW.approved_by_actor_id IS NOT (SELECT answered_by_actor_id FROM gates WHERE review_id = NEW.id
+           AND kind = 'domain-approval' AND status = 'applied' ORDER BY id DESC LIMIT 1);
 END;
 
 -- Logs 'status-changed' with change_actor_id and change_note, sets updated_at, and sets completed_at on handed-off
@@ -2070,8 +2122,18 @@ CREATE TRIGGER tr_run_review_approved BEFORE INSERT ON reviewer_runs BEGIN
   SELECT RAISE(ABORT, 'reviewer runs need the domain included in review_domains')
   WHERE NOT EXISTS (SELECT 1 FROM review_domains WHERE review_id = NEW.review_id
                       AND domain_code = NEW.domain_code AND decision = 'included');
-  SELECT RAISE(ABORT, 'that domain is retired; use a current one')
-  WHERE EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL);
+END;
+
+-- A retired domain takes no new reviewer runs, and no run moves into one.
+CREATE TRIGGER tr_run_domain_active BEFORE INSERT ON reviewer_runs
+WHEN EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL) BEGIN
+  SELECT RAISE(ABORT, 'that domain is retired; use a current one');
+END;
+-- A reviewer run moved to a retired domain is refused, as on INSERT.
+CREATE TRIGGER tr_run_domain_active_upd BEFORE UPDATE OF domain_code ON reviewer_runs
+WHEN OLD.domain_code IS NOT NEW.domain_code
+ AND EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL) BEGIN
+  SELECT RAISE(ABORT, 'that domain is retired; use a current one');
 END;
 
 -- Logs 'reviewer-run-created' on the review, with the run's label, domain and scope.
@@ -2081,15 +2143,27 @@ CREATE TRIGGER tr_run_created AFTER INSERT ON reviewer_runs BEGIN
           NEW.domain_code || ': ' || NEW.scope);
 END;
 
--- A retired domain takes no new reviews.
+-- A retired domain takes no new reviews, and none moves into one.
 CREATE TRIGGER tr_review_domain_active BEFORE INSERT ON review_domains
 WHEN EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL) BEGIN
   SELECT RAISE(ABORT, 'that domain is retired; use a current one');
 END;
+-- A review domain moved to a retired domain is refused, as on INSERT.
+CREATE TRIGGER tr_review_domain_active_upd BEFORE UPDATE OF domain_code ON review_domains
+WHEN OLD.domain_code IS NOT NEW.domain_code
+ AND EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL) BEGIN
+  SELECT RAISE(ABORT, 'that domain is retired; use a current one');
+END;
 
--- A retired domain takes no new metrics.
+-- A retired domain takes no new metrics, and none moves into one.
 CREATE TRIGGER tr_metric_domain_active BEFORE INSERT ON metrics
 WHEN EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL) BEGIN
+  SELECT RAISE(ABORT, 'that domain is retired; use a current one');
+END;
+-- A metric moved to a retired domain is refused, as on INSERT.
+CREATE TRIGGER tr_metric_domain_active_upd BEFORE UPDATE OF domain_code ON metrics
+WHEN OLD.domain_code IS NOT NEW.domain_code
+ AND EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL) BEGIN
   SELECT RAISE(ABORT, 'that domain is retired; use a current one');
 END;
 
@@ -2162,9 +2236,15 @@ WHEN NEW.status NOT IN ('proposed','approved') BEGIN
   SELECT RAISE(ABORT, 'a design goal starts proposed (or approved, with its approver)');
 END;
 
--- A retired domain takes no new design goals.
+-- A retired domain takes no new design goals, and none moves into one.
 CREATE TRIGGER tr_goal_domain_active BEFORE INSERT ON design_goals
 WHEN EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL) BEGIN
+  SELECT RAISE(ABORT, 'that domain is retired; use a current one');
+END;
+-- A design goal moved to a retired domain is refused, as on INSERT.
+CREATE TRIGGER tr_goal_domain_active_upd BEFORE UPDATE OF domain_code ON design_goals
+WHEN OLD.domain_code IS NOT NEW.domain_code
+ AND EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL) BEGIN
   SELECT RAISE(ABORT, 'that domain is retired; use a current one');
 END;
 
@@ -2666,6 +2746,17 @@ WHEN OLD.status IS NOT NEW.status BEGIN
   WHERE OLD.status = 'awaiting-approval' AND NEW.status = 'approved'
     AND EXISTS (SELECT 1 FROM gates g WHERE g.plan_id = NEW.id AND g.kind = 'plan-approval'
                   AND g.status IN ('open','answered'));
+  SELECT RAISE(ABORT, 'a plan is approved only after its plan-approval gate is applied with the answer approve')
+  WHERE OLD.status = 'awaiting-approval' AND NEW.status = 'approved'
+    AND (SELECT answer_value FROM gates WHERE plan_id = NEW.id AND kind = 'plan-approval' AND status = 'applied'
+         ORDER BY id DESC LIMIT 1) IS NOT 'approve';
+  SELECT RAISE(ABORT, 'the approver (approved_by_actor_id) is who answered the approval gate')
+  WHERE OLD.status = 'awaiting-approval' AND NEW.status = 'approved'
+    AND NEW.approved_by_actor_id IS NOT (SELECT answered_by_actor_id FROM gates WHERE plan_id = NEW.id
+           AND kind = 'plan-approval' AND status = 'applied' ORDER BY id DESC LIMIT 1);
+  SELECT RAISE(ABORT, 'a plan is complete when every step is done or dropped')
+  WHERE NEW.status = 'complete'
+    AND EXISTS (SELECT 1 FROM steps WHERE plan_id = NEW.id AND status NOT IN ('done','dropped'));
 END;
 
 -- Logs 'status-changed' with change_actor_id and change_note, and sets updated_at.
@@ -2704,7 +2795,8 @@ END;
 -- ----- Plan structure: phases, steps, dependencies, coverage links
 
 -- Plan rules enforced by the database, on INSERT and on UPDATE: a step depends on another step of its own plan,
--- of any number, and no chain of dependencies leads back to the step.
+-- of any number, and no chain of dependencies leads back to the step; a step's phase is of its plan
+-- (tr_step_phase_plan); a step closes only findings of its plan's reviews (tr_step_finding_in_plan).
 CREATE TRIGGER tr_dep_order BEFORE INSERT ON step_dependencies BEGIN
   SELECT RAISE(ABORT, 'a step may only depend on another step of the same plan')
   WHERE NEW.step_id = NEW.depends_on_step_id OR NOT EXISTS (
@@ -2850,8 +2942,15 @@ CREATE TRIGGER tr_step_no_delete BEFORE DELETE ON steps BEGIN
   SELECT RAISE(ABORT, 'history is append-only: steps cannot be deleted; set status dropped instead');
 END;
 
--- A step closes only findings of the reviews its plan covers.
+-- A step closes only findings of the reviews its plan covers, on INSERT and on UPDATE.
 CREATE TRIGGER tr_step_finding_in_plan BEFORE INSERT ON step_findings
+WHEN NOT EXISTS (SELECT 1 FROM steps s JOIN findings f ON f.id = NEW.finding_id
+                 JOIN plan_reviews pr ON pr.plan_id = s.plan_id AND pr.review_id = f.review_id
+                 WHERE s.id = NEW.step_id) BEGIN
+  SELECT RAISE(ABORT, 'the finding''s review is not one of the step''s plan reviews (plan_reviews)');
+END;
+-- A step finding moved outside the plan's reviews is refused, as on INSERT.
+CREATE TRIGGER tr_step_finding_in_plan_upd BEFORE UPDATE OF step_id, finding_id ON step_findings
 WHEN NOT EXISTS (SELECT 1 FROM steps s JOIN findings f ON f.id = NEW.finding_id
                  JOIN plan_reviews pr ON pr.plan_id = s.plan_id AND pr.review_id = f.review_id
                  WHERE s.id = NEW.step_id) BEGIN
@@ -4309,6 +4408,8 @@ INSERT INTO gate_kinds(value, label, position) VALUES
  ('confirm','Confirm',9),
  ('other','Question',10),
  ('feature-pick','Pick ideas to build',11);
+UPDATE gate_kinds SET options = '[{"value":"approve","label":"Approve"},{"value":"change","label":"Change it first"}]'
+  WHERE value IN ('domain-approval','plan-approval');
 INSERT INTO goal_statuses(value, label, position, served) VALUES
  ('proposed','Waiting for your approval',1,0),
  ('approved','Approved',2,1),
@@ -4608,7 +4709,7 @@ INSERT INTO enum_labels(enum, value, label, position) VALUES
  ('tool_output_format','json','JSON',5), ('tool_output_format','jsonl','JSON lines',6),
  ('tool_result_level','error','Error',1), ('tool_result_level','warning','Warning',2),
  ('tool_result_level','note','Note',3), ('tool_result_level','none','No level',4);
-INSERT INTO meta(key, value) VALUES ('schema_version','24');
+INSERT INTO meta(key, value) VALUES ('schema_version','25');
 INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger schema'),
   (2, 'url, path, hash and code checks; repositories.allow_outside_root; finding_locations.excerpt_redacted'),
   (3, 'integrity rules: codes, hashes, checks, append-only history, owner actor on gate answers'),
@@ -4632,7 +4733,8 @@ INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger s
   (21, 'indexes for check''s views, which read them instead of every row; the answers-imported event'),
   (22, 'correction commands: who corrects a gate, a location or a check, and why'),
   (23, 'measured guard tests: guard_tests.measured_at and measured_commit_sha; v_unproven_steps; the guard-dropped and guard-renamed events'),
-  (24, 'events take the entity type ''ledger'': a redaction of a row that belongs to no other entity');
+  (24, 'events take the entity type ''ledger'': a redaction of a row that belongs to no other entity'),
+  (25, 'masked excerpts hash the masked lines; rule triggers hold on UPDATE; approval follows the owner''s applied answer');
 """
 PAGE = r"""<!doctype html>
 <html lang="en">
@@ -4765,9 +4867,9 @@ nav.rail small{display:block;font-size:12px;opacity:.75}
 <div class="visually-hidden" id="live" role="status"></div>
 <script>
 "use strict";
-// The viewer page. `ledger.py serve` sends it as it is; `ledger.py progress-page` sends the same page with the
-// ledger's answers embedded before this script (window.LEDGER_SNAPSHOT: see STATIC). The viewer's key arrives in
-// the launch address (#k=...) and goes back with every request as X-Ledger-Token; the page holds no secret.
+// The viewer page. `ledger.py serve` sends it as it is; `ledger.py progress-page` writes the same page to a file
+// with every API answer embedded before this script (window.LEDGER_SNAPSHOT: see STATIC). The viewer's key goes
+// back with every request as X-Ledger-Token; the page holds no secret.
 //
 // Addresses (the part after #), the view that draws each, and what it asks the server (/api/...):
 //   #/                                   home      overview (every page), home, then checks
@@ -4787,7 +4889,7 @@ nav.rail small{display:block;font-size:12px;opacity:.75}
 //   #/explore, #/explore/<table>?offset= explore   tables, table/<name>, sql
 // Any view: source/<id> when a code reference is opened. An unknown address draws the home page.
 // The token arrives once, in the launch URL's fragment (#k=<token>, optionally followed by #/route); it is kept in
-// sessionStorage for this tab and removed from the address bar. The page itself carries no secret.
+// sessionStorage for this tab and removed from the address bar.
 let TOKEN = "";
 function takeToken(){
   const m = /^#k=([A-Za-z0-9_-]+)\/?(#.*)?$/.exec(location.hash);
@@ -4805,7 +4907,7 @@ let LABELS = {domains:{}, themes:{}}, OVERVIEW = null;
 // ---------- the shared copy
 // `ledger.py progress-page` writes this page as one file with every API answer embedded (window.LEDGER_SNAPSHOT).
 // STATIC is that data; in the viewer it is null. With it the page answers api() from the data, routes on hash names
-// a published page allows (#issue-ISS-0019), shows the How it works tab, and keeps the owner's gate answers for
+// a published page allows (#issue-ISS-0019) and keeps the owner's gate answers for
 // `ledger.py import-answers` (see ANSWER_STORES).
 const STATIC = (s => s && typeof s === "object" && s.responses ? s : null)(window.LEDGER_SNAPSHOT);
 let CUR_PATH = null;
@@ -8281,6 +8383,98 @@ CREATE INDEX ix_fk_events_review_id                  ON events(review_id);
 CREATE INDEX ix_fk_events_step_id                    ON events(step_id);
 
 INSERT INTO enum_labels(enum, value, label, position) VALUES ('entity_type','ledger','Ledger',13);
+-- migration: 0025-masked-hashes-and-rules.sql
+-- masked excerpts hash the masked lines; rule triggers hold on UPDATE; approval follows the owner's applied answer
+-- Plan P-0002 step 341 (ISS-0714). A masked excerpt's excerpt_sha256 is the sha256 of the masked text, so it never
+-- confirms a guess of the secret. migrate gives this connection sha256_hex(text) for this update.
+
+UPDATE finding_locations SET excerpt_sha256 = sha256_hex(excerpt)
+  WHERE excerpt_redacted = 1 AND excerpt IS NOT NULL AND excerpt_sha256 IS NOT sha256_hex(excerpt);
+
+-- Step 43 (ISS-0005, ISS-0169, ISS-0170). The rule triggers' UPDATE twins and the theme triggers come with the
+-- shipped schema, which migrate re-creates. A repository's path is required ('.' where it was empty), and a plan is
+-- superseded exactly when it names its successor: both tables are rebuilt with their rows kept.
+
+UPDATE repositories SET path = '.' WHERE path IS NULL;
+
+CREATE TABLE repositories_new (
+  id             INTEGER PRIMARY KEY,
+  name           TEXT NOT NULL UNIQUE,   -- short name used in the brief
+  path           TEXT NOT NULL DEFAULT '.',  -- relative to the project root, '.' for the root repo
+  remote_url     TEXT,
+  default_branch TEXT,
+  permalink_template TEXT CHECK (permalink_template IS NULL OR permalink_template GLOB 'https://*'
+                                 OR permalink_template GLOB 'http://*'),
+                                         -- e.g. https://github.com/o/r/blob/{sha}/{path}#L{start}-L{end}
+  notes          TEXT,
+  created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  allow_outside_root INTEGER NOT NULL DEFAULT 0 CHECK (allow_outside_root IN (0,1)),
+                                         -- 1 = the owner listed this repo explicitly as living outside the
+                                         -- project root (a sibling checkout); its path may then be absolute or
+                                         -- start with ../. Otherwise ledger.py refuses to read outside the root.
+  -- path: no leading -, no control characters; and unless allow_outside_root, relative (no leading /, no
+  -- backslash) with no .. segment
+  CHECK ((path NOT GLOB '-*' AND (path NOT GLOB '*[' || char(1) || '-' || char(31) || char(127) || ']*')
+         AND (allow_outside_root = 1 OR (path NOT GLOB '/*' AND path NOT GLOB '*\*' AND path <> '..'
+              AND path NOT GLOB '../*' AND path NOT GLOB '*/../*' AND path NOT GLOB '*/..'))))
+);
+INSERT INTO repositories_new(id, name, path, remote_url, default_branch, permalink_template, notes, created_at, allow_outside_root)
+  SELECT id, name, path, remote_url, default_branch, permalink_template, notes, created_at, allow_outside_root FROM repositories;
+DROP TABLE repositories;
+ALTER TABLE repositories_new RENAME TO repositories;
+CREATE UNIQUE INDEX ux_repositories_path      ON repositories(path);
+
+CREATE TABLE plans_new (
+  id                   INTEGER PRIMARY KEY,
+  code                 TEXT NOT NULL UNIQUE    -- P-0001
+                         CHECK (code GLOB 'P-[0-9][0-9][0-9][0-9]*' AND code NOT GLOB 'P-*[^0-9]*'),
+  title                TEXT NOT NULL,
+  status               TEXT NOT NULL DEFAULT 'drafting' CHECK (status IN
+                         ('drafting','awaiting-approval','approved','in-progress','complete',
+                          'superseded','abandoned'))
+                         -- approved, in-progress and complete only once the owner approved (set approved_at with it)
+                         CHECK (status IN ('drafting','awaiting-approval','superseded','abandoned')
+                                OR approved_at IS NOT NULL),
+  approved_by_actor_id INTEGER REFERENCES actors(id),
+  approved_at          TEXT,
+  superseded_by        INTEGER REFERENCES plans(id)   -- set exactly when status is superseded
+                         CHECK ((status = 'superseded') = (superseded_by IS NOT NULL)),
+  doc_url              TEXT,
+  page_url             TEXT,
+  created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  -- Context for the next status change, copied into its event and then cleared; leaving superseded or
+  -- abandoned needs change_note.
+  change_actor_id      INTEGER REFERENCES actors(id),
+  change_note          TEXT,
+  narrative_md         TEXT                    -- the plan's narrative for the owner (Markdown: how to read it,
+                                               -- why this order), shown in the viewer; `ledger.py set-narrative`
+);
+INSERT INTO plans_new(id, code, title, status, approved_by_actor_id, approved_at, superseded_by, doc_url, page_url, created_at, updated_at, change_actor_id, change_note, narrative_md)
+  SELECT id, code, title, status, approved_by_actor_id, approved_at, superseded_by, doc_url, page_url, created_at, updated_at, change_actor_id, change_note, narrative_md FROM plans;
+DROP TABLE plans;
+ALTER TABLE plans_new RENAME TO plans;
+CREATE INDEX ix_fk_plans_change_actor_id      ON plans(change_actor_id);
+CREATE INDEX ix_fk_plans_approved_by_actor_id        ON plans(approved_by_actor_id);
+CREATE INDEX ix_fk_plans_superseded_by               ON plans(superseded_by);
+
+-- Step 44 (ISS-0010). Domain-approval and plan-approval gates have the fixed options approve and change
+-- (gate_kinds.options); a review or plan is approved only from its latest applied approval gate answered approve,
+-- by the person who answered it, and a plan is complete only when every step is done or dropped (the shipped
+-- tr_review_transition and tr_plan_transition).
+
+CREATE TABLE gate_kinds_new (
+  value    TEXT PRIMARY KEY,
+  label    TEXT NOT NULL,
+  position INTEGER NOT NULL UNIQUE,
+  options  TEXT CHECK (options IS NULL OR (json_valid(options) AND json_type(options) = 'array'))
+                                  -- the fixed options every gate of this kind has (open-gate uses them); NULL: any
+);
+INSERT INTO gate_kinds_new(value, label, position) SELECT value, label, position FROM gate_kinds;
+DROP TABLE gate_kinds;
+ALTER TABLE gate_kinds_new RENAME TO gate_kinds;
+UPDATE gate_kinds SET options = '[{"value":"approve","label":"Approve"},{"value":"change","label":"Change it first"}]'
+  WHERE value IN ('domain-approval','plan-approval');
 """
 
 
@@ -8598,6 +8792,11 @@ class MigrationError(Exception):
     """migrate() could not upgrade the ledger; the message says why. The ledger file is as it was."""
 
 
+def sha256_hex(text):
+    """The sha256 of text as UTF-8, in hex; None for None. migrate gives it to SQL as sha256_hex()."""
+    return None if text is None else hashlib.sha256(str(text).encode()).hexdigest()
+
+
 def free_backup_name(db, v):
     """Where migrate keeps the copy of a schema-v ledger: <db>.bak-v<v>, or .2, .3 ... when that name is taken, so
     an earlier backup is never written over."""
@@ -8681,6 +8880,7 @@ def migrate(db):
             dest.close()
         make_private(backup)  # a full copy of the ledger: as private as the ledger itself
     con.isolation_level = None
+    con.create_function("sha256_hex", 1, sha256_hex)  # for migrations that rehash stored text (0025)
     con.execute("PRAGMA foreign_keys = OFF")  # the table-rebuild recipe needs it off; a no-op inside a transaction
     step = "the update" if pending else "the check of the current schema"
     try:
@@ -8790,8 +8990,9 @@ def plan_tool_copy(home, force):
 
 GITIGNORE = ("# The ledger runs in WAL mode: ledger.sqlite-wal and -shm exist while it is open, and dump checkpoints\n"
              "# them into ledger.sqlite. The rest are local backups and temporary files of ledger.py.\n"
-             "ledger.sqlite-journal\nledger.sqlite-wal\nledger.sqlite-shm\nledger.sqlite.tmp\nledger.sqlite.bak-v*\n"
-             "ledger.py.bak\nledger.py.tmp\nledger.sql.tmp\n")
+             "ledger.sqlite-journal\nledger.sqlite-wal\nledger.sqlite-shm\nledger.sqlite.bak-v*\n"
+             "ledger.sqlite.bak-merge*\nledger.py.bak\n*.tmp\n*.tmp-*\nviewer-launch.*.html\n")
+OLD_GITIGNORE_LINES = ("ledger.sqlite.tmp", "ledger.py.tmp", "ledger.sql.tmp")  # covered by *.tmp; repair drops them
 TOOL_SIGNATURE = '"""Code review ledger:'  # the second line of every ledger.py this tool builds
 
 
@@ -8887,10 +9088,12 @@ def make_private(path, mode=0o600):
 
 def repaired_gitignore(text):
     """(new text, lines added) for an existing .gitignore: the owner's own lines first, then the tool's lines in
-    order; a line that is only the start of one of the tool's lines (a truncated write) is dropped."""
+    order; a line that is only the start of one of the tool's lines (a truncated write) and the fixed temp names
+    of OLD_GITIGNORE_LINES are dropped."""
     want = GITIGNORE.splitlines()
     have = text.splitlines()
-    own = [l for l in have if l not in want and not any(w.startswith(l) for w in want)]
+    own = [l for l in have if l not in want and l not in OLD_GITIGNORE_LINES
+           and not any(w.startswith(l) for w in want)]
     added = [l for l in want if l not in have and not l.startswith("#")]
     return "".join(l + "\n" for l in own + want), added
 
@@ -9403,6 +9606,12 @@ def check(con, quiet=False, full=False):
             print(f"    0  {label}")
     for path in missing_artifacts(con):
         print(f"  warning  a recorded review file is not on disk: {path}")
+    try:
+        stale = stale_dump(con)
+    except (sqlite3.Error, OSError):
+        stale = None
+    if stale:
+        print(f"  warning  {stale}; run ledger.py dump and copy ledger.sql off this machine")
     optimize(con)
     return bad
 
@@ -10196,13 +10405,15 @@ def dump(con, db):
         con.commit()
     con.execute("BEGIN")
     tmp = None
+    started = now()
     try:
         con.execute("SELECT count(*) FROM sqlite_master").fetchone()  # the snapshot starts here
         fd, tmp = private_temp(out)
         with open(fd, "w", encoding="utf-8", newline="\n") as f:
             f.write(DUMP_HEADER + "\n")
             for line in con.iterdump():
-                f.write(line + "\n")
+                if not line.startswith(DUMP_RECORD_ROWS):  # the record of the last dump is not part of the dump
+                    f.write(line + "\n")
             f.flush()
             os.fsync(f.fileno())
         os.replace(str(tmp), str(out))
@@ -10216,7 +10427,54 @@ def dump(con, db):
         sys.exit(f"dump: could not write {out} ({e}); it holds the previous whole dump, or one another run wrote")
     finally:
         con.rollback()
+    record_dump(con, out, started)
     print(f"wrote {out}")
+
+
+DUMP_RECORD_ROWS = ("INSERT INTO \"meta\" VALUES('last_dump_at',", "INSERT INTO \"meta\" VALUES('last_dump_sha256',")
+
+
+def record_dump(con, path, at):
+    """Keep the last dump in meta (last_dump_sha256, last_dump_at: when its snapshot began), for stale_dump. A
+    ledger another writer holds keeps its old record, and stale_dump then warns."""
+    digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    try:
+        if con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] != str(SCHEMA_VERSION):
+            return  # a ledger of another schema is only read
+        con.execute("BEGIN IMMEDIATE")
+        con.executemany("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+                        (("last_dump_sha256", digest), ("last_dump_at", at)))
+        con.execute("COMMIT")
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)")  # ledger.sqlite alone holds the record too
+    except sqlite3.Error as e:
+        if con.in_transaction:
+            con.rollback()
+        print(f"note: the dump is written but not recorded in the ledger ({_one_line(e)})", file=sys.stderr)
+
+
+def stale_dump(con, db=None):
+    """Why the dump beside the ledger (<db>.sql) is not current, or None: it is missing while the ledger has
+    events, or the ledger has an event newer than its last dump, or the file is not the dump last recorded. The
+    dump is the copy of the ledger that leaves this machine (SKILL.md, Step 7)."""
+    if db is None:
+        db = next((r[2] for r in con.execute("PRAGMA database_list") if r[1] == "main"), "")
+        if not db:
+            return None
+    out = Path(db).with_suffix(".sql")
+    newest = con.execute("SELECT max(at) FROM events").fetchone()[0]
+    if newest is None:
+        return None
+    if not out.exists():
+        return f"{out} is missing"
+    meta = dict(con.execute("SELECT key, value FROM meta WHERE key IN ('last_dump_at', 'last_dump_sha256')")
+                .fetchall())
+    at = meta.get("last_dump_at") or datetime.fromtimestamp(out.stat().st_mtime, timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    if at < newest:
+        return f"{out} is older than the ledger's last change ({newest})"
+    if meta.get("last_dump_sha256") and hashlib.sha256(out.read_bytes()).hexdigest() != meta["last_dump_sha256"]:
+        return f"{out} is not the last dump this ledger wrote"
+    return None
 
 
 # ---------------------------------------------------------------- viewer API
@@ -12194,6 +12452,9 @@ def restore(source, target):
         con.set_authorizer(_restore_authorizer)
         con.executescript(sql)
         con.set_authorizer(None)
+        con.executemany("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",  # the dump it came from
+                        (("last_dump_sha256", hashlib.sha256(sql.encode("utf-8")).hexdigest()),
+                         ("last_dump_at", now())))
         con.commit()
     except sqlite3.Error as e:
         con.close()
@@ -13054,11 +13315,47 @@ def cmd_new_review(ctx):
     return out
 
 
+def _need_fresh_dump(ctx, what):
+    """WriteError while stale_dump finds the dump behind the ledger: the owner's copy must be current first."""
+    stale = stale_dump(ctx.con, ctx.db)
+    if stale:
+        raise WriteError(f"{stale}; run ledger.py dump and copy ledger.sql off this machine before {what}")
+
+
+def approval_gate(con, kind, column, row_id, code, where):
+    """The applied approval gate (domain-approval of a review, plan-approval of a plan) that lets code be approved:
+    the latest applied one, answered approve. WriteError naming the next step otherwise; tr_review_transition and
+    tr_plan_transition hold the same rule."""
+    gates = rows(con, f"SELECT * FROM gates WHERE {column}=? AND kind=? ORDER BY id", (row_id, kind))
+    pending = [g for g in gates if g["status"] in ("open", "answered")]
+    applied = [g for g in gates if g["status"] == "applied"]
+    if pending:
+        raise WriteError(f"the {kind} gate {pending[0]['code']} of {code} is {pending[0]['status']}; record the "
+                         f"owner's answer and apply it first (apply-gate {pending[0]['code']})")
+    if not applied:
+        raise WriteError(f"{code} has no applied {kind} gate; ask the owner first (open-gate {kind} {where}, "
+                         f"answer-gate, apply-gate)")
+    if applied[-1]["answer_value"] != "approve":
+        raise WriteError(f"the owner answered the {kind} gate {applied[-1]['code']} of {code} with "
+                         f"{applied[-1]['answer_value'] or 'a note'!r}, not approve; make the changes and ask again")
+    return applied[-1]
+
+
+def _approver(con, gate, given):
+    """Who approved: the person who answered gate. --approved-by may name only that person."""
+    who = gate["answered_by_actor_id"]
+    if given and resolve_actor(con, given, "--approved-by") != who:
+        raise WriteError(f"--approved-by {given} is not who answered {gate['code']}"
+                         + (f" ({actor_code(who)})" if who is not None else "") + "; leave it out")
+    return who
+
+
 REVIEW_STATUSES = ('planning', 'awaiting-approval', 'approved', 'running', 'verifying', 'indexing', 'consolidating',
                    'handed-off', 'abandoned')
 
 
-@_command("review-status", "move a review to its next status (approved records who approved it and when)",
+@_command("review-status", "move a review to its next status (approved needs its applied domain-approval gate "
+          "answered approve, and records who answered it and when)",
           "ledger.py review-status R-0001 approved|running|verifying|indexing|consolidating|handed-off|... "
           "--note TEXT [--approved-by A-0001] [--actor A-0001]")
 def cmd_review_status(ctx):
@@ -13066,11 +13363,14 @@ def cmd_review_status(ctx):
     rv = review_row(con, a.review)
     if a.status not in REVIEW_STATUSES:
         raise WriteError(f"status {a.status!r} is not one of {', '.join(REVIEW_STATUSES)}")
+    if a.status == "handed-off" and rv["status"] != "handed-off":
+        _need_fresh_dump(ctx, f"{rv['code']} is handed off")
     sets, args = {"status": a.status, "change_actor_id": ctx.actor_id, "change_note": a.note}, []
     if a.status not in ('planning', 'awaiting-approval', 'abandoned') and rv["approved_at"] is None:
         sets["approved_at"] = now()
-        sets["approved_by_actor_id"] = (resolve_actor(con, a.approved_by, "--approved-by") if a.approved_by
-                                        else owner_actor(con))
+        if rv["status"] == "awaiting-approval":  # any other move is refused by tr_review_transition
+            gate = approval_gate(con, "domain-approval", "review_id", rv["id"], rv["code"], f"--review {rv['code']}")
+            sets["approved_by_actor_id"] = _approver(con, gate, a.approved_by)
     ctx.x(f"UPDATE reviews SET {', '.join(k + '=?' for k in sets)} WHERE id=?", (*sets.values(), rv["id"]))
     return [f"{rv['code']}: {rv['status']} -> {a.status}"]
 
@@ -13657,6 +13957,15 @@ def cmd_open_gate(ctx):
     if a.kind not in kinds:
         raise WriteError(f"kind {a.kind!r} is not one of {', '.join(kinds)}")
     opts = _gate_options(a.option, a.options_json)
+    fixed = con.execute("SELECT options FROM gate_kinds WHERE value=?", (a.kind,)).fetchone()[0]
+    if fixed:
+        fixed = json.loads(fixed)
+        if opts and [o["value"] for o in opts] != [o["value"] for o in fixed]:
+            raise WriteError(f"a {a.kind} gate has the fixed options "
+                             f"{', '.join(o['value'] for o in fixed)}; leave out --option")
+        if a.multi:
+            raise WriteError(f"a {a.kind} gate takes one answer; leave out --multi")
+        opts = fixed
     if a.no_text and not opts:
         raise WriteError("a gate without free text needs at least one --option")
     if a.multi and not opts:
@@ -15086,7 +15395,8 @@ def cmd_new_plan(ctx):
     return [code, f"{code}: drafting, covers {', '.join(r['code'] for r in reviews)}"]
 
 
-@_command("plan-status", "move a plan to its next status (approved only once its plan-approval gate is applied)",
+@_command("plan-status", "move a plan to its next status (approved only once its plan-approval gate is applied "
+          "with the answer approve)",
           "ledger.py plan-status P-0001 awaiting-approval|approved|in-progress|complete|drafting|superseded|abandoned "
           "--note TEXT [--approved-by A-0001] [--superseded-by P-0002] [--actor A-0001]")
 def cmd_plan_status(ctx):
@@ -15097,18 +15407,9 @@ def cmd_plan_status(ctx):
     note = _need(_text_arg(a.note, "--note"), "--note (why the status changes)")
     sets = {"status": a.status, "change_note": note, "change_actor_id": ctx.actor_id}
     if a.status == "approved" and pl["status"] != "approved":
-        gates = rows(con, "SELECT * FROM gates WHERE plan_id=? AND kind='plan-approval' ORDER BY id", (pl["id"],))
-        pending = [g for g in gates if g["status"] in ("open", "answered")]
-        applied = [g for g in gates if g["status"] == "applied"]
-        if pending:
-            raise WriteError(f"the plan-approval gate {pending[0]['code']} of {pl['code']} is {pending[0]['status']}; "
-                             f"record the owner's answer and apply it first (apply-gate {pending[0]['code']})")
-        if not applied:
-            raise WriteError(f"{pl['code']} has no applied plan-approval gate; ask the owner first (open-gate "
-                             f"plan-approval --plan {pl['code']}, answer-gate, apply-gate)")
+        gate = approval_gate(con, "plan-approval", "plan_id", pl["id"], pl["code"], f"--plan {pl['code']}")
         sets["approved_at"] = now()
-        sets["approved_by_actor_id"] = (resolve_actor(con, a.approved_by, "--approved-by") if a.approved_by
-                                        else applied[-1]["answered_by_actor_id"] or owner_actor(con))
+        sets["approved_by_actor_id"] = _approver(con, gate, a.approved_by)
     if a.status == "complete":
         left = rows(con, "SELECT number, status FROM steps WHERE plan_id=? AND status NOT IN ('done','dropped') "
                          "ORDER BY number", (pl["id"],))
@@ -15116,6 +15417,9 @@ def cmd_plan_status(ctx):
             raise WriteError(f"step {left[0]['number']} of {pl['code']} is {left[0]['status']}"
                              + (f" (and {len(left) - 1} more)" if len(left) > 1 else "")
                              + "; a plan is complete when every step is done or dropped")
+        _need_fresh_dump(ctx, f"{pl['code']} is complete")
+    if a.status == "superseded" and not a.superseded_by:
+        raise WriteError("status superseded needs --superseded-by P-0002, the plan that replaces it")
     if a.superseded_by:
         if a.status != "superseded":
             raise WriteError("--superseded-by goes with status superseded")
@@ -16501,7 +16805,8 @@ def add_write_commands(sub):
     s.add_argument("--goal", action="append"); s.add_argument("--request"); s.add_argument("--previous")
     s.add_argument("--manager")
     s = p("review-status"); s.add_argument("review"); s.add_argument("status")
-    s.add_argument("--note"); s.add_argument("--approved-by")
+    s.add_argument("--note")
+    s.add_argument("--approved-by", help="only the person who answered the approval gate (the default)")
     s = p("snapshot"); s.add_argument("review"); s.add_argument("--repo", action="append")
     s = p("add-run"); s.add_argument("review"); s.add_argument("domain"); s.add_argument("label")
     s.add_argument("--scope"); s.add_argument("--reviewer"); s.add_argument("--model"); s.add_argument("--prompt")
@@ -16637,7 +16942,8 @@ def add_write_commands_131(p):
     s.add_argument("--json", action="store_true", help="print JSON")
     s = p("new-plan"); s.add_argument("--title"); s.add_argument("--review", action="append")
     s = p("plan-status"); s.add_argument("plan"); s.add_argument("status"); s.add_argument("--note")
-    s.add_argument("--approved-by"); s.add_argument("--superseded-by")
+    s.add_argument("--approved-by", help="only the person who answered the approval gate (the default)")
+    s.add_argument("--superseded-by")
     s = p("add-requirement"); s.add_argument("text", nargs="?"); s.add_argument("--source")
     s.add_argument("--location"); s.add_argument("--stated-at"); s.add_argument("--review")
     s = p("add-domain"); s.add_argument("code"); s.add_argument("name"); s.add_argument("--description")

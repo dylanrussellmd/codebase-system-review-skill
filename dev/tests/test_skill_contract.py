@@ -34,6 +34,8 @@ WORD_LISTS = {
 }
 GLOSSARY = ("ledger", "review", "domain", "point", "finding", "issue", "plan", "step", "gate", "decision", "hub")
 GLOBAL_FLAGS = {"--root", "--db", "--version", "--help", "-h"}
+# Commands the docs name that ledger.py does not have; each is marked (proposed) where it is named.
+PROPOSED = {"env-vars", "check-log-sample", "validate"}
 
 def skill_text():
     return SKILL_MD.read_text(encoding="utf-8")
@@ -151,6 +153,24 @@ class Commands(unittest.TestCase):
                     for flag in re.findall(r"(?<![\w'=-])(--[a-z][a-z-]*)", rest):
                         if flag not in flags[cmd]:
                             problems.append(f"{f.name}: `{span}` gives {cmd} the flag {flag}, which it does not take")
+        self.assertEqual(problems, [])
+
+    def test_references_name_only_existing_commands(self):
+        """Every `ledger.py <word>` in the whole text of README.md, SKILL.md and references/*.md (prose, tables and
+        code alike) is a command, `--version` or `--help`, or a command of PROPOSED marked (proposed) on its line.
+        A `ledger.py` that a backtick closes is the file, not a command."""
+        names, _ = Tool.get()
+        problems = []
+        for f in [REPO / "README.md"] + doc_files():
+            for n, line in enumerate(f.read_text(encoding="utf-8").split("\n"), 1):
+                line = re.sub(r"<[^<>]*>", "X", line)
+                for m in re.finditer(r"ledger\.py(?: --(?:root|db) \S+)* (--version|--help|[a-z][a-z0-9-]*)", line):
+                    word = m.group(1)
+                    if word in names or word in ("--version", "--help"):
+                        continue
+                    if word in PROPOSED and "(proposed)" in line[m.end():]:
+                        continue
+                    problems.append(f"{f.name}:{n}: ledger.py {word}")
         self.assertEqual(problems, [])
 
     def test_skill_examples_accepted(self):

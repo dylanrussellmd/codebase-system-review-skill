@@ -1,5 +1,5 @@
 -- =====================================================================
--- Code review ledger — schema version 24
+-- Code review ledger — schema version 25
 -- One SQLite file per project: <project root>/.code-review/ledger.sqlite
 -- Every connection must run:  PRAGMA foreign_keys = ON;
 -- Times are UTC ISO-8601 text with milliseconds (strftime('%Y-%m-%dT%H:%M:%fZ','now')); the tr_time_*
@@ -93,7 +93,9 @@ CREATE TABLE relation_types (
 CREATE TABLE gate_kinds (
   value    TEXT PRIMARY KEY,
   label    TEXT NOT NULL,
-  position INTEGER NOT NULL UNIQUE
+  position INTEGER NOT NULL UNIQUE,
+  options  TEXT CHECK (options IS NULL OR (json_valid(options) AND json_type(options) = 'array'))
+                                  -- the fixed options every gate of this kind has (open-gate uses them); NULL: any
 );
 
 -- The statuses a design goal can have.
@@ -128,7 +130,7 @@ CREATE TABLE enum_labels (
 CREATE TABLE repositories (
   id             INTEGER PRIMARY KEY,
   name           TEXT NOT NULL UNIQUE,   -- short name used in the brief
-  path           TEXT,                   -- relative to the project root, '.' for the root repo
+  path           TEXT NOT NULL DEFAULT '.',  -- relative to the project root, '.' for the root repo
   remote_url     TEXT,
   default_branch TEXT,
   permalink_template TEXT CHECK (permalink_template IS NULL OR permalink_template GLOB 'https://*'
@@ -142,7 +144,7 @@ CREATE TABLE repositories (
                                          -- start with ../. Otherwise ledger.py refuses to read outside the root.
   -- path: no leading -, no control characters; and unless allow_outside_root, relative (no leading /, no
   -- backslash) with no .. segment
-  CHECK (path IS NULL OR (path NOT GLOB '-*' AND (path NOT GLOB '*[' || char(1) || '-' || char(31) || char(127) || ']*')
+  CHECK ((path NOT GLOB '-*' AND (path NOT GLOB '*[' || char(1) || '-' || char(31) || char(127) || ']*')
          AND (allow_outside_root = 1 OR (path NOT GLOB '/*' AND path NOT GLOB '*\*' AND path <> '..'
               AND path NOT GLOB '../*' AND path NOT GLOB '*/../*' AND path NOT GLOB '*/..'))))
 );
@@ -204,7 +206,8 @@ CREATE TABLE domain_checks (
 );
 
 -- The topics a point can be filed under, whatever its domain.
--- A theme with retired_at set is not accepted for new findings; rows that already use it stay.
+-- A theme with retired_at set is not accepted for new findings or issues, nor set on an issue
+-- (tr_finding_theme_active, tr_issue_theme_active); rows that already use it stay.
 CREATE TABLE themes (
   code       TEXT PRIMARY KEY,           -- 'authorization', 'logging-audit' ...
   name       TEXT NOT NULL,
@@ -754,7 +757,8 @@ CREATE TABLE plans (
                                 OR approved_at IS NOT NULL),
   approved_by_actor_id INTEGER REFERENCES actors(id),
   approved_at          TEXT,
-  superseded_by        INTEGER REFERENCES plans(id),
+  superseded_by        INTEGER REFERENCES plans(id)   -- set exactly when status is superseded
+                         CHECK ((status = 'superseded') = (superseded_by IS NOT NULL)),
   doc_url              TEXT,
   page_url             TEXT,
   created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
@@ -1371,10 +1375,27 @@ CREATE TRIGGER tr_issue_code_fixed BEFORE UPDATE OF code ON issues WHEN OLD.code
   SELECT RAISE(ABORT, 'codes never change');
 END;
 
--- A retired domain takes no new issues.
+-- A retired domain or theme takes no new issues, and no issue moves into one.
 CREATE TRIGGER tr_issue_domain_active BEFORE INSERT ON issues
 WHEN EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL) BEGIN
   SELECT RAISE(ABORT, 'that domain is retired; use a current one');
+END;
+-- An issue moved to a retired domain is refused, as on INSERT.
+CREATE TRIGGER tr_issue_domain_active_upd BEFORE UPDATE OF domain_code ON issues
+WHEN OLD.domain_code IS NOT NEW.domain_code
+ AND EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL) BEGIN
+  SELECT RAISE(ABORT, 'that domain is retired; use a current one');
+END;
+-- A retired theme takes no new issues.
+CREATE TRIGGER tr_issue_theme_active BEFORE INSERT ON issues
+WHEN EXISTS (SELECT 1 FROM themes WHERE code = NEW.theme_code AND retired_at IS NOT NULL) BEGIN
+  SELECT RAISE(ABORT, 'that theme is retired; use a current one');
+END;
+-- An issue moved to a retired theme is refused, as on INSERT.
+CREATE TRIGGER tr_issue_theme_active_upd BEFORE UPDATE OF theme_code ON issues
+WHEN OLD.theme_code IS NOT NEW.theme_code
+ AND EXISTS (SELECT 1 FROM themes WHERE code = NEW.theme_code AND retired_at IS NOT NULL) BEGIN
+  SELECT RAISE(ABORT, 'that theme is retired; use a current one');
 END;
 
 -- Logs 'opened'. The INSERT may carry change_actor_id, change_step_id, change_commit_sha and change_note: they go
@@ -1554,10 +1575,16 @@ WHEN NEW.reviewer_run_id IS NOT NULL
   SELECT RAISE(ABORT, 'the reviewer run belongs to another review');
 END;
 
--- A retired domain takes no new findings.
+-- A retired domain or theme takes no new findings (a finding's domain and theme never change:
+-- tr_finding_immutable).
 CREATE TRIGGER tr_finding_domain_active BEFORE INSERT ON findings
 WHEN EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL) BEGIN
   SELECT RAISE(ABORT, 'that domain is retired; use a current one');
+END;
+-- A retired theme takes no new findings.
+CREATE TRIGGER tr_finding_theme_active BEFORE INSERT ON findings
+WHEN EXISTS (SELECT 1 FROM themes WHERE code = NEW.theme_code AND retired_at IS NOT NULL) BEGIN
+  SELECT RAISE(ABORT, 'that theme is retired; use a current one');
 END;
 
 -- Severity T means a missing test, nothing else (a finding's severity and kind never change after insert).
@@ -1797,9 +1824,24 @@ CREATE TRIGGER tr_relation_created AFTER INSERT ON issue_relations BEGIN
           NEW.established_by_actor_id, NEW.established_in_review_id, NEW.rationale);
 END;
 
--- Recording that an active issue is a duplicate of (or merged into) another closes it as duplicate.
+-- Recording that an active issue is a duplicate of (or merged into) another closes it as duplicate, whether the
+-- relation is inserted with that type or updated to it.
 CREATE TRIGGER tr_relation_closes_duplicate AFTER INSERT ON issue_relations
 WHEN NEW.relation IN (SELECT value FROM relation_types WHERE closes = 1) BEGIN
+  UPDATE issues SET
+    status = 'duplicate',
+    resolution = COALESCE(resolution, NEW.relation || ' ' || (SELECT code FROM issues WHERE id = NEW.to_issue_id)),
+    change_actor_id = NEW.established_by_actor_id,
+    change_review_id = NEW.established_in_review_id,
+    change_step_id = NULL,
+    change_commit_sha = NULL,
+    change_note = NEW.relation || ' ' || (SELECT code FROM issues WHERE id = NEW.to_issue_id) || ': ' || NEW.rationale
+  WHERE id = NEW.from_issue_id AND status IN (SELECT value FROM issue_statuses WHERE active = 1);
+END;
+-- A relation updated to duplicate-of or merged-into closes the source issue, as on INSERT.
+CREATE TRIGGER tr_relation_closes_duplicate_upd AFTER UPDATE OF relation ON issue_relations
+WHEN NEW.relation IN (SELECT value FROM relation_types WHERE closes = 1)
+ AND OLD.relation NOT IN (SELECT value FROM relation_types WHERE closes = 1) BEGIN
   UPDATE issues SET
     status = 'duplicate',
     resolution = COALESCE(resolution, NEW.relation || ' ' || (SELECT code FROM issues WHERE id = NEW.to_issue_id)),
@@ -1986,6 +2028,16 @@ WHEN OLD.status IS NOT NEW.status BEGIN
   WHERE OLD.status = 'awaiting-approval' AND NEW.status <> 'abandoned'
     AND EXISTS (SELECT 1 FROM gates g WHERE g.review_id = NEW.id AND g.kind = 'domain-approval'
                   AND g.status IN ('open','answered'));
+  -- Approval comes from the owner: the latest applied domain-approval gate answered approve, and the approver is
+  -- the person who answered it.
+  SELECT RAISE(ABORT, 'a review is approved only after its domain-approval gate is applied with the answer approve')
+  WHERE OLD.status = 'awaiting-approval' AND NEW.status = 'approved'
+    AND (SELECT answer_value FROM gates WHERE review_id = NEW.id AND kind = 'domain-approval' AND status = 'applied'
+         ORDER BY id DESC LIMIT 1) IS NOT 'approve';
+  SELECT RAISE(ABORT, 'the approver (approved_by_actor_id) is who answered the approval gate')
+  WHERE OLD.status = 'awaiting-approval' AND NEW.status = 'approved'
+    AND NEW.approved_by_actor_id IS NOT (SELECT answered_by_actor_id FROM gates WHERE review_id = NEW.id
+           AND kind = 'domain-approval' AND status = 'applied' ORDER BY id DESC LIMIT 1);
 END;
 
 -- Logs 'status-changed' with change_actor_id and change_note, sets updated_at, and sets completed_at on handed-off
@@ -2025,8 +2077,18 @@ CREATE TRIGGER tr_run_review_approved BEFORE INSERT ON reviewer_runs BEGIN
   SELECT RAISE(ABORT, 'reviewer runs need the domain included in review_domains')
   WHERE NOT EXISTS (SELECT 1 FROM review_domains WHERE review_id = NEW.review_id
                       AND domain_code = NEW.domain_code AND decision = 'included');
-  SELECT RAISE(ABORT, 'that domain is retired; use a current one')
-  WHERE EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL);
+END;
+
+-- A retired domain takes no new reviewer runs, and no run moves into one.
+CREATE TRIGGER tr_run_domain_active BEFORE INSERT ON reviewer_runs
+WHEN EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL) BEGIN
+  SELECT RAISE(ABORT, 'that domain is retired; use a current one');
+END;
+-- A reviewer run moved to a retired domain is refused, as on INSERT.
+CREATE TRIGGER tr_run_domain_active_upd BEFORE UPDATE OF domain_code ON reviewer_runs
+WHEN OLD.domain_code IS NOT NEW.domain_code
+ AND EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL) BEGIN
+  SELECT RAISE(ABORT, 'that domain is retired; use a current one');
 END;
 
 -- Logs 'reviewer-run-created' on the review, with the run's label, domain and scope.
@@ -2036,15 +2098,27 @@ CREATE TRIGGER tr_run_created AFTER INSERT ON reviewer_runs BEGIN
           NEW.domain_code || ': ' || NEW.scope);
 END;
 
--- A retired domain takes no new reviews.
+-- A retired domain takes no new reviews, and none moves into one.
 CREATE TRIGGER tr_review_domain_active BEFORE INSERT ON review_domains
 WHEN EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL) BEGIN
   SELECT RAISE(ABORT, 'that domain is retired; use a current one');
 END;
+-- A review domain moved to a retired domain is refused, as on INSERT.
+CREATE TRIGGER tr_review_domain_active_upd BEFORE UPDATE OF domain_code ON review_domains
+WHEN OLD.domain_code IS NOT NEW.domain_code
+ AND EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL) BEGIN
+  SELECT RAISE(ABORT, 'that domain is retired; use a current one');
+END;
 
--- A retired domain takes no new metrics.
+-- A retired domain takes no new metrics, and none moves into one.
 CREATE TRIGGER tr_metric_domain_active BEFORE INSERT ON metrics
 WHEN EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL) BEGIN
+  SELECT RAISE(ABORT, 'that domain is retired; use a current one');
+END;
+-- A metric moved to a retired domain is refused, as on INSERT.
+CREATE TRIGGER tr_metric_domain_active_upd BEFORE UPDATE OF domain_code ON metrics
+WHEN OLD.domain_code IS NOT NEW.domain_code
+ AND EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL) BEGIN
   SELECT RAISE(ABORT, 'that domain is retired; use a current one');
 END;
 
@@ -2117,9 +2191,15 @@ WHEN NEW.status NOT IN ('proposed','approved') BEGIN
   SELECT RAISE(ABORT, 'a design goal starts proposed (or approved, with its approver)');
 END;
 
--- A retired domain takes no new design goals.
+-- A retired domain takes no new design goals, and none moves into one.
 CREATE TRIGGER tr_goal_domain_active BEFORE INSERT ON design_goals
 WHEN EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL) BEGIN
+  SELECT RAISE(ABORT, 'that domain is retired; use a current one');
+END;
+-- A design goal moved to a retired domain is refused, as on INSERT.
+CREATE TRIGGER tr_goal_domain_active_upd BEFORE UPDATE OF domain_code ON design_goals
+WHEN OLD.domain_code IS NOT NEW.domain_code
+ AND EXISTS (SELECT 1 FROM domains WHERE code = NEW.domain_code AND retired_at IS NOT NULL) BEGIN
   SELECT RAISE(ABORT, 'that domain is retired; use a current one');
 END;
 
@@ -2621,6 +2701,17 @@ WHEN OLD.status IS NOT NEW.status BEGIN
   WHERE OLD.status = 'awaiting-approval' AND NEW.status = 'approved'
     AND EXISTS (SELECT 1 FROM gates g WHERE g.plan_id = NEW.id AND g.kind = 'plan-approval'
                   AND g.status IN ('open','answered'));
+  SELECT RAISE(ABORT, 'a plan is approved only after its plan-approval gate is applied with the answer approve')
+  WHERE OLD.status = 'awaiting-approval' AND NEW.status = 'approved'
+    AND (SELECT answer_value FROM gates WHERE plan_id = NEW.id AND kind = 'plan-approval' AND status = 'applied'
+         ORDER BY id DESC LIMIT 1) IS NOT 'approve';
+  SELECT RAISE(ABORT, 'the approver (approved_by_actor_id) is who answered the approval gate')
+  WHERE OLD.status = 'awaiting-approval' AND NEW.status = 'approved'
+    AND NEW.approved_by_actor_id IS NOT (SELECT answered_by_actor_id FROM gates WHERE plan_id = NEW.id
+           AND kind = 'plan-approval' AND status = 'applied' ORDER BY id DESC LIMIT 1);
+  SELECT RAISE(ABORT, 'a plan is complete when every step is done or dropped')
+  WHERE NEW.status = 'complete'
+    AND EXISTS (SELECT 1 FROM steps WHERE plan_id = NEW.id AND status NOT IN ('done','dropped'));
 END;
 
 -- Logs 'status-changed' with change_actor_id and change_note, and sets updated_at.
@@ -2659,7 +2750,8 @@ END;
 -- ----- Plan structure: phases, steps, dependencies, coverage links
 
 -- Plan rules enforced by the database, on INSERT and on UPDATE: a step depends on another step of its own plan,
--- of any number, and no chain of dependencies leads back to the step.
+-- of any number, and no chain of dependencies leads back to the step; a step's phase is of its plan
+-- (tr_step_phase_plan); a step closes only findings of its plan's reviews (tr_step_finding_in_plan).
 CREATE TRIGGER tr_dep_order BEFORE INSERT ON step_dependencies BEGIN
   SELECT RAISE(ABORT, 'a step may only depend on another step of the same plan')
   WHERE NEW.step_id = NEW.depends_on_step_id OR NOT EXISTS (
@@ -2805,8 +2897,15 @@ CREATE TRIGGER tr_step_no_delete BEFORE DELETE ON steps BEGIN
   SELECT RAISE(ABORT, 'history is append-only: steps cannot be deleted; set status dropped instead');
 END;
 
--- A step closes only findings of the reviews its plan covers.
+-- A step closes only findings of the reviews its plan covers, on INSERT and on UPDATE.
 CREATE TRIGGER tr_step_finding_in_plan BEFORE INSERT ON step_findings
+WHEN NOT EXISTS (SELECT 1 FROM steps s JOIN findings f ON f.id = NEW.finding_id
+                 JOIN plan_reviews pr ON pr.plan_id = s.plan_id AND pr.review_id = f.review_id
+                 WHERE s.id = NEW.step_id) BEGIN
+  SELECT RAISE(ABORT, 'the finding''s review is not one of the step''s plan reviews (plan_reviews)');
+END;
+-- A step finding moved outside the plan's reviews is refused, as on INSERT.
+CREATE TRIGGER tr_step_finding_in_plan_upd BEFORE UPDATE OF step_id, finding_id ON step_findings
 WHEN NOT EXISTS (SELECT 1 FROM steps s JOIN findings f ON f.id = NEW.finding_id
                  JOIN plan_reviews pr ON pr.plan_id = s.plan_id AND pr.review_id = f.review_id
                  WHERE s.id = NEW.step_id) BEGIN
@@ -4264,6 +4363,8 @@ INSERT INTO gate_kinds(value, label, position) VALUES
  ('confirm','Confirm',9),
  ('other','Question',10),
  ('feature-pick','Pick ideas to build',11);
+UPDATE gate_kinds SET options = '[{"value":"approve","label":"Approve"},{"value":"change","label":"Change it first"}]'
+  WHERE value IN ('domain-approval','plan-approval');
 INSERT INTO goal_statuses(value, label, position, served) VALUES
  ('proposed','Waiting for your approval',1,0),
  ('approved','Approved',2,1),
@@ -4563,7 +4664,7 @@ INSERT INTO enum_labels(enum, value, label, position) VALUES
  ('tool_output_format','json','JSON',5), ('tool_output_format','jsonl','JSON lines',6),
  ('tool_result_level','error','Error',1), ('tool_result_level','warning','Warning',2),
  ('tool_result_level','note','Note',3), ('tool_result_level','none','No level',4);
-INSERT INTO meta(key, value) VALUES ('schema_version','24');
+INSERT INTO meta(key, value) VALUES ('schema_version','25');
 INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger schema'),
   (2, 'url, path, hash and code checks; repositories.allow_outside_root; finding_locations.excerpt_redacted'),
   (3, 'integrity rules: codes, hashes, checks, append-only history, owner actor on gate answers'),
@@ -4587,4 +4688,5 @@ INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger s
   (21, 'indexes for check''s views, which read them instead of every row; the answers-imported event'),
   (22, 'correction commands: who corrects a gate, a location or a check, and why'),
   (23, 'measured guard tests: guard_tests.measured_at and measured_commit_sha; v_unproven_steps; the guard-dropped and guard-renamed events'),
-  (24, 'events take the entity type ''ledger'': a redaction of a row that belongs to no other entity');
+  (24, 'events take the entity type ''ledger'': a redaction of a row that belongs to no other entity'),
+  (25, 'masked excerpts hash the masked lines; rule triggers hold on UPDATE; approval follows the owner''s applied answer');

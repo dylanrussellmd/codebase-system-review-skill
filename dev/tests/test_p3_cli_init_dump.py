@@ -3,7 +3,7 @@ and 50).
 
 init copies ledger.py first (via a temp file and os.replace), builds the schema in a temp file of its own inside
 one transaction and links it into place, refuses an incomplete or foreign ledger with one line, and repairs a damaged
-.gitignore. dump reads one snapshot (a read transaction), writes <db>.sql.tmp, fsyncs and renames it, and refuses to
+.gitignore. dump reads one snapshot (a read transaction), writes a temp file of its own, fsyncs and renames it, and refuses to
 overwrite a .sql file it did not write. With --db outside a .code-review folder, init copies no ledger.py and writes
 no .gitignore there.
 """
@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from dev.tests import fixtures
@@ -139,6 +140,37 @@ class AtomicInit(unittest.TestCase):
         run_ledger("--root", d, "init")
         self.assertEqual(gi.read_text(), "my-notes.txt\n" + GITIGNORE)
 
+    def test_gitignore_covers_temp_names(self):
+        """Every temp name private_temp, build_ledger and write_launch_file make in .code-review, with SQLite's side
+        files, matches a line of GITIGNORE; repaired_gitignore drops the old fixed temp names."""
+        import fnmatch
+        mod = fixtures.load_ledger_module(fresh=True)
+        patterns = [l for l in GITIGNORE.splitlines() if l and not l.startswith("#")]
+        folder = fresh_project() / ".code-review"
+        folder.mkdir()
+        made = []
+        mkstemp = mod.tempfile.mkstemp
+
+        def recorded(*a, **kw):
+            fd, name = mkstemp(*a, **kw)
+            made.append(Path(name).name)
+            return fd, name
+
+        with mock.patch.object(mod.tempfile, "mkstemp", recorded):
+            for name in ("ledger.sqlite", "ledger.py", "ledger.sql", "ledger.py.bak", ".gitignore", ".gitattributes"):
+                fd, _ = mod.private_temp(folder / name)
+                os.close(fd)
+            self.assertTrue(mod.build_ledger(folder.parent, folder / "ledger.sqlite"))
+            mod.write_launch_file(folder / "ledger.sqlite", "http://127.0.0.1:1/#k=x")
+        self.assertEqual(len(made), 8)
+        names = made + [n + s for n in made if n.endswith(".tmp") for s in ("-journal", "-wal", "-shm")]
+        for n in names:
+            with self.subTest(name=n):
+                self.assertTrue(any(fnmatch.fnmatch(n, p) for p in patterns), n)
+        old = "ledger.sqlite.tmp\nledger.py.tmp\nledger.sql.tmp\n"
+        new, _ = mod.repaired_gitignore("my-notes.txt\n" + old)
+        self.assertEqual(new, "my-notes.txt\n" + GITIGNORE)
+
     def test_concurrent_inits_build_one_ledger(self):
         """Two inits on a new project, each held after building its schema until the other has built its own."""
         mod = fixtures.load_ledger_module(fresh=True)
@@ -235,6 +267,8 @@ class AtomicDump(unittest.TestCase):
         for (t,) in src.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"):
             with self.subTest(table=t):
                 q = f'SELECT * FROM "{t}" ORDER BY 1'
+                if t == "meta":  # the record of the last dump (record_dump) is written after it, not into it
+                    q = "SELECT * FROM meta WHERE key NOT LIKE 'last_dump_%' ORDER BY 1"
                 self.assertEqual(con.execute(q).fetchall(), src.execute(q).fetchall())
         src.close()
         con.close()

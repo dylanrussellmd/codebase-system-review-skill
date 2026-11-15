@@ -65,7 +65,7 @@ class SeedDemo(unittest.TestCase):
                          ["opened", "current-state-changed", "seen", "current-state-changed", "seen", "checked"])
         self.assertEqual([e[3:] for e in L.events("step") if e[2] == "status-changed"],
                          [("not-started", "doing"), ("doing", "done"), ("not-started", "waiting-owner")])
-        walk = [("planning", "awaiting-approval"), ("awaiting-approval", "approved"), ("approved", "running")]
+        walk = [("approved", "running")]  # inserted approved: an approval by UPDATE needs an applied gate
         self.assertEqual([e[3:] for e in L.events("review") if e[2] == "status-changed"],
                          walk + [("running", "verifying"), ("verifying", "indexing"), ("indexing", "consolidating"),
                                  ("consolidating", "handed-off")] + walk)

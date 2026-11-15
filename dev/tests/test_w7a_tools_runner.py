@@ -190,6 +190,7 @@ class Leads(unittest.TestCase):
         repo, L, sha = tool_project(self)
         ok(L, "tool-run", "sarif", "--review", "R-0001", "--from", str(DATA / "semgrep.sarif"), "--actor", "A-0001")
         ok(L, "dismiss-lead", "LD-0001", "--reason", "fetch is only called in tests", "--actor", "A-0001")
+        ok(L, "dump")
         ok(L, "review-status", "R-0001", "handed-off", "--note", "done", "--actor", "A-0001")
         ok(L, "new-review", "--title", "Second", "--scope", "full", "--previous", "R-0001", "--actor", "A-0001")
         ok(L, "tool-run", "sarif", "--review", "R-0002", "--from", str(DATA / "semgrep.sarif"), "--actor", "A-0001")

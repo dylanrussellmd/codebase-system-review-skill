@@ -779,14 +779,14 @@ def seed_demo(ledger):
     g2 = L.design_goal("G-02", "No internal names on screen.", source="owner")
 
     def review(code, sha, prev, status, subject):
-        # Inserted planning, then moved through the approval to running (findings and runs need an approved review);
-        # R-0001 moves on to handed-off once its points are in.
+        # Inserted approved (an approval by UPDATE needs an applied domain-approval gate, and the demo's gate codes
+        # start at GATE-0001), then moved to running (findings and runs need an approved review); R-0001 moves on
+        # to handed-off once its points are in.
         rid = L.review(code, title=f"Comprehensive review {code}", scope="second" if prev else "full",
-                       status="planning", request_text="Run the full system review", requested_by_actor_id=owner,
+                       status="approved", request_text="Run the full system review", requested_by_actor_id=owner,
                        manager_actor_id=manager, approved_by_actor_id=owner, approved_at=L.clock.tick(),
                        previous_review_id=prev, verdict="Solid core; sign-in codes and notice rules need work.")
-        for st in ("awaiting-approval", "approved", "running"):
-            L.update("reviews", rid, status=st, change_actor_id=owner if st == "approved" else manager)
+        L.update("reviews", rid, status="running", change_actor_id=manager)
         L.review_repository(rid, sha, repository_id=ids["repository"], commit_subject=subject)
         L.insert("review_goals", review_id=rid, goal_id=g1)
         L.insert("review_goals", review_id=rid, goal_id=g2)
@@ -839,7 +839,8 @@ def seed_demo(ledger):
         L.update("reviews", r1, status=st, change_actor_id=manager)
 
     # ---- plan
-    pid = L.plan("P-0001", "Fix plan for R-0001", "drafting", reviews=(r1,), approved_by_actor_id=owner,
+    # Inserted approved: an approval by UPDATE needs an applied plan-approval gate (see review() above).
+    pid = L.plan("P-0001", "Fix plan for R-0001", "approved", reviews=(r1,), approved_by_actor_id=owner,
                  approved_at=L.clock.tick())
     ph1 = L.phase(pid, 1, "Safety net", "Every later step is checked by tests.")
     ph2 = L.phase(pid, 2, "Fix first", "Confirmed defects fixed with failing tests first.")
@@ -866,8 +867,7 @@ def seed_demo(ledger):
     L.step_finding(s2, f1)
     L.step_finding(s3, f2)
     L.step_finding(s1, f3)
-    for st in ("awaiting-approval", "approved", "in-progress"):
-        L.update("plans", pid, status=st, change_actor_id=owner if st == "approved" else manager)
+    L.update("plans", pid, status="in-progress", change_actor_id=manager)
     L.update("steps", s2, status="doing", change_actor_id=manager, change_note="Started the change.")
     L.update("steps", s2, status="done", progress_note="Sign-in codes now come from a secure generator.",
              change_commit_sha=c2, change_note="Sign-in codes now come from a secure generator.")

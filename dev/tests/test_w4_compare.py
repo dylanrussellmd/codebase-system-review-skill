@@ -5,7 +5,7 @@ overall, so drift is measured over time."""
 import json
 import unittest
 
-from dev.tests._p5_writes_helpers import ok, project, refused, index_row
+from dev.tests._p5_writes_helpers import approve, ok, project, refused, index_row
 
 APP = "".join(f"line {n}\n" for n in range(1, 21))
 
@@ -17,7 +17,7 @@ def run_review(L, code, run, points, matches, domains=("spec", "tests")):
         for d in domains:
             ok(L, "review-domain", code, d, "include", "--reason", "rerun")
         ok(L, "review-status", code, "awaiting-approval", "--note", "n")
-        ok(L, "review-status", code, "approved", "--note", "n")
+        approve(L, code)
         ok(L, "review-status", code, "running", "--note", "n")
         ok(L, "add-run", code, "spec", run, "--scope", "all", "--model", "m1")
     f = L.dir / "reviews" / code / "points.tsv"

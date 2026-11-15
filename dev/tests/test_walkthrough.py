@@ -151,9 +151,7 @@ class Walkthrough(unittest.TestCase):
                              ["# Proposal", "", "Domains: spec, tests. Skipped: ui (no pages)."])
         self.run_cmd("review-status", review, "awaiting-approval", "--note", "domains proposed", "--actor", mgr)
         gate = self.code("open-gate", "domain-approval", "--review", review, "--title", "Approve the review domains",
-                         "--question", "Run these domains?", "--context", f"@{proposal}",
-                         "--option", "approve=Approve as listed", "--option", "change=Add or remove domains",
-                         "--option", "goals=Edit the goals", "--actor", mgr)
+                         "--question", "Run these domains?", "--context", f"@{proposal}", "--actor", mgr)
         self.run_cmd("progress-page")
         self.assertIn(f"{gate}  [open] domain-approval", self.run_cmd("gates"))
         if answer_file:
@@ -513,6 +511,7 @@ class Walkthrough(unittest.TestCase):
                      "Refused requests are listed in the log.", "--plan", plan, "--actor", fixer)
         self.run_cmd("feature-status", "FP-0001", "built", "--note", "test_refused_logged passes", "--actor", fixer)
         self.assertEqual(self.query("SELECT status, step FROM v_feature_proposals"), [["built", "P-0001#3"]])
+        self.run_cmd("dump")
         self.run_cmd("plan-status", plan, "complete", "--note", "every step is done", "--actor", mgr)
         self.run_cmd("check", "--quiet")
         self.run_cmd("dump")

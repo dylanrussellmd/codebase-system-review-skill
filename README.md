@@ -147,7 +147,7 @@ no server and can be read anywhere.
 From the repository root (`DEMO` is a new or empty folder; leave it out to get a temporary one):
 
     python3 dev/build.py                          regenerate scripts/ledger.py
-    python3 dev/build.py --check                  exit 1 if scripts/ledger.py is stale
+    python3 dev/build.py --check                  exit 1 if a rebuild would change scripts/ledger.py
     python3 dev/tests/seed_demo.py DEMO           a small git project with a filled ledger (reviews, a plan, gates)
     python3 scripts/ledger.py --version           print the tool version (from SKILL.md) and the schema version
     python3 scripts/ledger.py --root DEMO check   the demo ledger passes every check
@@ -228,7 +228,7 @@ since 1. `dev/tests/data/` holds a ledger of each released schema with a row in 
    are off while the steps run and `PRAGMA foreign_key_check` must be clean at the end.
 2. Edit `references/schema.sql` to the new end state, and in the same change set its header line to `schema version
    NNNN`, the meta seed to `'NNNN'`, and add `(NNNN, '<description>')` to the `schema_migrations` seed. The build
-   refuses if any of these disagrees with the highest migration (`SCHEMA_VERSION` in ledger.py is that number).
+   refuses if any of these disagrees with the highest migration (`SCHEMA_VERSION` in `ledger.py` is that number).
 3. Add a test that restores the fixture of the schema before it (`M.restore(N)`, `dev/tests/_migrate_helpers.py`),
    runs `migrate`, and checks what the migration does; a new table gets a row in `FILL`. Then rebuild with
    `python3 dev/build.py`.
