@@ -858,7 +858,7 @@ ROUTE_KEYS = {
         "position closes search commits[commit_sha branch pr_url summary]]",
     "step/*/*":
         "number change proof owner_question behavior_note progress_note no_findings_reason started_at done_at "
-        "commits[commit_sha branch pr_url summary] closes[point_id severity summary review issue report]",
+        "commits[commit_sha branch pr_url summary] closes[point_id severity summary review issue issue_title report]",
     "goals":
         "goals[code domain text status approved_at note adopted_at retired_at used_by sources[code question]]",
     "ideas":

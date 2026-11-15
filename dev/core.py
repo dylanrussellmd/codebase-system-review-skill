@@ -2490,6 +2490,7 @@ def _plan_closes(con, where, args):
     """{step id: [the points it closes]} for the steps a WHERE on steps s picks."""
     out = {}
     for c in rows(con, f"""SELECT sf.step_id, f.id, f.point_id, f.severity, f.summary, r.code review, i.code issue,
+                                  i.title issue_title,
                                   COALESCE(ru.report_path, ru.label) report
                            FROM step_findings sf JOIN steps s ON s.id=sf.step_id JOIN findings f ON f.id=sf.finding_id
                            JOIN reviews r ON r.id=f.review_id LEFT JOIN issues i ON i.id=f.issue_id

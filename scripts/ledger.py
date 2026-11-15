@@ -39,7 +39,7 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote
 
 TOOL_VERSION = "1.12.0"  # stamped by dev/build.py from `metadata: version:` in SKILL.md's frontmatter
-TOOL_HASH = "fa6a51dcc405cad8ca51a914a0e5d5a2e0259ee9e96fca0237bb5706a3382f6a"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
+TOOL_HASH = "1b4f513cbd5c3c97eb499e7e0de3abe97a00baf2dba83f621bac4758281e7ec5"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
 # Placeholders: dev/build.py puts references/schema.sql, dev/page.html and references/migrations/*.sql in their
 # place when it writes scripts/ledger.py. dev/core.py itself is never run as the tool.
 SCHEMA = r"""-- =====================================================================
@@ -4902,15 +4902,18 @@ function answersFile(){
 const HANDOVER = () => HUB.store && HUB.store.local
   ? [" ", answersFile(), " and give the file to the agent, or tell it your answer in the chat."]
   : [" The agent records it the next time it checks (or tell it in the chat to check now)."];
-function md(text){
-  const lines = String(text || "").split("\n"), out = []; let i = 0;
-  const inline = str => { const parts = []; const re = /(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\(https?:\/\/[^)\s]+\))/g; let last = 0, m;
+// **bold**, `code` and [text](https://...) links in one line of stored text; everything else stays text.
+function inlineMd(str){ const parts = []; const re = /(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\(https?:\/\/[^)\s]+\))/g; let last = 0, m;
     while ((m = re.exec(str))) { if (m.index > last) parts.push(str.slice(last, m.index)); const t = m[0];
       if (t.startsWith("**")) parts.push(h("b", null, t.slice(2, -2)));
       else if (t.startsWith("`")) parts.push(h("code", null, t.slice(1, -1)));
       else { const mm = t.match(/^\[([^\]]+)\]\((.+)\)$/); parts.push(h("a", {href: mm[2], target: "_blank", rel: "noopener noreferrer"}, mm[1])); }
       last = re.lastIndex; }
-    if (last < str.length) parts.push(str.slice(last)); return parts; };
+    if (last < str.length) parts.push(str.slice(last)); return parts;
+}
+function md(text){
+  const lines = String(text || "").split("\n"), out = []; let i = 0;
+  const inline = inlineMd;
   const cells = r => r.replace(/^\|/, "").replace(/\|\s*$/, "").split("|").map(c => c.trim());
   while (i < lines.length) {
     const l = lines[i]; let m;
@@ -5075,7 +5078,7 @@ function whenCell(stored, withTime){
 const SHORT_SHA = 10;   // characters of a commit id shown: enough to tell commits apart, as git does
 const short = sha => sha ? sha.slice(0, SHORT_SHA) : "";   // a commit id as shown
 // A list of [label, value] pairs; an empty value leaves its pair out.
-const kv = pairs => h("dl", {class:"kv"}, pairs.filter(p => p[1] != null && p[1] !== "" && !(Array.isArray(p[1]) && !p[1].length)).map(([k,v]) => [h("dt", null, k), h("dd", null, v)]));
+const kv = pairs => h("dl", {class:"kv"}, pairs.filter(p => p[1] != null && p[1] !== "" && !(Array.isArray(p[1]) && !p[1].length)).map(([k,v]) => [h("dt", null, k), h("dd", null, typeof v === "string" ? inlineMd(v) : v)]));
 // What a list says when it has nothing to show.
 const empty = t => h("p", {class:"empty"}, t);
 const sect = title => h("h2", {class:"sec"}, title);   // a section of a page: second level, in the small style
@@ -5731,7 +5734,7 @@ VIEWS.issue = async ([code]) => {
     h("div", {class:"card"}, kv([["First found", h("span", null, h("a", {href:"#/review/" + i.first_seen}, i.first_seen), " · " + when(i.opened_at))],
       ["Last raised", i.last_seen ? h("a", {href:"#/review/" + i.last_seen}, i.last_seen) : null], ["Last looked for", i.last_checked ? h("a", {href:"#/review/" + i.last_checked}, i.last_checked) : null],
       ["Raised in", plural(i.times_seen, "review")],
-      ["Before", i.before_state], ["Now", i.current_state], ["Once fixed", i.after_state], ["Agreed fix", i.recommendation], ["Resolution", i.resolution],
+      ["Before", i.before_state], ["Now", i.current_state !== i.before_state ? i.current_state : null], ["Once fixed", i.after_state], ["Agreed fix", i.recommendation], ["Resolution", i.resolution],
       ["Fixed", whenCell(i.resolved_at)], ["Fix confirmed", whenCell(i.verified_at)],
       ["Guard test", d.unguarded.length ? (d.unguarded[0].problem === "no guard test" ? "None: no test guards this fix yet." : "Removed: the test that guarded this fix is gone.") : null]])),
     d.relations.length ? [sect("Related issues"), table([{label:"Link", get:x => x.dir === "out" ? lab("rel", x.relation) : lab("relIn", x.relation)},
@@ -5792,9 +5795,13 @@ VIEWS.plan = async ([code, , phaseArg]) => {
   const commitLine = c => h("div", null, h("code", null, short(c.commit_sha)), c.branch ? ` on ${c.branch}` : "",
     c.summary ? " " + c.summary : "", c.pr_url ? [" ", extLink(c.pr_url, "pull request")] : "");
   const closeLine = c => h("div", {class:"refline", title:c.report ? "Report: " + c.report.split("/").pop() : null}, h("code", null, `${c.review} · ${c.point_id}`), sevTag(c.severity),
-    c.issue ? h("a", {href:"#/issue/" + c.issue}, c.issue) : null, h("span", null, c.summary));
+    c.issue ? h("a", {href:"#/issue/" + c.issue}, c.issue) : null, h("span", null, inlineMd(c.summary || "")));
+  const problems = closes => { const seen = new Set(), out = [];   // each issue once, by its title; a point with no issue by its summary
+    for (const c of closes) { const key = c.issue || c.point_id; if (seen.has(key)) continue; seen.add(key);
+      out.push(h("div", null, c.issue ? [h("a", {href:"#/issue/" + c.issue}, c.issue), " "] : null, inlineMd(c.issue_title || c.summary || ""))); }
+    return out; };
   const stepBody = (s, closes) => [
-    kv([["Progress", s.progress_note], [(s.commits || []).length > 1 ? "Commits" : "Commit", (s.commits || []).length ? s.commits.map(commitLine) : null],
+    kv([["Problem", problems(closes)], ["Progress", s.progress_note], [(s.commits || []).length > 1 ? "Commits" : "Commit", (s.commits || []).length ? s.commits.map(commitLine) : null],
       ["Change", s.change], ["Proof", s.proof],
       ["Depends on", s.depends.length ? `${noun(s.depends.length, "Step")} ${s.depends.join(", ")}` : null],
       ["Changes behaviour", s.behavior_note], ["Needs you", s.owner_question],
@@ -10682,6 +10689,7 @@ def _plan_closes(con, where, args):
     """{step id: [the points it closes]} for the steps a WHERE on steps s picks."""
     out = {}
     for c in rows(con, f"""SELECT sf.step_id, f.id, f.point_id, f.severity, f.summary, r.code review, i.code issue,
+                                  i.title issue_title,
                                   COALESCE(ru.report_path, ru.label) report
                            FROM step_findings sf JOIN steps s ON s.id=sf.step_id JOIN findings f ON f.id=sf.finding_id
                            JOIN reviews r ON r.id=f.review_id LEFT JOIN issues i ON i.id=f.issue_id
