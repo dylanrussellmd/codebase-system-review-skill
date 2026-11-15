@@ -1720,6 +1720,53 @@ TEXT_TARGETS = {"set-report": ("reviews", "report_md", "review", REVIEW_CODE),
                 "set-narrative": ("plans", "narrative_md", "plan", re.compile(r"P-[0-9]{4,}"))}
 
 
+# Prose options of the write commands: text a person reads on the page, checked by warn_run_ons.
+PROSE_ARGS = {"note", "reason", "title", "summary", "text", "why", "rationale", "resolution", "description", "message",
+              "evidence", "after", "before", "fix", "test", "proof", "change", "progress_note", "new_step",
+              "split_note", "revisit_when", "requirement", "question", "behavior_note", "owner_question"}
+# Letters that name things when a number follows (sha256, utf8, ipv6), and units after a number (10ms, 2nd).
+_NUM_STEMS = {"sha", "md", "utf", "base", "ipv", "py", "python", "iso", "rfc", "cve", "win", "arm", "aarch", "amd",
+              "es", "ecma", "http", "tls", "ssl", "aes", "rsa", "ed", "sqlite", "mp", "vp", "cp", "gpt", "oauth",
+              "ubuntu", "debian", "node", "html", "css", "int", "uint", "float", "fp", "pg", "ms"}
+_NUM_UNITS = {"st", "nd", "rd", "th", "ms", "us", "ns", "kb", "mb", "gb", "tb", "kib", "mib", "gib", "px", "em", "rem",
+              "pt", "fps", "hz", "khz", "mhz", "ghz", "bit", "bits", "am", "pm", "min", "mins", "sec", "secs", "hr",
+              "hrs", "kbps", "mbps", "rpm", "dpi", "ppi", "km", "cm", "mm"}
+
+
+def run_on_numbers(text):
+    """The spots in prose where a word runs into a number ("Steps1,2", "and38", "73Python"), each as the
+    whitespace-separated piece it is in ("verified63work" too). Text in backticks, paths, links and names with _ . / = @ # inside are
+    left alone, as are codes (ISS-0001), hashes, versions (v3) and units (10ms)."""
+    spots = []
+    for piece in re.sub(r"`[^`]*`", " ", text or "").split():
+        core = piece.strip("()[]{}\"'*,;!?")
+        if "://" in core or re.search(r"[_/=@#\\]|\w\.\w", core):
+            continue
+        for run in re.findall(r"[A-Za-z0-9]+", core):
+            if not (re.search(r"[A-Za-z]", run) and re.search(r"\d", run)):
+                continue
+            if len(run) >= 7 and re.fullmatch(r"[0-9a-f]+", run):
+                continue                                        # a commit hash
+            m = re.fullmatch(r"([A-Za-z]{2,})(\d+)", run)
+            if m and not (m.group(1).lower() in _NUM_STEMS or m.group(1).isupper()):
+                spots.append(piece); break
+            m = re.fullmatch(r"(\d+)([A-Za-z]{2,})", run)
+            if m and m.group(2).lower() not in _NUM_UNITS:
+                spots.append(piece); break
+            if re.fullmatch(r"[A-Za-z]{2,}\d+[A-Za-z]{2,}", run):
+                spots.append(piece); break
+    return spots
+
+
+def warn_run_ons(cmd, label, text):
+    """Print a warning to standard error naming each spot where text runs a word into a number. The text is still
+    stored."""
+    spots = run_on_numbers(text)
+    if spots:
+        shown = ", ".join(f"'{s}'" for s in spots[:5]) + (f" and {len(spots) - 5} more" if len(spots) > 5 else "")
+        print(f"warning: {cmd} {label}: a word runs into a number at {shown}; add the missing space", file=sys.stderr)
+
+
 def set_text(con, cmd, code, source):
     """set-report R-0007 FILE / set-narrative P-0001 FILE: store the review document or the plan's narrative
     (Markdown, UTF-8; FILE '-' reads standard input) in the ledger, where the viewer shows it. Returns 0."""
@@ -1730,6 +1777,7 @@ def set_text(con, cmd, code, source):
         text = sys.stdin.read() if source == "-" else Path(source).read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as e:
         sys.exit(f"{cmd}: cannot read {source}: {e}")
+    warn_run_ons(cmd, code, text)
     cur = con.execute(f"UPDATE {table} SET {column}=? WHERE code=?", (text, code))
     if cur.rowcount != 1:
         con.rollback()
@@ -13488,6 +13536,11 @@ def _main():
     fill_arg_help(sub)
     add_review_tool_parsers(sub)
     a = ap.parse_args()
+    for dest, value in vars(a).items():
+        if dest in PROSE_ARGS:
+            for v in value if isinstance(value, list) else [value]:
+                if isinstance(v, str):
+                    warn_run_ons(a.cmd, "--" + dest.replace("_", "-"), v)
     if a.cmd == "schema":
         print(SCHEMA); return
     explicit = a.root is not None  # any --root given, '.' included, is used as given
