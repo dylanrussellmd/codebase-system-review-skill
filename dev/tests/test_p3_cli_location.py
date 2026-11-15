@@ -71,6 +71,29 @@ class LedgerLocation(unittest.TestCase):
         self.assertIn(f"now records {moved}", p.stdout)
         self.assertNotIn("warning", self.run_("check", env=env).stderr)
 
+    def test_code_review_dir_refuses_other_project(self):
+        db = self.outside / "ledger.sqlite"
+        for args in (["init"], ["add-repo", "demo", "."]):
+            p = self.run_(*args)
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        other = ScratchRepo(self.repo.path.parent / "other", exclude_ledger=False)
+        other.write("b.py", "y = 2\n")
+        other.commit("other")
+        for phase in ("no review yet", "after a review"):
+            if phase == "after a review":
+                p = self.run_("new-review", "--title", "First", "--scope", "full")
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            before = db.read_bytes()
+            for args in (["add-repo", "other", "."], ["check"], ["init"]):
+                with self.subTest(phase=phase, args=args):
+                    p = run_ledger(*args, cwd=other.path, env=self.env)
+                    self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+                    self.assertIn(str(db), p.stderr)
+                    self.assertNotIn("Traceback", p.stderr)
+                    self.assertEqual(db.read_bytes(), before)
+            self.assertEqual(self.run_("check").returncode, 0)
+        self.assertEqual(other.git("status", "--porcelain", "--ignored"), "")
+
 
 if __name__ == "__main__":
     unittest.main()

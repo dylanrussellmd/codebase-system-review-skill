@@ -67,7 +67,7 @@ Everything sits in `.code-review/` at the project root: `ledger.sqlite`, the cop
 (`dump`), `hub.html`, `patches/`, `reviews/R-0001/` (brief, reports, indexes, the review report), and the
 `.code-review/.gitignore` and `.gitattributes` that `init` writes. These files and the local annotated tags
 `review/R-0001` that `tag-review` puts on each reviewed commit are the only writes this skill makes to a repository;
-`CODE_REVIEW_DIR=<folder>` for every command (or `--db FILE`) keeps everything outside it.
+`CODE_REVIEW_DIR=<folder>` set on each command, never in a shell profile, or `--db FILE` keeps everything outside it.
 
 At the first review open a `decision` gate "Where does the review ledger live?" with options `outside` (nothing in
 the repository: `CODE_REVIEW_DIR`, or `.code-review/` in `.gitignore`), `commit-dump` (commit `ledger.sql` only; the

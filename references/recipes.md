@@ -264,11 +264,9 @@ ledger.py correct-location R-0002:SPEC-M1 --from src/requests.py:2-4#can_request
 
 ### Correct a renamed file
 
-A recorded file has a new name or folder. Rename it first; the command checks the new path exists.
-
-```sh
-ledger.py correct-artifact 42 --path .code-review/reviews/R-0002/ui/issues-1280-light.png --reason 'the old name held the viewer key' --actor A-0002
-```
+A recorded file has a new name or folder. Rename it first, then run
+`ledger.py correct-artifact ID --path NEW --reason TEXT --actor A-0001` (ID from `ledger.py query "SELECT id, path
+FROM artifacts"`). It checks the new path exists.
 
 ### Correct a review's check
 

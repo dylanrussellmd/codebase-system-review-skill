@@ -196,7 +196,10 @@ ledger.py cite-lead LD-0001 R-0001:SEC-H3
   (`{"roles": {"admin": {"headers": {"Authorization": "Bearer {{admin_token}}"}}, "anonymous": {}},
   "expect": {"GET /api/users": {"anonymous": "denied", "admin": 200}, "*": {...}}, "params": {"id": "7"}}`;
   `allowed` is below 400, `denied` 401 to 403, no expectation means no 5xx), plus the project's own `.hurl` files.
-  A `{{name}}` in a header is passed as `--secret` from the environment variable of that name and never recorded.
+  A `{{name}}` in a matrix header comes from the environment variable of that name, through an owner-only
+  `--secrets-file` removed after the run; it is never on the command line or recorded. A project `.hurl` file gets
+  no other variable, and one with a request to a host other than `--target`'s is left out (named in the run's note)
+  unless `--online`.
   `mailpit` reads every message Mailpit caught (`--target`, default `http://127.0.0.1:8025`) after the walkthroughs:
   a lead for each one sent twice, without a plain-text part, a subject or a recipient; only sizes and hashes of the
   bodies are kept. It needs no binary on PATH: Mailpit may run in a container.
@@ -207,9 +210,12 @@ ledger.py cite-lead LD-0001 R-0001:SEC-H3
   built in: the commit's `.sql` files (schema files first, then by path) applied to an empty in-memory SQLite
   database, then `EXPLAIN QUERY PLAN` of every query the code holds as a string literal (or of a `--rules` file of
   statements), placeholders bound to NULL; reading a whole table (`SCAN t` without an index) or sorting in a
-  temporary B-tree is a lead at the query's line. `pg-explain` does the same on PostgreSQL 16 or later: it creates
+  temporary B-tree is a lead at the query's line. A file that uses ATTACH, DETACH, VACUUM INTO or a PRAGMA is
+  recorded under `failed`; extensions are off. `pg-explain` does the same on PostgreSQL 16 or later: it creates
   a throwaway database on the server at `--target`, applies the files, explains each query's generic plan with
-  sequential scans off (a `Seq Scan` left means no index fits), and drops the database.
+  sequential scans off (a `Seq Scan` left means no index fits), and drops the database. psql gets each statement
+  as a `-c` argument, which it sends to the server as it is; a file or query with a backslash at line start or
+  after a semicolon (a psql meta-command) is recorded under `failed` and not run.
 - **Budgets and translations.** `hyperfine` times the commands of the project's `budgets.json`
   (`{"budgets": [{"name": "build", "command": "...", "max_ms": 500, "runs": 10}]}`); the mean and spread of each are
   metrics measured, not counted, and a mean over its budget is a lead. `i18n-lint` runs ESLint with one rule,

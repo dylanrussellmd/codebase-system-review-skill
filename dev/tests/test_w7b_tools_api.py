@@ -171,7 +171,7 @@ class Hurl(unittest.TestCase):
         script = VERSION % "hurl 8.1.0" + (
             "import os, pathlib\nargs = sys.argv\nfiles = [a for a in args if a.endswith('.hurl')]\n"
             "assert len(files) == 4, files\n"
-            "assert 'admin_token=s3cret' in args, args\n"
+            "assert not any('s3cret' in a for a in args), args\n"
             "assert any(a.startswith('base=http://127.0.0.1') for a in args), args\n"
             "out = args[args.index('--report-junit') + 1]\n"
             f"open(out, 'w').write(open({str(DATA / 'hurl-documented.xml')!r}).read())\nsys.exit(3)\n")
@@ -186,7 +186,63 @@ class Hurl(unittest.TestCase):
         run = L.one("SELECT * FROM tool_runs")
         self.assertEqual((run["status"], run["exit_code"]), ("ran", 3))
         self.assertNotIn("s3cret", run["command"])
-        self.assertIn("admin_token={admin_token}", run["command"])
+        self.assertIn("--secrets-file {secrets}", run["command"])
+
+    # The stand-in hurl writes what it was given to $HURL_DUMP: its argv, and each file named after
+    # --secrets-file or --variables-file with that file's mode and text.
+    DUMPING = VERSION % "hurl 8.1.0" + (
+        "import json, os\nargs = sys.argv[1:]\ngiven = {}\n"
+        "for flag in ('--secrets-file', '--variables-file'):\n"
+        "    if flag in args:\n"
+        "        f = args[args.index(flag) + 1]\n"
+        "        given[flag] = {'path': f, 'mode': os.stat(f).st_mode & 0o777, 'text': open(f).read()}\n"
+        "json.dump({'argv': args, 'files': given}, open(os.environ['HURL_DUMP'], 'w'))\n"
+        "out = args[args.index('--report-junit') + 1]\n"
+        f"open(out, 'w').write(open({str(DATA / 'hurl-documented.xml')!r}).read())\nsys.exit(3)\n")
+
+    def run_dumping(self, files, matrix=None, extra=()):
+        repo, L, sha = tool_project(self, files=files)
+        dump = fixtures.temp_dir("w7b-dump-") / "dump.json"
+        env = env_with(shim("hurl", self.DUMPING))
+        env.update({"HURL_DUMP": str(dump), "admin_token": "s3cret", "AWS_SECRET_ACCESS_KEY": "wJalrXUtnFEMI"})
+        args = ["--rules", str(matrix)] if matrix else []
+        ok(L, "tool-run", "hurl", "--review", "R-0001", "--target", "http://127.0.0.1:8000", *args, *extra,
+           "--actor", "A-0001", env=env)
+        return L, json.loads(dump.read_text())
+
+    def test_hurl_never_passes_env_named_by_repo_files(self):
+        L, got = self.run_dumping({"openapi.yaml": SPEC, "tests/steal.hurl":
+                                   "GET {{base}}/api/users\nX-Key: {{AWS_SECRET_ACCESS_KEY}}\nHTTP 200\n"})
+        self.assertTrue(any(a.endswith("steal.hurl") for a in got["argv"]), got)
+        self.assertNotIn("wJalrXUtnFEMI", json.dumps(got))
+        self.assertNotIn("wJalrXUtnFEMI", L.scalar("SELECT command FROM tool_runs"))
+
+    def test_hurl_matrix_secret_not_on_argv(self):
+        matrix = fixtures.temp_dir("w7b-matrix-") / "matrix.json"
+        matrix.write_text(json.dumps({"roles": {"admin": {"headers": {"Authorization": "Bearer {{admin_token}}"}},
+                                                "anonymous": {}}}))
+        L, got = self.run_dumping({"openapi.yaml": SPEC}, matrix)
+        self.assertFalse(any("s3cret" in a for a in got["argv"]), got["argv"])
+        given = got["files"].get("--secrets-file")
+        self.assertIsNotNone(given, got)
+        self.assertEqual(given["mode"], 0o600)
+        self.assertEqual(given["text"], "admin_token=s3cret\n")
+        self.assertFalse(Path(given["path"]).exists())
+        self.assertFalse(Path(given["path"]).parent.exists())
+        self.assertEqual(L.scalar("SELECT status FROM tool_runs"), "ran")
+
+    def test_hurl_refuses_other_host_offline(self):
+        files = {"openapi.yaml": SPEC, "tests/ok.hurl": "GET {{base}}/api/users\nHTTP 200\n",
+                 "tests/away.hurl": "GET {{base}}/api/users\nHTTP 200\n\nPOST https://collect.example/x\nHTTP 200\n"}
+        L, got = self.run_dumping(files)
+        self.assertTrue(any(a.endswith("ok.hurl") for a in got["argv"]), got["argv"])
+        self.assertFalse(any(a.endswith("away.hurl") for a in got["argv"]), got["argv"])
+        L.commit()
+        note = L.scalar("SELECT note FROM tool_runs")
+        self.assertIn("tests/away.hurl:4", note or "")
+        self.assertIn("collect.example", note or "")
+        L, got = self.run_dumping(files, extra=["--online"])
+        self.assertTrue(any(a.endswith("away.hurl") for a in got["argv"]), got["argv"])
 
 
 SPEC_V2 = SPEC.replace("""  /api/users/{id}:
@@ -335,6 +391,24 @@ class Database(unittest.TestCase):
                       [(r["rule"], r["path"], r["line_start"]) for r in
                        L.all("SELECT rule, path, line_start FROM tool_results WHERE tool_run_id=2")])
 
+    def test_query_plan_refuses_attach(self):
+        made = fixtures.temp_dir("w7b-attach-")
+        attached, vacuumed = made / "attached.sqlite", made / "vacuumed.sqlite"
+        files = {"db/schema.sql": "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT);\n",
+                 "db/attach.sql": f"ATTACH DATABASE '{attached}' AS x;\nCREATE TABLE x.t (a INT);\n",
+                 "db/vacuum.sql": f"VACUUM INTO '{vacuumed}';\n",
+                 "db/pragma.sql": "PRAGMA writable_schema = ON;\n",
+                 "app/store.py": "Q = \"SELECT id FROM users WHERE email = ?\"\n"}
+        repo, L, sha = tool_project(self, files=files)
+        ok(L, "tool-run", "query-plan", "--review", "R-0001", "--actor", "A-0001")
+        self.assertFalse(attached.exists())
+        self.assertFalse(vacuumed.exists())
+        L.commit()
+        doc = json.loads((L.root / L.scalar("SELECT output_path FROM tool_runs")).read_text())
+        self.assertEqual(sorted(f["file"] for f in doc["failed"]), ["db/attach.sql", "db/pragma.sql", "db/vacuum.sql"])
+        self.assertEqual(doc["applied"], ["db/schema.sql"])
+        self.assertEqual([q.get("plan") is not None for q in doc["queries"]], [True])
+
     def test_pg_explain_import(self):
         repo, L, sha = tool_project(self, files=MIGRATIONS)
         ok(L, "tool-run", "pg-explain", "--review", "R-0001", "--from", str(DATA / "pg-explain.json"),
@@ -349,12 +423,12 @@ class Database(unittest.TestCase):
         log = fixtures.temp_dir("w7b-psql-") / "log.txt"
         plan = json.loads((DATA / "pg-explain.json").read_text())["queries"]
         script = VERSION % "psql (PostgreSQL) 16.15" + (
-            "import json\nargs, sql = sys.argv, (sys.stdin.read() if '-c' not in sys.argv else '')\n"
+            "import json\nargs = sys.argv\nsql = [args[i + 1] for i, a in enumerate(args) if a == '-c']\n"
             f"open({str(log)!r}, 'a').write(json.dumps([args[1], args[2:], sql]) + '\\n')\n"
-            "cmd = args[args.index('-c') + 1] if '-c' in args else sql\n"
+            "cmd = sql[-1]\n"
             "if 'EXPLAIN' in cmd:\n"
             f"    plans = {json.dumps({q['sql']: q['plan'] for q in plan})!r}\n"
-            "    q = cmd.split('GENERIC_PLAN) ', 1)[1].rstrip(';\\n').replace('$1', '%s')\n"
+            "    q = cmd.split('GENERIC_PLAN) ', 1)[1].replace('$1', '%s')\n"
             "    print(json.dumps(json.loads(plans)[q]))\n"
             "elif 'server_version' in cmd:\n    print('16.15')\n")
         repo, L, sha = tool_project(self, files=MIGRATIONS)
@@ -366,9 +440,43 @@ class Database(unittest.TestCase):
         self.assertTrue(calls[-1][1][-1].startswith('DROP DATABASE IF EXISTS "ledger_explain_'), calls[-1])
         self.assertEqual(calls[0][0], "postgresql://u@127.0.0.1:5432/app")
         self.assertTrue(all(c[0].startswith("postgresql://u@127.0.0.1:5432/ledger_explain_") for c in calls[1:-1]))
-        self.assertTrue(all("SET enable_seqscan = off" in c[2] for c in calls if "EXPLAIN" in c[2]))
+        self.assertTrue(all(c[2][0] == "SET enable_seqscan = off" for c in calls if "EXPLAIN" in c[2][-1]))
+        self.assertIn(["CREATE INDEX accounts_email ON accounts (email)",
+                       "ALTER TABLE accounts ADD COLUMN plan TEXT NOT NULL DEFAULT 'free'",
+                       "ALTER TABLE accounts ALTER COLUMN email TYPE VARCHAR(200)"], [c[2] for c in calls])
         self.assertEqual([g[1] for g in leads(L)], ["pg-explain.seq-scan"])
         self.assertNotIn("u@127", L.scalar("SELECT command FROM tool_runs"))
+
+    def test_pg_explain_refuses_meta_commands(self):
+        """A stand-in psql that runs `\\!` lines as real psql does, from its input and from a -c that starts with
+        a backslash: no project file reaches it that way."""
+        made = fixtures.temp_dir("w7b-meta-")
+        x, y = made / "X", made / "Y"
+        script = VERSION % "psql (PostgreSQL) 16.15" + (
+            "import os, re, subprocess\nargs = sys.argv[1:]\n"
+            "texts = [args[i + 1] for i, a in enumerate(args) if a == '-c']\n"
+            "if '-f' in args:\n    texts.append(sys.stdin.read())\n"
+            "for t in texts:\n"
+            "    for line in t.splitlines():\n"
+            "        m = re.search(r'(?:^|;)\\s*\\\\!(.*)', line)\n"
+            "        if m and (t.lstrip().startswith('\\\\') or '-f' in args):\n"
+            "            subprocess.run(m.group(1), shell=True)\n"
+            "if any('server_version' in t for t in texts):\n    print('16.15')\n")
+        files = {**MIGRATIONS, "migrations/0003_shell.sql": f"CREATE TABLE t (a INT);\n\\! touch {x}\n",
+                 "migrations/0004_inline.sql": f"CREATE TABLE u (b INT); \\! touch {y}\n"}
+        repo, L, sha = tool_project(self, files=files)
+        env = env_with(shim("psql", script))
+        ok(L, "tool-run", "pg-explain", "--review", "R-0001", "--target", "postgresql://u@127.0.0.1:5432/app",
+           "--actor", "A-0001", env=env)
+        self.assertFalse(x.exists())
+        self.assertFalse(y.exists())
+        L.commit()
+        doc = json.loads((L.root / L.scalar("SELECT output_path FROM tool_runs")).read_text())
+        failed = {f["file"]: f["error"] for f in doc["failed"]}
+        self.assertEqual(sorted(failed), ["migrations/0003_shell.sql", "migrations/0004_inline.sql"])
+        self.assertIn("line 2", failed["migrations/0003_shell.sql"])
+        self.assertIn("line 1", failed["migrations/0004_inline.sql"])
+        self.assertIn("migrations/0001_init.sql", doc["applied"])
 
     @unittest.skipUnless(os.environ.get("LEDGER_TEST_POSTGRES") and shutil.which("psql"),
                          "environment: set LEDGER_TEST_POSTGRES to a PostgreSQL server address to run EXPLAIN for real")

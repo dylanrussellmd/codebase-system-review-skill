@@ -78,8 +78,8 @@ In `<project root>/.code-review/` (owner-only: the folder 0700, the files 0600):
 dump, the hub page, saved patches and each review's brief, reports and indexes. The owner decides at the first review
 what is committed: nothing, only `ledger.sql`, or only `ledger.sqlite` (about 10 MB of ledger and 7 MB of dump per
 1,000 findings). Until then the agent lists `.code-review/` in `.git/info/exclude` and commits nothing. Review tags
-(`review/R-0001`) stay local unless that decision says to push them. `CODE_REVIEW_DIR=/some/folder` for every command
-(or `--db FILE`) writes nothing inside the repository. This repository keeps its own ledger out (decision D-0001:
+(`review/R-0001`) stay local unless that decision says to push them. `CODE_REVIEW_DIR=/some/folder` on each command
+(or `--db FILE`) writes nothing inside the repository; set it per command, never in a shell profile. This repository keeps its own ledger out (decision D-0001:
 `.code-review/` is in `.gitignore`).
 
 Each project keeps a copy of the tool at `.code-review/ledger.py`. Review a pull request that changes that copy or the

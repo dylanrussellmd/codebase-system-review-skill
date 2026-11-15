@@ -6,8 +6,12 @@ installed, TZ always), recording each run as a test run and each test that newly
 import json
 import os
 import random
+import sqlite3
+import subprocess
 import sys
+import time
 import unittest
+from pathlib import Path
 
 from dev.tests import fixtures
 from dev.tests._w7a_tools_helpers import APP_PY, DATA, env_with, ok, tool_project
@@ -144,6 +148,66 @@ class TestRuns(unittest.TestCase):
         p = L.run("test-runs", "--review", "R-0001", "--command", "python3 -m pytest", "--actor", "A-0001")
         self.assertEqual(p.returncode, 1)
         self.assertIn("{junit}", p.stderr)
+        self.assertEqual(L.count("test_runs"), 0)
+
+    def test_export_failure_midstream_returns(self):
+        files = {f"data/f{n}.txt": random.Random(n).randbytes(300000).hex() for n in range(6)}
+        repo, L, sha = tool_project(self, files={"src/app.py": APP_PY, "tests/run.py": RUNNER, **files})
+        driver = fixtures.temp_dir("w7a-export-") / "driver.py"
+        driver.write_text(
+            "import importlib.util, shutil, sys\n"
+            "spec = importlib.util.spec_from_file_location('ledger_driver', sys.argv[1])\n"
+            "mod = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(mod)\n"
+            "real, seen = shutil.copyfileobj, []\n"
+            "def copy(*a, **k):\n"
+            "    seen.append(1)\n"
+            "    if len(seen) == 3:\n"
+            "        raise OSError(28, 'No space left on device')\n"
+            "    return real(*a, **k)\n"
+            "shutil.copyfileobj = copy\n"
+            "sys.argv = ['ledger.py', *sys.argv[2:]]\n"
+            "sys.exit(mod.main())\n", encoding="utf-8")
+        L.commit()
+
+        def archives():
+            found = []
+            for d in Path("/proc").iterdir():
+                try:
+                    words = (d / "cmdline").read_bytes().split(b"\0")
+                except OSError:
+                    continue
+                if b"archive" in words and str(repo.path).encode() in words:
+                    found.append(int(d.name))
+            return found
+
+        def kill_left():
+            for pid in archives():
+                try:
+                    os.kill(pid, 9)
+                except OSError:
+                    pass
+        self.addCleanup(kill_left)
+        started = time.monotonic()
+        try:
+            p = subprocess.run([sys.executable, str(driver), str(L.ledger_py), "--root", str(L.root), "test-runs",
+                                "--review", "R-0001", "--command", f"{sys.executable} tests/run.py {{junit}}",
+                                "--actor", "A-0001"], capture_output=True, text=True, timeout=10,
+                               env=fixtures.git_env())
+        except subprocess.TimeoutExpired:
+            self.fail(f"test-runs hung for {time.monotonic() - started:.0f} s after the export failed")
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertEqual(len(p.stderr.strip().splitlines()), 1, p.stderr)
+        self.assertIn("No space left on device", p.stderr)
+        self.assertIn("nothing was written", p.stderr)
+        con = sqlite3.connect(str(L.db), timeout=0)
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            con.execute("ROLLBACK")
+        finally:
+            con.close()
+        self.assertEqual(archives(), [])
         self.assertEqual(L.count("test_runs"), 0)
 
     def test_clock_instants_come_from_zoneinfo(self):

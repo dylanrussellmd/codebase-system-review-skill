@@ -39,7 +39,7 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote
 
 TOOL_VERSION = "1.12.0"  # stamped by dev/build.py from `metadata: version:` in SKILL.md's frontmatter
-TOOL_HASH = "5708925a0ab94812bba8bcb6700692ac34e5a8bd33e5fe79bdd28077935fa75d"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
+TOOL_HASH = "9a324b7b333f14a55978c2a620c85812e8043bfd1e17b87ef3b835f3874ee09f"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
 # Placeholders: dev/build.py puts references/schema.sql, dev/page.html and references/migrations/*.sql in their
 # place when it writes scripts/ledger.py. dev/core.py itself is never run as the tool.
 SCHEMA = r"""-- =====================================================================
@@ -9100,6 +9100,46 @@ def _lists_repo(ledger_root, tops):
     return False
 
 
+ENV_LEDGER_COMMITS = 20  # reviewed commits env_ledger_refusal looks for: the newest are enough to tell a project
+
+
+def env_ledger_refusal(db, root):
+    """Why the CODE_REVIEW_DIR ledger db is not this project's, else None. It is when, read from root, one of its
+    repositories holds a commit one of its reviews looked at; with no reviewed commit yet, when its project_name is
+    root's folder name. A ledger that lists no repository yet fits any project. Reads only."""
+    try:
+        con = connect(db, readonly=True)
+        try:
+            repos = {r["id"]: r for r in rows(con, "SELECT id, path, allow_outside_root FROM repositories")}
+            seen = rows(con, """SELECT repository_id, commit_sha FROM review_repositories
+                                GROUP BY repository_id, commit_sha ORDER BY max(review_id) DESC LIMIT ?""",
+                        (ENV_LEDGER_COMMITS,))
+            name = one(con, "SELECT value FROM meta WHERE key='project_name'")
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return None  # the command itself reports a ledger it cannot read
+    if not repos:
+        return None
+    head = f"{db} (CODE_REVIEW_DIR) is not the ledger of {root}"
+    tail = "set CODE_REVIEW_DIR on each command to this project's ledger folder, or pass --db FILE"
+    if not seen:
+        if name and name["value"] == Path(root).name:
+            return None
+        return f"{head}: it was set up for project {name['value'] if name else '(unnamed)'!r}; {tail}"
+    for r in seen:
+        repo = repos.get(r["repository_id"])
+        if repo is None:
+            continue
+        try:
+            d = repo_dir(root, repo["path"], bool(repo["allow_outside_root"]))
+            git(d, "cat-file", "-e", f"{r['commit_sha']}^{{commit}}")
+            return None
+        except (RuntimeError, OSError, ValueError, subprocess.SubprocessError):
+            continue
+    return f"{head}: none of its repositories here holds a commit it reviewed; {tail}"
+
+
 def resolve_root(start, explicit=False, script=None):
     """(project root, how it was found). how is 'explicit' (--root given), 'script' (this ledger.py is the copy in a
     project's .code-review/), 'ledger' (an existing ledger found upward), 'git' (the top of the git repository) or
@@ -9352,6 +9392,7 @@ def git(cwd, *args, timeout=GIT_TIMEOUT):
 MAX_BLOB_BYTES = 20 * 1024 * 1024  # a file larger than this is not read (fill-refs, show, /api/source)
 BLOB_SECONDS = 15  # how long one blob read may take before the reader is stopped
 GIT_EXIT_SECONDS = 5  # how long a git process that was told to stop is waited for before it is killed
+EXPORT_SECONDS = 600  # how long one export of a commit (_export_commit) may take before git is killed
 
 
 class BlobReader:
@@ -9860,6 +9901,27 @@ def check_git_refs(root, con, quiet=False):
         print(f"    note: {skipped} reviewed repositories are not here; their commits and tags were not checked")
     elif not bad and not quiet:
         print("    0  Reviewed commits missing or review tags moved")
+    return bad
+
+
+def check_patches(root, con, quiet=False):
+    """Part of `check`: each recorded patch of uncommitted changes (review_repositories.dirty_patch_path) must be on
+    disk; a relative path is taken from the project root. Returns the number of missing patches."""
+    try:
+        found = rows(con, """SELECT rv.code, rp.name, rr.dirty_patch_path FROM review_repositories rr
+                             JOIN reviews rv ON rv.id = rr.review_id JOIN repositories rp ON rp.id = rr.repository_id
+                             WHERE rr.dirty_patch_path IS NOT NULL ORDER BY rv.id, rp.id""")
+    except sqlite3.Error as e:  # an older schema (check_schema has already reported it)
+        print(f"    note: recorded patches were not checked ({e})")
+        return 0
+    bad = 0
+    for r in found:
+        p = Path(r["dirty_patch_path"])
+        if not (p if p.is_absolute() else Path(root) / p).is_file():
+            print(f"patch: {r['code']} {r['name']}: the recorded patch {r['dirty_patch_path']} is not on disk")
+            bad += 1
+    if not bad and not quiet:
+        print("    0  Recorded patches missing from disk")
     return bad
 
 
@@ -12693,13 +12755,25 @@ def snapshot_repository(root, db, review_code, repo, commit=None):
 
 def _write_patch(ctx, review_code, repo, patch):
     """Save a review's uncommitted changes to one repository as <ledger folder>/patches/<review>-<repo>.patch (owner-
-    only) and return its path; the file is removed again if the command fails."""
+    only) and return its path. The patch is written beside it as .patch.new and moved into place once the command is
+    committed, so a refused command leaves the recorded patch as it was."""
     folder = Path(ctx.db).parent / "patches"
     folder.mkdir(mode=0o700, exist_ok=True)
     make_private(folder, 0o700)
     path = folder / f"{review_code}-{re.sub(r'[^A-Za-z0-9._-]', '_', repo['name'])}.patch"
-    write_atomic(path, patch, 0o600)
-    ctx.files.append(path)
+    pending = path.with_name(path.name + ".new")
+    write_atomic(pending, patch, 0o600)
+    ctx.files.append(pending)
+
+    def put_in_place():
+        if not pending.exists():  # the same patch written twice in one command: the first call moved it
+            return
+        try:
+            os.replace(str(pending), str(path))
+        except OSError as e:
+            print(f"warning: the patch {pending} could not be moved to {path} ({e}); check reports it",
+                  file=sys.stderr)
+    ctx.after.append(put_in_place)
     try:
         return path.resolve().relative_to(Path(ctx.root).resolve()).as_posix()
     except ValueError:
@@ -18484,6 +18558,8 @@ class ToolCall:
         self.root, self.con, self.review = root, con, review  # the project root, the ledger, the review row
         self.stderr = ""
         self.placeholders = {}  # path -> placeholder, so the recorded command holds no temporary path
+        self.notes = []  # what the adapter left out and why, for the run's note
+        self.cleanup = []  # callables run once the tool has ended (they remove what holds secrets)
 
 
 TOOL_ADAPTERS = {}
@@ -20578,8 +20654,40 @@ def access_matrix(spec_text, matrix):
     return out
 
 
+HURL_REQUEST = re.compile(r"^[ \t]*([A-Z]+)[ \t]+(\S+)")  # a request line of a .hurl file: METHOD URL
+
+
+def _origin(url):
+    """(scheme, host, port) of a URL, the port filled in for http and https; None when it has none."""
+    try:
+        u = urlsplit(url)
+        port = u.port or {"http": 80, "https": 443}.get(u.scheme.lower())
+    except ValueError:
+        return None
+    return (u.scheme.lower(), (u.hostname or "").lower(), port) if u.hostname else None
+
+
+def _hurl_away(text, target):
+    """(line, address) of the first request in a .hurl file that does not go to --target: its URL starts with
+    neither {{base}} nor target's scheme, host and port. None when every request goes there."""
+    want = _origin(target)
+    for n, line in enumerate(text.splitlines(), 1):
+        m = HURL_REQUEST.match(line)
+        if not m or m.group(1) == "HTTP":
+            continue
+        url = m.group(2)
+        if re.match(r"\{\{base\}\}(?:[/?#]|$)", url):
+            continue
+        if _origin(url) != want:  # a template host ({{host}}) is another host too
+            return n, url
+    return None
+
+
 def _hurl_argv(call):
-    """Hurl's command: the generated access matrix and the project's own .hurl files, JUnit to {out}."""
+    """Hurl's command: the generated access matrix and the project's own .hurl files, JUnit to {out}. Only the
+    variables the owner's matrix names in its headers are given to hurl, from the environment, through an owner-only
+    secrets file removed after the run. A project file with a request to another host than --target is left out
+    (noted on the run) unless --online."""
     needs(call, "hurl")
     url = _target(call, "base URL of the running API")
     matrix = {}
@@ -20596,14 +20704,30 @@ def _hurl_argv(call):
         for name, text, _ in access_matrix(export_text(call.work, specs[0]), matrix):
             (folder / name).write_text(text, encoding="utf-8")
             files.append(str(folder / name))
-    files += [str(Path(call.work) / f) for f in export_files(call.work) if f.endswith(".hurl")]
+    for f in export_files(call.work):
+        if not f.endswith(".hurl"):
+            continue
+        away = None if call.online else _hurl_away(export_text(call.work, f), url)
+        if away:
+            call.notes.append(f"left out {f}:{away[0]}: its request to {away[1]} is not to --target (--online "
+                              f"allows it)")
+            continue
+        files.append(str(Path(call.work) / f))
     call.placeholders[str(folder)] = "{matrix}"
+    headers = [str(v) for role in (matrix.get("roles") or {}).values() if isinstance(role, dict)
+               for v in ((role.get("headers") or {}).values() if isinstance(role.get("headers"), dict) else ())]
+    names = sorted(set(re.findall(r"\{\{(\w+)\}\}", "\n".join(headers))) - {"base"})
     secrets = []
-    for var in sorted(set(re.findall(r"\{\{(\w+)\}\}", "".join(Path(f).read_text(encoding="utf-8")
-                                                              for f in files))) - {"base"}):
-        if var in os.environ:
-            secrets += ["--secret", f"{var}={os.environ[var]}"]
-            call.placeholders[f"{var}={os.environ[var]}"] = f"{var}={{{var}}}"
+    given = [n for n in names if n in os.environ and "\n" not in os.environ[n]]
+    if given:
+        private = Path(tempfile.mkdtemp(prefix="ledger-hurl-"))  # owner-only, outside the export
+        call.cleanup.append(lambda: shutil.rmtree(private, ignore_errors=True))
+        f = private / "secrets.env"
+        fd = os.open(str(f), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with open(fd, "w", encoding="utf-8") as out:
+            out.write("".join(f"{n}={os.environ[n]}\n" for n in given))
+        call.placeholders[str(f)] = "{secrets}"
+        secrets = ["--secrets-file", str(f)]
     return ["hurl", "--test", "--no-color", "--variable", f"base={url}", *secrets, "--report-junit", str(call.out),
             *files]
 
@@ -20881,12 +21005,24 @@ def _schema_files(files):
     return sorted(sql, key=lambda f: (0 if "schema" in f.lower() else 1, f))
 
 
+def _inert_sql_authorizer(action, *rest):
+    """Repository SQL may only build and read its own in-memory database: no ATTACH (VACUUM INTO attaches too), no
+    DETACH, no PRAGMA."""
+    if action in (sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH, sqlite3.SQLITE_PRAGMA):
+        return sqlite3.SQLITE_DENY
+    return sqlite3.SQLITE_OK
+
+
 def query_plan(call):
     """The built-in SQLite planner check: the commit's .sql files applied to an empty in-memory database, then
-    EXPLAIN QUERY PLAN for each query the code holds. JSON, sorted."""
+    EXPLAIN QUERY PLAN for each query the code holds. JSON, sorted. The files run with extensions off and no ATTACH,
+    DETACH or PRAGMA (_inert_sql_authorizer); a file that tries one is recorded under failed."""
     needs(call, "query-plan")
     files = export_files(call.work)
     con = sqlite3.connect(":memory:")
+    if hasattr(con, "enable_load_extension"):
+        con.enable_load_extension(False)
+    con.set_authorizer(_inert_sql_authorizer)
     applied, failed, queries = [], [], []
     try:
         for f in _schema_files(files):
@@ -20955,10 +21091,86 @@ tool_adapter("query-plan", fmt="json", parse=parse_query_plan, domain="database"
              step=224)
 
 
+PSQL_META = re.compile(r"(?:^|;)[ \t]*\\", re.M)  # a psql meta-command: a backslash at line start or after a ;
+PSQL_ARG_BYTES = 100000  # the most SQL one psql -c argument carries (Linux refuses one argument over 128 KiB)
+PSQL_CALL_BYTES = 1000000  # the most SQL one psql process is given: a schema of many statements takes a few
+
+
+def sql_statements(text):
+    """The statements of an SQL text, split at each ; outside quotes ('...', E'...', "...", $tag$...$tag$) and
+    comments, each stripped; a piece that is only comments is left out."""
+    out, start, i, n, code = [], 0, 0, len(text), False
+    while i < n:
+        c = text[i]
+        if c == "-" and text.startswith("--", i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j + 1
+            continue
+        if c == "/" and text.startswith("/*", i):
+            depth, i = 1, i + 2
+            while i < n and depth:
+                if text.startswith("/*", i):
+                    depth, i = depth + 1, i + 2
+                elif text.startswith("*/", i):
+                    depth, i = depth - 1, i + 2
+                else:
+                    i += 1
+            continue
+        if c in "'\"":
+            escapes = c == "'" and i > 0 and text[i - 1] in "eE" and not (text[i - 2:i - 1].isalnum() if i > 1
+                                                                            else False)
+            i += 1
+            while i < n:
+                if escapes and text[i] == "\\":
+                    i += 2
+                elif text[i] == c:
+                    if text[i + 1:i + 2] == c:
+                        i += 2
+                    else:
+                        break
+                else:
+                    i += 1
+            i += 1
+            code = True
+            continue
+        m = re.match(r"\$([A-Za-z_][A-Za-z_0-9]*)?\$", text[i:i + 64]) if c == "$" else None
+        if m and not (i and (text[i - 1].isalnum() or text[i - 1] == "_")):
+            j = text.find(m.group(0), i + len(m.group(0)))
+            i = n if j < 0 else j + len(m.group(0))
+            code = True
+            continue
+        if c == ";":
+            if code:
+                out.append(text[start:i].strip())
+            start, code = i + 1, False
+        elif not c.isspace():
+            code = True
+        i += 1
+    if code and text[start:].strip():
+        out.append(text[start:].strip())
+    return out
+
+
+def psql_refusal(text):
+    """Why SQL text is not given to psql: the line of a backslash at line start or after a semicolon (a psql
+    meta-command, such as \\! that runs a shell command), or a statement too long for one argument. None when
+    it may go."""
+    m = PSQL_META.search(text)
+    if m:
+        return f"line {text.count(chr(10), 0, m.end()) + 1} holds a psql meta-command (a backslash at line start " \
+               f"or after a semicolon); the file was not run"
+    big = next((s for s in sql_statements(text) if len(s.encode("utf-8")) > PSQL_ARG_BYTES), None)
+    if big:
+        return f"a statement is longer than {PSQL_ARG_BYTES} bytes; the file was not run"
+    return None
+
+
 def pg_explain(call):
     """PostgreSQL EXPLAIN on a throwaway database: created on --target's server, given the commit's .sql files, each
     query's generic plan (GENERIC_PLAN, PostgreSQL 16 or later) explained with sequential scans off (so a Seq Scan
-    means no index fits), then dropped."""
+    means no index fits), then dropped. Repository SQL reaches psql only as -c arguments, one statement each, which
+    psql sends to the server as they are (never through its meta-command parser); a file or query holding a
+    backslash at line start or after a semicolon is recorded under failed and not run."""
     needs(call, "pg-explain")
     url = _target(call, "postgresql:// address of a PostgreSQL server where a throwaway database may be created")
     exe = shutil.which("psql") or "psql"
@@ -20966,12 +21178,13 @@ def pg_explain(call):
     parts = urlsplit(url)
     db_url = parts._replace(path="/" + name).geturl()
 
-    def psql(target, *args, sql=None):
-        p = subprocess.run([exe, target, "-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1", *args],
-                           input=sql.encode("utf-8") if sql is not None else None, capture_output=True,
-                           timeout=EXPLAIN_SECONDS, env=_tool_env(False))
+    def psql(target, *commands):
+        args = [a for c in commands for a in ("-c", c)]
+        p = subprocess.run([exe, target, "-X", "--no-psqlrc", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1", *args],
+                           stdin=subprocess.DEVNULL, capture_output=True, timeout=EXPLAIN_SECONDS,
+                           env=_tool_env(False))
         return p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
-    code, _, err = psql(url, "-c", f'CREATE DATABASE "{name}"')
+    code, _, err = psql(url, f'CREATE DATABASE "{name}"')
     if code != 0:
         call.stderr = err
         return code, b""
@@ -20979,12 +21192,31 @@ def pg_explain(call):
     applied, failed, queries, version = [], [], [], ""
     try:
         for f in _schema_files(files):
-            code, _, err = psql(db_url, "-f", "-", sql=export_text(call.work, f))
+            text = export_text(call.work, f)
+            why = psql_refusal(text)
+            if why:
+                failed.append({"file": f, "error": why})
+                continue
+            batch, size, code, err = [], 0, 0, ""
+            for stmt in sql_statements(text) + [None]:
+                if batch and (stmt is None or size + len(stmt.encode("utf-8")) > PSQL_CALL_BYTES):
+                    code, _, err = psql(db_url, *batch)
+                    batch, size = [], 0
+                    if code != 0:
+                        break
+                if stmt is not None:
+                    batch.append(stmt)
+                    size += len(stmt.encode("utf-8"))
             (applied.append(f) if code == 0 else failed.append({"file": f, "error": _one_line(err)[:300]}))
         for path, line, sql in sql_queries(call.work, files, call.rules):
             entry = {"path": path, "line": line, "sql": sql[:500]}
-            code, out, err = psql(db_url, sql="SET enable_seqscan = off;\nEXPLAIN (FORMAT JSON, GENERIC_PLAN) "
-                                  + _numbered(sql, "postgres")[0] + ";\n")
+            why = psql_refusal(sql)
+            if why:
+                entry["error"] = why
+                queries.append(entry)
+                continue
+            code, out, err = psql(db_url, "SET enable_seqscan = off",
+                                  "EXPLAIN (FORMAT JSON, GENERIC_PLAN) " + _numbered(sql, "postgres")[0])
             try:
                 entry["plan"] = json.loads(out) if code == 0 else None
             except ValueError:
@@ -20993,9 +21225,9 @@ def pg_explain(call):
                 entry.pop("plan")
                 entry["error"] = _one_line(err)[:300] or "no plan"
             queries.append(entry)
-        code, version, _ = psql(db_url, "-c", "SHOW server_version")
+        code, version, _ = psql(db_url, "SHOW server_version")
     finally:
-        psql(url, "-c", f'DROP DATABASE IF EXISTS "{name}"')
+        psql(url, f'DROP DATABASE IF EXISTS "{name}"')
     doc = {"engine": f"postgresql {version.strip()}", "applied": applied, "failed": failed, "queries": queries}
     return 0, (json.dumps(doc, indent=1, sort_keys=True) + "\n").encode("utf-8"), \
         ["psql", "{target}", "-c", "EXPLAIN (FORMAT JSON, GENERIC_PLAN) ...", "(on a throwaway database)"]
@@ -21314,32 +21546,62 @@ tool_adapter("pseudo-locale", fmt="json", parse=parse_pseudo_locale, domain="loc
 
 
 def _export_commit(repo_dir, sha, into):
-    """Write the files of a commit into an empty folder with `git archive` (no symlink is followed out of it)."""
+    """Write the files of a commit into an empty folder with `git archive` (no symlink is followed out of it). Any
+    failure, or an export that takes longer than EXPORT_SECONDS, kills git first and raises WriteError."""
     p = subprocess.Popen(["git", "-C", str(repo_dir), "archive", "--format=tar", sha], stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE)
+    late = threading.Event()
+
+    def stop():
+        late.set()
+        p.kill()
+    timer = threading.Timer(EXPORT_SECONDS, stop)
+    timer.daemon = True
+    timer.start()
     base = Path(into).resolve()
     try:
-        with tarfile.open(fileobj=p.stdout, mode="r|") as tar:
-            for m in tar:
-                target = (base / m.name).resolve()
-                if m.name.startswith("/") or ".." in Path(m.name).parts or base not in (target, *target.parents):
-                    continue
-                if m.isdir():
-                    target.mkdir(parents=True, exist_ok=True)
-                elif m.isfile():
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    src = tar.extractfile(m)
-                    with open(target, "wb") as f:
-                        shutil.copyfileobj(src, f)
-                    if m.mode & 0o111:
-                        target.chmod(0o755)
-                # symlinks and other members are left out: a tool reads the commit's regular files
+        try:
+            with tarfile.open(fileobj=p.stdout, mode="r|") as tar:
+                for m in tar:
+                    target = (base / m.name).resolve()
+                    if m.name.startswith("/") or ".." in Path(m.name).parts or base not in (target, *target.parents):
+                        continue
+                    if m.isdir():
+                        target.mkdir(parents=True, exist_ok=True)
+                    elif m.isfile():
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        src = tar.extractfile(m)
+                        with open(target, "wb") as f:
+                            shutil.copyfileobj(src, f)
+                        if m.mode & 0o111:
+                            target.chmod(0o755)
+                    # symlinks and other members are left out: a tool reads the commit's regular files
+        except BaseException as e:
+            p.kill()  # first: git blocks on a full pipe, so its stderr never ends while it lives
+            try:
+                p.communicate(timeout=GIT_EXIT_SECONDS)
+            except subprocess.TimeoutExpired:
+                pass
+            if not isinstance(e, Exception):
+                raise
+            if late.is_set():
+                raise WriteError(f"exporting commit {sha[:12]} took longer than {EXPORT_SECONDS} s") from e
+            raise WriteError(f"cannot export commit {sha[:12]}: {_one_line(e)}") from e
+        try:
+            err = p.communicate(timeout=GIT_EXIT_SECONDS)[1] or b""
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.communicate()
+            err = b"git did not exit"
+        if late.is_set():
+            raise WriteError(f"exporting commit {sha[:12]} took longer than {EXPORT_SECONDS} s")
+        if p.returncode != 0:
+            raise WriteError(f"git archive {sha[:12]} failed: {err.decode('utf-8', 'replace').strip()}")
     finally:
-        err = p.stderr.read()
-        p.stdout.close()
-        p.stderr.close()
-        if p.wait() != 0:
-            raise RuntimeError(f"git archive {sha[:12]} failed: {err.decode('utf-8', 'replace').strip()}")
+        timer.cancel()
+        for f in (p.stdout, p.stderr):
+            if f:
+                f.close()
 
 
 def _tool_env(online):
@@ -21361,6 +21623,15 @@ def _command_text(argv, call):
             w = w.replace(path, ph)
         words.append(w)
     return " ".join(shlex.quote(w) if not re.fullmatch(r"[{}A-Za-z0-9_@%+=:,./-]+", w) else w for w in words)
+
+
+def _end_call(call):
+    """Run the call's cleanup callables (each once), whatever happened to the tool."""
+    while call.cleanup:
+        try:
+            call.cleanup.pop()()
+        except OSError:
+            pass
 
 
 def _run_adapter(ad, call):
@@ -21567,23 +21838,31 @@ def cmd_tool_run(ctx):
         try:
             code, data, command, ms = _run_adapter(ad, call)
         except ToolSkip as e:
+            _end_call(call)
             run_id, _, _ = record_tool_run(ctx, rv, repo, sha, ad.name, **{**base, "status": "skipped",
                                            "version": version, "fallback": f"{e}; meanwhile: {ad.fallback}"})
             return [f"tool run {run_id}: {ad.name} not run: {e}"]
+        except BaseException:
+            _end_call(call)
+            raise
+        _end_call(call)
+        left = "; ".join(call.notes) or None
         rules = call.rules if call.rules else rules
         if code not in ad.ok_exits or (not data.strip() and ad.fmt not in ("json", "jsonl")):
             why = (getattr(call, "stderr", "") or "").strip().split("\n")[-1][:300] or "no output"
             run_id, _, _ = record_tool_run(ctx, rv, repo, sha, ad.name, **{**base, "status": "failed",
                                            "version": version, "command": command, "exit_code": code,
                                            "duration_ms": ms, "rules": rules,
-                                           "fallback": ad.fallback, "note": f"exit {code}: {why}"})
+                                           "fallback": ad.fallback,
+                                           "note": f"exit {code}: {why}" + (f"; {left}" if left else "")})
             return [f"tool run {run_id}: {ad.name} failed (exit {code}: {why}); instead: {ad.fallback}"]
         parsed = ad.parse(data, call)
         run_id, codes, out = record_tool_run(ctx, rv, repo, sha, ad.name, **{
             **base, "status": "ran", "fmt": ad.fmt, "data": data, "parsed": parsed,
             "version": version or parsed.get("version"), "command": command, "exit_code": code, "duration_ms": ms,
-            "rules": rules, "store": ad.store, "note": a.note or (f"version differs from the pin ({pinned})"
-                                                                   if pinned and version != pinned else None)})
+            "rules": rules, "store": ad.store,
+            "note": "; ".join(n for n in (a.note, f"version differs from the pin ({pinned})"
+                                          if pinned and version != pinned else None, left) if n) or None})
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     return [f"tool run {run_id}: {ad.name} {version or ''}".rstrip() + (f" (pinned {pinned})" if pinned else "")
@@ -21960,6 +22239,10 @@ def _main():
         db, where = Path(env_dir).expanduser().resolve() / "ledger.sqlite", "env"
     else:
         db, where = root / ".code-review" / "ledger.sqlite", "default"
+    if where == "env" and db.exists():
+        refusal = env_ledger_refusal(db, root)
+        if refusal:
+            sys.exit(f"{a.cmd}: {refusal}; nothing was written")
     if a.cmd == "init":
         print(f"project root: {root}")
         if how == "start" and where == "default":
@@ -21997,6 +22280,7 @@ def _main():
         try:
             bad = check(con, quiet=a.quiet, full=a.full)
             bad += check_git_refs(root, con, quiet=a.quiet)
+            bad += check_patches(root, con, quiet=a.quiet)
             bad += check_guard_refs(root, con, quiet=a.quiet)
             if import_reminder(con):
                 print(import_reminder(con))

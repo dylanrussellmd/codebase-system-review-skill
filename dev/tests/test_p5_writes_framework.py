@@ -145,6 +145,36 @@ class SnapshotTest(unittest.TestCase):
         check.git("apply", str(L.root / row["dirty_patch_path"]))
         self.assertEqual(check.read("src/new.py"), "B-UNTRACKED\n")
 
+    def test_refused_snapshot_keeps_recorded_patch(self):
+        repo, L, sha = project(self, approved=False)
+        other = fixtures.ScratchRepo(L.root / "other")
+        other.write("o.txt", "o\n")
+        other.commit("o")
+        ok(L, "add-repo", "other", "other")
+        repo.write("src/app.py", APP.replace("line 2\n", "FIRST\n"))
+        ok(L, "snapshot", "R-0001", "--repo", "demo")
+        recorded = L.root / L.scalar("SELECT dirty_patch_path FROM review_repositories")
+        before = recorded.read_bytes()
+        repo.write("src/app.py", APP.replace("line 2\n", "SECOND\n"))
+        self.assertIn("is not in the repository",
+                      refused(self, L, "snapshot", "R-0001", "--repo", "demo", "--repo", "other@0123abc"))
+        self.assertEqual(recorded.read_bytes(), before)
+        self.assertEqual(sorted(f.name for f in recorded.parent.iterdir()), [recorded.name])
+        ok(L, "snapshot", "R-0001", "--repo", "demo")
+        self.assertIn(b"+SECOND", recorded.read_bytes())
+
+    def test_check_reports_missing_patch(self):
+        repo, L, sha = project(self, approved=False)
+        repo.write("src/app.py", APP.replace("line 2\n", "CHANGED\n"))
+        ok(L, "snapshot", "R-0001")
+        self.assertEqual(L.run("check").returncode, 0)
+        path = L.scalar("SELECT dirty_patch_path FROM review_repositories")
+        (L.root / path).unlink()
+        p = L.run("check")
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertIn(path, p.stdout)
+        self.assertIn("R-0001", p.stdout)
+
     def test_fill_refs_dirty_repo_uses_reviewed_text(self):
         repo, L, sha = project(self)
         repo.write("src/app.py", APP.replace("line 2\n", "B2-UNCOMMITTED\n"))
