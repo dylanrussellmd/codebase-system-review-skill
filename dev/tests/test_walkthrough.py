@@ -158,7 +158,7 @@ class Walkthrough(unittest.TestCase):
             answers = self.file(f"reviews/{review}", "answers.json", [json.dumps(
                 [{"gate": gate, "answer_value": "approve", "answer_text": "Go ahead",
                   "answered_at": "2026-11-11T10:00:00.000Z"}])])
-            self.run_cmd("import-answers", answers)
+            self.run_cmd("import-answers", answers, "--yes")
             self.assertEqual(self.query(f"SELECT status, answer_value, answered_via FROM gates WHERE code='{gate}'"),
                              [["answered", "approve", "viewer"]])
         else:
@@ -284,7 +284,7 @@ class Walkthrough(unittest.TestCase):
         # --- Step 3: snapshot; each run's prompt generated (prompt), recorded with add-run; running. No subagent
         #     tool: the manager runs each scope itself, from the same prompt.
         self.assertIn("clean", self.run_cmd("snapshot", r1, "--actor", mgr))
-        for domain, label in (("spec", "spec-A"), ("tests", "tests-A"), ("features", "features-A")):
+        for domain, label in (("spec", "spec-A"), ("tests", "tests-A"), ("ui", "ui-A"), ("features", "features-A")):
             prompt = self.root / ".code-review" / "reviews" / r1 / f"prompt-{label}.txt"
             self.run_cmd("prompt", "--review", r1, "--domain", domain, "--scope", "everything", "--out", prompt)
             self.assertIn(f"goals --domain {domain}", prompt.read_text(encoding="utf-8"))
@@ -327,6 +327,9 @@ class Walkthrough(unittest.TestCase):
         self.assertIn("1 proposal", self.run_cmd("lint-report", report, "--domain", "features", "--review", r1,
                                                  "--record", "--actor", mgr))
         self.run_cmd("finish-run", r1, "features-A", "--report", report, "--items", "1", "--actor", mgr)
+        # Every included domain runs before consolidating (v_review_gaps): the ui reviewer found nothing.
+        ui = self.file(f"reviews/{r1}", "ui.md", ["# ui", "", "No pages in this project; nothing to report."])
+        self.run_cmd("finish-run", r1, "ui-A", "--report", ui, "--items", "0", "--actor", mgr)
         self.assertEqual(self.query("SELECT count(DISTINCT check_code) FROM checklist_answers")[0][0],
                          len(self.query("SELECT code FROM domain_checks WHERE domain_code IN ('spec','tests','features')")))
         self.code("add-actor", "verifier", "verifier 1", "--model", SUBMODEL, "--parent", mgr, "--review", r1,
@@ -591,6 +594,7 @@ class Walkthrough(unittest.TestCase):
         # --- Step 6 and 7.
         self.run_cmd("review-status", r2, "consolidating", "--note", "writing the review", "--actor", mgr)
         self.run_cmd("set-report", r2, self.file(f"reviews/{r2}", "review.md", ["# R-0002", "", "Three verified."]))
+        self.run_cmd("set-verdict", r2, "--verdict", "The fixes hold.", "--actor", mgr)
         self.run_cmd("check", "--quiet")
         self.run_cmd("dump")
         self.run_cmd("review-status", r2, "handed-off", "--note", "handed off to the owner", "--actor", mgr)

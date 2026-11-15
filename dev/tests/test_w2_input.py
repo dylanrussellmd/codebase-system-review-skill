@@ -123,7 +123,7 @@ class AnswerRules(unittest.TestCase):
     def imported(self, code, value=None, text=None):
         f = fixtures.temp_dir() / "answers.json"
         f.write_text(json.dumps({code: {"answer_value": value, "answer_text": text}}), encoding="utf-8")
-        p = self.L.run("import-answers", str(f))
+        p = self.L.run("import-answers", str(f), "--yes")
         return (200 if p.returncode == 0 and "left as it is" not in p.stdout else 400), p.stdout + p.stderr
 
     def gate(self, code):

@@ -443,6 +443,12 @@ A tool lead nobody judged. Give it to its domain's reviewer (the prompt lists it
 location covers its lines addresses it; else `ledger.py cite-lead LD-0001 R-0001:SEC-H3`, or
 `ledger.py dismiss-lead LD-0001 --reason '<why it is not a finding>'` (`references/tools.md#how-a-tool-is-wired-in`).
 
+#### `v_incomplete_reviews`
+
+A review handed off before it was complete, or consolidating with an included domain no run finished. Each row
+names what is missing: run the domain, finish the run, `set-report`, `set-verdict`, answer the gate, or fix the
+review check it names. `review-status` refuses consolidating and handed-off for the same reasons (`v_review_gaps`).
+
 #### `quick_check`
 
 The file is damaged. Stop writing. `ledger.py restore .code-review/ledger.sql --to /tmp/check.sqlite` rebuilds the last

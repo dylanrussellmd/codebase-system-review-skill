@@ -109,7 +109,7 @@ class HubPage(unittest.TestCase):
         self.assertClean(p, "after answering")
         f = L.root / "answers.json"
         f.write_text(json.dumps([{"id": k, "data": v} for k, v in saved.items()]))
-        out = L.run_ok("import-answers", str(f)).stdout
+        out = L.run_ok("import-answers", str(f), "--yes").stdout
         self.assertIn(f"{code}: recorded", out)
         self.assertEqual(L.scalar("SELECT answered_via FROM gates WHERE code=?", (code,)), "viewer")
 

@@ -161,7 +161,7 @@ class ImportAnswers(unittest.TestCase):
         f = self.write([{"gate": "GATE-0001", "answer_value": "b", "answer_text": None,
                          "answered_at": "2026-11-11T10:00:00.000Z"},
                         {"id": "GATE-0002", "data": {"answer_value": None, "answer_text": "Ship it"}}])
-        p = L.run_ok("import-answers", str(f))
+        p = L.run_ok("import-answers", str(f), "--yes")
         self.assertIn("GATE-0001: recorded", p.stdout)
         self.assertIn("GATE-0002: recorded", p.stdout)
         self.assertIn("import-answers: 2 recorded, 0 already answered, 0 refused", p.stdout)
@@ -171,12 +171,12 @@ class ImportAnswers(unittest.TestCase):
         self.assertEqual((g["status"], g["answer_text"], g["answered_via"]), ("answered", "Ship it", "viewer"))
         self.assertEqual(self.gate("GATE-0003")["status"], "open")
         # importing the same file again changes nothing
-        p = L.run_ok("import-answers", str(f))
+        p = L.run_ok("import-answers", str(f), "--yes")
         self.assertIn("GATE-0001: already answered or closed; left as it is", p.stdout)
         # a choice that is not an option, a gate that does not exist, and junk are refused (exit 1)
         f = self.write({"answers": {"GATE-0003": {"answer_value": "zzz"}, "GATE-0099": {"answer_text": "x"},
                                     "nonsense": {"answer_text": "x"}}})
-        p = L.run("import-answers", str(f))
+        p = L.run("import-answers", str(f), "--yes")
         self.assertEqual(p.returncode, 1)
         self.assertIn("GATE-0003: not recorded: That choice is not one of the options.", p.stdout)
         self.assertIn("GATE-0099: not recorded: no such gate", p.stdout)
@@ -186,12 +186,71 @@ class ImportAnswers(unittest.TestCase):
         self.assertEqual(p.returncode, 1)
         self.assertIn("cannot read", p.stderr)
 
+    def test_import_answers_needs_yes(self):
+        """Without --yes import-answers lists what it would record and writes nothing; with --yes it records (ISS-0427)."""
+        L = self.L
+        f = self.write([{"gate": "GATE-0001", "answer_value": "b"}, {"gate": "GATE-0002", "answer_text": "Ship it"},
+                        {"gate": "GATE-0003", "answer_value": "zzz"}])
+        before = L.scalar("SELECT count(*) FROM events")
+        p = L.run("import-answers", str(f))
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)   # GATE-0003's answer is refused
+        self.assertIn("GATE-0001: would record b", p.stdout)
+        self.assertIn("GATE-0002: would record \"Ship it\"", p.stdout)
+        self.assertIn("GATE-0003: not recorded: That choice is not one of the options.", p.stdout)
+        self.assertIn("nothing was written", p.stdout)
+        self.assertIn("--yes", p.stdout)
+        self.assertEqual([self.gate(c)["status"] for c in ("GATE-0001", "GATE-0002", "GATE-0003")], ["open"] * 3)
+        self.assertEqual(L.scalar("SELECT count(*) FROM events"), before)
+        p = L.run("import-answers", str(f), "--yes")
+        self.assertIn("import-answers: 2 recorded, 0 already answered, 1 refused", p.stdout)
+        self.assertEqual([self.gate(c)["status"] for c in ("GATE-0001", "GATE-0002", "GATE-0003")],
+                         ["answered", "answered", "open"])
+
+    def hub_answers(self, L, answers):
+        """What the hub of L saves for each {gate code: answer value}: the answer with the hub's ledger id and the
+        gate's created_at (page.html, hubGateBody)."""
+        html, _ = L.module.hub_page(L.root, L.db)
+        snap = snapshot_of(html)
+        made = {g["code"]: g["created_at"] for g in snap["responses"]["gates?status=pending"]["gates"]}
+        return [{"gate": c, "answer_value": v, "answer_text": None, "answered_at": "2026-11-11T10:00:00.000Z",
+                 "ledger_id": snap["ledger_id"], "gate_created_at": made[c]} for c, v in answers.items()]
+
+    def test_import_answers_refuses_other_ledger(self):
+        """Answers saved by ledger A's hub are refused by ledger B, whose gates have the same codes (ISS-0427)."""
+        A = self.L
+        B = Ledger()
+        self.addCleanup(B.repo.cleanup)
+        self.addCleanup(B.close)
+        opts = json.dumps([{"value": "a", "label": "Option A"}, {"value": "b", "label": "Option B"}])
+        B.gate("GATE-0001", title="Pick one", options=opts, allow_text=0)
+        B.commit()
+        self.assertNotEqual(A.scalar("SELECT value FROM meta WHERE key='ledger_id'"),
+                            B.scalar("SELECT value FROM meta WHERE key='ledger_id'"))
+        f = self.write(self.hub_answers(A, {"GATE-0001": "b"}))
+        p = B.run("import-answers", str(f), "--yes")
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertIn("GATE-0001: not recorded: the answer was saved by the hub of another ledger", p.stdout)
+        self.assertEqual(B.scalar("SELECT status FROM gates WHERE code='GATE-0001'"), "open")
+        with self.subTest("an answer to another gate of the same code"):
+            answers = self.hub_answers(A, {"GATE-0001": "b"})
+            answers[0]["gate_created_at"] = "2020-01-01T00:00:00.000Z"
+            p = A.run("import-answers", str(self.write(answers)), "--yes")
+            self.assertIn("GATE-0001: not recorded: the answer is to another question", p.stdout)
+            self.assertEqual(self.gate("GATE-0001")["status"], "open")
+
+    def test_import_answers_accepts_own_hub(self):
+        L = self.L
+        p = L.run("import-answers", str(self.write(self.hub_answers(L, {"GATE-0001": "b", "GATE-0003": "a"}))),
+                  "--yes")
+        self.assertIn("import-answers: 2 recorded, 0 already answered, 0 refused", p.stdout)
+        self.assertEqual((self.gate("GATE-0001")["status"], self.gate("GATE-0003")["answer_value"]), ("answered", "a"))
+
     def test_hub_answers_round_trip(self):
         L = self.L
         # the hub's database holds one document per answered gate (what hubGateBody writes)
         docs = [{"id": "GATE-0003", "data": {"gate": "GATE-0003", "answer_value": "a", "answer_text": "because",
                                              "answered_at": "2026-11-11T10:00:00.000Z"}}]
-        L.run_ok("import-answers", str(self.write(docs)))
+        L.run_ok("import-answers", str(self.write(docs)), "--yes")
         g = self.gate("GATE-0003")
         self.assertEqual((g["status"], g["answer_value"], g["answer_text"]), ("answered", "a", "because"))
         L.x("UPDATE gates SET status='applied', applied_note='Did A.' WHERE code='GATE-0003'")

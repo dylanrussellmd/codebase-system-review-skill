@@ -263,7 +263,8 @@ async function hubInit(){
 }
 // The answers kept in this browser as a file for the agent (import-answers takes this list as it is).
 function answersFile(){
-  const list = Object.entries(HUB.answers).map(([gate, a]) => ({gate, answer_value: a.answer_value ?? null, answer_text: a.answer_text ?? null, answered_at: a.answered_at || null}));
+  const list = Object.entries(HUB.answers).map(([gate, a]) => ({gate, answer_value: a.answer_value ?? null, answer_text: a.answer_text ?? null, answered_at: a.answered_at || null,
+    ledger_id: a.ledger_id || null, gate_created_at: a.gate_created_at || null, snapshot_taken: a.snapshot_taken || null}));
   const href = URL.createObjectURL(new Blob([JSON.stringify(list, null, 1)], {type: "application/json"}));
   return h("a", {href, download: "answers.json"}, "Download your answers");
 }
@@ -311,7 +312,8 @@ function hubGateBody(card, g, hid){
     if (!g.multi && !val && !txt) { put(msg, errorBox("Choose an option or write an answer.")); return; }
     send.disabled = true;
     try {
-      const a = {gate: g.code, answer_value: val, answer_text: txt || null, answered_at: new Date().toISOString()};
+      const a = {gate: g.code, answer_value: val, answer_text: txt || null, answered_at: new Date().toISOString(),
+                 ledger_id: STATIC.ledger_id || null, gate_created_at: g.created_at || null, snapshot_taken: STATIC.taken || null};
       await HUB.store.save(g.code, a);
       HUB.answers[g.code] = a;
       put(form, h("p", {class: "status"}, HUB.store.local ? "Saved in this browser." : "Saved.", HANDOVER()));

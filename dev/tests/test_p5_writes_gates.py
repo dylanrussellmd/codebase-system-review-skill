@@ -122,5 +122,75 @@ class GateCommandsTest(unittest.TestCase):
                          {"ok": True})
 
 
+class OwnerAnswersTest(unittest.TestCase):
+    """Only the owner or another human answers a gate, decides a decision or rejects a goal (ISS-0427)."""
+
+    def test_owner_gates_answered_by_owner_only(self):
+        L = gate_ledger(self)   # A-0001 is the manager
+        ok(L, "add-actor", "human", "Ann")   # A-0002
+        for kind, extra in (("production-action", ()), ("decision", OPTS), ("other", ())):
+            with self.subTest(kind=kind):
+                gate = ok(L, "open-gate", kind, "--title", "T", "--question", "Q", *extra)[0]
+                answer = ("--value", "keep") if extra else ("--text", "go ahead")
+                before = counts(L, "events", "gates", "actors")
+                self.assertIn("owner", refused(self, L, "answer-gate", gate, *answer, "--by", "A-0001"))
+                self.assertEqual(counts(L, "events", "gates", "actors"), before)
+                self.assertEqual(L.scalar("SELECT status FROM gates WHERE code=?", (gate,)), "open")
+                ok(L, "answer-gate", gate, *answer, "--by", "A-0002")
+                self.assertEqual(L.scalar("SELECT answered_by_actor_id FROM gates WHERE code=?", (gate,)), 2)
+        with self.subTest("the schema holds the same rule"):
+            gid = L.gate(kind="other")
+            with self.assertRaisesRegex(Exception, "answered by the owner"):
+                L.x("UPDATE gates SET status='answered', answer_text='yes', answered_by_actor_id=1 WHERE id=?", (gid,))
+            L.con.rollback()
+            did = L.insert("decisions", code="D-0001", question="Which?", status="open")
+            with self.assertRaisesRegex(Exception, "decided by the owner"):
+                L.x("UPDATE decisions SET status='decided', answer='a', decided_by_actor_id=1 WHERE id=?", (did,))
+            L.con.rollback()
+
+    def test_apply_refuses_unconfirmed_viewer_production_action(self):
+        """A production-action or accept-risk answer from the viewer is applied only after the owner confirms it in
+        chat (answer-gate --confirm); a chat answer applies at once (ISS-0427)."""
+        L = gate_ledger(self)
+        for kind in ("production-action", "accept-risk"):
+            with self.subTest(kind=kind):
+                gate = ok(L, "open-gate", kind, "--title", "Deploy?", "--question", "Deploy to production?")[0]
+                L.module.answer_gate(L.con, gate, None, "yes, deploy", via="viewer")
+                L.commit()
+                before = counts(L, "events", "gates")
+                self.assertIn("--confirm", refused(self, L, "apply-gate", gate, "--note", "deployed"))
+                self.assertEqual(counts(L, "events", "gates"), before)
+                with self.assertRaisesRegex(Exception, "confirmed by the owner in chat"):
+                    L.x("UPDATE gates SET status='applied', applied_note='x' WHERE code=?", (gate,))
+                L.con.rollback()
+                self.assertIn("owner", refused(self, L, "answer-gate", gate, "--confirm", "--by", "A-0001"))
+                ok(L, "answer-gate", gate, "--confirm", "--text", "yes, go")
+                g = L.one("SELECT confirmed_at, confirmed_by_actor_id FROM gates WHERE code=?", (gate,))
+                self.assertIsNotNone(g["confirmed_at"])
+                self.assertIn("answer-confirmed", [e[2] for e in L.events("gate", L.id_of("gates", gate))])
+                ok(L, "apply-gate", gate, "--note", "deployed")
+        with self.subTest("an answer given in chat needs no confirmation"):
+            gate = ok(L, "open-gate", "production-action", "--title", "Deploy?", "--question", "Deploy?")[0]
+            ok(L, "answer-gate", gate, "--text", "yes")
+            self.assertIn("in chat", refused(self, L, "answer-gate", gate, "--confirm"))
+            ok(L, "apply-gate", gate, "--note", "deployed")
+
+    def test_reject_goal_needs_owner(self):
+        L = gate_ledger(self)   # A-0001 is the manager
+        ok(L, "add-actor", "owner", "the owner")   # A-0002
+        ok(L, "propose-goal", "--domain", "spec", "Answers are kept.", "--review", "R-0001", "--gate")
+        gate = L.scalar("SELECT g.code FROM gates g JOIN design_goals d ON d.gate_id = g.id")
+        self.assertIn("owner", refused(self, L, "reject-goal", "G-01", "--note", "no", "--actor", "A-0001"))
+        self.assertIn("owner", refused(self, L, "reject-goal", "G-01", "--note", "no"))
+        self.assertEqual(L.scalar("SELECT status FROM gates WHERE code=?", (gate,)), "open")
+        self.assertEqual(L.scalar("SELECT status FROM design_goals"), "proposed")
+        with self.assertRaisesRegex(Exception, "rejected by the owner"):
+            L.x("UPDATE design_goals SET status='rejected', note='no', change_actor_id=1")
+        L.con.rollback()
+        ok(L, "reject-goal", "G-01", "--note", "not needed", "--actor", "A-0002")
+        self.assertEqual(L.scalar("SELECT status FROM design_goals"), "rejected")
+        self.assertNotEqual(L.scalar("SELECT status FROM gates WHERE code=?", (gate,)), "open")
+
+
 if __name__ == "__main__":
     unittest.main()

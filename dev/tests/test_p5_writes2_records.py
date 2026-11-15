@@ -240,7 +240,7 @@ class FixWritesTest(unittest.TestCase):
                           {"test_name": "App::test_keeps_quotes", "step_id": 1, "failed_before_fix": 1,
                            "passes_after_fix": 1}])
         L.x("UPDATE issues SET status='fixed', after_state='ok', change_note='done' WHERE code='ISS-0001'")
-        L.x("UPDATE review_repositories SET commit_sha=?", (fix,))
+        L.unguarded("review_repositories", "UPDATE review_repositories SET commit_sha=?", (fix,))
         L.commit()
         self.assertEqual(L.count("v_unguarded_fixes"), 0)
         with self.subTest("a later review confirms them, or finds one gone"):

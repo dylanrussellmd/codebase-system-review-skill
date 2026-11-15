@@ -67,7 +67,7 @@ class CheckQuiet(unittest.TestCase):
         bad, out = self.check(quiet=True, full=True)   # foreign_key_check runs only with --full (D-0016)
         self.assertGreaterEqual(bad, 1)
         self.assertIn("foreign_key_check: 2 broken references", out)
-        L.x("DELETE FROM review_goals WHERE review_id=999")
+        L.unguarded("review_goals", "DELETE FROM review_goals WHERE review_id=999")
         L.x("PRAGMA foreign_keys = ON")
 
         # each error view: counted, at most 5 sample rows, quiet hides only the zero lines
@@ -77,7 +77,7 @@ class CheckQuiet(unittest.TestCase):
             "'error', 999)")
         bad, out = self.check(quiet=True)
         self.assertEqual(bad, 1, out)
-        lines = out.splitlines()
+        lines = [x for x in out.splitlines() if not x.startswith("  warning  ")]  # this ledger has no dump
         self.assertEqual(lines[0], "    7  Seven test rows  (v_test_seven)")
         self.assertEqual(len(lines), 6)  # the count line and 5 samples
         self.assertNotIn("    0  ", out)
@@ -85,7 +85,7 @@ class CheckQuiet(unittest.TestCase):
         bad, out = self.check(quiet=True)
         self.assertEqual(bad, 0)
         self.assertIn("(v_test_seven)  warning", out)
-        L.x("DELETE FROM ledger_checks WHERE view='v_test_seven'")
+        L.unguarded("ledger_checks", "DELETE FROM ledger_checks WHERE view='v_test_seven'")
 
     def test_cli_check_quiet_flag(self):
         p = self.L.run("check", "--quiet")

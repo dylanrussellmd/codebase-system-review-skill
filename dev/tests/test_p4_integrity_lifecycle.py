@@ -6,6 +6,8 @@ Matching is an UPDATE of findings.issue_id (Ledger.match); a finding is never in
 import sqlite3
 import unittest
 
+from dev.tests._p5_writes_helpers import ok, project, refused
+
 from dev.tests._schema_helpers import FIXED, ISO_NOW
 from dev.tests.test_p4_integrity_plan import IntegrityCase
 
@@ -396,7 +398,7 @@ class Timestamps(Base):
         self.test_step_status_timestamps()
 
     def test_review_status_completed_at(self):
-        rid = self.review(status="consolidating")
+        rid = self.review(status="consolidating", report_md="# R", verdict="Sound.")   # complete: v_review_gaps
         self.L.update("reviews", rid, status="handed-off")
         self.assertFresh(self.scalar("SELECT completed_at FROM reviews WHERE id=?", (rid,)))
         self.raises("UPDATE reviews SET status='consolidating' WHERE id=?", (rid,), "only with change_note")
@@ -471,6 +473,82 @@ class FixedNeedsAfter(Base):
         self.L.update("issues", iid, status="planned", change_note="in the plan")
         self.assertIsNone(self.row(iid)["change_note"])
         self.raises("UPDATE issues SET status='in-progress' WHERE id=?", (iid,), "change_note")
+
+
+def consolidating(test, *, run_tests=True, report=True, verdict=True):
+    """project() taken to consolidating with its runs finished (the tests domain's only when run_tests), its report
+    and verdict stored when asked, and the ledger dumped: a review ready to hand off."""
+    repo, L, sha = project(test)
+    f = L.dir / "reviews" / "spec.md"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text("# spec\n")
+    ok(L, "finish-run", "R-0001", "spec-A", "--report", str(f), "--items", "1")
+    if run_tests:
+        ok(L, "add-run", "R-0001", "tests", "tests-A", "--scope", "all", "--model", "m1")
+        ok(L, "finish-run", "R-0001", "tests-A", "--report", str(f), "--items", "1")
+    for st in ("verifying", "indexing"):
+        ok(L, "review-status", "R-0001", st, "--note", "n")
+    if run_tests:
+        ok(L, "review-status", "R-0001", "consolidating", "--note", "n")
+    if report:
+        (L.dir / "review.md").write_text("# R-0001\n")
+        ok(L, "set-report", "R-0001", str(L.dir / "review.md"))
+    if verdict:
+        ok(L, "set-verdict", "R-0001", "--verdict", "Sound, two fixes.")
+    ok(L, "dump")
+    return L
+
+
+class HandOff(unittest.TestCase):
+    """A review is consolidated only once every included domain ran, and handed off only when complete (ISS-0010)."""
+
+    def test_handoff_refused_with_unrun_domain(self):
+        L = consolidating(self, run_tests=False)
+        msg = refused(self, L, "review-status", "R-0001", "consolidating", "--note", "n")
+        self.assertIn("tests", msg)
+        msg = refused(self, L, "review-status", "R-0001", "handed-off", "--note", "n")
+        self.assertIn("tests", msg)
+        self.assertEqual(L.scalar("SELECT status FROM reviews"), "indexing")
+
+    def test_handoff_refused_without_report(self):
+        L = consolidating(self, report=False)
+        self.assertIn("report", refused(self, L, "review-status", "R-0001", "handed-off", "--note", "n"))
+        L = consolidating(self, verdict=False)
+        self.assertIn("verdict", refused(self, L, "review-status", "R-0001", "handed-off", "--note", "n"))
+
+    def test_handoff_refused_while_checks_fail(self):
+        L = consolidating(self)
+        L.finding(1, point_id="SPEC-M9", summary="A point nobody matched.")
+        L.commit()
+        ok(L, "dump")
+        self.assertIn("SPEC-M9", refused(self, L, "review-status", "R-0001", "handed-off", "--note", "n"))
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "handed off only when"):
+            L.x("UPDATE reviews SET status='handed-off', change_note='n'")
+        L.con.rollback()
+        p = L.run("check")
+        self.assertNotIn("v_incomplete_reviews", p.stdout)   # consolidating: only its runs are required yet
+
+    def test_handoff_allowed_when_complete(self):
+        L = consolidating(self)
+        ok(L, "review-status", "R-0001", "handed-off", "--note", "n")
+        self.assertEqual(L.count("v_incomplete_reviews"), 0)
+        with self.subTest("a review handed off incomplete is listed by check"):
+            L.unguarded("reviews", "UPDATE reviews SET verdict=NULL")
+            L.commit()
+            p = L.run("check")
+            self.assertIn("v_incomplete_reviews", p.stdout)
+
+    def test_check_records_event(self):
+        L = consolidating(self)
+        n = L.scalar("SELECT count(*) FROM events")
+        L.run("check")
+        ev = L.all("SELECT entity_type, entity_id, event, to_value FROM events WHERE id > (SELECT max(id) - 1 FROM "
+                   "events) AND ? < (SELECT count(*) FROM events)", (n,))
+        self.assertEqual(L.scalar("SELECT count(*) FROM events"), n + 1)
+        self.assertEqual([(e["entity_type"], e["event"], e["to_value"]) for e in ev],
+                         [("review", "check-run", "passed")])
+        p = L.run("check")
+        self.assertNotIn("ledger.sql", p.stdout + p.stderr)   # recording the check leaves the dump current
 
 
 if __name__ == "__main__":

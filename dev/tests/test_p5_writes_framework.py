@@ -69,6 +69,7 @@ class WriteFrameworkTest(unittest.TestCase):
 
     def test_trigger_refusal_is_one_line(self):
         repo, L, _ = project(self, approved=False)
+        ok(L, "dump")   # a current dump, so the move itself is what is refused
         err = refused(self, L, "review-status", "R-0001", "handed-off", "--note", "skip ahead")
         self.assertIn("refused by the ledger", err)
         self.assertIn("a review moves planning", err)

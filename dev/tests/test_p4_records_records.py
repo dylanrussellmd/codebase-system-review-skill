@@ -98,18 +98,18 @@ class Discoveries(unittest.TestCase):
         with self.subTest("a dropped step does not close it"):
             s2 = L.step(self.pl, self.ph, 2, findings=[fid], status="dropped")
             self.assertEqual(L.count("v_unplanned_discoveries"), 1)
-            L.x("DELETE FROM step_findings WHERE step_id=?", (s2,))
+            L.unguarded("step_findings", "DELETE FROM step_findings WHERE step_id=?", (s2,))
         with self.subTest("a step closing another finding of the same issue closes it"):
             other = L.finding(self.r1, point_id="OTHER-1")
             L.match(other, iid, "still-present")
             s3 = L.step(self.pl, self.ph, 3, findings=[other])
             self.assertEqual(L.count("v_unplanned_discoveries"), 0)
-            L.x("DELETE FROM step_findings WHERE step_id=?", (s3,))
+            L.unguarded("step_findings", "DELETE FROM step_findings WHERE step_id=?", (s3,))
         with self.subTest("a step closing it clears it"):
             L.step(self.pl, self.ph, 4, findings=[fid])
             self.assertEqual(L.count("v_unplanned_discoveries"), 0)
         with self.subTest("a closed issue is not flagged"):
-            L.x("DELETE FROM step_findings WHERE finding_id=?", (fid,))
+            L.unguarded("step_findings", "DELETE FROM step_findings WHERE finding_id=?", (fid,))
             L.x("UPDATE issues SET status='wont-fix', change_note='Not worth fixing.', resolution='Not worth fixing.' WHERE id=?", (iid,))
             self.assertEqual(L.count("v_unplanned_discoveries"), 0)
 

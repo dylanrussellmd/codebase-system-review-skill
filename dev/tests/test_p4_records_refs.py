@@ -87,7 +87,8 @@ class FillRefsP4(unittest.TestCase):
         self.assertEqual(p.returncode, 1)
         self.assertIn("v_untraceable_refs", p.stdout)
         # an excerpt written by hand that is shorter than its lines (past the end) is caught by the view too
-        L.x("UPDATE finding_locations SET excerpt='line 5', line_start=5, line_end=7 WHERE id=?", (lid,))
+        L.unguarded("finding_locations", "UPDATE finding_locations SET excerpt='line 5', line_start=5, line_end=7 "
+                                         "WHERE id=?", (lid,))
         self.assertEqual(untraceable(L, "src/a.py"), ["excerpt does not cover its lines (past the end of the file?)"])
         L.x("UPDATE finding_locations SET excerpt='' WHERE id=?", (lid,))
         self.assertEqual(untraceable(L, "src/a.py"), ["no excerpt"])   # step 76 (schema 7): empty is no excerpt
@@ -113,7 +114,7 @@ class FillRefsP4(unittest.TestCase):
         (L.repo.path / "logo.bin").write_bytes(b"\x89PNG\x00\x01\xff")
         (L.repo.path / "latin.txt").write_bytes("caf\xe9\n".encode("latin-1"))
         sha = L.repo.commit("binary")
-        L.x("UPDATE review_repositories SET commit_sha=?", (sha,))
+        L.unguarded("review_repositories", "UPDATE review_repositories SET commit_sha=?", (sha,))
         logo = ref(L, rid, "logo.bin", None, None)
         latin = ref(L, rid, "latin.txt", 1, 1)
         failed, out = self.fill(L)
@@ -166,7 +167,7 @@ class CheckGit(unittest.TestCase):
         p = L.run("check")
         self.assertEqual(p.returncode, 1)
         self.assertIn("tag review/R-0001 is missing", p.stdout)
-        L.x("UPDATE review_repositories SET commit_sha=?", ("0" * 40,))
+        L.unguarded("review_repositories", "UPDATE review_repositories SET commit_sha=?", ("0" * 40,))
         p = L.run("check")
         self.assertEqual(p.returncode, 1)
         self.assertIn("the reviewed commit is not in the repository", p.stdout)

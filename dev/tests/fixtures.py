@@ -417,6 +417,7 @@ class Ledger:
             con = sqlite3.connect(str(self.db))
             con.execute("UPDATE meta SET value=? WHERE key='project_name'", (self.root.name,))
             con.execute("UPDATE meta SET value=? WHERE key='ledger_location'", (str(self.dir),))
+            con.execute("UPDATE meta SET value=lower(hex(randomblob(16))) WHERE key='ledger_id'")  # as init makes one
             con.commit()
             con.close()
         self.con = self.connect()
@@ -466,6 +467,19 @@ class Ledger:
     # -- queries
     def x(self, sql, args=()):
         return self.con.execute(sql, args)
+
+    def unguarded(self, table, sql, args=()):
+        """Run sql with table's append-only triggers lifted, as a ledger written by hand or by an older tool would
+        hold it, then put the triggers back. Returns the cursor."""
+        lifted = self.con.execute("SELECT name, sql FROM sqlite_master WHERE type='trigger' AND tbl_name=? "
+                                  "AND sql LIKE '%history is append-only%'", (table,)).fetchall()
+        for name, _ in lifted:
+            self.con.execute(f'DROP TRIGGER "{name}"')
+        try:
+            return self.con.execute(sql, args)
+        finally:
+            for _, q in lifted:
+                self.con.execute(q)
 
     def scalar(self, sql, args=()):
         r = self.con.execute(sql, args).fetchone()
@@ -681,6 +695,10 @@ class Ledger:
             kw["answer_text"] = "test answer"
         if kw.get("status") == "applied":
             kw.setdefault("applied_note", "applied in a test")
+        if "options" not in kw and "options" in self.columns("gate_kinds"):  # the kind's fixed options, as open-gate
+            fixed = self.scalar("SELECT options FROM gate_kinds WHERE value=?", (kind,))
+            if fixed:
+                kw["options"] = fixed
         code = code or self._code("GATE-")
         return self.insert("gates", code=code, kind=kind, title=title or f"Gate {code}", question=question, **kw)
 
@@ -836,6 +854,8 @@ def seed_demo(ledger):
     i3 = new_issue("ISS-0003", f3, r1, "Admins bypass the weekend limit", "spec", "spec-mismatch", "admin-bypass",
                    "L", "defect", "Admin bypass.")
     for st in ("verifying", "indexing", "consolidating", "handed-off"):
+        if st == "handed-off":   # a review is handed off with its report (v_review_gaps)
+            L.update("reviews", r1, report_md="# R-0001\n\nThree points: one high, one medium, one low.")
         L.update("reviews", r1, status=st, change_actor_id=manager)
 
     # ---- plan
@@ -916,7 +936,7 @@ def seed_demo(ledger):
                    "Run these 2 domains with 2 reviewers?",
                    context="Included: Security, Spec conformance. Skipped: Database (no database).",
                    options=[{"value": "approve", "label": "Approve as listed"},
-                            {"value": "add", "label": "Add skipped domains"}],
+                            {"value": "change", "label": "Add skipped domains"}],
                    allow_text=1, review_id=r2, opened_by_actor_id=manager)
     ids["gates"] = {"GATE-0001": gate1, "GATE-0002": gate2}
     for rid, v in ((r1, 61.0), (r2, 74.5)):

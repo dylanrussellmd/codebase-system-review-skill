@@ -52,15 +52,13 @@ class Deletes(IntegrityCase):
 
     def test_cascades(self):
         """Every ON DELETE CASCADE key removes its children when its parent row is deleted (on the seeded demo, with
-        the append-only triggers dropped and foreign keys deferred, inside a transaction that is rolled back); a
-        plan with no steps is the one cascade reachable in normal use."""
-        with self.subTest("an empty plan is deleted with its phases and plan_reviews"):
+        the append-only triggers dropped and foreign keys deferred, inside a transaction that is rolled back). In
+        normal use no row is deleted: even an empty plan is kept (ISS-0014)."""
+        with self.subTest("an empty plan is kept"):
             def go():
                 pid = self.L.plan(reviews=(self.r1,))
                 self.L.phase(pid, 1)
-                self.x("DELETE FROM plans WHERE id=?", (pid,))
-                self.assertEqual(self.scalar("SELECT count(*) FROM phases WHERE plan_id=?", (pid,)), 0)
-                self.assertEqual(self.scalar("SELECT count(*) FROM plan_reviews WHERE plan_id=?", (pid,)), 0)
+                self.raises("DELETE FROM plans WHERE id=?", (pid,), "append-only")
             self.in_savepoint(go)
         with self.subTest("a plan with steps is protected by the steps"):
             def go():

@@ -13,6 +13,7 @@ import struct
 from pathlib import Path
 from unittest import mock
 
+from dev.tests._p5_writes_helpers import complete
 from dev.tests import browser, fixtures
 from dev.tests._w7a_tools_helpers import (DATA, assert_matches_recording, env_with, leads, ok, shared_project,
                                           shim, tool_project)
@@ -281,6 +282,7 @@ class Odiff(unittest.TestCase):
         out = ok(L, "tool-run", "odiff", "--review", "R-0001", "--unpinned", "--actor", "A-0001", env=env)
         self.assertIn("not run", out[0])
         self.assertIn("follows up no review", L.scalar("SELECT fallback FROM tool_runs"))
+        complete(L)
         ok(L, "dump")
         ok(L, "review-status", "R-0001", "handed-off", "--note", "done", "--actor", "A-0001")
         ok(L, "new-review", "--title", "Second", "--scope", "full", "--previous", "R-0001", "--actor", "A-0001")

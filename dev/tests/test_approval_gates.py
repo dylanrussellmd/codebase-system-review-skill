@@ -3,6 +3,7 @@
 The rule lives in tr_review_transition and tr_plan_transition, so raw SQL is held to it as the commands are; the
 approver is the person who answered the gate. A plan is complete only when every step is done or dropped.
 """
+import json
 import unittest
 
 from dev.tests._p5_writes_helpers import ok, project, refused
@@ -13,6 +14,7 @@ REVIEW_RULE = "domain-approval gate"
 PLAN_RULE = "plan-approval gate"
 APPROVER_RULE = "who answered the approval gate"
 COMPLETE_RULE = "a plan is complete when every step is done or dropped"
+FIXED_RULE = "this kind of gate has fixed options"
 
 
 class Sql(SchemaCase):
@@ -59,6 +61,25 @@ class Sql(SchemaCase):
         self.gate("approve", kind="plan-approval", plan_id=pid)
         self.x("UPDATE plans SET status='approved', approved_at=?, approved_by_actor_id=? WHERE id=?",
                (AT, self.owner, pid))
+
+    def test_approval_gate_options_fixed(self):
+        """An approval gate has its kind's fixed option values, in order, whether inserted or changed (ISS-0715)."""
+        yes_no = json.dumps([{"value": "yes", "label": "Yes"}, {"value": "no", "label": "No"}])
+        fixed = json.dumps([{"value": "approve", "label": "Approve as listed"},
+                            {"value": "change", "label": "Add or remove domains"}])
+        swapped = json.dumps([{"value": "change", "label": "Change"}, {"value": "approve", "label": "Approve"}])
+        for kind in ("domain-approval", "plan-approval"):
+            for name, opts in (("yes/no", yes_no), ("no options", None), ("swapped", swapped)):
+                with self.subTest(kind=kind, options=name):
+                    self.refuse("INSERT INTO gates(code, kind, title, question, options) VALUES ('GATE-0901',?,'t',"
+                                "'q',?)", (kind, opts), FIXED_RULE)
+            with self.subTest(kind=kind, change="options"):
+                gid = self.L.gate(kind=kind, options=fixed)  # other labels are fine: the values are the kind's
+                self.refuse("UPDATE gates SET options=? WHERE id=?", (yes_no, gid), FIXED_RULE)
+        with self.subTest(change="kind"):
+            gid = self.L.gate(kind="other", options=yes_no)
+            self.refuse("UPDATE gates SET kind='domain-approval' WHERE id=?", (gid,), FIXED_RULE)
+        self.L.gate(kind="other", options=yes_no)  # a kind without fixed options takes any
 
     def test_plan_rules_in_schema(self):
         pid = self.L.plan(status="awaiting-approval")

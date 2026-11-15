@@ -118,7 +118,7 @@ codes both sides made are renumbered (the mapping is printed), and the ledger be
 
 After every review step and fix batch the agent writes the hub: the viewer as one file (`.code-review/hub.html`,
 `ledger.py progress-page`). Answers given in the hub file download as `answers.json` (a published copy with an answer
-store exports the same file); `ledger.py import-answers` records them. Publishing it elsewhere is optional.
+store exports the same file); `ledger.py import-answers answers.json` lists them and, with `--yes`, records them. Publishing it elsewhere is optional.
 
 The live viewer, from the project root, runs the skill's copy of ledger.py, not the project's `.code-review/ledger.py`
 (run that one only right after `init` refreshed it):

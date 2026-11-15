@@ -110,10 +110,10 @@ class Measure(unittest.TestCase):
     def test_confirm_guard_refuses_a_test_that_is_not_there(self):
         repo, L, fix = plan(self)
         ok(L, "step-status", "1", "done", "--note", "done", "--commit", fix, "--guard", GUARD, *ACT)
-        L.x("UPDATE review_repositories SET commit_sha=?", (fix,))
+        L.unguarded("review_repositories", "UPDATE review_repositories SET commit_sha=?", (fix,))
         L.commit()
         self.assertEqual(len(ok(L, "confirm-guard", "R-0001", "ISS-0001")), 1)
-        L.x("UPDATE review_repositories SET commit_sha=?", (repo.commits[0],))
+        L.unguarded("review_repositories", "UPDATE review_repositories SET commit_sha=?", (repo.commits[0],))
         L.commit()
         self.assertIn("--gone", refused(self, L, "confirm-guard", "R-0001", "ISS-0001"))
         ok(L, "confirm-guard", "R-0001", "ISS-0001", "--gone")
@@ -170,10 +170,10 @@ class Unproven(unittest.TestCase):
             L.x("INSERT INTO test_runs(step_id, command, purpose, failed) VALUES (1, 'python3 -m unittest', "
                 "'before-fix', 1)")
             self.assertEqual(L.count("v_unproven_steps"), 0)
-            L.x("DELETE FROM test_runs")
+            L.unguarded("test_runs", "DELETE FROM test_runs")
         with self.subTest("a measured guard is proof"):
             self.assertEqual(L.count("v_unproven_steps"), 1)
-            L.x("DELETE FROM guard_tests")
+            L.unguarded("guard_tests", "DELETE FROM guard_tests")
             L.commit()
             L.x("UPDATE steps SET status='doing', change_note='again' WHERE number=1")
             L.commit()
@@ -227,7 +227,8 @@ class Prune(unittest.TestCase):
         ok(L, "add-commit", "1", skip)
         L.x("INSERT INTO guard_tests(issue_id, repository_id, test_path, test_name, step_id) "
             "VALUES (1, 1, 'tests/test_skip.py', 'S::test_s', 1)")
-        L.x("UPDATE guard_tests SET test_name='Handler::test_renamed' WHERE test_name='Handler::test_first_letter'")
+        L.unguarded("guard_tests", "UPDATE guard_tests SET test_name='Handler::test_renamed' "
+                                   "WHERE test_name='Handler::test_first_letter'")
         L.commit()
         out = ok(L, "measure-guards", "--issue", "ISS-0001", "--drop", "--note", "prune", *ACT)
         self.assertIn(f"ISS-0001: tests/test_app.py::Handler::test_renamed: not measured: Handler::test_renamed is "
@@ -256,7 +257,7 @@ class InTheTree(unittest.TestCase):
             self.assertEqual(bad, 1)
             self.assertEqual(lines, [f"guard: ISS-0001 tests/test_app.py::Nope.test_x is not in the tree at "
                                      f"{fix[:10]} (confirm-guard --gone, or add-guard under its new name)"])
-            L.x("DELETE FROM guard_tests WHERE test_name='Nope.test_x'")
+            L.unguarded("guard_tests", "DELETE FROM guard_tests WHERE test_name='Nope.test_x'")
             L.commit()
         with self.subTest("a guarded test renamed"):
             repo.write("tests/test_app.py", TESTS.replace("test_empty_request", "test_empty_is_none"))
@@ -265,7 +266,7 @@ class InTheTree(unittest.TestCase):
             self.assertEqual(bad, 1)
             self.assertEqual(lines, [f"guard: ISS-0001 {GUARD} is not in the tree at {head[:10]} (confirm-guard "
                                      f"--gone, or add-guard under its new name)"])
-            L.x("UPDATE review_repositories SET commit_sha=?", (head,))
+            L.unguarded("review_repositories", "UPDATE review_repositories SET commit_sha=?", (head,))
             L.commit()
             ok(L, "confirm-guard", "R-0001", "ISS-0001", "--gone")
             self.assertEqual(self.check_lines(L)[1], [])

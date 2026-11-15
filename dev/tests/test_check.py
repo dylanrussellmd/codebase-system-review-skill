@@ -103,7 +103,7 @@ def offend(L, view, count=1):
         ph = L.phase(plan, 1)
         fs = [traced(L, L.finding(r1, issue_id=L.issue(first_seen_review_id=r1))) for _ in range(count)]
         L.step(plan, ph, 1, findings=fs)
-        L.x("DELETE FROM plan_reviews WHERE plan_id=?", (plan,))  # the review left the plan; its links stay
+        L.unguarded("plan_reviews", "DELETE FROM plan_reviews WHERE plan_id=?", (plan,))  # the review left the plan; its links stay
     elif view == "v_done_steps_open_issues":
         plan = L.plan(reviews=[r1])
         ph = L.phase(plan, 1)
@@ -142,6 +142,10 @@ def offend(L, view, count=1):
         for n in range(count):
             L.insert("tool_results", code=L._code("LD-"), tool_run_id=run, rule="r", level="warning",
                      path="src/app.py", line_start=n + 1, message="A lead.", fingerprint=f"fp{n}")
+    elif view == "v_incomplete_reviews":   # a review consolidating with included domains no run finished
+        r = L.review(status="consolidating")
+        for dom in ("spec", "tests", "ui")[:count]:
+            L.review_domain(r, dom)
     else:
         raise AssertionError(f"no offending fixture for {view}")
     L.commit()

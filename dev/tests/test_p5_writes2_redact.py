@@ -151,8 +151,8 @@ class RedactTest(unittest.TestCase):
     def test_redact_rehashes_excerpt(self):
         L = self.L
         lid = L.scalar("SELECT id FROM finding_locations WHERE finding_id=?", (self.fid,))
-        L.x("UPDATE finding_locations SET line_start=5, line_end=5, excerpt=NULL, excerpt_sha256=NULL, blob_sha=NULL "
-            "WHERE id=?", (lid,))
+        L.unguarded("finding_locations", "UPDATE finding_locations SET line_start=5, line_end=5, excerpt=NULL, "
+                    "excerpt_sha256=NULL, blob_sha=NULL WHERE id=?", (lid,))
         L.commit()
         ok(L, "fill-refs", "R-0001")
         real = L.scalar("SELECT excerpt FROM finding_locations WHERE id=?", (lid,))

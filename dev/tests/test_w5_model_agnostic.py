@@ -161,7 +161,7 @@ class HubWithoutStore(unittest.TestCase):
         self.assertIn("You answered", p.page.locator(".card.gate", has=p.page.locator("a[download]")).inner_text())
         f = L.root / "answers.json"
         f.write_text(saved)
-        self.assertIn(f"{code}: recorded", L.run_ok("import-answers", str(f)).stdout)
+        self.assertIn(f"{code}: recorded", L.run_ok("import-answers", str(f), "--yes").stdout)
         self.assertEqual((p.page_errors, p.console_errors, p.outside_requests), ([], [], []))
 
 

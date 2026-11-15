@@ -160,7 +160,7 @@ class GoalsTest(unittest.TestCase):
         self.assertIn("rejected", refused(self, L, "approve-goals", "G-01", "--actor", "A-0002"))
         ok(L, "propose-goal", "Another goal.")
         with self.assertRaisesRegex(sqlite3.IntegrityError, "CHECK constraint failed"):  # rejected needs a note
-            L.x("UPDATE design_goals SET status='rejected' WHERE code='G-02'")
+            L.x("UPDATE design_goals SET status='rejected', change_actor_id=2 WHERE code='G-02'")
         L.con.rollback()
 
     def test_goal_sources(self):
@@ -237,7 +237,7 @@ class GoalsTest(unittest.TestCase):
             p = L.root / "answers.json"
             p.write_text(json.dumps([{"gate": "GATE-0003", "answer_value": "change",
                                       "answer_text": "say a minute"}]), encoding="utf-8")
-            L.run_ok("import-answers", str(p))
+            L.run_ok("import-answers", str(p), "--yes")
             self.assertEqual([g["status"] for g in self.goals("--all") if g["code"] == "G-03"], ["proposed"])
 
     def test_approve_goals_answers_their_gate(self):

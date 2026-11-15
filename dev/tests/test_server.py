@@ -410,7 +410,7 @@ class GateAnswerOverHttp(unittest.TestCase):
 
         mod.one = stale
         try:
-            res = mod.api(self.L.root, self.L.db, "/api/gates/GATE-0002/answer", {}, {"answer_value": "add"})
+            res = mod.api(self.L.root, self.L.db, "/api/gates/GATE-0002/answer", {}, {"answer_value": "change"})
         finally:
             mod.one = real_one
         self.assertEqual(res, ({"error": "This question was already answered."}, 409))

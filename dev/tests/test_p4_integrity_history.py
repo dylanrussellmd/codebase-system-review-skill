@@ -223,7 +223,7 @@ class Actors(IntegrityCase):
         self.assertEqual(got, [("answered", "a: go"), ("applied", "Did A.")])
         self.assertEqual([r[0] for r in self.x("SELECT actor_id FROM events WHERE entity_type='gate' AND entity_id=? "
                                                "AND event='status-changed' ORDER BY id", (gid,))], [owner, mgr])
-        r3 = self.review(status="consolidating")
+        r3 = self.review(status="consolidating", report_md="# R", verdict="Sound.")   # complete: v_review_gaps
         self.x("UPDATE reviews SET status='handed-off', change_actor_id=?, change_note='done' WHERE id=?", (mgr, r3))
         p = self.L.plan()
         self.x("UPDATE plans SET status='awaiting-approval', change_actor_id=? WHERE id=?", (mgr, p))
@@ -287,7 +287,7 @@ class Transitions(IntegrityCase):
         return owner
 
     def test_review_status_transitions(self):
-        rid = self.review(status="planning")
+        rid = self.review(status="planning", report_md="# R", verdict="Sound.")   # complete: v_review_gaps
         self.raises("UPDATE reviews SET status='handed-off', approved_at=? WHERE id=?",
                     ("2026-11-01T00:00:00.000Z", rid), "a review moves")
         self.raises("UPDATE reviews SET status='running' WHERE id=?", (rid,), "")
@@ -309,7 +309,7 @@ class Transitions(IntegrityCase):
     def test_review_cannot_run_before_approval(self):
         rid = self.review(status="awaiting-approval")
         owner = self.actor("owner")
-        gid = self.L.gate(kind="domain-approval", review_id=rid, options=[{"value": "approve", "label": "Approve"}])
+        gid = self.L.gate(kind="domain-approval", review_id=rid)
         self.raises("UPDATE reviews SET status='approved', approved_at='2026-11-01T00:00:00.000Z' WHERE id=?", (rid,),
                     "domain-approval gate")
         self.raises("UPDATE reviews SET status='approved' WHERE id=?", (rid,), "")   # no approved_at
@@ -349,7 +349,7 @@ class Transitions(IntegrityCase):
         p = self.L.plan()
         self.raises("UPDATE plans SET status='in-progress' WHERE id=?", (p,), "a plan moves")
         owner = self.actor("owner")
-        gid = self.L.gate(kind="plan-approval", plan_id=p, options=[{"value": "approve", "label": "Approve"}])
+        gid = self.L.gate(kind="plan-approval", plan_id=p)
         self.x("UPDATE plans SET status='awaiting-approval' WHERE id=?", (p,))
         self.raises("UPDATE plans SET status='approved', approved_at='2026-11-01T00:00:00.000Z' WHERE id=?", (p,),
                     "plan-approval gate")
@@ -419,6 +419,90 @@ class GateAnswers(IntegrityCase):
                (self.actor(), gid))
         self.raises("UPDATE gates SET status='answered', answer_value='keep' WHERE id=?", (gid,),
                     ("answer it before", "cannot be changed"))
+
+
+def migrated_fixture(test):
+    """A connection to the schema-25 fixture (a row in every table) after migrate: the shipped schema with rows."""
+    project, db = M.restore(25)
+    p = fixtures.run_ledger("--root", project, "migrate")
+    test.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+    con = sqlite3.connect(str(db))
+    con.execute("PRAGMA foreign_keys = ON")
+    test.addCleanup(con.close)
+    return con
+
+
+# Tables whose rows may be deleted: meta holds stamps (schema hash, last dump, last write) that commands rewrite.
+DELETE_EXEMPT = {"meta"}
+# Tables whose rows never change once written.
+NEVER_UPDATED = ("plan_reviews", "review_goals", "finding_goals", "finding_requirements",
+                 "decision_issues", "schema_migrations", "checklist_answers")
+
+
+class AppendOnlyEverywhere(unittest.TestCase):
+    """Every history table refuses DELETE, and the record tables refuse the rewrites that would change what was
+    recorded (ISS-0014)."""
+
+    def setUp(self):
+        self.con = migrated_fixture(self)
+
+    def refused(self, sql, args=()):
+        self.con.execute("SAVEPOINT probe")
+        try:
+            with self.assertRaises(sqlite3.IntegrityError) as cm:
+                self.con.execute(sql, args)
+            self.assertIn("history is append-only", str(cm.exception))
+        finally:
+            self.con.execute("ROLLBACK TO probe")
+            self.con.execute("RELEASE probe")
+
+    def test_every_table_is_append_only_or_exempt(self):
+        tables = [r[0] for r in self.con.execute("SELECT name FROM sqlite_master WHERE type='table' "
+                                                 "AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+        for t in tables:
+            if t in DELETE_EXEMPT:
+                continue
+            with self.subTest(table=t):
+                self.assertGreater(self.con.execute(f'SELECT count(*) FROM "{t}"').fetchone()[0], 0)
+                self.refused(f'DELETE FROM "{t}"')
+
+    def test_record_tables_refuse_delete(self):
+        for t in ("step_commits", "guard_tests", "step_dependencies", "step_findings", "plan_reviews",
+                  "review_repositories", "review_goals", "review_domains", "finding_goals", "finding_requirements",
+                  "decision_issues", "requirements", "metrics", "issue_relations", "checklist_answers",
+                  "schema_migrations", "ledger_checks", "issue_statuses", "severities", "match_types",
+                  "relation_types", "gate_kinds", "goal_statuses", "enum_labels"):
+            with self.subTest(delete=t):
+                self.refused(f'DELETE FROM "{t}" WHERE rowid = (SELECT min(rowid) FROM "{t}")')
+        for t in NEVER_UPDATED:
+            col = [r[1] for r in self.con.execute(f'PRAGMA table_info("{t}")')][-1]
+            with self.subTest(update=t, column=col):
+                self.refused(f'UPDATE "{t}" SET "{col}" = "{col}" || \'\' WHERE rowid = (SELECT min(rowid) FROM "{t}")')
+        with self.subTest("a guard test's identity"):
+            self.refused("UPDATE guard_tests SET issue_id = issue_id + 0, step_id = NULL")
+            self.refused("UPDATE guard_tests SET test_name = 'other'")   # renamed only by rename-guard
+        with self.subTest("a fix's commit"):
+            self.refused("UPDATE step_commits SET commit_sha = ?", ("d" * 40,))
+            self.con.execute("UPDATE step_commits SET pr_url = 'https://example.com/pr/1' WHERE pr_url IS NULL")
+            self.refused("UPDATE step_commits SET pr_url = 'https://example.com/pr/2'")
+        with self.subTest("a filled location line"):
+            self.refused("UPDATE finding_locations SET line_start = line_start + 1 WHERE line_start IS NOT NULL")
+
+    def test_reviewed_commit_is_fixed(self):
+        self.refused("UPDATE review_repositories SET commit_sha = ?", ("e" * 40,))
+        self.con.execute("UPDATE review_repositories SET tag_name = 'review/R-0001'")   # tag_name stays open
+
+    def test_schema_upgrade_to_26(self):
+        """A schema-25 ledger migrates through 0026: a ledger id is made, checklist answers keep their rows, and the
+        gate confirmation columns are there."""
+        meta = dict(self.con.execute("SELECT key, value FROM meta"))
+        self.assertRegex(meta["ledger_id"], r"^[0-9a-f]{32}$")
+        self.assertRegex(meta["last_write_at"], r"^2\d{3}-")   # migrate stamps it
+        self.assertEqual(self.con.execute("SELECT count(*) FROM checklist_answers WHERE id IS NOT NULL "
+                                          "AND recorded_at IS NOT NULL").fetchone()[0],
+                         self.con.execute("SELECT count(*) FROM checklist_answers").fetchone()[0])
+        cols = [r[1] for r in self.con.execute("PRAGMA table_info(gates)")]
+        self.assertEqual(cols[-3:], ["confirmed_at", "confirmed_by_actor_id", "confirmed_text"])
 
 
 if __name__ == "__main__":

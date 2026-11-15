@@ -200,7 +200,7 @@ class Gates(RouteCase):
         g = {x["code"]: x for x in self.ok("/api/gates")["gates"]}
         self.assertEqual(g["GATE-0001"]["options"][0],
                          {"value": "keep-14", "label": "Keep 14 days", "description": "Current behaviour stays the default."})
-        self.assertEqual([o["value"] for o in g["GATE-0002"]["options"]], ["approve", "add"])
+        self.assertEqual([o["value"] for o in g["GATE-0002"]["options"]], ["approve", "change"])
         self.assertEqual(g["GATE-0004"]["options"], [])  # NULL options -> []
         one = g["GATE-0001"]
         self.assertEqual((one["review_code"], one["plan_code"], one["step_number"], one["issue_code"],

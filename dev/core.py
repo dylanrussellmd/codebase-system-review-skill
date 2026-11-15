@@ -472,6 +472,7 @@ def migrate(db):
             step = "the checks after " + ", ".join(f"migration {m[0]:04d}-{m[1]}" for m in pending)
             con.execute("UPDATE meta SET value=? WHERE key='schema_version'", (str(SCHEMA_VERSION),))
             _create_views_and_triggers(con)
+            con.execute("UPDATE meta SET value=? WHERE key='last_write_at'", (now(),))  # the dump is of the old schema
             notes = []
         else:
             notes = sync_views_and_triggers(con)
@@ -2022,16 +2023,45 @@ def record_dump(con, path, at):
         print(f"note: the dump is written but not recorded in the ledger ({_one_line(e)})", file=sys.stderr)
 
 
+def record_check(db, bad):
+    """Record check's result as a check-run event on the review in progress (the newest one not handed off or
+    abandoned): 'passed', or how many checks failed. A ledger of another schema, or one another writer holds, keeps
+    no record; check's own output is what counts."""
+    try:
+        con = connect(db)
+    except (sqlite3.Error, LedgerError):
+        return
+    try:
+        con.execute("PRAGMA busy_timeout = 2000")
+        if con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] != str(SCHEMA_VERSION):
+            return
+        con.isolation_level = None
+        con.execute("BEGIN IMMEDIATE")
+        con.execute("""INSERT INTO events(entity_type, entity_id, event, to_value, review_id)
+                       SELECT 'review', id, 'check-run', ?, id FROM reviews
+                       WHERE status NOT IN ('handed-off','abandoned') ORDER BY id DESC LIMIT 1""",
+                    ("passed" if not bad else f"{bad} failed",))
+        con.execute("COMMIT")
+    except sqlite3.Error as e:
+        if con.in_transaction:
+            con.execute("ROLLBACK")
+        print(f"note: check's result is not recorded in the ledger ({_one_line(e)})", file=sys.stderr)
+    finally:
+        con.close()
+
+
 def stale_dump(con, db=None):
-    """Why the dump beside the ledger (<db>.sql) is not current, or None: it is missing while the ledger has
-    events, or the ledger has an event newer than its last dump, or the file is not the dump last recorded. The
-    dump is the copy of the ledger that leaves this machine (SKILL.md, Step 7)."""
+    """Why the dump beside the ledger (<db>.sql) is not current, or None: it is missing while the ledger has been
+    written, or the ledger was written after its last dump (the newest event, or meta last_write_at, which every
+    write to a table stamps), or the file is not the dump last recorded. The dump is the copy of the ledger that
+    leaves this machine (SKILL.md, Step 7)."""
     if db is None:
         db = next((r[2] for r in con.execute("PRAGMA database_list") if r[1] == "main"), "")
         if not db:
             return None
     out = Path(db).with_suffix(".sql")
-    newest = con.execute("SELECT max(at) FROM events").fetchone()[0]
+    newest = con.execute("""SELECT max(t) FROM (SELECT max(at) t FROM events WHERE event <> 'check-run' UNION ALL
+                            SELECT NULLIF(value, '') FROM meta WHERE key = 'last_write_at')""").fetchone()[0]
     if newest is None:
         return None
     if not out.exists():
@@ -2305,6 +2335,7 @@ CHECK_ACTIONS = {
     "v_unresolved_conflicts": "The agent judges each pair of steps with resolve-conflict before the plan is approved.",
     "v_late_step_conflicts": "The agent judges each pair with resolve-conflict before the added step starts.",
     "v_unaddressed_tool_results": "The agent has each tool lead cited by a finding or dismissed with a reason.",
+    "v_incomplete_reviews": "The agent runs each domain, finishes each run and stores the report and verdict.",
 }
 RECIPES_FILE = "references/recipes.md"
 
@@ -3842,7 +3873,9 @@ def hub_snapshot(root, db, con, start=None):
         active = [r[0] for r in con.execute("SELECT value FROM issue_statuses WHERE active = 1 ORDER BY position")]
     except sqlite3.Error:
         active = ["open", "needs-decision", "planned", "in-progress", "regressed"]
-    return {"taken": now(), "start": start, "active": active, "guide": HUB_GUIDE_MD, "responses": R}
+    lid = con.execute("SELECT value FROM meta WHERE key='ledger_id'").fetchone()
+    return {"taken": now(), "ledger_id": lid[0] if lid else None, "start": start, "active": active,
+            "guide": HUB_GUIDE_MD, "responses": R}
 
 
 def hub_page(root, db, start=None, page=None):
@@ -3944,12 +3977,27 @@ def record_answers_import(con, source, recorded, skipped, refused):
     con.commit()
 
 
-def import_answers(db, source):
-    """`ledger.py import-answers FILE`: record the owner's answers given in the hub (the answers.json it downloads,
-    or the documents of a published page's answer store) into the ledger. Each goes through answer_gate(), the one set
-    of answer rules the viewer and answer-gate use, so it is checked against the gate's options and recorded
-    answered_via='viewer' by the owner. A gate that is no longer open is left as it is and said so. The time the
-    owner answered in the hub is not kept: the gate records when it was imported. Returns 1 when any answer was
+def _answer_unbound(con, code, data, ledger_id):
+    """Why an answer saved by a hub does not belong to this ledger's gate, or None: the hub was of another ledger
+    (its ledger_id differs), or the gate it answered was made at another time than this ledger's gate of that code.
+    An answer that carries neither (written by hand) is checked by the gate's rules alone."""
+    if data.get("ledger_id") is not None and data.get("ledger_id") != ledger_id:
+        return "the answer was saved by the hub of another ledger"
+    made = data.get("gate_created_at")
+    if made is not None:
+        g = con.execute("SELECT created_at FROM gates WHERE code=?", (code,)).fetchone()
+        if g and g[0] != made:
+            return f"the answer is to another question with this code (asked at {made}; this one at {g[0]})"
+    return None
+
+
+def import_answers(db, source, yes=False):
+    """`ledger.py import-answers FILE [--yes]`: record the owner's answers given in the hub (the answers.json it
+    downloads, or the documents of a published page's answer store) into the ledger. Each goes through answer_gate(),
+    the one set of answer rules the viewer and answer-gate use, so it is checked against the gate's options and
+    recorded answered_via='viewer' by the owner. A gate that is no longer open is left as it is and said so. Without
+    yes it lists what it would record and writes nothing; with yes it records them all in one transaction. The time
+    the owner answered in the hub is not kept: the gate records when it was imported. Returns 1 when any answer was
     refused, else 0."""
     try:
         raw = sys.stdin.read() if source == "-" else Path(source).read_text(encoding="utf-8")
@@ -3959,10 +4007,16 @@ def import_answers(db, source):
         return 1
     recorded = skipped = refused = 0
     con = connect(db)
+    con.isolation_level = None
     try:
+        con.execute("BEGIN IMMEDIATE")
+        ledger_id = (con.execute("SELECT value FROM meta WHERE key='ledger_id'").fetchone() or [None])[0]
         for code, data in items:
             if not code or not GATE_CODE.fullmatch(code) or data is None or data.get("bad"):
                 print(f"{code or '?'}: not an answer to a gate (skipped)"); refused += 1; continue
+            wrong = _answer_unbound(con, code, data, ledger_id)
+            if wrong:
+                print(f"{code}: not recorded: {wrong}"); refused += 1; continue
             try:
                 answer_gate(con, code, data.get("answer_value"), data.get("answer_text"), via="viewer")
             except GateRefused as e:
@@ -3971,12 +4025,28 @@ def import_answers(db, source):
                 else:
                     print(f"{code}: not recorded: {e}"); refused += 1
                 continue
-            print(f"{code}: recorded")
+            if yes:
+                print(f"{code}: recorded")
+            else:
+                g = con.execute("SELECT answer_value, answer_text FROM gates WHERE code=?", (code,)).fetchone()
+                said = " ".join(x for x in (g[0], json.dumps(_one_line(g[1])[:200]) if g[1] else None) if x)
+                print(f"{code}: would record {said}")
             recorded += 1
-        record_answers_import(con, source, recorded, skipped, refused)
+        if yes:
+            record_answers_import(con, source, recorded, skipped, refused)
+            if con.in_transaction:
+                con.execute("COMMIT")
+        else:
+            con.execute("ROLLBACK")
     finally:
+        if con.in_transaction:
+            con.execute("ROLLBACK")
         con.close()
-    print(f"import-answers: {recorded} recorded, {skipped} already answered, {refused} refused")
+    if yes:
+        print(f"import-answers: {recorded} recorded, {skipped} already answered, {refused} refused")
+    else:
+        print(f"import-answers: {recorded} to record, {skipped} already answered, {refused} refused; nothing was "
+              f"written. Check each answer above came from the owner, then run again with --yes")
     return 1 if refused else 0
 
 
@@ -4351,8 +4421,10 @@ def add_tool_parsers(sub):
                                    "{gate, answer_value, answer_text, answered_at}; or an answer store's documents) "
                                    "and record each in its gate as the viewer does (answered_via 'viewer'). A gate "
                                    "no longer open is "
-                                   "left as it is. FILE - reads standard input.")
+                                   "left as it is. FILE - reads standard input. Without --yes it lists what it "
+                                   "would record and writes nothing.")
     s.add_argument("file")
+    s.add_argument("--yes", action="store_true", help="record the answers listed (run once without it to check them)")
     s = sub.add_parser("restore", help="rebuild a ledger from a dump into a new file, then check it",
                        description="Rebuild a ledger from ledger.sql (written by dump) into a new file and run check "
                                    "on it. Never writes over an existing file. Example: python3 ledger.py restore "
@@ -4380,7 +4452,7 @@ def tool_command(a, root, db):
     if a.cmd == "import-answers":
         con = open_ledger(db, write=True, verify=True)
         con.close()
-        return import_answers(db, a.file)
+        return import_answers(db, a.file, a.yes)
     con = open_ledger(db, verify=True)
     try:
         if a.cmd == "progress-md":
@@ -4933,6 +5005,17 @@ def cmd_review_status(ctx):
     rv = review_row(con, a.review)
     if a.status not in REVIEW_STATUSES:
         raise WriteError(f"status {a.status!r} is not one of {', '.join(REVIEW_STATUSES)}")
+    if a.status in ("consolidating", "handed-off") and rv["status"] not in (a.status, "planning", "awaiting-approval",
+                                                                         "handed-off", "abandoned"):
+        need = ("consolidating",) if a.status == "consolidating" else ("consolidating", "handed-off")
+        gap = one(con, f"""SELECT reason FROM v_review_gaps WHERE review_id=? AND needed_for IN
+                           ({','.join('?' * len(need))}) ORDER BY rank, reason LIMIT 1""", (rv["id"], *need))
+        if gap:
+            more = con.execute(f"SELECT count(*) FROM v_review_gaps WHERE review_id=? AND needed_for IN "
+                               f"({','.join('?' * len(need))})", (rv["id"], *need)).fetchone()[0] - 1
+            raise WriteError(f"{rv['code']} is not ready to be {'consolidated' if a.status == 'consolidating' else 'handed off'}: "
+                             f"{gap['reason']}" + (f" ({more} more: ledger.py query \"SELECT * FROM v_review_gaps "
+                                                   f"WHERE review = '{rv['code']}'\")" if more else ""))
     if a.status == "handed-off" and rv["status"] != "handed-off":
         _need_fresh_dump(ctx, f"{rv['code']} is handed off")
     sets, args = {"status": a.status, "change_actor_id": ctx.actor_id, "change_note": a.note}, []
@@ -5634,12 +5717,21 @@ def answer_gate(con, code, value=None, text=None, via="chat", actor_id=None):
             con.execute("ROLLBACK")
 
 
-@_command("answer-gate", "record the owner's answer given in chat (the viewer's rules)",
+@_command("answer-gate", "record the owner's answer given in chat (the viewer's rules), or with --confirm their "
+                         "confirmation in chat of an answer they gave in the viewer",
           "ledger.py answer-gate GATE-0001 [--value OPTION]... [--text 'their words'] [--via chat|other] "
-          "[--by A-0001 (default: the owner)]")
+          "[--by A-0001 (the owner or another human; default: the owner)] | "
+          "ledger.py answer-gate GATE-0001 --confirm [--text 'their words'] [--by A-0001]")
 def cmd_answer_gate(ctx):
     a = ctx.a
     who = resolve_actor(ctx.con, a.by, "--by") if a.by else None
+    if who is not None:
+        kind = ctx.con.execute("SELECT kind FROM actors WHERE id=?", (who,)).fetchone()[0]
+        if kind not in OWNER_KINDS:
+            raise WriteError(f"{actor_code(who)} is a {kind}; only the owner or another human answers a gate: leave "
+                             f"out --by (the owner) or give a human's code")
+    if a.confirm:
+        return _confirm_answer(ctx, who)
     g = one(ctx.con, "SELECT multi FROM gates WHERE code=?", (a.gate,))
     values = a.value or []
     value = values if (g and g["multi"] and values) else (values[0] if len(values) == 1 else (values or None))
@@ -5649,6 +5741,28 @@ def cmd_answer_gate(ctx):
     if g["answer_value"] is not None and g["answer_value"].startswith("["):
         shown = ", ".join(json.loads(g["answer_value"])) or "none"
     return [f"{a.gate}: answered ({', '.join(x for x in (shown, g['answer_text']) if x)})"]
+
+
+CONFIRMED_KINDS = ("production-action", "accept-risk")  # a viewer answer of these is confirmed in chat first
+
+
+def _confirm_answer(ctx, who):
+    """answer-gate --confirm: record that the owner confirmed in chat the answer they gave in the viewer."""
+    a, con = ctx.a, ctx.con
+    if a.value:
+        raise WriteError("--confirm takes no --value: it confirms the answer the gate already has")
+    g = one(con, "SELECT * FROM gates WHERE code=?", (a.gate,))
+    if not g:
+        raise WriteError(f"no gate {a.gate}")
+    if g["status"] != "answered":
+        raise WriteError(f"{a.gate} is {g['status']}; only an answered gate is confirmed")
+    if g["answered_via"] != "viewer":
+        raise WriteError(f"{a.gate} was answered in chat; it needs no confirmation")
+    if g["confirmed_at"]:
+        raise WriteError(f"{a.gate} was confirmed at {g['confirmed_at']}")
+    ctx.x("UPDATE gates SET confirmed_at=?, confirmed_by_actor_id=?, confirmed_text=? WHERE id=?",
+          (now(), who if who is not None else owner_actor(con), _text_arg(a.text, "--text"), g["id"]))
+    return [f"{a.gate}: the answer is confirmed in chat"]
 
 
 @_command("apply-gate", "record what was done with a gate's answer (a decision gate also records the decision)",
@@ -5662,6 +5776,10 @@ def cmd_apply_gate(ctx):
         raise WriteError(f"no gate {a.gate}")
     if g["status"] != "answered":
         raise WriteError(f"{a.gate} is {g['status']}; only an answered gate can be applied")
+    if g["kind"] in CONFIRMED_KINDS and g["answered_via"] == "viewer" and not g["confirmed_at"]:
+        raise WriteError(f"{a.gate} is a {g['kind']} gate answered in the viewer; ask the owner in chat to confirm "
+                         f"the answer, then record it with: ledger.py answer-gate {a.gate} --confirm --text "
+                         f"'<their words>'")
     out = []
     if g["kind"] == "decision":
         answer = " - ".join(x for x in (g["answer_value"], g["answer_text"]) if x)
@@ -5864,13 +5982,16 @@ def _close_goal_gates(ctx, gate_ids, actor_id):
                     "decided in chat: " + ", ".join(f"{x['code']} {x['status']}" for x in goals), "chat", actor_id)
 
 
+OWNER_KINDS = ("owner", "human")  # the actors who answer gates, decide decisions and approve or reject goals
+
+
 def _owner_decides(ctx, what):
     """The acting actor's id when it is the owner or another human; WriteError otherwise, since only the owner decides
     design goals."""
     if ctx.actor_id is None:
         raise WriteError(f"give --actor: the owner who {what} (their A- code)")
     kind = ctx.con.execute("SELECT kind FROM actors WHERE id=?", (ctx.actor_id,)).fetchone()[0]
-    if kind not in ("owner", "human"):
+    if kind not in OWNER_KINDS:
         raise WriteError(f"{actor_code(ctx.actor_id)} is a {kind}; design goals are decided by the owner: give the "
                          f"owner's code as --actor")
     return ctx.actor_id
@@ -5895,16 +6016,17 @@ def cmd_approve_goals(ctx):
 
 
 @_command("reject-goal", "record that the owner did not approve a proposed design goal, with their reason",
-          "ledger.py reject-goal G-01 --note 'the owner's reason' [--actor A-0001]")
+          "ledger.py reject-goal G-01 --note 'the owner's reason' --actor A-0001 (the owner)")
 def cmd_reject_goal(ctx):
     a = ctx.a
     note = _need(_text_arg(a.note, "--note"), "--note (the owner's reason)")
+    owner = _owner_decides(ctx, "rejected it")
     g = goal_row(ctx.con, a.goal)
     if g["status"] != "proposed":
         raise WriteError(f"{a.goal} is {g['status']}; only a proposed goal can be rejected")
-    ctx.x("UPDATE design_goals SET status='rejected', note=?, change_actor_id=? WHERE id=?", (note, ctx.actor_id, g["id"]))
+    ctx.x("UPDATE design_goals SET status='rejected', note=?, change_actor_id=? WHERE id=?", (note, owner, g["id"]))
     if g["gate_id"]:
-        _close_goal_gates(ctx, {g["gate_id"]}, ctx.actor_id if ctx.actor_id is not None else owner_actor(ctx.con))
+        _close_goal_gates(ctx, {g["gate_id"]}, owner)
     return [f"{a.goal}: rejected"]
 
 
@@ -6659,7 +6781,8 @@ def cmd_reopen_gate(ctx):
     if g["status"] == "applied":
         raise WriteError(f"{g['code']} is applied: its answer was acted on; open a new gate to ask again")
     ctx.x("""UPDATE gates SET status='open', answer_value=NULL, answer_text=NULL, answered_by=NULL, answered_via=NULL,
-             answered_by_actor_id=NULL, answered_at=NULL, change_actor_id=?, change_note=? WHERE id=?""",
+             answered_by_actor_id=NULL, answered_at=NULL, confirmed_at=NULL, confirmed_by_actor_id=NULL,
+             confirmed_text=NULL, change_actor_id=?, change_note=? WHERE id=?""",
           (actor, note, g["id"]))
     was = ": ".join(x for x in (g["answer_value"], g["answer_text"]) if x)
     return [f"{g['code']}: {g['status']} -> open" + (f" (the answer was {was})" if was else "")]
@@ -7248,8 +7371,8 @@ def record_step_commit(ctx, step, ref, repo_name=None, pr=None, summary=None):
     subject = info[1].strip() if len(info) > 1 else None
     ctx.x("""INSERT INTO step_commits(step_id, repository_id, commit_sha, branch, pr_url, summary, committed_at)
              VALUES (?,?,?,?,?,?,?)
-             ON CONFLICT(step_id, commit_sha) DO UPDATE SET pr_url=COALESCE(excluded.pr_url, pr_url),
-               summary=COALESCE(?, summary), branch=COALESCE(branch, excluded.branch)""",
+             ON CONFLICT(step_id, commit_sha) DO UPDATE SET pr_url=COALESCE(pr_url, excluded.pr_url),
+               summary=COALESCE(summary, ?), branch=COALESCE(branch, excluded.branch)""",
           (step["id"], repo["id"], sha, branch, pr, summary or subject, utc_time(info[0].strip()), summary))
     return sha, f"step {step['number']}: commit {sha[:10]}" + (f" on {branch}" if branch else "")
 
@@ -7772,10 +7895,10 @@ def _guard_not_in_review(ctx, rv, g):
 
 def _drop_guard(ctx, iss_id, g, note):
     """Delete guard test row g of issue iss_id with a guard-dropped event on the issue (the test, who and why)."""
-    ctx.x("DELETE FROM guard_tests WHERE id=?", (g["id"],))
     ctx.x("""INSERT INTO events(entity_type, entity_id, event, from_value, actor_id, step_id, note)
              VALUES ('issue', ?, 'guard-dropped', ?, ?, ?, ?)""",
           (iss_id, f"{g['test_path']}::{g['test_name']}", ctx.actor_id, g["step_id"], note))
+    ctx.x("DELETE FROM guard_tests WHERE id=?", (g["id"],))  # tr_guard_tests_no_delete needs the event first
 
 
 @_command("drop-guard", "remove a guard test from an issue, with who and why (an event on the issue)",
@@ -7819,10 +7942,11 @@ def cmd_rename_guard(ctx):
         reader.close()
     if why:
         raise WriteError(why)
-    ctx.x("UPDATE guard_tests SET test_path=?, test_name=? WHERE id=?", (new_path, new_name, g["id"]))
     ctx.x("""INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, step_id, note)
              VALUES ('issue', ?, 'guard-renamed', ?, ?, ?, ?, ?)""",
-          (iss["id"], f"{path}::{name}", f"{new_path}::{new_name}", actor, g["step_id"], reason))
+          (iss["id"], f"{g['test_path']}::{g['test_name']}", f"{new_path}::{new_name}", actor, g["step_id"], reason))
+    # tr_guard_renamed_only needs the event first
+    ctx.x("UPDATE guard_tests SET test_path=?, test_name=? WHERE id=?", (new_path, new_name, g["id"]))
     return [f"{iss['code']}: guard test {path}::{name} -> {new_path}::{new_name}"]
 
 
@@ -8405,6 +8529,9 @@ def add_write_commands(sub):
                                                     "gate)")
     s.add_argument("--text")
     s.add_argument("--via", default="chat", choices=("chat", "other")); s.add_argument("--by")
+    s.add_argument("--confirm", action="store_true",
+                   help="record that the owner confirmed in chat the answer they gave in the viewer (--text: their "
+                        "words); a production-action or accept-risk gate answered there is applied only after it")
     s = p("apply-gate"); s.add_argument("gate"); s.add_argument("--note"); s.add_argument("--revisit-when")
     s = p("interview-ask"); s.add_argument("question", nargs="?"); s.add_argument("--review"); s.add_argument("--domain")
     s.add_argument("--why", help="what in the code prompted the question")
@@ -10392,9 +10519,8 @@ def lint_report_command(a, root, db):
         if dismissed:
             lines.append(f"{name}: recorded {len(dismissed)} dismissed lead{'s' if len(dismissed) != 1 else ''}")
         for code, (answer, evidence) in sorted(answers.items()):
-            ctx.x("""INSERT INTO checklist_answers(review_id, check_code, report, answer, evidence) VALUES (?,?,?,?,?)
-                     ON CONFLICT(review_id, check_code, report) DO UPDATE SET answer=excluded.answer,
-                       evidence=excluded.evidence""", (rv["id"], code, name, answer, evidence))
+            ctx.x("INSERT INTO checklist_answers(review_id, check_code, report, answer, evidence) VALUES (?,?,?,?,?)",
+                  (rv["id"], code, name, answer, evidence))
         return ([] if a.json else lines) + [f"recorded {plural(len(answers), 'checklist answer')} on {rv['code']}"]
     return run_write_command(con, root, db, a, record)
 
@@ -10435,7 +10561,7 @@ def compare_runs(con, ra, rb):
 
     def answers(rv):
         out = {}
-        for r in rows(con, "SELECT check_code, answer FROM checklist_answers WHERE review_id=? ORDER BY report",
+        for r in rows(con, "SELECT check_code, answer FROM v_checklist_answers WHERE review_id=? ORDER BY report",
                       (rv["id"],)):
             out.setdefault(r["check_code"], r["answer"])
         return out
@@ -14730,6 +14856,7 @@ def _main():
             bad += check_git_refs(root, con, quiet=a.quiet)
             bad += check_patches(root, con, quiet=a.quiet)
             bad += check_guard_refs(root, con, quiet=a.quiet)
+            record_check(db, bad)
             if import_reminder(con, root):
                 print(import_reminder(con, root))
         except sqlite3.DatabaseError as e:  # a damaged file stops a later read: what was found is printed already

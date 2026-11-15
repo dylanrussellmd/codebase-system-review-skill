@@ -6,7 +6,7 @@ the same ledger make the same matches and print the same text."""
 import json
 import unittest
 
-from dev.tests._p5_writes_helpers import approve, ok, project, refused, index_row
+from dev.tests._p5_writes_helpers import approve, complete, index_row, ok, project, refused
 
 APP = "".join(f"line {n}\n" for n in range(1, 11)).replace("line 5\n", "def handler(request):\n") \
     .replace("line 8\n", "def parse(text):\n")
@@ -20,6 +20,7 @@ def load(L, review, run, rows):
 
 
 def second_review(L):
+    complete(L)
     ok(L, "review-status", "R-0001", "verifying", "--note", "n")
     ok(L, "review-status", "R-0001", "indexing", "--note", "n")
     ok(L, "review-status", "R-0001", "consolidating", "--note", "n")

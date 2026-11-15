@@ -49,7 +49,7 @@ class ImportReminder(unittest.TestCase):
                 self.assertNotIn(".code-review/ledger.py", out)
         answers = L.root / "answers.json"
         answers.write_text("[]", encoding="utf-8")
-        p = L.run("import-answers", str(answers))
+        p = L.run("import-answers", str(answers), "--yes")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         at = L.scalar("SELECT at FROM events WHERE event = 'answers-imported'")
         self.assertIn(f"(answers last imported: {at})", ok(L, "gates"))
@@ -72,13 +72,13 @@ class ImportReminder(unittest.TestCase):
         answers = L.root / "answers.json"
         answers.write_text(json.dumps([{"gate": gate["code"], "answer_value": value, "answer_text": "Yes."},
                                        {"gate": "GATE-9999", "answer_text": "?"}]), encoding="utf-8")
-        p = L.run("import-answers", str(answers))
+        p = L.run("import-answers", str(answers), "--yes")
         self.assertIn(f"{gate['code']}: recorded", p.stdout, p.stdout + p.stderr)
         events = L.all("SELECT entity_type, entity_id, to_value, note FROM events WHERE event = 'answers-imported'")
         self.assertEqual(events, [{"entity_type": "plan", "entity_id": L.scalar("SELECT id FROM plans"),
                                    "to_value": "1 recorded, 0 already answered, 1 refused",
                                    "note": "from answers.json"}])
-        L.run("import-answers", str(answers))
+        L.run("import-answers", str(answers), "--yes")
         self.assertEqual(L.count("events", "event = 'answers-imported'"), 2)
         self.assertEqual(L.scalar("SELECT label FROM enum_labels WHERE enum = 'event' AND value = 'answers-imported'"),
                          "Answers brought in from the published page")
@@ -92,7 +92,7 @@ class ImportReminder(unittest.TestCase):
         L.run("add-artifact", "progress-page", "--plan", "P-0001", "--url", URL)
         answers = L.root / "answers.json"
         answers.write_text("[]", encoding="utf-8")
-        L.run("import-answers", str(answers))
+        L.run("import-answers", str(answers), "--yes")
         with fixtures.ServerThread(L) as srv:
             home = srv.get("/api/home").json()
         self.assertEqual(home["published_page"], URL)

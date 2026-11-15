@@ -56,7 +56,7 @@ class GateAnswer(unittest.TestCase):
         out = {}
         threads = [threading.Thread(target=lambda v=v: out.__setitem__(v, self.answer(mod, "GATE-0002",
                                                                                          {"answer_value": v})))
-                   for v in ("approve", "add")]
+                   for v in ("approve", "change")]
         for t in threads:
             t.start()
         for t in threads:
@@ -88,7 +88,7 @@ class GateAnswer(unittest.TestCase):
             return r
 
         mod.one = stale
-        self.assertEqual(self.answer(mod, "GATE-0002", {"answer_value": "add"}),
+        self.assertEqual(self.answer(mod, "GATE-0002", {"answer_value": "change"}),
                          (409, {"error": "This question was already answered."}))
         g = self.gate("GATE-0002")
         self.assertEqual((g["answer_value"], g["answered_via"]), ("approve", "chat"))

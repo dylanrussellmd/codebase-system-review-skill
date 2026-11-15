@@ -121,6 +121,11 @@ def _gate_options(t):
             lambda: t.x("UPDATE gates SET options=? WHERE id=?", (BAD_OPTIONS, t.L.gate(options=GOOD_OPTIONS))))
 
 
+def _gate_fixed_options(t):
+    return (lambda: t.L.gate(kind="plan-approval", options=GOOD_OPTIONS),
+            lambda: t.x("UPDATE gates SET options=? WHERE id=?", (GOOD_OPTIONS, t.L.gate(kind="plan-approval"))))
+
+
 def _gate_multi(t):
     return (lambda: t.L.gate(options=GOOD_OPTIONS, multi=1, preselect='["z"]'),
             lambda: t.x("UPDATE gates SET preselect='[\"z\"]' WHERE id=?",
@@ -133,6 +138,28 @@ def _goal_approver(t):
     return (lambda: t.L.design_goal(status="approved", approved_by_actor_id=mgr, approved_at=RETIRED),
             lambda: t.x("UPDATE design_goals SET status='approved', approved_by_actor_id=?, approved_at=? WHERE id=?",
                         (mgr, RETIRED, t.L.design_goal())))
+
+
+def _gate_answerer(t):
+    mgr = t.L.actor("manager")
+    return (lambda: t.L.gate(kind="other", status="answered", answer_text="yes", answered_by_actor_id=mgr),
+            lambda: t.x("UPDATE gates SET status='answered', answer_text='yes', answered_by_actor_id=? WHERE id=?",
+                        (mgr, t.L.gate(kind="other"))))
+
+
+def _decision_decider(t):
+    mgr = t.L.actor("manager")
+    return (lambda: t.insert("decisions", code="D-0001", question="q", status="decided", answer="a",
+                             decided_by_actor_id=mgr),
+            lambda: t.x("UPDATE decisions SET status='decided', answer='a', decided_by_actor_id=? WHERE id=?",
+                        (mgr, t.insert("decisions", code="D-0001", question="q", status="open"))))
+
+
+def _goal_rejecter(t):
+    mgr = t.L.actor("manager")
+    return (lambda: t.L.design_goal(status="rejected", note="no", change_actor_id=mgr),
+            lambda: t.x("UPDATE design_goals SET status='rejected', note='no', change_actor_id=? WHERE id=?",
+                        (mgr, t.L.design_goal())))
 
 
 def _manager_kind(t):
@@ -183,8 +210,12 @@ TWINS = {
     "tr_dep_order": _dep_order,
     "tr_step_phase_plan": _step_phase_plan,
     "tr_gate_options_shape": _gate_options,
+    "tr_gate_fixed_options": _gate_fixed_options,
     "tr_gate_multi_shape": _gate_multi,
     "tr_goal_approver": _goal_approver,
+    "tr_gate_answerer": _gate_answerer,
+    "tr_decision_decider": _decision_decider,
+    "tr_goal_rejecter": _goal_rejecter,
     "tr_review_manager_kind": _manager_kind,
     "tr_relation_noreverse_dup": _relation_reverse,
     "tr_relation_no_cycle": _relation_cycle,

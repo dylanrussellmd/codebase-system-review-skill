@@ -11,6 +11,7 @@ import sys
 import unittest
 from pathlib import Path
 
+from dev.tests._p5_writes_helpers import complete
 from dev.tests import fixtures
 from dev.tests._w7a_tools_helpers import DATA, env_with, ok, shim, tool_project
 
@@ -50,6 +51,7 @@ def follow_up(repo, L, files):
     for rel, text in files.items():
         repo.write(rel, text)
     repo.commit("second")
+    complete(L)
     ok(L, "dump")
     ok(L, "review-status", "R-0001", "handed-off", "--note", "done", "--actor", "A-0001")
     ok(L, "new-review", "--title", "Second", "--scope", "full", "--previous", "R-0001", "--actor", "A-0001")

@@ -220,8 +220,12 @@ class LintReport(unittest.TestCase):
         self.assertEqual(got["spec.4"], ("not-applicable", "one requirement only", "spec.md"))
         p = lint(L, report(L), "--review", "R-0001", "--record", "--actor", "A-0001")     # a corrected report
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        self.assertEqual(L.one("SELECT answer FROM checklist_answers WHERE check_code='spec.1'")["answer"], "yes")
-        self.assertEqual(L.one("SELECT count(*) n FROM checklist_answers")["n"], 4)
+        # both answers are kept (ISS-0014); v_checklist_answers holds the latest of each
+        self.assertEqual([r["answer"] for r in L.all("SELECT answer FROM checklist_answers WHERE check_code='spec.1' "
+                                                     "ORDER BY id")], ["no", "yes"])
+        self.assertEqual(L.one("SELECT answer FROM v_checklist_answers WHERE check_code='spec.1'")["answer"], "yes")
+        self.assertEqual(L.one("SELECT count(*) n FROM checklist_answers")["n"], 8)
+        self.assertEqual(L.one("SELECT count(*) n FROM v_checklist_answers")["n"], 4)
 
 
 class ChecklistsAreData(unittest.TestCase):

@@ -423,7 +423,7 @@ class Consistency(Base):
         with self.assertRaises(sqlite3.IntegrityError):          # a new off-plan link is refused
             p2 = self.L.plan("P-0002", reviews=[self.r1])
             self.insert("step_findings", step_id=self.L.step(p2, self.L.phase(p2, 1), 1), finding_id=other)
-        self.x("DELETE FROM plan_reviews WHERE plan_id=? AND review_id=?", (plan, self.r2))
+        self.L.unguarded("plan_reviews", "DELETE FROM plan_reviews WHERE plan_id=? AND review_id=?", (plan, self.r2))
         self.assertEqual([(r["plan"], r["step"], r["review"], r["point_id"]) for r in self.view("v_off_plan_coverage")],
                          [("P-0001", 1, "R-0002", "B-1")])
         self.assertTrue(s)

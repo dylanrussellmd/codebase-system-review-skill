@@ -67,7 +67,7 @@ class TagReview(unittest.TestCase):
     def test_tag_review_rejects_non_hex_sha(self):
         L, sha, rid, rep = project(test=self)
         L.x("PRAGMA ignore_check_constraints = ON")  # a ledger from before the hex CHECK, or edited by hand
-        L.x("UPDATE review_repositories SET commit_sha=? WHERE review_id=?", ("--message=" + "0" * 30, rid))
+        L.unguarded("review_repositories", "UPDATE review_repositories SET commit_sha=? WHERE review_id=?", ("--message=" + "0" * 30, rid))
         L.x("PRAGMA ignore_check_constraints = OFF")
         p = L.run("tag-review", "R-0001")
         self.assertEqual(p.returncode, 1, p.stdout + p.stderr)

@@ -54,7 +54,7 @@ class MetricNames(unittest.TestCase):
                              "Brand new metric")
             self.assertEqual(L.x("PRAGMA foreign_key_check").fetchall(), [])
             with self.assertRaisesRegex(sqlite3.IntegrityError, "FOREIGN KEY"):
-                L.x("DELETE FROM metric_defs WHERE name='brand_new_metric'")
+                L.unguarded("metric_defs", "DELETE FROM metric_defs WHERE name='brand_new_metric'")
 
 
 class Upgrade(unittest.TestCase):

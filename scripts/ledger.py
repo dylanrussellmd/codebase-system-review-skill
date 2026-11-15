@@ -40,11 +40,11 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote
 
 TOOL_VERSION = "1.12.0"  # stamped by dev/build.py from `metadata: version:` in SKILL.md's frontmatter
-TOOL_HASH = "81448f280c94d37a90dfd8ce7a001091bab13f3e899b46d5eb2d4403d665cfc3"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
+TOOL_HASH = "0ac61a3d00fe6e66e35b71090d10da1cf7e230bd0a44a8bca06400aea6918479"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
 # Placeholders: dev/build.py puts references/schema.sql, dev/page.html and references/migrations/*.sql in their
 # place when it writes scripts/ledger.py. dev/core.py itself is never run as the tool.
 SCHEMA = r"""-- =====================================================================
--- Code review ledger — schema version 25
+-- Code review ledger — schema version 26
 -- One SQLite file per project: <project root>/.code-review/ledger.sqlite
 -- Every connection must run:  PRAGMA foreign_keys = ON;
 -- Times are UTC ISO-8601 text with milliseconds (strftime('%Y-%m-%dT%H:%M:%fZ','now')); the tr_time_*
@@ -62,7 +62,9 @@ SCHEMA = r"""-- ================================================================
 -- Facts about this ledger file, one per row.
 CREATE TABLE meta (
   key   TEXT PRIMARY KEY,                -- schema_version, project_name, created_at, ledger_location,
-                                         -- created_by_skill, written_by_tool, schema_hash
+                                         -- created_by_skill, written_by_tool, schema_hash, last_write_at
+                                         -- (the triggers below stamp it), ledger_id (random, made once: the
+                                         -- hub's saved answers carry it); dump adds the last dump's time and hash
   value TEXT NOT NULL
 );
 
@@ -293,14 +295,13 @@ CREATE TABLE design_goals (
 
 -- ---------- Reviews -----------------------------------------------------
 
--- History is append-only: reviews, findings, steps and decisions refuse DELETE (tr_*_no_delete). The keys from
+-- History is append-only: every table but meta refuses DELETE (tr_*_no_delete). The keys from
 -- the children of reviews (review_repositories, review_goals, review_domains, reviewer_runs, review_actors,
 -- findings, review_requirement_checks, review_issue_checks, metrics) and of findings (finding_locations,
 -- finding_goals, finding_requirements) are ON DELETE RESTRICT (schema 6), so even with the triggers gone a
 -- review or finding with rows under it cannot be deleted. The ON DELETE CASCADE keys left (phases, steps,
 -- plan_reviews of plans; step_dependencies, step_findings, step_commits of steps; decision_issues of decisions)
--- fire only when their parent row is deleted, which the triggers refuse for steps and decisions; so they reach
--- only parents nothing protects (a plan with no steps, for instance). Abandon a review (status 'abandoned')
+-- fire only when their parent row is deleted, which the triggers refuse. Abandon a review (status 'abandoned')
 -- instead of deleting it.
 
 -- One row for each review of the project.
@@ -399,14 +400,16 @@ CREATE TABLE review_environment (
 );
 
 -- The answer each report gave to each item of its domain's checklist.
--- Written by `ledger.py lint-report --record` for a report that passes; a corrected report replaces its answers.
+-- Written by `ledger.py lint-report --record` for a report that passes. A corrected report adds its answers as new
+-- rows; v_checklist_answers holds the latest answer of each report to each check.
 CREATE TABLE checklist_answers (
-  review_id  INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
-  check_code TEXT NOT NULL REFERENCES domain_checks(code),
-  report     TEXT NOT NULL,                -- the report's file name
-  answer     TEXT NOT NULL CHECK (answer IN ('yes','no','partly','not-applicable')),
-  evidence   TEXT NOT NULL CHECK (length(trim(evidence)) > 0),
-  PRIMARY KEY (review_id, check_code, report)
+  id          INTEGER PRIMARY KEY,
+  review_id   INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
+  check_code  TEXT NOT NULL REFERENCES domain_checks(code),
+  report      TEXT NOT NULL,                -- the report's file name
+  answer      TEXT NOT NULL CHECK (answer IN ('yes','no','partly','not-applicable')),
+  evidence    TEXT NOT NULL CHECK (length(trim(evidence)) > 0),
+  recorded_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
 -- One row for each reviewer that ran in a review.
@@ -742,8 +745,12 @@ CREATE TABLE gates (
   multi INTEGER NOT NULL DEFAULT 0 CHECK (multi IN (0,1)),   -- takes any number of its options (schema 18)
   preselect TEXT CHECK (preselect IS NULL OR (json_valid(preselect) AND json_type(preselect) = 'array')),
                                             -- the option values a multi-select gate shows ticked first
-  change_note TEXT                          -- why the next status change (withdrawn, reopened) is made; copied into
+  change_note TEXT,                         -- why the next status change (withdrawn, reopened) is made; copied into
                                             -- its event with change_actor_id, then cleared (schema 22)
+  confirmed_at TEXT,                        -- when the owner confirmed in chat an answer given in the viewer
+                                            -- (answer-gate --confirm; schema 26)
+  confirmed_by_actor_id INTEGER REFERENCES actors(id),  -- who confirmed it: the owner or another human
+  confirmed_text TEXT                       -- the owner's words in chat
 );
 
 -- ---------- The owner interview (schema 9, plan step 129) --------------
@@ -1290,6 +1297,7 @@ CREATE INDEX ix_fk_reviews_change_actor_id    ON reviews(change_actor_id);
 CREATE INDEX ix_fk_plans_change_actor_id      ON plans(change_actor_id);
 CREATE INDEX ix_fk_gates_change_actor_id      ON gates(change_actor_id);
 CREATE INDEX ix_fk_gates_answered_by_actor_id ON gates(answered_by_actor_id);
+CREATE INDEX ix_fk_gates_confirmed_by_actor_id ON gates(confirmed_by_actor_id);
 -- A leading index for every foreign-key column (a parent delete or update checks its children through it, and
 -- views look gates up by step and decision); dev/tests/test_p4_views_indexes.py keeps the list complete.
 CREATE INDEX ix_fk_actors_parent_actor_id            ON actors(parent_actor_id);
@@ -1317,6 +1325,7 @@ CREATE INDEX ix_fk_review_goals_goal_id              ON review_goals(goal_id);
 CREATE INDEX ix_fk_domain_checks_domain_code       ON domain_checks(domain_code);
 CREATE INDEX ix_fk_domain_checks_severity          ON domain_checks(severity);
 CREATE INDEX ix_fk_checklist_answers_check_code    ON checklist_answers(check_code);
+CREATE INDEX ix_checklist_answers_latest ON checklist_answers(review_id, check_code, report, id);
 CREATE INDEX ix_step_touches_target                  ON step_touches(kind, target);
 CREATE INDEX ix_fk_step_conflicts_step_b_id           ON step_conflicts(step_b_id);
 CREATE INDEX ix_fk_step_conflicts_late_step_id        ON step_conflicts(late_step_id);
@@ -1783,9 +1792,11 @@ END;
 CREATE TRIGGER tr_location_immutable BEFORE UPDATE ON finding_locations
 WHEN OLD.finding_id IS NOT NEW.finding_id OR OLD.repository_id IS NOT NEW.repository_id OR OLD.role IS NOT NEW.role
   OR (OLD.commit_sha IS NOT NULL AND OLD.commit_sha IS NOT NEW.commit_sha)
-  OR ((OLD.path IS NOT NEW.path OR OLD.symbol IS NOT NEW.symbol)
+  OR ((OLD.path IS NOT NEW.path OR OLD.symbol IS NOT NEW.symbol
+       OR (OLD.line_start IS NOT NULL AND OLD.line_start IS NOT NEW.line_start)
+       OR (OLD.line_end IS NOT NULL AND OLD.line_end IS NOT NEW.line_end))
       AND (NEW.change_actor_id IS NULL OR NULLIF(trim(NEW.change_note), '') IS NULL)) BEGIN
-  SELECT RAISE(ABORT, 'history is append-only: a location''s finding, repository, commit and role cannot change, and its path and symbol change only with who and why (ledger.py correct-location)');
+  SELECT RAISE(ABORT, 'history is append-only: a location''s finding, repository, commit and role cannot change, and its path, symbol and filled lines change only with who and why (ledger.py correct-location)');
 END;
 
 -- Logs 'location-corrected' on the finding (from and to: path[:start[-end]][#symbol]) with who and why, then clears
@@ -2083,6 +2094,12 @@ WHEN OLD.status IS NOT NEW.status BEGIN
   WHERE OLD.status = 'awaiting-approval' AND NEW.status = 'approved'
     AND NEW.approved_by_actor_id IS NOT (SELECT answered_by_actor_id FROM gates WHERE review_id = NEW.id
            AND kind = 'domain-approval' AND status = 'applied' ORDER BY id DESC LIMIT 1);
+  -- Consolidating needs every included domain run; handed-off needs the review complete (v_review_gaps).
+  SELECT RAISE(ABORT, 'a review is consolidated only when every included domain has a finished reviewer run (v_review_gaps)')
+  WHERE NEW.status = 'consolidating'
+    AND EXISTS (SELECT 1 FROM v_review_gaps WHERE review_id = NEW.id AND needed_for = 'consolidating');
+  SELECT RAISE(ABORT, 'a review is handed off only when complete: every domain run, no run unfinished, a report, a verdict, no blocking gate open and no row in its review checks (v_review_gaps)')
+  WHERE NEW.status = 'handed-off' AND EXISTS (SELECT 1 FROM v_review_gaps WHERE review_id = NEW.id);
 END;
 
 -- Logs 'status-changed' with change_actor_id and change_note, sets updated_at, and sets completed_at on handed-off
@@ -2260,6 +2277,20 @@ CREATE TRIGGER tr_goal_approver_upd BEFORE UPDATE OF status, approved_by_actor_i
 WHEN NEW.status = 'approved'
  AND NOT EXISTS (SELECT 1 FROM actors WHERE id = NEW.approved_by_actor_id AND kind IN ('owner','human')) BEGIN
   SELECT RAISE(ABORT, 'a design goal is approved by the owner: its approver (approved_by_actor_id) must be an actor of kind owner or human');
+END;
+
+-- Only the owner or another human rejects a goal: the change that rejects it names them in change_actor_id.
+CREATE TRIGGER tr_goal_rejecter BEFORE INSERT ON design_goals
+WHEN NEW.status = 'rejected'
+ AND NOT EXISTS (SELECT 1 FROM actors WHERE id = NEW.change_actor_id AND kind IN ('owner','human')) BEGIN
+  SELECT RAISE(ABORT, 'a design goal is rejected by the owner: change_actor_id must be an actor of kind owner or human');
+END;
+
+-- The same when a goal is rejected later.
+CREATE TRIGGER tr_goal_rejecter_upd BEFORE UPDATE OF status ON design_goals
+WHEN NEW.status = 'rejected' AND OLD.status IS NOT 'rejected'
+ AND NOT EXISTS (SELECT 1 FROM actors WHERE id = NEW.change_actor_id AND kind IN ('owner','human')) BEGIN
+  SELECT RAISE(ABORT, 'a design goal is rejected by the owner: change_actor_id must be an actor of kind owner or human');
 END;
 
 -- The moves a goal's status may make.
@@ -2467,6 +2498,20 @@ END;
 
 -- ----- Decisions
 
+-- Only the owner or another human decides: decided_by_actor_id, when it is set, is an actor of kind owner or human.
+CREATE TRIGGER tr_decision_decider BEFORE INSERT ON decisions
+WHEN NEW.decided_by_actor_id IS NOT NULL
+ AND NOT EXISTS (SELECT 1 FROM actors WHERE id = NEW.decided_by_actor_id AND kind IN ('owner','human')) BEGIN
+  SELECT RAISE(ABORT, 'a decision is decided by the owner: decided_by_actor_id must be an actor of kind owner or human');
+END;
+
+-- The same when a decision is decided later, or its decider changed.
+CREATE TRIGGER tr_decision_decider_upd BEFORE UPDATE OF status, decided_by_actor_id ON decisions
+WHEN NEW.decided_by_actor_id IS NOT NULL
+ AND NOT EXISTS (SELECT 1 FROM actors WHERE id = NEW.decided_by_actor_id AND kind IN ('owner','human')) BEGIN
+  SELECT RAISE(ABORT, 'a decision is decided by the owner: decided_by_actor_id must be an actor of kind owner or human');
+END;
+
 -- Codes: D- and the next number, zero-padded to 4 digits (D-0001 ...); never reused.
 CREATE TRIGGER tr_decision_code BEFORE INSERT ON decisions
 -- (a malformed code is left to the code CHECK, which names it)
@@ -2557,6 +2602,31 @@ WHEN NEW.options IS NOT NULL AND json_valid(NEW.options) AND json_type(NEW.optio
   SELECT RAISE(ABORT, 'gate options must be objects with a text value and label (and an optional description)');
 END;
 
+-- A gate of a kind with fixed options (gate_kinds.options: domain-approval, plan-approval) has exactly those option
+-- values, in that order; labels and descriptions may differ. open-gate fills them.
+CREATE TRIGGER tr_gate_fixed_options BEFORE INSERT ON gates
+WHEN (SELECT options FROM gate_kinds WHERE value = NEW.kind) IS NOT NULL
+ AND (NEW.options IS NULL OR NOT json_valid(NEW.options)
+      OR (SELECT json_group_array(v) FROM (SELECT json_extract(j.value, '$.value') AS v
+                                           FROM json_each(NEW.options) j ORDER BY j.key))
+         IS NOT (SELECT json_group_array(v) FROM (SELECT json_extract(j.value, '$.value') AS v
+                                                  FROM gate_kinds k, json_each(k.options) j
+                                                  WHERE k.value = NEW.kind ORDER BY j.key))) BEGIN
+  SELECT RAISE(ABORT, 'this kind of gate has fixed options: use the values in gate_kinds.options, in order');
+END;
+
+-- The same when the options or the kind change.
+CREATE TRIGGER tr_gate_fixed_options_upd BEFORE UPDATE OF kind, options ON gates
+WHEN (SELECT options FROM gate_kinds WHERE value = NEW.kind) IS NOT NULL
+ AND (NEW.options IS NULL OR NOT json_valid(NEW.options)
+      OR (SELECT json_group_array(v) FROM (SELECT json_extract(j.value, '$.value') AS v
+                                           FROM json_each(NEW.options) j ORDER BY j.key))
+         IS NOT (SELECT json_group_array(v) FROM (SELECT json_extract(j.value, '$.value') AS v
+                                                  FROM gate_kinds k, json_each(k.options) j
+                                                  WHERE k.value = NEW.kind ORDER BY j.key))) BEGIN
+  SELECT RAISE(ABORT, 'this kind of gate has fixed options: use the values in gate_kinds.options, in order');
+END;
+
 -- The answer rules of answer_gate() (the viewer, answer-gate, import-answers), for answers written as SQL:
 -- answer_value is one of the option values, or on a multi-select gate a JSON list of them ('[]': none); a gate
 -- without free text needs an option chosen and takes no note; a note is at most 10,000 characters.
@@ -2618,6 +2688,36 @@ WHEN OLD.status IS NOT NEW.status BEGIN
   WHERE NEW.status = 'withdrawn' AND (NEW.change_actor_id IS NULL OR NULLIF(trim(NEW.change_note), '') IS NULL);
 END;
 
+-- A production-action or accept-risk answer given in the viewer is applied only once the owner has confirmed it in
+-- chat (answer-gate --confirm), as SKILL.md requires.
+CREATE TRIGGER tr_gate_viewer_confirmed BEFORE UPDATE OF status ON gates
+WHEN OLD.status = 'answered' AND NEW.status = 'applied' AND NEW.kind IN ('production-action','accept-risk')
+ AND NEW.answered_via = 'viewer' AND NEW.confirmed_at IS NULL BEGIN
+  SELECT RAISE(ABORT, 'a production-action or accept-risk answer from the viewer is confirmed by the owner in chat before it is applied (answer-gate --confirm)');
+END;
+
+-- A confirmation is of a viewer answer, by the owner or another human, once; reopening the gate clears it.
+CREATE TRIGGER tr_gate_confirm_rules BEFORE UPDATE OF confirmed_at, confirmed_by_actor_id, confirmed_text ON gates
+WHEN OLD.confirmed_at IS NOT NEW.confirmed_at OR OLD.confirmed_by_actor_id IS NOT NEW.confirmed_by_actor_id
+  OR OLD.confirmed_text IS NOT NEW.confirmed_text BEGIN
+  SELECT RAISE(ABORT, 'a confirmation is cleared only by reopening the gate')
+  WHERE NEW.confirmed_at IS NULL AND NEW.status <> 'open';
+  SELECT RAISE(ABORT, 'a confirmation is recorded once, on an answered gate whose answer came from the viewer')
+  WHERE NEW.confirmed_at IS NOT NULL
+    AND (OLD.confirmed_at IS NOT NULL OR NEW.status <> 'answered' OR NEW.answered_via IS NOT 'viewer');
+  SELECT RAISE(ABORT, 'an answer is confirmed by the owner: confirmed_by_actor_id must be an actor of kind owner or human')
+  WHERE NEW.confirmed_at IS NOT NULL
+    AND NOT EXISTS (SELECT 1 FROM actors WHERE id = NEW.confirmed_by_actor_id AND kind IN ('owner','human'));
+END;
+
+-- Logs 'answer-confirmed' with who confirmed and their words.
+CREATE TRIGGER tr_gate_confirmed AFTER UPDATE OF confirmed_at ON gates
+WHEN OLD.confirmed_at IS NULL AND NEW.confirmed_at IS NOT NULL BEGIN
+  INSERT INTO events(entity_type, entity_id, event, to_value, actor_id, review_id, step_id, note)
+  VALUES ('gate', NEW.id, 'answer-confirmed', 'chat', NEW.confirmed_by_actor_id, NEW.review_id, NEW.step_id,
+          NEW.confirmed_text);
+END;
+
 -- Logs 'opened' with the gate's title and who opened it.
 CREATE TRIGGER tr_gate_created AFTER INSERT ON gates BEGIN
   INSERT INTO events(entity_type, entity_id, event, to_value, actor_id, review_id, step_id, note)
@@ -2655,6 +2755,21 @@ WHEN OLD.status <> 'open'
  AND (OLD.answer_value IS NOT NEW.answer_value OR OLD.answer_text IS NOT NEW.answer_text)
  AND NOT (NEW.status = 'open' AND NEW.answer_value IS NULL AND NEW.answer_text IS NULL) BEGIN
   SELECT RAISE(ABORT, 'the answer of a gate that is no longer open cannot be changed; open a new gate');
+END;
+
+-- Only the owner or another human answers a gate: answered_by_actor_id, when it is set, is an actor of kind owner
+-- or human. answer-gate --by, the viewer and import-answers are held to it.
+CREATE TRIGGER tr_gate_answerer BEFORE INSERT ON gates
+WHEN NEW.answered_by_actor_id IS NOT NULL
+ AND NOT EXISTS (SELECT 1 FROM actors WHERE id = NEW.answered_by_actor_id AND kind IN ('owner','human')) BEGIN
+  SELECT RAISE(ABORT, 'a gate is answered by the owner: answered_by_actor_id must be an actor of kind owner or human');
+END;
+
+-- The same when a gate is answered later, or its answerer changed.
+CREATE TRIGGER tr_gate_answerer_upd BEFORE UPDATE OF status, answered_by_actor_id ON gates
+WHEN NEW.answered_by_actor_id IS NOT NULL
+ AND NOT EXISTS (SELECT 1 FROM actors WHERE id = NEW.answered_by_actor_id AND kind IN ('owner','human')) BEGIN
+  SELECT RAISE(ABORT, 'a gate is answered by the owner: answered_by_actor_id must be an actor of kind owner or human');
 END;
 
 -- Likewise who answered, how and when (answered_at may still be filled once, by tr_gate_status).
@@ -3178,15 +3293,17 @@ END;
 CREATE TRIGGER tr_time_gates_ins BEFORE INSERT ON gates
 WHEN (NEW.answered_at IS NOT NULL AND (NEW.answered_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.answered_at) IS NOT NEW.answered_at))
      OR (NEW.applied_at IS NOT NULL AND (NEW.applied_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.applied_at) IS NOT NEW.applied_at))
-     OR (NEW.created_at IS NOT NULL AND (NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at) IS NOT NEW.created_at)) BEGIN
-  SELECT RAISE(ABORT, 'gates: answered_at, applied_at, created_at must be UTC times like 2026-11-10T09:30:00.000Z');
+     OR (NEW.created_at IS NOT NULL AND (NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at) IS NOT NEW.created_at))
+     OR (NEW.confirmed_at IS NOT NULL AND (NEW.confirmed_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.confirmed_at) IS NOT NEW.confirmed_at)) BEGIN
+  SELECT RAISE(ABORT, 'gates: answered_at, applied_at, created_at, confirmed_at must be UTC times like 2026-11-10T09:30:00.000Z');
 END;
 
-CREATE TRIGGER tr_time_gates_upd BEFORE UPDATE OF answered_at, applied_at, created_at ON gates
+CREATE TRIGGER tr_time_gates_upd BEFORE UPDATE OF answered_at, applied_at, created_at, confirmed_at ON gates
 WHEN (NEW.answered_at IS NOT NULL AND (NEW.answered_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.answered_at) IS NOT NEW.answered_at))
      OR (NEW.applied_at IS NOT NULL AND (NEW.applied_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.applied_at) IS NOT NEW.applied_at))
-     OR (NEW.created_at IS NOT NULL AND (NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at) IS NOT NEW.created_at)) BEGIN
-  SELECT RAISE(ABORT, 'gates: answered_at, applied_at, created_at must be UTC times like 2026-11-10T09:30:00.000Z');
+     OR (NEW.created_at IS NOT NULL AND (NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at) IS NOT NEW.created_at))
+     OR (NEW.confirmed_at IS NOT NULL AND (NEW.confirmed_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.confirmed_at) IS NOT NEW.confirmed_at)) BEGIN
+  SELECT RAISE(ABORT, 'gates: answered_at, applied_at, created_at, confirmed_at must be UTC times like 2026-11-10T09:30:00.000Z');
 END;
 
 CREATE TRIGGER tr_time_plans_ins BEFORE INSERT ON plans
@@ -3258,6 +3375,16 @@ END;
 CREATE TRIGGER tr_time_test_runs_upd BEFORE UPDATE OF started_at ON test_runs
 WHEN (NEW.started_at IS NOT NULL AND (NEW.started_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.started_at) IS NOT NEW.started_at)) BEGIN
   SELECT RAISE(ABORT, 'test_runs: started_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_checklist_answers_ins BEFORE INSERT ON checklist_answers
+WHEN (NEW.recorded_at IS NOT NULL AND (NEW.recorded_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.recorded_at) IS NOT NEW.recorded_at)) BEGIN
+  SELECT RAISE(ABORT, 'checklist_answers: recorded_at must be UTC times like 2026-11-10T09:30:00.000Z');
+END;
+
+CREATE TRIGGER tr_time_checklist_answers_upd BEFORE UPDATE OF recorded_at ON checklist_answers
+WHEN (NEW.recorded_at IS NOT NULL AND (NEW.recorded_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' OR strftime('%Y-%m-%dT%H:%M:%fZ', NEW.recorded_at) IS NOT NEW.recorded_at)) BEGIN
+  SELECT RAISE(ABORT, 'checklist_answers: recorded_at must be UTC times like 2026-11-10T09:30:00.000Z');
 END;
 
 CREATE TRIGGER tr_time_metrics_ins BEFORE INSERT ON metrics
@@ -3471,7 +3598,1011 @@ WHEN (NEW.created_at IS NOT NULL AND (NEW.created_at NOT GLOB '[0-9][0-9][0-9][0
   SELECT RAISE(ABORT, 'tool_results: created_at and disposed_at must be UTC times like 2026-11-10T09:30:00.000Z');
 END;
 
+-- ----- Append-only records
+
+-- No row of a history table is deleted; meta, which holds the tool stamps, is the one table outside the rule.
+-- A guard test is dropped only by drop-guard, which writes its guard-dropped event first.
+CREATE TRIGGER tr_schema_migrations_no_delete BEFORE DELETE ON schema_migrations BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: schema_migrations rows cannot be deleted');
+END;
+
+-- A ledger_checks row is never deleted.
+CREATE TRIGGER tr_ledger_checks_no_delete BEFORE DELETE ON ledger_checks BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: ledger_checks rows cannot be deleted');
+END;
+
+-- A issue_statuses row is never deleted.
+CREATE TRIGGER tr_issue_statuses_no_delete BEFORE DELETE ON issue_statuses BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: issue_statuses rows cannot be deleted');
+END;
+
+-- A severities row is never deleted.
+CREATE TRIGGER tr_severities_no_delete BEFORE DELETE ON severities BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: severities rows cannot be deleted');
+END;
+
+-- A match_types row is never deleted.
+CREATE TRIGGER tr_match_types_no_delete BEFORE DELETE ON match_types BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: match_types rows cannot be deleted');
+END;
+
+-- A relation_types row is never deleted.
+CREATE TRIGGER tr_relation_types_no_delete BEFORE DELETE ON relation_types BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: relation_types rows cannot be deleted');
+END;
+
+-- A gate_kinds row is never deleted.
+CREATE TRIGGER tr_gate_kinds_no_delete BEFORE DELETE ON gate_kinds BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: gate_kinds rows cannot be deleted');
+END;
+
+-- A goal_statuses row is never deleted.
+CREATE TRIGGER tr_goal_statuses_no_delete BEFORE DELETE ON goal_statuses BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: goal_statuses rows cannot be deleted');
+END;
+
+-- A enum_labels row is never deleted.
+CREATE TRIGGER tr_enum_labels_no_delete BEFORE DELETE ON enum_labels BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: enum_labels rows cannot be deleted');
+END;
+
+-- A repositories row is never deleted.
+CREATE TRIGGER tr_repositories_no_delete BEFORE DELETE ON repositories BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: repositories rows cannot be deleted');
+END;
+
+-- A actors row is never deleted.
+CREATE TRIGGER tr_actors_no_delete BEFORE DELETE ON actors BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: actors rows cannot be deleted');
+END;
+
+-- A domains row is never deleted.
+CREATE TRIGGER tr_domains_no_delete BEFORE DELETE ON domains BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: domains rows cannot be deleted');
+END;
+
+-- A domain_rules row is never deleted.
+CREATE TRIGGER tr_domain_rules_no_delete BEFORE DELETE ON domain_rules BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: domain_rules rows cannot be deleted');
+END;
+
+-- A domain_checks row is never deleted.
+CREATE TRIGGER tr_domain_checks_no_delete BEFORE DELETE ON domain_checks BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: domain_checks rows cannot be deleted');
+END;
+
+-- A themes row is never deleted.
+CREATE TRIGGER tr_themes_no_delete BEFORE DELETE ON themes BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: themes rows cannot be deleted');
+END;
+
+-- A review_repositories row is never deleted.
+CREATE TRIGGER tr_review_repositories_no_delete BEFORE DELETE ON review_repositories BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: review_repositories rows cannot be deleted');
+END;
+
+-- A review_goals row is never deleted.
+CREATE TRIGGER tr_review_goals_no_delete BEFORE DELETE ON review_goals BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: review_goals rows cannot be deleted');
+END;
+
+-- A review_domains row is never deleted.
+CREATE TRIGGER tr_review_domains_no_delete BEFORE DELETE ON review_domains BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: review_domains rows cannot be deleted');
+END;
+
+-- A review_environment row is never deleted.
+CREATE TRIGGER tr_review_environment_no_delete BEFORE DELETE ON review_environment BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: review_environment rows cannot be deleted');
+END;
+
+-- A checklist_answers row is never deleted.
+CREATE TRIGGER tr_checklist_answers_no_delete BEFORE DELETE ON checklist_answers BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: checklist_answers rows cannot be deleted');
+END;
+
+-- A reviewer_runs row is never deleted.
+CREATE TRIGGER tr_reviewer_runs_no_delete BEFORE DELETE ON reviewer_runs BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: reviewer_runs rows cannot be deleted');
+END;
+
+-- A review_actors row is never deleted.
+CREATE TRIGGER tr_review_actors_no_delete BEFORE DELETE ON review_actors BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: review_actors rows cannot be deleted');
+END;
+
+-- A requirements row is never deleted.
+CREATE TRIGGER tr_requirements_no_delete BEFORE DELETE ON requirements BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: requirements rows cannot be deleted');
+END;
+
+-- A finding_goals row is never deleted.
+CREATE TRIGGER tr_finding_goals_no_delete BEFORE DELETE ON finding_goals BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: finding_goals rows cannot be deleted');
+END;
+
+-- A finding_requirements row is never deleted.
+CREATE TRIGGER tr_finding_requirements_no_delete BEFORE DELETE ON finding_requirements BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: finding_requirements rows cannot be deleted');
+END;
+
+-- A review_requirement_checks row is never deleted.
+CREATE TRIGGER tr_review_requirement_checks_no_delete BEFORE DELETE ON review_requirement_checks BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: review_requirement_checks rows cannot be deleted');
+END;
+
+-- A decision_issues row is never deleted.
+CREATE TRIGGER tr_decision_issues_no_delete BEFORE DELETE ON decision_issues BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: decision_issues rows cannot be deleted');
+END;
+
+-- A plans row is never deleted.
+CREATE TRIGGER tr_plans_no_delete BEFORE DELETE ON plans BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: plans rows cannot be deleted');
+END;
+
+-- A plan_reviews row is never deleted.
+CREATE TRIGGER tr_plan_reviews_no_delete BEFORE DELETE ON plan_reviews BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: plan_reviews rows cannot be deleted');
+END;
+
+-- A phases row is never deleted.
+CREATE TRIGGER tr_phases_no_delete BEFORE DELETE ON phases BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: phases rows cannot be deleted');
+END;
+
+-- A step_dependencies row is never deleted.
+CREATE TRIGGER tr_step_dependencies_no_delete BEFORE DELETE ON step_dependencies BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: step_dependencies rows cannot be deleted');
+END;
+
+-- A step_findings row is never deleted.
+CREATE TRIGGER tr_step_findings_no_delete BEFORE DELETE ON step_findings BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: step_findings rows cannot be deleted');
+END;
+
+-- A step_touches row is never deleted.
+CREATE TRIGGER tr_step_touches_no_delete BEFORE DELETE ON step_touches BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: step_touches rows cannot be deleted');
+END;
+
+-- A step_conflicts row is never deleted.
+CREATE TRIGGER tr_step_conflicts_no_delete BEFORE DELETE ON step_conflicts BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: step_conflicts rows cannot be deleted');
+END;
+
+-- A step_commits row is never deleted.
+CREATE TRIGGER tr_step_commits_no_delete BEFORE DELETE ON step_commits BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: step_commits rows cannot be deleted');
+END;
+
+-- A test_runs row is never deleted.
+CREATE TRIGGER tr_test_runs_no_delete BEFORE DELETE ON test_runs BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: test_runs rows cannot be deleted');
+END;
+
+-- A metric_defs row is never deleted.
+CREATE TRIGGER tr_metric_defs_no_delete BEFORE DELETE ON metric_defs BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: metric_defs rows cannot be deleted');
+END;
+
+-- A metrics row is never deleted.
+CREATE TRIGGER tr_metrics_no_delete BEFORE DELETE ON metrics BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: metrics rows cannot be deleted');
+END;
+
+-- A artifacts row is never deleted.
+CREATE TRIGGER tr_artifacts_no_delete BEFORE DELETE ON artifacts BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: artifacts rows cannot be deleted');
+END;
+
+-- A guard test is deleted only right after its guard-dropped event.
+CREATE TRIGGER tr_guard_tests_no_delete BEFORE DELETE ON guard_tests
+WHEN NOT EXISTS (SELECT 1 FROM events e WHERE e.id = (SELECT max(id) FROM events) AND e.event = 'guard-dropped'
+                 AND e.entity_type = 'issue' AND e.entity_id = OLD.issue_id
+                 AND e.from_value = OLD.test_path || '::' || OLD.test_name) BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: a guard test is removed only with who and why (ledger.py drop-guard)');
+END;
+
+-- These record rows never change once written.
+
+-- A plan_reviews row is never changed.
+CREATE TRIGGER tr_plan_reviews_no_update BEFORE UPDATE ON plan_reviews BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: plan_reviews rows cannot be changed');
+END;
+
+-- A review_goals row is never changed.
+CREATE TRIGGER tr_review_goals_no_update BEFORE UPDATE ON review_goals BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: review_goals rows cannot be changed');
+END;
+
+-- A finding_goals row is never changed.
+CREATE TRIGGER tr_finding_goals_no_update BEFORE UPDATE ON finding_goals BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: finding_goals rows cannot be changed');
+END;
+
+-- A finding_requirements row is never changed.
+CREATE TRIGGER tr_finding_requirements_no_update BEFORE UPDATE ON finding_requirements BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: finding_requirements rows cannot be changed');
+END;
+
+-- A decision_issues row is never changed.
+CREATE TRIGGER tr_decision_issues_no_update BEFORE UPDATE ON decision_issues BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: decision_issues rows cannot be changed');
+END;
+
+-- A schema_migrations row is never changed.
+CREATE TRIGGER tr_schema_migrations_no_update BEFORE UPDATE ON schema_migrations BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: schema_migrations rows cannot be changed');
+END;
+
+-- A checklist_answers row is never changed.
+CREATE TRIGGER tr_checklist_answers_no_update BEFORE UPDATE ON checklist_answers BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: checklist_answers rows cannot be changed');
+END;
+
+-- A fix's commit is recorded once: its step, repository, hash and time never change, and its branch, pull request
+-- and summary are only filled in when empty (add-commit again).
+CREATE TRIGGER tr_step_commit_fixed BEFORE UPDATE ON step_commits
+WHEN OLD.step_id IS NOT NEW.step_id OR OLD.repository_id IS NOT NEW.repository_id
+  OR OLD.commit_sha IS NOT NEW.commit_sha OR OLD.committed_at IS NOT NEW.committed_at
+  OR (OLD.branch IS NOT NULL AND OLD.branch IS NOT NEW.branch)
+  OR (OLD.pr_url IS NOT NULL AND OLD.pr_url IS NOT NEW.pr_url)
+  OR (OLD.summary IS NOT NULL AND OLD.summary IS NOT NEW.summary) BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: a fix''s commit is recorded once; only its empty branch, pull request and summary can be filled in');
+END;
+
+-- The commit a review looked at never changes once reviewers run (snapshot may record it again before); its tag,
+-- push and time stay open.
+CREATE TRIGGER tr_review_commit_fixed BEFORE UPDATE OF commit_sha ON review_repositories
+WHEN OLD.commit_sha IS NOT NEW.commit_sha
+ AND (SELECT status FROM reviews WHERE id = NEW.review_id) NOT IN ('planning','awaiting-approval','approved') BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: the commit a review looked at cannot change');
+END;
+
+-- A guard test keeps its issue, step, repository and commit; its path and name change only by rename-guard, which
+-- writes its guard-renamed event first. Its measured outcomes and still_exists stay open.
+CREATE TRIGGER tr_guard_identity_fixed BEFORE UPDATE OF issue_id, step_id, repository_id, added_commit_sha ON guard_tests
+WHEN OLD.issue_id IS NOT NEW.issue_id OR OLD.step_id IS NOT NEW.step_id OR OLD.repository_id IS NOT NEW.repository_id
+  OR OLD.added_commit_sha IS NOT NEW.added_commit_sha BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: a guard test keeps its issue, step, repository and commit');
+END;
+
+-- A guard test's path and name change only right after its guard-renamed event.
+CREATE TRIGGER tr_guard_renamed_only BEFORE UPDATE OF test_path, test_name ON guard_tests
+WHEN (OLD.test_path IS NOT NEW.test_path OR OLD.test_name IS NOT NEW.test_name)
+ AND NOT EXISTS (SELECT 1 FROM events e WHERE e.id = (SELECT max(id) FROM events) AND e.event = 'guard-renamed'
+                 AND e.entity_type = 'issue' AND e.entity_id = OLD.issue_id
+                 AND e.from_value = OLD.test_path || '::' || OLD.test_name
+                 AND e.to_value = NEW.test_path || '::' || NEW.test_name) BEGIN
+  SELECT RAISE(ABORT, 'history is append-only: a guard test is renamed only with who and why (ledger.py rename-guard)');
+END;
+
+
+-- ----- The last write (meta last_write_at, for the stale-dump check)
+
+-- Every INSERT, UPDATE and DELETE on a table other than meta stamps meta last_write_at, so check can tell a dump
+-- older than the ledger even when the write logged no event. The row starts as '' (no write yet) and is the last
+-- seed row, so init's own seed rows leave it ''. The check-run event that check writes is not a change of the
+-- ledger's content and stamps nothing.
+
+-- An insert into schema_migrations stamps the last write.
+CREATE TRIGGER tr_written_schema_migrations_ins AFTER INSERT ON schema_migrations BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of schema_migrations stamps the last write.
+CREATE TRIGGER tr_written_schema_migrations_upd AFTER UPDATE ON schema_migrations BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from schema_migrations stamps the last write.
+CREATE TRIGGER tr_written_schema_migrations_del AFTER DELETE ON schema_migrations BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into ledger_checks stamps the last write.
+CREATE TRIGGER tr_written_ledger_checks_ins AFTER INSERT ON ledger_checks BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of ledger_checks stamps the last write.
+CREATE TRIGGER tr_written_ledger_checks_upd AFTER UPDATE ON ledger_checks BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from ledger_checks stamps the last write.
+CREATE TRIGGER tr_written_ledger_checks_del AFTER DELETE ON ledger_checks BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into issue_statuses stamps the last write.
+CREATE TRIGGER tr_written_issue_statuses_ins AFTER INSERT ON issue_statuses BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of issue_statuses stamps the last write.
+CREATE TRIGGER tr_written_issue_statuses_upd AFTER UPDATE ON issue_statuses BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from issue_statuses stamps the last write.
+CREATE TRIGGER tr_written_issue_statuses_del AFTER DELETE ON issue_statuses BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into severities stamps the last write.
+CREATE TRIGGER tr_written_severities_ins AFTER INSERT ON severities BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of severities stamps the last write.
+CREATE TRIGGER tr_written_severities_upd AFTER UPDATE ON severities BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from severities stamps the last write.
+CREATE TRIGGER tr_written_severities_del AFTER DELETE ON severities BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into match_types stamps the last write.
+CREATE TRIGGER tr_written_match_types_ins AFTER INSERT ON match_types BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of match_types stamps the last write.
+CREATE TRIGGER tr_written_match_types_upd AFTER UPDATE ON match_types BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from match_types stamps the last write.
+CREATE TRIGGER tr_written_match_types_del AFTER DELETE ON match_types BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into relation_types stamps the last write.
+CREATE TRIGGER tr_written_relation_types_ins AFTER INSERT ON relation_types BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of relation_types stamps the last write.
+CREATE TRIGGER tr_written_relation_types_upd AFTER UPDATE ON relation_types BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from relation_types stamps the last write.
+CREATE TRIGGER tr_written_relation_types_del AFTER DELETE ON relation_types BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into gate_kinds stamps the last write.
+CREATE TRIGGER tr_written_gate_kinds_ins AFTER INSERT ON gate_kinds BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of gate_kinds stamps the last write.
+CREATE TRIGGER tr_written_gate_kinds_upd AFTER UPDATE ON gate_kinds BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from gate_kinds stamps the last write.
+CREATE TRIGGER tr_written_gate_kinds_del AFTER DELETE ON gate_kinds BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into goal_statuses stamps the last write.
+CREATE TRIGGER tr_written_goal_statuses_ins AFTER INSERT ON goal_statuses BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of goal_statuses stamps the last write.
+CREATE TRIGGER tr_written_goal_statuses_upd AFTER UPDATE ON goal_statuses BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from goal_statuses stamps the last write.
+CREATE TRIGGER tr_written_goal_statuses_del AFTER DELETE ON goal_statuses BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into enum_labels stamps the last write.
+CREATE TRIGGER tr_written_enum_labels_ins AFTER INSERT ON enum_labels BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of enum_labels stamps the last write.
+CREATE TRIGGER tr_written_enum_labels_upd AFTER UPDATE ON enum_labels BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from enum_labels stamps the last write.
+CREATE TRIGGER tr_written_enum_labels_del AFTER DELETE ON enum_labels BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into repositories stamps the last write.
+CREATE TRIGGER tr_written_repositories_ins AFTER INSERT ON repositories BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of repositories stamps the last write.
+CREATE TRIGGER tr_written_repositories_upd AFTER UPDATE ON repositories BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from repositories stamps the last write.
+CREATE TRIGGER tr_written_repositories_del AFTER DELETE ON repositories BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into actors stamps the last write.
+CREATE TRIGGER tr_written_actors_ins AFTER INSERT ON actors BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of actors stamps the last write.
+CREATE TRIGGER tr_written_actors_upd AFTER UPDATE ON actors BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from actors stamps the last write.
+CREATE TRIGGER tr_written_actors_del AFTER DELETE ON actors BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into domains stamps the last write.
+CREATE TRIGGER tr_written_domains_ins AFTER INSERT ON domains BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of domains stamps the last write.
+CREATE TRIGGER tr_written_domains_upd AFTER UPDATE ON domains BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from domains stamps the last write.
+CREATE TRIGGER tr_written_domains_del AFTER DELETE ON domains BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into domain_rules stamps the last write.
+CREATE TRIGGER tr_written_domain_rules_ins AFTER INSERT ON domain_rules BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of domain_rules stamps the last write.
+CREATE TRIGGER tr_written_domain_rules_upd AFTER UPDATE ON domain_rules BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from domain_rules stamps the last write.
+CREATE TRIGGER tr_written_domain_rules_del AFTER DELETE ON domain_rules BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into domain_checks stamps the last write.
+CREATE TRIGGER tr_written_domain_checks_ins AFTER INSERT ON domain_checks BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of domain_checks stamps the last write.
+CREATE TRIGGER tr_written_domain_checks_upd AFTER UPDATE ON domain_checks BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from domain_checks stamps the last write.
+CREATE TRIGGER tr_written_domain_checks_del AFTER DELETE ON domain_checks BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into themes stamps the last write.
+CREATE TRIGGER tr_written_themes_ins AFTER INSERT ON themes BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of themes stamps the last write.
+CREATE TRIGGER tr_written_themes_upd AFTER UPDATE ON themes BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from themes stamps the last write.
+CREATE TRIGGER tr_written_themes_del AFTER DELETE ON themes BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into design_goals stamps the last write.
+CREATE TRIGGER tr_written_design_goals_ins AFTER INSERT ON design_goals BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of design_goals stamps the last write.
+CREATE TRIGGER tr_written_design_goals_upd AFTER UPDATE ON design_goals BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from design_goals stamps the last write.
+CREATE TRIGGER tr_written_design_goals_del AFTER DELETE ON design_goals BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into reviews stamps the last write.
+CREATE TRIGGER tr_written_reviews_ins AFTER INSERT ON reviews BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of reviews stamps the last write.
+CREATE TRIGGER tr_written_reviews_upd AFTER UPDATE ON reviews BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from reviews stamps the last write.
+CREATE TRIGGER tr_written_reviews_del AFTER DELETE ON reviews BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into review_repositories stamps the last write.
+CREATE TRIGGER tr_written_review_repositories_ins AFTER INSERT ON review_repositories BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of review_repositories stamps the last write.
+CREATE TRIGGER tr_written_review_repositories_upd AFTER UPDATE ON review_repositories BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from review_repositories stamps the last write.
+CREATE TRIGGER tr_written_review_repositories_del AFTER DELETE ON review_repositories BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into review_goals stamps the last write.
+CREATE TRIGGER tr_written_review_goals_ins AFTER INSERT ON review_goals BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of review_goals stamps the last write.
+CREATE TRIGGER tr_written_review_goals_upd AFTER UPDATE ON review_goals BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from review_goals stamps the last write.
+CREATE TRIGGER tr_written_review_goals_del AFTER DELETE ON review_goals BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into review_domains stamps the last write.
+CREATE TRIGGER tr_written_review_domains_ins AFTER INSERT ON review_domains BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of review_domains stamps the last write.
+CREATE TRIGGER tr_written_review_domains_upd AFTER UPDATE ON review_domains BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from review_domains stamps the last write.
+CREATE TRIGGER tr_written_review_domains_del AFTER DELETE ON review_domains BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into review_environment stamps the last write.
+CREATE TRIGGER tr_written_review_environment_ins AFTER INSERT ON review_environment BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of review_environment stamps the last write.
+CREATE TRIGGER tr_written_review_environment_upd AFTER UPDATE ON review_environment BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from review_environment stamps the last write.
+CREATE TRIGGER tr_written_review_environment_del AFTER DELETE ON review_environment BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into checklist_answers stamps the last write.
+CREATE TRIGGER tr_written_checklist_answers_ins AFTER INSERT ON checklist_answers BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of checklist_answers stamps the last write.
+CREATE TRIGGER tr_written_checklist_answers_upd AFTER UPDATE ON checklist_answers BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from checklist_answers stamps the last write.
+CREATE TRIGGER tr_written_checklist_answers_del AFTER DELETE ON checklist_answers BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into reviewer_runs stamps the last write.
+CREATE TRIGGER tr_written_reviewer_runs_ins AFTER INSERT ON reviewer_runs BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of reviewer_runs stamps the last write.
+CREATE TRIGGER tr_written_reviewer_runs_upd AFTER UPDATE ON reviewer_runs BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from reviewer_runs stamps the last write.
+CREATE TRIGGER tr_written_reviewer_runs_del AFTER DELETE ON reviewer_runs BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into review_actors stamps the last write.
+CREATE TRIGGER tr_written_review_actors_ins AFTER INSERT ON review_actors BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of review_actors stamps the last write.
+CREATE TRIGGER tr_written_review_actors_upd AFTER UPDATE ON review_actors BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from review_actors stamps the last write.
+CREATE TRIGGER tr_written_review_actors_del AFTER DELETE ON review_actors BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into requirements stamps the last write.
+CREATE TRIGGER tr_written_requirements_ins AFTER INSERT ON requirements BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of requirements stamps the last write.
+CREATE TRIGGER tr_written_requirements_upd AFTER UPDATE ON requirements BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from requirements stamps the last write.
+CREATE TRIGGER tr_written_requirements_del AFTER DELETE ON requirements BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into issues stamps the last write.
+CREATE TRIGGER tr_written_issues_ins AFTER INSERT ON issues BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of issues stamps the last write.
+CREATE TRIGGER tr_written_issues_upd AFTER UPDATE ON issues BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from issues stamps the last write.
+CREATE TRIGGER tr_written_issues_del AFTER DELETE ON issues BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into issue_relations stamps the last write.
+CREATE TRIGGER tr_written_issue_relations_ins AFTER INSERT ON issue_relations BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of issue_relations stamps the last write.
+CREATE TRIGGER tr_written_issue_relations_upd AFTER UPDATE ON issue_relations BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from issue_relations stamps the last write.
+CREATE TRIGGER tr_written_issue_relations_del AFTER DELETE ON issue_relations BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into findings stamps the last write.
+CREATE TRIGGER tr_written_findings_ins AFTER INSERT ON findings BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of findings stamps the last write.
+CREATE TRIGGER tr_written_findings_upd AFTER UPDATE ON findings BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from findings stamps the last write.
+CREATE TRIGGER tr_written_findings_del AFTER DELETE ON findings BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into finding_locations stamps the last write.
+CREATE TRIGGER tr_written_finding_locations_ins AFTER INSERT ON finding_locations BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of finding_locations stamps the last write.
+CREATE TRIGGER tr_written_finding_locations_upd AFTER UPDATE ON finding_locations BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from finding_locations stamps the last write.
+CREATE TRIGGER tr_written_finding_locations_del AFTER DELETE ON finding_locations BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into finding_goals stamps the last write.
+CREATE TRIGGER tr_written_finding_goals_ins AFTER INSERT ON finding_goals BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of finding_goals stamps the last write.
+CREATE TRIGGER tr_written_finding_goals_upd AFTER UPDATE ON finding_goals BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from finding_goals stamps the last write.
+CREATE TRIGGER tr_written_finding_goals_del AFTER DELETE ON finding_goals BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into finding_requirements stamps the last write.
+CREATE TRIGGER tr_written_finding_requirements_ins AFTER INSERT ON finding_requirements BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of finding_requirements stamps the last write.
+CREATE TRIGGER tr_written_finding_requirements_upd AFTER UPDATE ON finding_requirements BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from finding_requirements stamps the last write.
+CREATE TRIGGER tr_written_finding_requirements_del AFTER DELETE ON finding_requirements BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into review_requirement_checks stamps the last write.
+CREATE TRIGGER tr_written_review_requirement_checks_ins AFTER INSERT ON review_requirement_checks BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of review_requirement_checks stamps the last write.
+CREATE TRIGGER tr_written_review_requirement_checks_upd AFTER UPDATE ON review_requirement_checks BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from review_requirement_checks stamps the last write.
+CREATE TRIGGER tr_written_review_requirement_checks_del AFTER DELETE ON review_requirement_checks BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into review_issue_checks stamps the last write.
+CREATE TRIGGER tr_written_review_issue_checks_ins AFTER INSERT ON review_issue_checks BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of review_issue_checks stamps the last write.
+CREATE TRIGGER tr_written_review_issue_checks_upd AFTER UPDATE ON review_issue_checks BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from review_issue_checks stamps the last write.
+CREATE TRIGGER tr_written_review_issue_checks_del AFTER DELETE ON review_issue_checks BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into decisions stamps the last write.
+CREATE TRIGGER tr_written_decisions_ins AFTER INSERT ON decisions BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of decisions stamps the last write.
+CREATE TRIGGER tr_written_decisions_upd AFTER UPDATE ON decisions BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from decisions stamps the last write.
+CREATE TRIGGER tr_written_decisions_del AFTER DELETE ON decisions BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into decision_issues stamps the last write.
+CREATE TRIGGER tr_written_decision_issues_ins AFTER INSERT ON decision_issues BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of decision_issues stamps the last write.
+CREATE TRIGGER tr_written_decision_issues_upd AFTER UPDATE ON decision_issues BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from decision_issues stamps the last write.
+CREATE TRIGGER tr_written_decision_issues_del AFTER DELETE ON decision_issues BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into gates stamps the last write.
+CREATE TRIGGER tr_written_gates_ins AFTER INSERT ON gates BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of gates stamps the last write.
+CREATE TRIGGER tr_written_gates_upd AFTER UPDATE ON gates BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from gates stamps the last write.
+CREATE TRIGGER tr_written_gates_del AFTER DELETE ON gates BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into interview_questions stamps the last write.
+CREATE TRIGGER tr_written_interview_questions_ins AFTER INSERT ON interview_questions BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of interview_questions stamps the last write.
+CREATE TRIGGER tr_written_interview_questions_upd AFTER UPDATE ON interview_questions BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from interview_questions stamps the last write.
+CREATE TRIGGER tr_written_interview_questions_del AFTER DELETE ON interview_questions BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into interview_answers stamps the last write.
+CREATE TRIGGER tr_written_interview_answers_ins AFTER INSERT ON interview_answers BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of interview_answers stamps the last write.
+CREATE TRIGGER tr_written_interview_answers_upd AFTER UPDATE ON interview_answers BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from interview_answers stamps the last write.
+CREATE TRIGGER tr_written_interview_answers_del AFTER DELETE ON interview_answers BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into goal_sources stamps the last write.
+CREATE TRIGGER tr_written_goal_sources_ins AFTER INSERT ON goal_sources BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of goal_sources stamps the last write.
+CREATE TRIGGER tr_written_goal_sources_upd AFTER UPDATE ON goal_sources BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from goal_sources stamps the last write.
+CREATE TRIGGER tr_written_goal_sources_del AFTER DELETE ON goal_sources BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into plans stamps the last write.
+CREATE TRIGGER tr_written_plans_ins AFTER INSERT ON plans BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of plans stamps the last write.
+CREATE TRIGGER tr_written_plans_upd AFTER UPDATE ON plans BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from plans stamps the last write.
+CREATE TRIGGER tr_written_plans_del AFTER DELETE ON plans BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into plan_reviews stamps the last write.
+CREATE TRIGGER tr_written_plan_reviews_ins AFTER INSERT ON plan_reviews BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of plan_reviews stamps the last write.
+CREATE TRIGGER tr_written_plan_reviews_upd AFTER UPDATE ON plan_reviews BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from plan_reviews stamps the last write.
+CREATE TRIGGER tr_written_plan_reviews_del AFTER DELETE ON plan_reviews BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into phases stamps the last write.
+CREATE TRIGGER tr_written_phases_ins AFTER INSERT ON phases BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of phases stamps the last write.
+CREATE TRIGGER tr_written_phases_upd AFTER UPDATE ON phases BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from phases stamps the last write.
+CREATE TRIGGER tr_written_phases_del AFTER DELETE ON phases BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into steps stamps the last write.
+CREATE TRIGGER tr_written_steps_ins AFTER INSERT ON steps BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of steps stamps the last write.
+CREATE TRIGGER tr_written_steps_upd AFTER UPDATE ON steps BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from steps stamps the last write.
+CREATE TRIGGER tr_written_steps_del AFTER DELETE ON steps BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into step_dependencies stamps the last write.
+CREATE TRIGGER tr_written_step_dependencies_ins AFTER INSERT ON step_dependencies BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of step_dependencies stamps the last write.
+CREATE TRIGGER tr_written_step_dependencies_upd AFTER UPDATE ON step_dependencies BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from step_dependencies stamps the last write.
+CREATE TRIGGER tr_written_step_dependencies_del AFTER DELETE ON step_dependencies BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into step_findings stamps the last write.
+CREATE TRIGGER tr_written_step_findings_ins AFTER INSERT ON step_findings BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of step_findings stamps the last write.
+CREATE TRIGGER tr_written_step_findings_upd AFTER UPDATE ON step_findings BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from step_findings stamps the last write.
+CREATE TRIGGER tr_written_step_findings_del AFTER DELETE ON step_findings BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into step_goals stamps the last write.
+CREATE TRIGGER tr_written_step_goals_ins AFTER INSERT ON step_goals BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of step_goals stamps the last write.
+CREATE TRIGGER tr_written_step_goals_upd AFTER UPDATE ON step_goals BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from step_goals stamps the last write.
+CREATE TRIGGER tr_written_step_goals_del AFTER DELETE ON step_goals BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into step_touches stamps the last write.
+CREATE TRIGGER tr_written_step_touches_ins AFTER INSERT ON step_touches BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of step_touches stamps the last write.
+CREATE TRIGGER tr_written_step_touches_upd AFTER UPDATE ON step_touches BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from step_touches stamps the last write.
+CREATE TRIGGER tr_written_step_touches_del AFTER DELETE ON step_touches BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into step_conflicts stamps the last write.
+CREATE TRIGGER tr_written_step_conflicts_ins AFTER INSERT ON step_conflicts BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of step_conflicts stamps the last write.
+CREATE TRIGGER tr_written_step_conflicts_upd AFTER UPDATE ON step_conflicts BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from step_conflicts stamps the last write.
+CREATE TRIGGER tr_written_step_conflicts_del AFTER DELETE ON step_conflicts BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into step_commits stamps the last write.
+CREATE TRIGGER tr_written_step_commits_ins AFTER INSERT ON step_commits BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of step_commits stamps the last write.
+CREATE TRIGGER tr_written_step_commits_upd AFTER UPDATE ON step_commits BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from step_commits stamps the last write.
+CREATE TRIGGER tr_written_step_commits_del AFTER DELETE ON step_commits BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into guard_tests stamps the last write.
+CREATE TRIGGER tr_written_guard_tests_ins AFTER INSERT ON guard_tests BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of guard_tests stamps the last write.
+CREATE TRIGGER tr_written_guard_tests_upd AFTER UPDATE ON guard_tests BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from guard_tests stamps the last write.
+CREATE TRIGGER tr_written_guard_tests_del AFTER DELETE ON guard_tests BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into feature_proposals stamps the last write.
+CREATE TRIGGER tr_written_feature_proposals_ins AFTER INSERT ON feature_proposals BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of feature_proposals stamps the last write.
+CREATE TRIGGER tr_written_feature_proposals_upd AFTER UPDATE ON feature_proposals BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from feature_proposals stamps the last write.
+CREATE TRIGGER tr_written_feature_proposals_del AFTER DELETE ON feature_proposals BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into feature_status_changes stamps the last write.
+CREATE TRIGGER tr_written_feature_status_changes_ins AFTER INSERT ON feature_status_changes BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of feature_status_changes stamps the last write.
+CREATE TRIGGER tr_written_feature_status_changes_upd AFTER UPDATE ON feature_status_changes BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from feature_status_changes stamps the last write.
+CREATE TRIGGER tr_written_feature_status_changes_del AFTER DELETE ON feature_status_changes BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into tool_runs stamps the last write.
+CREATE TRIGGER tr_written_tool_runs_ins AFTER INSERT ON tool_runs BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of tool_runs stamps the last write.
+CREATE TRIGGER tr_written_tool_runs_upd AFTER UPDATE ON tool_runs BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from tool_runs stamps the last write.
+CREATE TRIGGER tr_written_tool_runs_del AFTER DELETE ON tool_runs BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into tool_results stamps the last write.
+CREATE TRIGGER tr_written_tool_results_ins AFTER INSERT ON tool_results BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of tool_results stamps the last write.
+CREATE TRIGGER tr_written_tool_results_upd AFTER UPDATE ON tool_results BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from tool_results stamps the last write.
+CREATE TRIGGER tr_written_tool_results_del AFTER DELETE ON tool_results BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into test_runs stamps the last write.
+CREATE TRIGGER tr_written_test_runs_ins AFTER INSERT ON test_runs BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of test_runs stamps the last write.
+CREATE TRIGGER tr_written_test_runs_upd AFTER UPDATE ON test_runs BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from test_runs stamps the last write.
+CREATE TRIGGER tr_written_test_runs_del AFTER DELETE ON test_runs BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into metric_defs stamps the last write.
+CREATE TRIGGER tr_written_metric_defs_ins AFTER INSERT ON metric_defs BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of metric_defs stamps the last write.
+CREATE TRIGGER tr_written_metric_defs_upd AFTER UPDATE ON metric_defs BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from metric_defs stamps the last write.
+CREATE TRIGGER tr_written_metric_defs_del AFTER DELETE ON metric_defs BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into metrics stamps the last write.
+CREATE TRIGGER tr_written_metrics_ins AFTER INSERT ON metrics BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of metrics stamps the last write.
+CREATE TRIGGER tr_written_metrics_upd AFTER UPDATE ON metrics BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from metrics stamps the last write.
+CREATE TRIGGER tr_written_metrics_del AFTER DELETE ON metrics BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into artifacts stamps the last write.
+CREATE TRIGGER tr_written_artifacts_ins AFTER INSERT ON artifacts BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of artifacts stamps the last write.
+CREATE TRIGGER tr_written_artifacts_upd AFTER UPDATE ON artifacts BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from artifacts stamps the last write.
+CREATE TRIGGER tr_written_artifacts_del AFTER DELETE ON artifacts BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An insert into events stamps the last write.
+CREATE TRIGGER tr_written_events_ins AFTER INSERT ON events WHEN NEW.event IS NOT 'check-run' BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- An update of events stamps the last write.
+CREATE TRIGGER tr_written_events_upd AFTER UPDATE ON events BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+-- A delete from events stamps the last write.
+CREATE TRIGGER tr_written_events_del AFTER DELETE ON events BEGIN
+  UPDATE meta SET value = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'last_write_at';
+END;
+
+
 -- ---------- Views ---------------------------------------------------------
+
+-- The latest answer of each report to each checklist item (lint-report --record adds a row for each run).
+CREATE VIEW v_checklist_answers AS
+SELECT a.* FROM checklist_answers a
+WHERE a.id = (SELECT max(b.id) FROM checklist_answers b WHERE b.review_id = a.review_id
+              AND b.check_code = a.check_code AND b.report = a.report);
 
 -- Issues still to fix, most severe first, then oldest.
 -- locations: the primary locations of the issue's real findings (v_real_findings), each prefixed with its
@@ -4214,6 +5345,51 @@ FROM v_tool_results v JOIN reviews r ON r.code = v.review
 WHERE v.disposition = 'open' AND r.status <> 'abandoned'
 ORDER BY v.review, v.lead;
 
+-- The reasons each review is not complete yet, first reason first.
+-- An included domain with no finished reviewer run (needed before consolidating), then (needed before handed-off) a run still queued or running, no report, no verdict, a
+-- blocking gate of the review still open (not a plan's or step's gate, nor one opened after the hand-off such as a
+-- review-handoff gate), and the rows of v_unmatched_findings, v_unchecked_known_issues and
+-- v_unaddressed_tool_results.
+-- tr_review_transition refuses consolidating and handed-off while the review has the rows that status needs.
+CREATE VIEW v_review_gaps AS
+SELECT r.id AS review_id, r.code AS review, 'consolidating' AS needed_for, 1 AS rank,
+       'domain ' || rd.domain_code || ' has no finished reviewer run' AS reason
+FROM reviews r JOIN review_domains rd ON rd.review_id = r.id AND rd.decision = 'included'
+WHERE NOT EXISTS (SELECT 1 FROM reviewer_runs u WHERE u.review_id = r.id AND u.domain_code = rd.domain_code
+                  AND u.status = 'finished')
+UNION ALL
+SELECT r.id, r.code, 'handed-off', 2, 'reviewer run ' || u.label || ' is ' || u.status
+FROM reviews r JOIN reviewer_runs u ON u.review_id = r.id WHERE u.status IN ('queued','running')
+UNION ALL
+SELECT r.id, r.code, 'handed-off', 3, 'it has no report (ledger.py set-report)'
+FROM reviews r WHERE NULLIF(trim(r.report_md), '') IS NULL
+UNION ALL
+SELECT r.id, r.code, 'handed-off', 4, 'it has no verdict (ledger.py set-verdict)'
+FROM reviews r WHERE NULLIF(trim(r.verdict), '') IS NULL
+UNION ALL
+SELECT r.id, r.code, 'handed-off', 5, 'gate ' || g.code || ' is open'
+FROM reviews r JOIN gates g ON g.review_id = r.id
+WHERE g.status = 'open' AND g.blocking = 1 AND g.plan_id IS NULL AND g.step_id IS NULL
+  AND (r.completed_at IS NULL OR g.created_at <= r.completed_at)
+UNION ALL
+SELECT r.id, r.code, 'handed-off', 6, 'finding ' || v.point_id || ' is not matched to an issue'
+FROM reviews r JOIN v_unmatched_findings v ON v.review = r.code
+UNION ALL
+SELECT r.id, r.code, 'handed-off', 7, 'known issue ' || v.issue || ' has no check recorded'
+FROM reviews r JOIN v_unchecked_known_issues v ON v.review = r.code
+UNION ALL
+SELECT r.id, r.code, 'handed-off', 8, 'tool result ' || v.lead || ' is not addressed'
+FROM reviews r JOIN v_unaddressed_tool_results v ON v.review = r.code;
+
+-- Must be empty: reviews handed off before they were complete, and reviews consolidating with a domain not run.
+-- A review handed off before schema 26 made this a rule is history and is not listed.
+CREATE VIEW v_incomplete_reviews AS
+SELECT g.review, r.status, g.reason
+FROM v_review_gaps g JOIN reviews r ON r.id = g.review_id
+WHERE (r.status = 'handed-off' AND r.completed_at >= (SELECT applied_at FROM schema_migrations WHERE version = 26))
+   OR (r.status = 'consolidating' AND g.needed_for = 'consolidating')
+ORDER BY g.review, g.rank, g.reason;
+
 -- Every tool run of every review, newest last, with how many leads it gave and how many are still unaddressed.
 -- The tools page and `ledger.py env` read it; absent and skipped runs carry the fallback the reviewer follows.
 CREATE VIEW v_tool_runs AS
@@ -4547,6 +5723,11 @@ INSERT INTO enum_labels(enum, value, label, position) VALUES
  ('event','check-corrected','A review check was corrected',34),
  ('event','guard-dropped','A guard test was dropped',35),
  ('event','guard-renamed','A guard test was renamed',36);
+INSERT INTO enum_labels(enum, value, label, position) VALUES
+ ('event','answer-confirmed','The owner confirmed an answer in chat',37),
+ ('event','check-run','The ledger was checked',38);
+INSERT INTO ledger_checks(view, label, tier, position) VALUES
+ ('v_incomplete_reviews','Reviews handed off incomplete, or consolidating with a domain not run','error',86);
 
 INSERT INTO ledger_checks(view, label, tier, position) VALUES
  ('v_artifacts_outside_ledger','Review files recorded outside the ledger''s folder','warning',110);
@@ -4709,7 +5890,8 @@ INSERT INTO enum_labels(enum, value, label, position) VALUES
  ('tool_output_format','json','JSON',5), ('tool_output_format','jsonl','JSON lines',6),
  ('tool_result_level','error','Error',1), ('tool_result_level','warning','Warning',2),
  ('tool_result_level','note','Note',3), ('tool_result_level','none','No level',4);
-INSERT INTO meta(key, value) VALUES ('schema_version','25');
+INSERT INTO meta(key, value) VALUES ('schema_version','26');
+INSERT INTO meta(key, value) VALUES ('ledger_id', lower(hex(randomblob(16))));  -- binds hub answers to this ledger
 INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger schema'),
   (2, 'url, path, hash and code checks; repositories.allow_outside_root; finding_locations.excerpt_redacted'),
   (3, 'integrity rules: codes, hashes, checks, append-only history, owner actor on gate answers'),
@@ -4734,7 +5916,9 @@ INSERT INTO schema_migrations(version, description) VALUES (1, 'initial ledger s
   (22, 'correction commands: who corrects a gate, a location or a check, and why'),
   (23, 'measured guard tests: guard_tests.measured_at and measured_commit_sha; v_unproven_steps; the guard-dropped and guard-renamed events'),
   (24, 'events take the entity type ''ledger'': a redaction of a row that belongs to no other entity'),
-  (25, 'masked excerpts hash the masked lines; rule triggers hold on UPDATE; approval follows the owner''s applied answer');
+  (25, 'masked excerpts hash the masked lines; rule triggers hold on UPDATE; approval follows the owner''s applied answer'),
+  (26, 'approval gates keep their fixed options; meta last_write_at; only the owner answers, decides and rejects goals');
+INSERT INTO meta(key, value) VALUES ('last_write_at', '');  -- the last seed row: see tr_written_*
 """
 PAGE = r"""<!doctype html>
 <html lang="en">
@@ -5001,7 +6185,8 @@ async function hubInit(){
 }
 // The answers kept in this browser as a file for the agent (import-answers takes this list as it is).
 function answersFile(){
-  const list = Object.entries(HUB.answers).map(([gate, a]) => ({gate, answer_value: a.answer_value ?? null, answer_text: a.answer_text ?? null, answered_at: a.answered_at || null}));
+  const list = Object.entries(HUB.answers).map(([gate, a]) => ({gate, answer_value: a.answer_value ?? null, answer_text: a.answer_text ?? null, answered_at: a.answered_at || null,
+    ledger_id: a.ledger_id || null, gate_created_at: a.gate_created_at || null, snapshot_taken: a.snapshot_taken || null}));
   const href = URL.createObjectURL(new Blob([JSON.stringify(list, null, 1)], {type: "application/json"}));
   return h("a", {href, download: "answers.json"}, "Download your answers");
 }
@@ -5049,7 +6234,8 @@ function hubGateBody(card, g, hid){
     if (!g.multi && !val && !txt) { put(msg, errorBox("Choose an option or write an answer.")); return; }
     send.disabled = true;
     try {
-      const a = {gate: g.code, answer_value: val, answer_text: txt || null, answered_at: new Date().toISOString()};
+      const a = {gate: g.code, answer_value: val, answer_text: txt || null, answered_at: new Date().toISOString(),
+                 ledger_id: STATIC.ledger_id || null, gate_created_at: g.created_at || null, snapshot_taken: STATIC.taken || null};
       await HUB.store.save(g.code, a);
       HUB.answers[g.code] = a;
       put(form, h("p", {class: "status"}, HUB.store.local ? "Saved in this browser." : "Saved.", HANDOVER()));
@@ -8475,6 +9661,66 @@ DROP TABLE gate_kinds;
 ALTER TABLE gate_kinds_new RENAME TO gate_kinds;
 UPDATE gate_kinds SET options = '[{"value":"approve","label":"Approve"},{"value":"change","label":"Change it first"}]'
   WHERE value IN ('domain-approval','plan-approval');
+-- migration: 0026-owner-answers-and-history.sql
+-- approval gates keep their fixed options; meta last_write_at; only the owner answers, decides and rejects goals
+-- Plan P-0002 step 342 (ISS-0715). tr_gate_fixed_options and its UPDATE twin hold a domain-approval or plan-approval
+-- gate to the option values of gate_kinds.options; gates already stored keep theirs. migrate re-creates the triggers
+-- with the shipped schema.
+
+SELECT 1;
+
+-- Step 343 (ISS-0716). meta last_write_at holds the time of the last write to any table; the tr_written_* triggers
+-- of the shipped schema stamp it. It starts as '' (no write yet), and migrate stamps it once it is done, so a dump
+-- made before the upgrade shows as stale.
+INSERT OR IGNORE INTO meta(key, value) VALUES ('last_write_at', '');
+
+-- Step 45 (ISS-0427). Only an actor of kind owner or human answers a gate (tr_gate_answerer), decides a decision
+-- (tr_decision_decider) or rejects a design goal (tr_goal_rejecter); each has its UPDATE twin. Rows already stored
+-- keep their actors.
+
+-- Step 46 (ISS-0427). A production-action or accept-risk answer given in the viewer is applied only after the owner
+-- confirms it in chat: answer-gate --confirm fills confirmed_at, confirmed_by_actor_id and confirmed_text, and
+-- tr_gate_viewer_confirmed refuses apply until then. The confirmation is logged as an answer-confirmed event.
+ALTER TABLE gates ADD COLUMN confirmed_at TEXT;
+ALTER TABLE gates ADD COLUMN confirmed_by_actor_id INTEGER REFERENCES actors(id);
+ALTER TABLE gates ADD COLUMN confirmed_text TEXT;
+CREATE INDEX ix_fk_gates_confirmed_by_actor_id ON gates(confirmed_by_actor_id);
+INSERT INTO enum_labels(enum, value, label, position) VALUES
+ ('event','answer-confirmed','The owner confirmed an answer in chat',37);
+
+-- Step 47 (ISS-0427). meta ledger_id is a random id made once per ledger. The hub embeds it, every answer the hub
+-- saves carries it with the gate's created_at, and import-answers refuses an answer from another ledger's hub or to
+-- another gate of the same code.
+INSERT OR IGNORE INTO meta(key, value) VALUES ('ledger_id', lower(hex(randomblob(16))));
+
+-- Step 48 (ISS-0014). Every table but meta refuses DELETE; the record tables whose rows never change refuse UPDATE;
+-- a review's commit, a guard test's identity and a location's filled lines are fixed (all triggers of the shipped
+-- schema). checklist_answers keeps every answer lint-report --record writes: it is rebuilt with an id and
+-- recorded_at, its rows kept, and v_checklist_answers holds the latest of each.
+CREATE TABLE checklist_answers_new (
+  id          INTEGER PRIMARY KEY,
+  review_id   INTEGER NOT NULL REFERENCES reviews(id) ON DELETE RESTRICT,
+  check_code  TEXT NOT NULL REFERENCES domain_checks(code),
+  report      TEXT NOT NULL,                -- the report's file name
+  answer      TEXT NOT NULL CHECK (answer IN ('yes','no','partly','not-applicable')),
+  evidence    TEXT NOT NULL CHECK (length(trim(evidence)) > 0),
+  recorded_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+INSERT INTO checklist_answers_new(review_id, check_code, report, answer, evidence)
+  SELECT review_id, check_code, report, answer, evidence FROM checklist_answers ORDER BY rowid;
+DROP TABLE checklist_answers;
+ALTER TABLE checklist_answers_new RENAME TO checklist_answers;
+CREATE INDEX ix_fk_checklist_answers_check_code    ON checklist_answers(check_code);
+CREATE INDEX ix_checklist_answers_latest ON checklist_answers(review_id, check_code, report, id);
+
+-- Step 49 (ISS-0010). v_review_gaps lists why a review is not complete; tr_review_transition refuses consolidating
+-- while an included domain has no finished run and handed-off while the review has any gap. v_incomplete_reviews
+-- (must be empty) lists reviews already in those states with the gaps they need closed. check records its result
+-- as a check-run event on the review in progress.
+INSERT INTO enum_labels(enum, value, label, position) VALUES
+ ('event','check-run','The ledger was checked',38);
+INSERT INTO ledger_checks(view, label, tier, position) VALUES
+ ('v_incomplete_reviews','Reviews handed off incomplete, or consolidating with a domain not run','error',86);
 """
 
 
@@ -8902,6 +10148,7 @@ def migrate(db):
             step = "the checks after " + ", ".join(f"migration {m[0]:04d}-{m[1]}" for m in pending)
             con.execute("UPDATE meta SET value=? WHERE key='schema_version'", (str(SCHEMA_VERSION),))
             _create_views_and_triggers(con)
+            con.execute("UPDATE meta SET value=? WHERE key='last_write_at'", (now(),))  # the dump is of the old schema
             notes = []
         else:
             notes = sync_views_and_triggers(con)
@@ -10452,16 +11699,45 @@ def record_dump(con, path, at):
         print(f"note: the dump is written but not recorded in the ledger ({_one_line(e)})", file=sys.stderr)
 
 
+def record_check(db, bad):
+    """Record check's result as a check-run event on the review in progress (the newest one not handed off or
+    abandoned): 'passed', or how many checks failed. A ledger of another schema, or one another writer holds, keeps
+    no record; check's own output is what counts."""
+    try:
+        con = connect(db)
+    except (sqlite3.Error, LedgerError):
+        return
+    try:
+        con.execute("PRAGMA busy_timeout = 2000")
+        if con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] != str(SCHEMA_VERSION):
+            return
+        con.isolation_level = None
+        con.execute("BEGIN IMMEDIATE")
+        con.execute("""INSERT INTO events(entity_type, entity_id, event, to_value, review_id)
+                       SELECT 'review', id, 'check-run', ?, id FROM reviews
+                       WHERE status NOT IN ('handed-off','abandoned') ORDER BY id DESC LIMIT 1""",
+                    ("passed" if not bad else f"{bad} failed",))
+        con.execute("COMMIT")
+    except sqlite3.Error as e:
+        if con.in_transaction:
+            con.execute("ROLLBACK")
+        print(f"note: check's result is not recorded in the ledger ({_one_line(e)})", file=sys.stderr)
+    finally:
+        con.close()
+
+
 def stale_dump(con, db=None):
-    """Why the dump beside the ledger (<db>.sql) is not current, or None: it is missing while the ledger has
-    events, or the ledger has an event newer than its last dump, or the file is not the dump last recorded. The
-    dump is the copy of the ledger that leaves this machine (SKILL.md, Step 7)."""
+    """Why the dump beside the ledger (<db>.sql) is not current, or None: it is missing while the ledger has been
+    written, or the ledger was written after its last dump (the newest event, or meta last_write_at, which every
+    write to a table stamps), or the file is not the dump last recorded. The dump is the copy of the ledger that
+    leaves this machine (SKILL.md, Step 7)."""
     if db is None:
         db = next((r[2] for r in con.execute("PRAGMA database_list") if r[1] == "main"), "")
         if not db:
             return None
     out = Path(db).with_suffix(".sql")
-    newest = con.execute("SELECT max(at) FROM events").fetchone()[0]
+    newest = con.execute("""SELECT max(t) FROM (SELECT max(at) t FROM events WHERE event <> 'check-run' UNION ALL
+                            SELECT NULLIF(value, '') FROM meta WHERE key = 'last_write_at')""").fetchone()[0]
     if newest is None:
         return None
     if not out.exists():
@@ -10735,6 +12011,7 @@ CHECK_ACTIONS = {
     "v_unresolved_conflicts": "The agent judges each pair of steps with resolve-conflict before the plan is approved.",
     "v_late_step_conflicts": "The agent judges each pair with resolve-conflict before the added step starts.",
     "v_unaddressed_tool_results": "The agent has each tool lead cited by a finding or dismissed with a reason.",
+    "v_incomplete_reviews": "The agent runs each domain, finishes each run and stores the report and verdict.",
 }
 RECIPES_FILE = "references/recipes.md"
 
@@ -12272,7 +13549,9 @@ def hub_snapshot(root, db, con, start=None):
         active = [r[0] for r in con.execute("SELECT value FROM issue_statuses WHERE active = 1 ORDER BY position")]
     except sqlite3.Error:
         active = ["open", "needs-decision", "planned", "in-progress", "regressed"]
-    return {"taken": now(), "start": start, "active": active, "guide": HUB_GUIDE_MD, "responses": R}
+    lid = con.execute("SELECT value FROM meta WHERE key='ledger_id'").fetchone()
+    return {"taken": now(), "ledger_id": lid[0] if lid else None, "start": start, "active": active,
+            "guide": HUB_GUIDE_MD, "responses": R}
 
 
 def hub_page(root, db, start=None, page=None):
@@ -12374,12 +13653,27 @@ def record_answers_import(con, source, recorded, skipped, refused):
     con.commit()
 
 
-def import_answers(db, source):
-    """`ledger.py import-answers FILE`: record the owner's answers given in the hub (the answers.json it downloads,
-    or the documents of a published page's answer store) into the ledger. Each goes through answer_gate(), the one set
-    of answer rules the viewer and answer-gate use, so it is checked against the gate's options and recorded
-    answered_via='viewer' by the owner. A gate that is no longer open is left as it is and said so. The time the
-    owner answered in the hub is not kept: the gate records when it was imported. Returns 1 when any answer was
+def _answer_unbound(con, code, data, ledger_id):
+    """Why an answer saved by a hub does not belong to this ledger's gate, or None: the hub was of another ledger
+    (its ledger_id differs), or the gate it answered was made at another time than this ledger's gate of that code.
+    An answer that carries neither (written by hand) is checked by the gate's rules alone."""
+    if data.get("ledger_id") is not None and data.get("ledger_id") != ledger_id:
+        return "the answer was saved by the hub of another ledger"
+    made = data.get("gate_created_at")
+    if made is not None:
+        g = con.execute("SELECT created_at FROM gates WHERE code=?", (code,)).fetchone()
+        if g and g[0] != made:
+            return f"the answer is to another question with this code (asked at {made}; this one at {g[0]})"
+    return None
+
+
+def import_answers(db, source, yes=False):
+    """`ledger.py import-answers FILE [--yes]`: record the owner's answers given in the hub (the answers.json it
+    downloads, or the documents of a published page's answer store) into the ledger. Each goes through answer_gate(),
+    the one set of answer rules the viewer and answer-gate use, so it is checked against the gate's options and
+    recorded answered_via='viewer' by the owner. A gate that is no longer open is left as it is and said so. Without
+    yes it lists what it would record and writes nothing; with yes it records them all in one transaction. The time
+    the owner answered in the hub is not kept: the gate records when it was imported. Returns 1 when any answer was
     refused, else 0."""
     try:
         raw = sys.stdin.read() if source == "-" else Path(source).read_text(encoding="utf-8")
@@ -12389,10 +13683,16 @@ def import_answers(db, source):
         return 1
     recorded = skipped = refused = 0
     con = connect(db)
+    con.isolation_level = None
     try:
+        con.execute("BEGIN IMMEDIATE")
+        ledger_id = (con.execute("SELECT value FROM meta WHERE key='ledger_id'").fetchone() or [None])[0]
         for code, data in items:
             if not code or not GATE_CODE.fullmatch(code) or data is None or data.get("bad"):
                 print(f"{code or '?'}: not an answer to a gate (skipped)"); refused += 1; continue
+            wrong = _answer_unbound(con, code, data, ledger_id)
+            if wrong:
+                print(f"{code}: not recorded: {wrong}"); refused += 1; continue
             try:
                 answer_gate(con, code, data.get("answer_value"), data.get("answer_text"), via="viewer")
             except GateRefused as e:
@@ -12401,12 +13701,28 @@ def import_answers(db, source):
                 else:
                     print(f"{code}: not recorded: {e}"); refused += 1
                 continue
-            print(f"{code}: recorded")
+            if yes:
+                print(f"{code}: recorded")
+            else:
+                g = con.execute("SELECT answer_value, answer_text FROM gates WHERE code=?", (code,)).fetchone()
+                said = " ".join(x for x in (g[0], json.dumps(_one_line(g[1])[:200]) if g[1] else None) if x)
+                print(f"{code}: would record {said}")
             recorded += 1
-        record_answers_import(con, source, recorded, skipped, refused)
+        if yes:
+            record_answers_import(con, source, recorded, skipped, refused)
+            if con.in_transaction:
+                con.execute("COMMIT")
+        else:
+            con.execute("ROLLBACK")
     finally:
+        if con.in_transaction:
+            con.execute("ROLLBACK")
         con.close()
-    print(f"import-answers: {recorded} recorded, {skipped} already answered, {refused} refused")
+    if yes:
+        print(f"import-answers: {recorded} recorded, {skipped} already answered, {refused} refused")
+    else:
+        print(f"import-answers: {recorded} to record, {skipped} already answered, {refused} refused; nothing was "
+              f"written. Check each answer above came from the owner, then run again with --yes")
     return 1 if refused else 0
 
 
@@ -12781,8 +14097,10 @@ def add_tool_parsers(sub):
                                    "{gate, answer_value, answer_text, answered_at}; or an answer store's documents) "
                                    "and record each in its gate as the viewer does (answered_via 'viewer'). A gate "
                                    "no longer open is "
-                                   "left as it is. FILE - reads standard input.")
+                                   "left as it is. FILE - reads standard input. Without --yes it lists what it "
+                                   "would record and writes nothing.")
     s.add_argument("file")
+    s.add_argument("--yes", action="store_true", help="record the answers listed (run once without it to check them)")
     s = sub.add_parser("restore", help="rebuild a ledger from a dump into a new file, then check it",
                        description="Rebuild a ledger from ledger.sql (written by dump) into a new file and run check "
                                    "on it. Never writes over an existing file. Example: python3 ledger.py restore "
@@ -12810,7 +14128,7 @@ def tool_command(a, root, db):
     if a.cmd == "import-answers":
         con = open_ledger(db, write=True, verify=True)
         con.close()
-        return import_answers(db, a.file)
+        return import_answers(db, a.file, a.yes)
     con = open_ledger(db, verify=True)
     try:
         if a.cmd == "progress-md":
@@ -13363,6 +14681,17 @@ def cmd_review_status(ctx):
     rv = review_row(con, a.review)
     if a.status not in REVIEW_STATUSES:
         raise WriteError(f"status {a.status!r} is not one of {', '.join(REVIEW_STATUSES)}")
+    if a.status in ("consolidating", "handed-off") and rv["status"] not in (a.status, "planning", "awaiting-approval",
+                                                                         "handed-off", "abandoned"):
+        need = ("consolidating",) if a.status == "consolidating" else ("consolidating", "handed-off")
+        gap = one(con, f"""SELECT reason FROM v_review_gaps WHERE review_id=? AND needed_for IN
+                           ({','.join('?' * len(need))}) ORDER BY rank, reason LIMIT 1""", (rv["id"], *need))
+        if gap:
+            more = con.execute(f"SELECT count(*) FROM v_review_gaps WHERE review_id=? AND needed_for IN "
+                               f"({','.join('?' * len(need))})", (rv["id"], *need)).fetchone()[0] - 1
+            raise WriteError(f"{rv['code']} is not ready to be {'consolidated' if a.status == 'consolidating' else 'handed off'}: "
+                             f"{gap['reason']}" + (f" ({more} more: ledger.py query \"SELECT * FROM v_review_gaps "
+                                                   f"WHERE review = '{rv['code']}'\")" if more else ""))
     if a.status == "handed-off" and rv["status"] != "handed-off":
         _need_fresh_dump(ctx, f"{rv['code']} is handed off")
     sets, args = {"status": a.status, "change_actor_id": ctx.actor_id, "change_note": a.note}, []
@@ -14064,12 +15393,21 @@ def answer_gate(con, code, value=None, text=None, via="chat", actor_id=None):
             con.execute("ROLLBACK")
 
 
-@_command("answer-gate", "record the owner's answer given in chat (the viewer's rules)",
+@_command("answer-gate", "record the owner's answer given in chat (the viewer's rules), or with --confirm their "
+                         "confirmation in chat of an answer they gave in the viewer",
           "ledger.py answer-gate GATE-0001 [--value OPTION]... [--text 'their words'] [--via chat|other] "
-          "[--by A-0001 (default: the owner)]")
+          "[--by A-0001 (the owner or another human; default: the owner)] | "
+          "ledger.py answer-gate GATE-0001 --confirm [--text 'their words'] [--by A-0001]")
 def cmd_answer_gate(ctx):
     a = ctx.a
     who = resolve_actor(ctx.con, a.by, "--by") if a.by else None
+    if who is not None:
+        kind = ctx.con.execute("SELECT kind FROM actors WHERE id=?", (who,)).fetchone()[0]
+        if kind not in OWNER_KINDS:
+            raise WriteError(f"{actor_code(who)} is a {kind}; only the owner or another human answers a gate: leave "
+                             f"out --by (the owner) or give a human's code")
+    if a.confirm:
+        return _confirm_answer(ctx, who)
     g = one(ctx.con, "SELECT multi FROM gates WHERE code=?", (a.gate,))
     values = a.value or []
     value = values if (g and g["multi"] and values) else (values[0] if len(values) == 1 else (values or None))
@@ -14079,6 +15417,28 @@ def cmd_answer_gate(ctx):
     if g["answer_value"] is not None and g["answer_value"].startswith("["):
         shown = ", ".join(json.loads(g["answer_value"])) or "none"
     return [f"{a.gate}: answered ({', '.join(x for x in (shown, g['answer_text']) if x)})"]
+
+
+CONFIRMED_KINDS = ("production-action", "accept-risk")  # a viewer answer of these is confirmed in chat first
+
+
+def _confirm_answer(ctx, who):
+    """answer-gate --confirm: record that the owner confirmed in chat the answer they gave in the viewer."""
+    a, con = ctx.a, ctx.con
+    if a.value:
+        raise WriteError("--confirm takes no --value: it confirms the answer the gate already has")
+    g = one(con, "SELECT * FROM gates WHERE code=?", (a.gate,))
+    if not g:
+        raise WriteError(f"no gate {a.gate}")
+    if g["status"] != "answered":
+        raise WriteError(f"{a.gate} is {g['status']}; only an answered gate is confirmed")
+    if g["answered_via"] != "viewer":
+        raise WriteError(f"{a.gate} was answered in chat; it needs no confirmation")
+    if g["confirmed_at"]:
+        raise WriteError(f"{a.gate} was confirmed at {g['confirmed_at']}")
+    ctx.x("UPDATE gates SET confirmed_at=?, confirmed_by_actor_id=?, confirmed_text=? WHERE id=?",
+          (now(), who if who is not None else owner_actor(con), _text_arg(a.text, "--text"), g["id"]))
+    return [f"{a.gate}: the answer is confirmed in chat"]
 
 
 @_command("apply-gate", "record what was done with a gate's answer (a decision gate also records the decision)",
@@ -14092,6 +15452,10 @@ def cmd_apply_gate(ctx):
         raise WriteError(f"no gate {a.gate}")
     if g["status"] != "answered":
         raise WriteError(f"{a.gate} is {g['status']}; only an answered gate can be applied")
+    if g["kind"] in CONFIRMED_KINDS and g["answered_via"] == "viewer" and not g["confirmed_at"]:
+        raise WriteError(f"{a.gate} is a {g['kind']} gate answered in the viewer; ask the owner in chat to confirm "
+                         f"the answer, then record it with: ledger.py answer-gate {a.gate} --confirm --text "
+                         f"'<their words>'")
     out = []
     if g["kind"] == "decision":
         answer = " - ".join(x for x in (g["answer_value"], g["answer_text"]) if x)
@@ -14294,13 +15658,16 @@ def _close_goal_gates(ctx, gate_ids, actor_id):
                     "decided in chat: " + ", ".join(f"{x['code']} {x['status']}" for x in goals), "chat", actor_id)
 
 
+OWNER_KINDS = ("owner", "human")  # the actors who answer gates, decide decisions and approve or reject goals
+
+
 def _owner_decides(ctx, what):
     """The acting actor's id when it is the owner or another human; WriteError otherwise, since only the owner decides
     design goals."""
     if ctx.actor_id is None:
         raise WriteError(f"give --actor: the owner who {what} (their A- code)")
     kind = ctx.con.execute("SELECT kind FROM actors WHERE id=?", (ctx.actor_id,)).fetchone()[0]
-    if kind not in ("owner", "human"):
+    if kind not in OWNER_KINDS:
         raise WriteError(f"{actor_code(ctx.actor_id)} is a {kind}; design goals are decided by the owner: give the "
                          f"owner's code as --actor")
     return ctx.actor_id
@@ -14325,16 +15692,17 @@ def cmd_approve_goals(ctx):
 
 
 @_command("reject-goal", "record that the owner did not approve a proposed design goal, with their reason",
-          "ledger.py reject-goal G-01 --note 'the owner's reason' [--actor A-0001]")
+          "ledger.py reject-goal G-01 --note 'the owner's reason' --actor A-0001 (the owner)")
 def cmd_reject_goal(ctx):
     a = ctx.a
     note = _need(_text_arg(a.note, "--note"), "--note (the owner's reason)")
+    owner = _owner_decides(ctx, "rejected it")
     g = goal_row(ctx.con, a.goal)
     if g["status"] != "proposed":
         raise WriteError(f"{a.goal} is {g['status']}; only a proposed goal can be rejected")
-    ctx.x("UPDATE design_goals SET status='rejected', note=?, change_actor_id=? WHERE id=?", (note, ctx.actor_id, g["id"]))
+    ctx.x("UPDATE design_goals SET status='rejected', note=?, change_actor_id=? WHERE id=?", (note, owner, g["id"]))
     if g["gate_id"]:
-        _close_goal_gates(ctx, {g["gate_id"]}, ctx.actor_id if ctx.actor_id is not None else owner_actor(ctx.con))
+        _close_goal_gates(ctx, {g["gate_id"]}, owner)
     return [f"{a.goal}: rejected"]
 
 
@@ -15089,7 +16457,8 @@ def cmd_reopen_gate(ctx):
     if g["status"] == "applied":
         raise WriteError(f"{g['code']} is applied: its answer was acted on; open a new gate to ask again")
     ctx.x("""UPDATE gates SET status='open', answer_value=NULL, answer_text=NULL, answered_by=NULL, answered_via=NULL,
-             answered_by_actor_id=NULL, answered_at=NULL, change_actor_id=?, change_note=? WHERE id=?""",
+             answered_by_actor_id=NULL, answered_at=NULL, confirmed_at=NULL, confirmed_by_actor_id=NULL,
+             confirmed_text=NULL, change_actor_id=?, change_note=? WHERE id=?""",
           (actor, note, g["id"]))
     was = ": ".join(x for x in (g["answer_value"], g["answer_text"]) if x)
     return [f"{g['code']}: {g['status']} -> open" + (f" (the answer was {was})" if was else "")]
@@ -15678,8 +17047,8 @@ def record_step_commit(ctx, step, ref, repo_name=None, pr=None, summary=None):
     subject = info[1].strip() if len(info) > 1 else None
     ctx.x("""INSERT INTO step_commits(step_id, repository_id, commit_sha, branch, pr_url, summary, committed_at)
              VALUES (?,?,?,?,?,?,?)
-             ON CONFLICT(step_id, commit_sha) DO UPDATE SET pr_url=COALESCE(excluded.pr_url, pr_url),
-               summary=COALESCE(?, summary), branch=COALESCE(branch, excluded.branch)""",
+             ON CONFLICT(step_id, commit_sha) DO UPDATE SET pr_url=COALESCE(pr_url, excluded.pr_url),
+               summary=COALESCE(summary, ?), branch=COALESCE(branch, excluded.branch)""",
           (step["id"], repo["id"], sha, branch, pr, summary or subject, utc_time(info[0].strip()), summary))
     return sha, f"step {step['number']}: commit {sha[:10]}" + (f" on {branch}" if branch else "")
 
@@ -16202,10 +17571,10 @@ def _guard_not_in_review(ctx, rv, g):
 
 def _drop_guard(ctx, iss_id, g, note):
     """Delete guard test row g of issue iss_id with a guard-dropped event on the issue (the test, who and why)."""
-    ctx.x("DELETE FROM guard_tests WHERE id=?", (g["id"],))
     ctx.x("""INSERT INTO events(entity_type, entity_id, event, from_value, actor_id, step_id, note)
              VALUES ('issue', ?, 'guard-dropped', ?, ?, ?, ?)""",
           (iss_id, f"{g['test_path']}::{g['test_name']}", ctx.actor_id, g["step_id"], note))
+    ctx.x("DELETE FROM guard_tests WHERE id=?", (g["id"],))  # tr_guard_tests_no_delete needs the event first
 
 
 @_command("drop-guard", "remove a guard test from an issue, with who and why (an event on the issue)",
@@ -16249,10 +17618,11 @@ def cmd_rename_guard(ctx):
         reader.close()
     if why:
         raise WriteError(why)
-    ctx.x("UPDATE guard_tests SET test_path=?, test_name=? WHERE id=?", (new_path, new_name, g["id"]))
     ctx.x("""INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, step_id, note)
              VALUES ('issue', ?, 'guard-renamed', ?, ?, ?, ?, ?)""",
-          (iss["id"], f"{path}::{name}", f"{new_path}::{new_name}", actor, g["step_id"], reason))
+          (iss["id"], f"{g['test_path']}::{g['test_name']}", f"{new_path}::{new_name}", actor, g["step_id"], reason))
+    # tr_guard_renamed_only needs the event first
+    ctx.x("UPDATE guard_tests SET test_path=?, test_name=? WHERE id=?", (new_path, new_name, g["id"]))
     return [f"{iss['code']}: guard test {path}::{name} -> {new_path}::{new_name}"]
 
 
@@ -16835,6 +18205,9 @@ def add_write_commands(sub):
                                                     "gate)")
     s.add_argument("--text")
     s.add_argument("--via", default="chat", choices=("chat", "other")); s.add_argument("--by")
+    s.add_argument("--confirm", action="store_true",
+                   help="record that the owner confirmed in chat the answer they gave in the viewer (--text: their "
+                        "words); a production-action or accept-risk gate answered there is applied only after it")
     s = p("apply-gate"); s.add_argument("gate"); s.add_argument("--note"); s.add_argument("--revisit-when")
     s = p("interview-ask"); s.add_argument("question", nargs="?"); s.add_argument("--review"); s.add_argument("--domain")
     s.add_argument("--why", help="what in the code prompted the question")
@@ -18822,9 +20195,8 @@ def lint_report_command(a, root, db):
         if dismissed:
             lines.append(f"{name}: recorded {len(dismissed)} dismissed lead{'s' if len(dismissed) != 1 else ''}")
         for code, (answer, evidence) in sorted(answers.items()):
-            ctx.x("""INSERT INTO checklist_answers(review_id, check_code, report, answer, evidence) VALUES (?,?,?,?,?)
-                     ON CONFLICT(review_id, check_code, report) DO UPDATE SET answer=excluded.answer,
-                       evidence=excluded.evidence""", (rv["id"], code, name, answer, evidence))
+            ctx.x("INSERT INTO checklist_answers(review_id, check_code, report, answer, evidence) VALUES (?,?,?,?,?)",
+                  (rv["id"], code, name, answer, evidence))
         return ([] if a.json else lines) + [f"recorded {plural(len(answers), 'checklist answer')} on {rv['code']}"]
     return run_write_command(con, root, db, a, record)
 
@@ -18865,7 +20237,7 @@ def compare_runs(con, ra, rb):
 
     def answers(rv):
         out = {}
-        for r in rows(con, "SELECT check_code, answer FROM checklist_answers WHERE review_id=? ORDER BY report",
+        for r in rows(con, "SELECT check_code, answer FROM v_checklist_answers WHERE review_id=? ORDER BY report",
                       (rv["id"],)):
             out.setdefault(r["check_code"], r["answer"])
         return out
@@ -23160,6 +24532,7 @@ def _main():
             bad += check_git_refs(root, con, quiet=a.quiet)
             bad += check_patches(root, con, quiet=a.quiet)
             bad += check_guard_refs(root, con, quiet=a.quiet)
+            record_check(db, bad)
             if import_reminder(con, root):
                 print(import_reminder(con, root))
         except sqlite3.DatabaseError as e:  # a damaged file stops a later read: what was found is printed already

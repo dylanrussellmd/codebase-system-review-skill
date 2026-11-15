@@ -66,7 +66,7 @@ class HubMultiSelect(unittest.TestCase):
         self.assertEqual((p.page_errors, p.console_errors, p.outside_requests), ([], [], []))
         f = L.root / "answers.json"
         f.write_text(json.dumps([{"id": k, "data": v} for k, v in saved.items()]))
-        self.assertIn(f"{code}: recorded", L.run_ok("import-answers", str(f)).stdout)
+        self.assertIn(f"{code}: recorded", L.run_ok("import-answers", str(f), "--yes").stdout)
         self.assertEqual(json.loads(L.scalar("SELECT answer_value FROM gates WHERE code=?", (code,))), ["ruff", "vale"])
 
 

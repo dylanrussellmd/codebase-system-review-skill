@@ -232,9 +232,10 @@ def build(proj, scale=1, reviews=5, files=300, reports=None, ledger_py=None, see
         rid = lastid()
         review_ids.append(rid)
         # the owner's applied domain-approval gate, answered approve: the only way a review is approved
-        x("""INSERT INTO gates(code,kind,title,question,status,answer_value,answered_by_actor_id,applied_note,review_id,
-             opened_by_actor_id,created_at) VALUES (?,'domain-approval','Approve the domains','Run them?','applied',
-             'approve',?,'approved',?,?,?)""", (next_gate(), owner, rid, mgr, _ts(day, 30)))
+        x("""INSERT INTO gates(code,kind,title,question,options,status,answer_value,answered_by_actor_id,applied_note,
+             review_id,opened_by_actor_id,created_at) VALUES (?,'domain-approval','Approve the domains','Run them?',
+             (SELECT options FROM gate_kinds WHERE value='domain-approval'),'applied','approve',?,'approved',?,?,?)""",
+          (next_gate(), owner, rid, mgr, _ts(day, 30)))
         for st in ("awaiting-approval", "approved", "running", "verifying", "indexing"):
             # schema 3: a review past awaiting-approval has approved_at
             x("UPDATE reviews SET status=?, approved_at=CASE WHEN ?='approved' THEN ? ELSE approved_at END WHERE id=?",
@@ -243,7 +244,7 @@ def build(proj, scale=1, reviews=5, files=300, reports=None, ledger_py=None, see
           "VALUES (?,1,?,'main',?)", (rid, sha, f"commit {k}"))
         for j in range(1, 9):
             x("INSERT INTO review_goals(review_id,goal_id) VALUES (?,?)", (rid, j))
-        inc = domains[:20]
+        inc = domains[:12]   # each included domain has its finished run (v_review_gaps)
         for d in domains:
             x("INSERT INTO review_domains(review_id,domain_code,decision,reason) VALUES (?,?,?,?)",
               (rid, d, "included" if d in inc else "skipped", text(10)))
@@ -411,16 +412,18 @@ def build(proj, scale=1, reviews=5, files=300, reports=None, ledger_py=None, see
                 x("UPDATE decisions SET status='decided', decided_by_actor_id=? WHERE id=?", (owner, did))
         for j in range(gates_per_review):
             opts = json.dumps([{"value": f"o{v}", "label": text(4), "description": text(12)} for v in range(3)])
+            # non-blocking: a review is handed off with its blocking gates answered (v_review_gaps)
             x("""INSERT INTO gates(code,kind,title,question,context,options,review_id,issue_id,opened_by_actor_id,
-                 created_at) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                 created_at,blocking) VALUES (?,?,?,?,?,?,?,?,?,?,0)""",
               (next_gate(),
-               rnd.choice(["decision", "accept-risk", "confirm-false-finding", "other", "domain-approval"]),
+               rnd.choice(["decision", "accept-risk", "confirm-false-finding", "other", "production-action"]),
                text(6), text(25), text(80), opts, rid, rnd.choice(allids), mgr, _ts(day, j)))
             gid = lastid()
             if k < R - 1 or rnd.random() < 0.8:
                 x("UPDATE gates SET status='answered', answer_value='o1', answered_via='chat' WHERE id=?", (gid,))
                 if rnd.random() < 0.9:
                     x("UPDATE gates SET status='applied', applied_note=? WHERE id=?", (text(10), gid))
+        x("UPDATE reviews SET report_md='# Review', verdict='Reviewed.' WHERE id=?", (rid,))  # complete: v_review_gaps
         for st in ("consolidating", "handed-off"):
             x("UPDATE reviews SET status=? WHERE id=?", (st, rid))
         x("COMMIT")
@@ -510,8 +513,9 @@ def _build_plan(con, rnd, text, review_ids, all_findings, n_steps, head_sha, T, 
     nupd = 0
     x("BEGIN")
     x("UPDATE plans SET status='awaiting-approval' WHERE id=?", (plan_id,))
-    x("""INSERT INTO gates(code,kind,title,question,status,answer_value,answered_by_actor_id,applied_note,plan_id,
-         created_at) VALUES (?,'plan-approval','Approve the plan','Start?','applied','approve',?,'approved',?,?)""",
+    x("""INSERT INTO gates(code,kind,title,question,options,status,answer_value,answered_by_actor_id,applied_note,
+         plan_id,created_at) VALUES (?,'plan-approval','Approve the plan','Start?',
+         (SELECT options FROM gate_kinds WHERE value='plan-approval'),'applied','approve',?,'approved',?,?)""",
       (next_gate(), owner, plan_id, _ts(0)))
     x("UPDATE plans SET status='approved', approved_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?", (plan_id,))
     x("UPDATE plans SET status='in-progress' WHERE id=?", (plan_id,))

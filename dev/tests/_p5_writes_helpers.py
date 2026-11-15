@@ -34,6 +34,26 @@ def refused(test, L, *args, **kw):
     return err[0]
 
 
+def complete(L, code="R-0001"):
+    """What a review needs before consolidating and hand-off (v_review_gaps): a finished run in each included domain
+    (one is added where there is none), every run finished, a report and a verdict."""
+    L.commit()
+    f = L.dir / "reviews" / f"{code}-done.md"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text("# done\n")
+    for d in L.all("""SELECT rd.domain_code FROM review_domains rd JOIN reviews r ON r.id = rd.review_id
+                      WHERE r.code=? AND rd.decision='included' AND NOT EXISTS (SELECT 1 FROM reviewer_runs u
+                      WHERE u.review_id = r.id AND u.domain_code = rd.domain_code)""", (code,)):
+        ok(L, "add-run", code, d["domain_code"], f"{d['domain_code']}-done", "--scope", "all", "--model", "m1")
+    for u in L.all("""SELECT u.label FROM reviewer_runs u JOIN reviews r ON r.id = u.review_id
+                      WHERE r.code=? AND u.status IN ('queued','running')""", (code,)):
+        ok(L, "finish-run", code, u["label"], "--report", str(f), "--items", "1")
+    if not L.scalar("SELECT report_md FROM reviews WHERE code=?", (code,)):
+        ok(L, "set-report", code, str(f))
+    if not L.scalar("SELECT verdict FROM reviews WHERE code=?", (code,)):
+        ok(L, "set-verdict", code, "--verdict", "Done.")
+
+
 def approve(L, code, kind="domain-approval", *extra):
     """Open the approval gate of a review (or, with kind plan-approval, a plan), answer it approve as the owner,
     apply it, and approve: the only way a review or plan is approved."""

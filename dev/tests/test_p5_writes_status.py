@@ -3,7 +3,7 @@ import json
 import unittest
 
 from dev.tests import fixtures
-from dev.tests._p5_writes_helpers import counts, ok, project, refused
+from dev.tests._p5_writes_helpers import complete, counts, ok, project, refused
 
 
 def plan_with_points(test, points=("SPEC-M1", "SPEC-M2", "SPEC-L1")):
@@ -116,10 +116,26 @@ if __name__ == "__main__":
 
 
 class StaleDumpTest(unittest.TestCase):
+    def test_dump_stale_after_any_write(self):
+        """A write that logs no event (review-domain, add-actor) still makes the dump stale (ISS-0716)."""
+        repo, L, sha = project(self)
+        dump = L.db.with_suffix(".sql")
+        for name, args in (("review-domain", ("review-domain", "R-0001", "security", "skip", "--reason", "no auth")),
+                           ("add-actor", ("add-actor", "reviewer", "a security reviewer"))):
+            with self.subTest(write=name):
+                ok(L, "dump")
+                self.assertNotIn(dump.name, (lambda p: p.stdout + p.stderr)(L.run("check")))
+                events = L.scalar("SELECT count(*) FROM events")
+                ok(L, *args)
+                self.assertEqual(L.scalar("SELECT count(*) FROM events"), events)  # it logs no event
+                p = L.run("check")
+                self.assertIn(f"{dump.name} is older than the ledger's last change", p.stdout + p.stderr)
+
     def test_check_warns_on_stale_dump(self):
         """A ledger written after its last dump (or never dumped) makes check warn and review-status handed-off and
         plan-status complete refuse, naming dump; a fresh dump clears all three."""
         repo, L, sha = project(self)
+        complete(L)
         for st in ("verifying", "indexing", "consolidating"):
             ok(L, "review-status", "R-0001", st, "--note", "n")
         ok(L, "new-plan", "--title", "Plan", "--review", "R-0001")

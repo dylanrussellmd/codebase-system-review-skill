@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 
 from dev.tests import fixtures
-from dev.tests._p5_writes_helpers import refused
+from dev.tests._p5_writes_helpers import complete, refused
 from dev.tests._w7a_tools_helpers import DATA, env_with, leads, ok, shim, tool_project
 
 SEMGREP_SHIM = """import shutil, sys
@@ -190,6 +190,7 @@ class Leads(unittest.TestCase):
         repo, L, sha = tool_project(self)
         ok(L, "tool-run", "sarif", "--review", "R-0001", "--from", str(DATA / "semgrep.sarif"), "--actor", "A-0001")
         ok(L, "dismiss-lead", "LD-0001", "--reason", "fetch is only called in tests", "--actor", "A-0001")
+        complete(L)
         ok(L, "dump")
         ok(L, "review-status", "R-0001", "handed-off", "--note", "done", "--actor", "A-0001")
         ok(L, "new-review", "--title", "Second", "--scope", "full", "--previous", "R-0001", "--actor", "A-0001")

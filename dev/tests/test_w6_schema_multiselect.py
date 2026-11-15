@@ -91,7 +91,7 @@ class MultiSelect(unittest.TestCase):
         f = L.dir / "answers.json"
         f.write_text(json.dumps([{"gate": gate, "answer_value": ["mypy", "ruff"], "answer_text": "and nothing else"},
                                  {"gate": one, "answer_value": ["ruff", "mypy"]}]), encoding="utf-8")
-        p = L.run("import-answers", str(f))
+        p = L.run("import-answers", str(f), "--yes")
         self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
         self.assertIn(f"{gate}: recorded", p.stdout)
         self.assertIn(f"{one}: not recorded", p.stdout)
