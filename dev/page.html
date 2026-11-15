@@ -154,7 +154,7 @@ nav.rail small{display:block;font-size:12px;opacity:.75}
 // sessionStorage for this tab and removed from the address bar. The page itself carries no secret.
 let TOKEN = "";
 function takeToken(){
-  const m = /^#k=([A-Za-z0-9_-]+)(#.*)?$/.exec(location.hash);
+  const m = /^#k=([A-Za-z0-9_-]+)\/?(#.*)?$/.exec(location.hash);
   if (m) {
     TOKEN = m[1];
     try { sessionStorage.setItem("ledger-token", TOKEN); } catch {}

@@ -39,7 +39,7 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote
 
 TOOL_VERSION = "1.12.0"  # stamped by dev/build.py from `metadata: version:` in SKILL.md's frontmatter
-TOOL_HASH = "1d481cf1634166307d91299ba47102aee55895f6b1d6d4b33be83d248b557915"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
+TOOL_HASH = "49afb4b3fa7f028d8dd21ef64d2910feb04bf662629f1d69ad8894c3cae5e392"  # stamped by dev/build.py: sha256 of the built file with this value as the placeholder
 # Placeholders: dev/build.py puts references/schema.sql, dev/page.html and references/migrations/*.sql in their
 # place when it writes scripts/ledger.py. dev/core.py itself is never run as the tool.
 SCHEMA = r"""-- =====================================================================
@@ -4786,7 +4786,7 @@ nav.rail small{display:block;font-size:12px;opacity:.75}
 // sessionStorage for this tab and removed from the address bar. The page itself carries no secret.
 let TOKEN = "";
 function takeToken(){
-  const m = /^#k=([A-Za-z0-9_-]+)(#.*)?$/.exec(location.hash);
+  const m = /^#k=([A-Za-z0-9_-]+)\/?(#.*)?$/.exec(location.hash);
   if (m) {
     TOKEN = m[1];
     try { sessionStorage.setItem("ledger-token", TOKEN); } catch {}
@@ -11278,13 +11278,14 @@ def logged_path(raw):
     return u.path[:200] + ("?" + "&".join(names) if names else "")
 
 
-def make_server(root, db, port=0, ipv6=False):
+def make_server(root, db, port=0, ipv6=False, quiet=False, read_only=False):
     """Build the viewer's handler and bind it to 127.0.0.1:port (0 = any free port); returns (server, token).
     The caller runs server.serve_forever(). The Host allow-list uses the port actually bound. The page itself holds
     no secret: the token reaches the browser only in the launch URL's #k= fragment (see serve), and every /api/
     request must send it back as X-Ledger-Token. ipv6: also bind [::1] on the same port where the machine has
     IPv6 and the port is free there; that second server is server.also[0] (the caller runs and closes it too).
-    Nothing but the two loopback addresses is ever bound."""
+    Nothing but the two loopback addresses is ever bound. quiet: no request lines on stderr. read_only: every POST
+    is refused (ui-capture's own viewer: a page it opens cannot answer a gate)."""
     token = secrets.token_urlsafe(32)
     token_bytes = token.encode()
     page = PAGE.encode("utf-8")
@@ -11307,6 +11308,8 @@ def make_server(root, db, port=0, ipv6=False):
             """One line per answer on stderr: UTC time, method, path (logged_path: parameter names only, so no
             search text or key is written), status, milliseconds."""
             from time import monotonic
+            if quiet:
+                return
             ms = int((monotonic() - getattr(self, "started", monotonic())) * 1000)
             status = getattr(code, "value", code)
             # a request the library refused before reading it whole has no method or path yet
@@ -11436,6 +11439,8 @@ def make_server(root, db, port=0, ipv6=False):
                 return self.send(404, {"error": "not found"})
             if not self.token_ok():
                 return
+            if read_only:
+                return self.send(403, {"error": "this viewer is read-only"})
             allowed = allowed_methods(u.path)
             if allowed and "POST" not in allowed:  # before the body is read
                 res = wrong_method("POST", allowed)
@@ -16313,7 +16318,7 @@ def working_tree_bytes(root, con, loc, committed):
 # same thing). Each prints the same bytes for the same inputs: every list is sorted and no text carries a time.
 
 import shutil
-from urllib.parse import quote, urlsplit
+from urllib.parse import parse_qsl, quote, urlsplit, urlunsplit
 
 REVIEW_TOOLS = {}  # name -> handler(a, root, db) returning the exit code
 
@@ -16608,24 +16613,74 @@ def _no_playwright(cmd):
     return 2
 
 
+VIEWER_KEY_ENV = "LEDGER_VIEWER_KEY"   # a running viewer's key, for --base; it is never put in an address
+VIEWER_ERROR = "This page could not be loaded"   # the viewer's heading when it could not draw a page
+VIEWER_NO_KEY = "missing the viewer's key"       # in the viewer's error box when the key was not given
+
+
+def _without_key(url):
+    """url with a #k=KEY part of its fragment dropped and the route after it kept."""
+    head, sep, frag = str(url).partition("#")
+    if not sep:
+        return head
+    frag = re.sub(r"^k=[^#/]*/?(#|$)", "", frag)
+    return head + ("#" + frag if frag else "")
+
+
+def _ui_file(t):
+    """The file:// address of a local HTML file, with the #fragment it was given (hub.html#/inbox)."""
+    path, sep, frag = str(t).partition("#")
+    p = Path(path).expanduser().resolve()
+    if not path or not p.is_file():
+        raise WriteError(f"{t}: not an http(s) address, a viewer route (#/issues) or a local HTML file (page.html, "
+                         f"or hub.html#/inbox for one of its routes)")
+    return p.as_uri() + ("#" + frag if sep else "")
+
+
+def _with_route(base, route):
+    """A viewer route (#/issues) on base, an http(s) address or a local file: base's fragment is replaced."""
+    if re.match(r"https?://", base):
+        parts = urlsplit(base)
+        return urlunsplit((parts.scheme, parts.netloc, parts.path or "/", parts.query, route[1:]))
+    return _ui_file(base.partition("#")[0] + route)
+
+
+def _ui_name(url):
+    """A file name for a page from its route alone: the fragment's path and parameter names (issues, issue-iss-0001,
+    issues-status), else the file's name or the address's last path segment. Never a host, port, key or value."""
+    parts = urlsplit(url)
+    if parts.fragment:
+        path, _, query = parts.fragment.partition("?")
+        raw = " ".join([path] + [k for k, _ in parse_qsl(query, keep_blank_values=True)])
+    elif parts.scheme == "file":
+        raw = Path(parts.path).name
+    else:
+        raw = parts.path.rstrip("/").rsplit("/", 1)[-1]
+    return re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-") or "home"
+
+
 def _ui_targets(targets, base):
-    """[(name for files, address)] for each target: an http(s) address, a viewer route (#/issues) on --base, or a
-    local HTML file."""
+    """[(name for files, address)] for each target: an http(s) address, a viewer route (#/issues) on base, or a
+    local HTML file with or without a route. An address holding the viewer's key (#k=) is refused, and the
+    refusal does not repeat the key."""
+    if base is not None and "#k=" in str(base):
+        raise WriteError(f"--base holds the viewer's key (#k=...); give the address alone and put the key in "
+                         f"{VIEWER_KEY_ENV}, or leave out --base and the ledger is served for this run")
     out, used = [], set()
     for t in targets:
         t = str(t)
+        if "#k=" in t:
+            raise WriteError(f"{_without_key(t)}: the address holds the viewer's key (#k=...); give the route "
+                             f"alone (#/issues)")
         if re.match(r"https?://", t):
             url = t
         elif t.startswith("#"):
-            url = base.rstrip("/") + "/" + t
+            if base is None:
+                raise WriteError(f"{t}: a viewer route needs --base")
+            url = _with_route(str(base), t)
         else:
-            p = Path(t).expanduser().resolve()
-            if not p.is_file():
-                raise WriteError(f"{t}: not an http(s) address, a viewer route (#/...) or a file")
-            url = p.as_uri()
-        parts = urlsplit(url)
-        raw = Path(parts.path).name if parts.scheme == "file" else f"{parts.netloc}{parts.path}{parts.fragment}"
-        name = re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-") or "page"
+            url = _ui_file(t)
+        name = _ui_name(url)
         n, unique = 1, name
         while unique in used:
             n += 1
@@ -16633,6 +16688,85 @@ def _ui_targets(targets, base):
         used.add(unique)
         out.append((unique, url))
     return out
+
+
+class _UiViewer:
+    """Where ui-capture and ui-audit find the viewer for routes (#/issues), and the key its pages get. Without
+    --base the ledger is served for the run: a fresh key, a free port, read-only, quiet, stopped at the end. With
+    --base the key comes from LEDGER_VIEWER_KEY. The key reaches the page through sessionStorage, set before the
+    page's script runs; it is never in an address, a file name or the output."""
+
+    def __init__(self, a, root, db):
+        self.server, self.key, self.base = None, None, a.base
+        self.wanted = any(str(t).startswith("#") for t in a.targets)
+        if a.base is None and self.wanted:
+            if not Path(db).is_file():
+                raise WriteError(f"viewer routes need a ledger, and there is none at {db}")
+            self.base = "http://127.0.0.1:0/"   # for checking the targets; start() gives the real port
+        elif a.base is not None:
+            self.key = os.environ.get(VIEWER_KEY_ENV) or None
+        self.root, self.db = root, db
+
+    def start(self, a):
+        """Serve the ledger when no --base was given; returns the targets on the base in use."""
+        if self.base == "http://127.0.0.1:0/":
+            self.server, self.key = make_server(self.root, self.db, 0, quiet=True, read_only=True)
+            threading.Thread(target=self.server.serve_forever, daemon=True).start()
+            self.base = f"http://127.0.0.1:{self.server.server_address[1]}/"
+        return _ui_targets(a.targets, self.base)
+
+    def stop(self):
+        """Stop the ledger served for this run, if one was."""
+        if self.server is not None:
+            self.server.shutdown()
+            self.server.server_close()
+            self.server = None
+
+    def key_for(self, url):
+        """The key for a page of this viewer, else None."""
+        if not self.key or not self.base or not re.match(r"https?://", self.base):
+            return None
+        mine = urlsplit(self.base)
+        return self.key if (urlsplit(url).scheme, urlsplit(url).netloc) == (mine.scheme, mine.netloc) else None
+
+    def shown(self, url):
+        """The page as ui-audit prints it: a route of the ledger served for this run as the route alone (its port
+        changes), a local file by its name and route, anything else as given."""
+        parts = urlsplit(url)
+        if self.server is not None and self.key_for(url):
+            return "#" + parts.fragment
+        if parts.scheme == "file":
+            return Path(parts.path).name + ("#" + parts.fragment if parts.fragment else "")
+        return _without_key(url)
+
+
+def _ui_drawn(page, shown):
+    """(the page's first heading, why the page is not the one asked for or None). The viewer's error page fails,
+    with what to do when its key was missing."""
+    head = page.evaluate("() => { const e = document.querySelector('h1');"
+                         " return e ? e.textContent.replace(/\\s+/g, ' ').trim() : ''; }")
+    if head != VIEWER_ERROR:
+        return head, None
+    if VIEWER_NO_KEY in page.evaluate("() => document.body ? document.body.innerText : ''"):
+        return head, (f"{shown} drew '{VIEWER_ERROR}' because the viewer's key is missing: leave out --base and the "
+                      f"ledger is served for the capture, or set {VIEWER_KEY_ENV} to the running viewer's key")
+    return head, f"{shown} drew '{VIEWER_ERROR}'"
+
+
+def _themes(text):
+    """light, dark or both, else WriteError."""
+    themes = [t.strip() for t in str(text).split(",") if t.strip()]
+    if not themes or set(themes) - {"light", "dark"}:
+        raise WriteError(f"--themes {text!r}: light, dark or both")
+    return themes
+
+
+def _write_private(f, data):
+    """Write bytes to a file only its owner can read (0600), also when it was there before."""
+    fd = os.open(str(f), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as out:
+        out.write(data)
+    os.chmod(str(f), 0o600)
 
 
 def _open_browser(sync_playwright):
@@ -16648,10 +16782,12 @@ def _open_browser(sync_playwright):
     return pw, browser
 
 
-def _ui_page(browser, url, width, theme, allowed):
-    """A settled page at one width and colour scheme. Requests to any host but the pages' own are stopped."""
+def _ui_page(browser, url, width, theme, allowed, key=None):
+    """A settled page at one width and colour scheme. Requests to any host but the pages' own are stopped. key:
+    the viewer's key, put in the page's sessionStorage before its script runs (never in the address). The page's
+    Content-Security-Policy is bypassed so axe-core can be added to it."""
     context = browser.new_context(viewport={"width": width, "height": 900}, color_scheme=theme,
-                                  device_scale_factor=1, reduced_motion="reduce")
+                                  device_scale_factor=1, reduced_motion="reduce", bypass_csp=True)
 
     def guard(route):
         parts = urlsplit(route.request.url)
@@ -16660,6 +16796,10 @@ def _ui_page(browser, url, width, theme, allowed):
         else:
             route.abort()
     context.route("**/*", guard)
+    if key:
+        origin = "{0.scheme}://{0.netloc}".format(urlsplit(url))
+        context.add_init_script(script="if (location.origin === %s) { try { sessionStorage.setItem('ledger-token', "
+                                       "%s); } catch (e) {} }" % (json.dumps(origin), json.dumps(key)))
     page = context.new_page()
     weights = []
     page.on("response", lambda r: weights.append(r))
@@ -16684,23 +16824,23 @@ def _ints(text, what):
 
 @_review_tool("ui-capture")
 def ui_capture_command(a, root, db):
-    """`ledger.py ui-capture`: screenshot pages at each width and theme; record them on a review."""
+    """`ledger.py ui-capture`: screenshot pages at each width and theme; record them on a review. A page that draws
+    the viewer's error page, or a set of pages that all give the same image, fails and nothing is recorded."""
     cmd = "ui-capture"
     folder = db.parent.resolve()
     try:
         widths = _ints(a.widths, "--widths")
-        themes = [t.strip() for t in a.themes.split(",") if t.strip()]
-        if not themes or set(themes) - {"light", "dark"}:
-            raise WriteError(f"--themes {a.themes!r}: light, dark or both")
+        themes = _themes(a.themes)
         if not a.review and not a.out:
             raise WriteError("give --review R-0001 (the screenshots go to its folder and are recorded) or --out DIR")
         out = Path(a.out).expanduser().resolve() if a.out else folder / "reviews" / a.review / "ui"
         if out != folder and folder not in out.parents:
             raise WriteError(f"--out {a.out} is not inside the ledger's folder {folder}; nothing was written")
+        viewer = _UiViewer(a, root, db)
+        _ui_targets(a.targets, viewer.base)
         if a.review:
             con = _tool_ledger(db, write=True)
             review_row(con, a.review)
-        targets = _ui_targets(a.targets, a.base)
     except WriteError as e:
         return _refuse(cmd, e)
     sync_playwright = playwright_api()
@@ -16711,27 +16851,47 @@ def ui_capture_command(a, root, db):
     except RuntimeError as e:
         print(f"{cmd}: {e}", file=sys.stderr)
         return 2
-    allowed = {(urlsplit(u).scheme, urlsplit(u).netloc) for _, u in targets}
-    written = []
+    written, lines, problem, images = [], [], None, {}
     try:
+        targets = viewer.start(a)
+        allowed = {(urlsplit(u).scheme, urlsplit(u).netloc) for _, u in targets}
         out.mkdir(parents=True, exist_ok=True)
         for name, url in targets:
             for width in widths:
                 for theme in themes:
-                    context, page, _ = _ui_page(browser, url, width, theme, allowed)
+                    context, page, _ = _ui_page(browser, url, width, theme, allowed, viewer.key_for(url))
                     try:
+                        head, problem = _ui_drawn(page, viewer.shown(url))
+                        if problem:
+                            break
                         f = out / f"{name}-{width}-{theme}.png"
-                        page.screenshot(path=str(f), full_page=True, animations="disabled", caret="hide")
+                        data = page.screenshot(full_page=True, animations="disabled", caret="hide")
+                        _write_private(f, data)
                         written.append(f)
+                        images.setdefault((width, theme), set()).add(hashlib.sha256(data).hexdigest())
+                        lines.append(f"wrote {f}" + (f": {head}" if head else ""))
                     finally:
                         context.close()
+                if problem:
+                    break
+            if problem:
+                break
     except Exception as e:  # noqa: BLE001 - a page that cannot be opened: say which, keep what was captured
         print(f"{cmd}: {_one_line(e)[:300]}", file=sys.stderr)
         return 1
     finally:
         browser.close()
         pw.stop()
-    lines = [f"wrote {f}" for f in written]
+        viewer.stop()
+    if not problem and len(targets) > 1:
+        same = [k for k, shas in sorted(images.items()) if len(shas) == 1]
+        if same:
+            problem = (f"every page at {same[0][0]} px, {same[0][1]} gave the same image, so they did not draw the "
+                       f"pages asked for")
+    if problem:
+        for f in written:
+            f.unlink()
+        return _refuse(cmd, f"{problem}; nothing was recorded")
     if not a.review:
         print("\n".join(lines))
         return 0
@@ -16825,6 +16985,7 @@ def _lighthouse(url, root):
     it); otherwise what to install and what was measured without it."""
     missing = {"available": False, "note": "not installed (npm install -g lighthouse); contrast, names, page "
                                            "weight and layout shift were measured without it"}
+    url = _without_key(url)  # its argv is visible to every process on the machine
     if not url.startswith("http") or not lighthouse_installed(root):
         return missing
     env = dict(os.environ)
@@ -16869,13 +17030,13 @@ def ui_audit_lines(result):
 
 @_review_tool("ui-audit")
 def ui_audit_command(a, root, db):
-    """`ledger.py ui-audit`: measure each rendered page; print text or --json."""
+    """`ledger.py ui-audit`: measure each rendered page at every width and theme; print text or --json."""
     cmd = "ui-audit"
     try:
-        width = _ints(a.width, "--width")[0]
-        if a.theme not in ("light", "dark"):
-            raise WriteError(f"--theme {a.theme!r}: light or dark")
-        targets = _ui_targets(a.targets, a.base)
+        widths = _ints(a.widths, "--widths")
+        themes = _themes(a.themes)
+        viewer = _UiViewer(a, root, db)
+        _ui_targets(a.targets, viewer.base)
     except WriteError as e:
         return _refuse(cmd, e)
     sync_playwright = playwright_api()
@@ -16886,32 +17047,49 @@ def ui_audit_command(a, root, db):
     except RuntimeError as e:
         print(f"{cmd}: {e}", file=sys.stderr)
         return 2
-    allowed = {(urlsplit(u).scheme, urlsplit(u).netloc) for _, u in targets}
-    pages = []
+    pages, problem = [], None
     try:
+        targets = viewer.start(a)
+        allowed = {(urlsplit(u).scheme, urlsplit(u).netloc) for _, u in targets}
         for _, url in targets:
-            context, page, responses = _ui_page(browser, url, width, a.theme, allowed)
-            try:
-                found = page.evaluate(UI_AUDIT_SCRIPT)
-                axe = ui_axe(page, root)
-                weight = 0
-                for r in responses:
+            shown, key = viewer.shown(url), viewer.key_for(url)
+            lighthouse = ({"available": lighthouse_installed(root), "note": "not run: the viewer's pages need its "
+                           "key, and Lighthouse is never given it"} if key else None)
+            for width in widths:
+                for theme in themes:
+                    context, page, responses = _ui_page(browser, url, width, theme, allowed, key)
                     try:
-                        weight += len(r.body())
-                    except Exception:  # noqa: BLE001 - a redirect or a stopped request has no body
-                        pass
-                shown = url if not url.startswith("file:") else Path(urlsplit(url).path).name
-                pages.append(dict(found, page=shown, width=width, theme=a.theme,
-                                  page_weight_bytes=weight or len(page.content().encode("utf-8")),
-                                  requests=len(responses), lighthouse=_lighthouse(url, root), axe=axe))
-            finally:
-                context.close()
+                        problem = _ui_drawn(page, shown)[1]
+                        if problem:
+                            break
+                        found = page.evaluate(UI_AUDIT_SCRIPT)
+                        axe = ui_axe(page, root)
+                        weight = 0
+                        for r in responses:
+                            try:
+                                weight += len(r.body())
+                            except Exception:  # noqa: BLE001 - a redirect or a stopped request has no body
+                                pass
+                        if lighthouse is None:   # once per page: its scores do not depend on the width or theme
+                            lighthouse = _lighthouse(url, root)
+                        pages.append(dict(found, page=shown, width=width, theme=theme,
+                                          page_weight_bytes=weight or len(page.content().encode("utf-8")),
+                                          requests=len(responses), lighthouse=lighthouse, axe=axe))
+                    finally:
+                        context.close()
+                if problem:
+                    break
+            if problem:
+                break
     except Exception as e:  # noqa: BLE001 - a page that cannot be opened
         print(f"{cmd}: {_one_line(e)[:300]}", file=sys.stderr)
         return 1
     finally:
         browser.close()
         pw.stop()
+        viewer.stop()
+    if problem:
+        return _refuse(cmd, problem)
     result = {"pages": pages, "lighthouse": pages[0]["lighthouse"]["available"] if pages else False}
     print(json.dumps(result, indent=1, sort_keys=True, ensure_ascii=False) if a.json
           else "\n".join(ui_audit_lines(result)))
@@ -21521,25 +21699,31 @@ def _add_review_tool_parsers(sub):
     s = sub.add_parser("ui-capture", help="screenshot pages at phone and desktop width, light and dark",
                        description="Screenshot each page with Playwright at every width and colour scheme into "
                                    "<ledger folder>/reviews/<review>/ui/ and record the files on the review. A "
-                                   "target is an http(s) address, a viewer route (#/issues, on --base) or a local "
-                                   "HTML file. Requests to other hosts are stopped. Without Playwright it prints "
-                                   "the install line and exits 2.")
+                                   "target is an http(s) address, a viewer route (#/issues) or a local HTML file "
+                                   "(hub.html#/inbox for a route). Files are named by route only and are 0600. A "
+                                   "page that draws the viewer's error page fails, and nothing is recorded. "
+                                   "Requests to other hosts are stopped. Without Playwright it prints the install "
+                                   "line and exits 2.")
     s.add_argument("targets", nargs="+", metavar="page")
     s.add_argument("--review"); s.add_argument("--widths", default="390,1280")
     s.add_argument("--themes", default="light,dark")
     s.add_argument("--out", help="another folder inside the ledger's folder")
-    s.add_argument("--base", default="http://127.0.0.1:8765", help="where viewer routes are served (serve)")
+    s.add_argument("--base", help="a running viewer for the routes (its key in LEDGER_VIEWER_KEY); without it the "
+                                  "ledger is served for the capture")
     s.add_argument("--actor", help=actor)
     s = sub.add_parser("ui-audit", help="measure rendered pages: contrast, names, colours and sizes in use, weight",
-                       description="Load each page with Playwright and report texts below the required contrast, "
+                       description="Load each page with Playwright at every width and colour scheme and report "
+                                   "texts below the required contrast, "
                                    "images, fields, buttons and links without a name, every colour, font size and "
                                    "spacing value in use, page weight and layout shift. Lighthouse scores are "
                                    "added only when Lighthouse is already installed, axe-core's violations when "
                                    "axe-core is (LEDGER_AXE, node_modules or npm's global folder; import them with "
                                    "tool-run axe --from). Without Playwright it prints the install line and exits 2.")
     s.add_argument("targets", nargs="+", metavar="page")
-    s.add_argument("--width", default="1280"); s.add_argument("--theme", default="light")
-    s.add_argument("--base", default="http://127.0.0.1:8765", help="where viewer routes are served (serve)")
+    s.add_argument("--widths", "--width", dest="widths", default="390,1280")
+    s.add_argument("--themes", "--theme", dest="themes", default="light,dark")
+    s.add_argument("--base", help="a running viewer for the routes (its key in LEDGER_VIEWER_KEY); without it the "
+                                  "ledger is served for the audit")
     s.add_argument("--json", action="store_true")
     s = sub.add_parser("scan", help="inventory the repositories at the reviewed commit and propose the domains",
                        description="Read each repository of the review at its recorded commit (never the working "

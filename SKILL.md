@@ -268,7 +268,7 @@ ledger.py review-status R-0001 running --note 'reviewers started' --actor A-0002
 `ledger.py tool-run <tool> --review R-0001`, and `ledger.py test-runs` for the suites; each lead is cited by a
 finding or `dismiss-lead`. Launch one subagent per approved scope with the subagent tool, all at once (without one,
 run the scopes yourself in turn), each with its generated prompt: brief, scope, its domain's approved goals, the line
-`ledger.py goals --domain <D>`, known issues, tool leads, checklist, report file. For `ui` and `walkthroughs`: `ledger.py ui-capture <pages> --review R-0001`, `ledger.py ui-audit <pages>` (`references/environment.md#rendered-pages`).
+`ledger.py goals --domain <D>`, known issues, tool leads, checklist, report file. For `ui` and `walkthroughs`: `ledger.py ui-capture <pages> --review R-0001`, `ledger.py ui-audit <pages>`, on demo or anonymized data, never real people's (`references/environment.md#rendered-pages`).
 
 ## Step 4: Verify before reporting
 

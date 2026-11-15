@@ -153,6 +153,85 @@ class Env(unittest.TestCase):
         self.assertIn("not inside the ledger's folder", p.stderr)
         self.assertEqual(list(outside.iterdir()), [])
 
+    def test_ui_targets_refuse_key_in_base(self):
+        mod = fixtures.load_ledger_module()
+        for targets, base in ((["#/issues"], "http://h:1/#k=abcdef"), (["http://h:1/#k=abcdef#/issues"], None),
+                              (["http://h:1/#k=abcdef/#/issues"], None), (["page.html#k=abcdef"], None)):
+            with self.subTest(targets=targets, base=base):
+                with self.assertRaises(mod.WriteError) as e:
+                    mod._ui_targets(targets, base)
+                self.assertNotIn("abcdef", str(e.exception))
+                self.assertIn("key", str(e.exception))
+        repo, L, _ = project(self)
+        for cmd in ("ui-capture", "ui-audit"):
+            p = L.run(cmd, "#/issues", "--base", "http://127.0.0.1:9/#k=abcdef",
+                      *(["--review", "R-0001"] if cmd == "ui-capture" else []))
+            self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+            self.assertNotIn("abcdef", p.stdout + p.stderr)
+            self.assertEqual(len(p.stderr.strip().split("\n")), 1, p.stderr)
+        self.assertFalse((L.dir / "reviews" / "R-0001" / "ui").exists())
+        # Lighthouse is never handed a key, even one that reached it some other way
+        seen = []
+
+        class Done:
+            stdout = b'{"categories": {}}'
+        old = mod.lighthouse_installed, mod.subprocess.run
+        mod.lighthouse_installed = lambda root: True
+        mod.subprocess.run = lambda argv, **kw: seen.append(argv) or Done()
+        try:
+            mod._lighthouse("http://127.0.0.1:5/#k=abcdef/#/issues", L.root)
+        finally:
+            mod.lighthouse_installed, mod.subprocess.run = old
+        self.assertTrue(seen)
+        self.assertNotIn("abcdef", " ".join(seen[0]))
+
+    def test_ui_viewer_is_read_only(self):
+        # the viewer ui-capture serves for itself reads, and refuses every POST
+        import threading
+        import urllib.error
+        import urllib.request
+        mod = fixtures.load_ledger_module()
+        repo, L, _ = project(self)
+        L.commit()
+        srv, key = mod.make_server(L.root, L.db, 0, quiet=True, read_only=True)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        url = f"http://127.0.0.1:{srv.server_address[1]}/api/"
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        got = opener.open(urllib.request.Request(url + "overview", headers={"X-Ledger-Token": key}))
+        self.assertEqual(got.status, 200)
+        post = urllib.request.Request(url + "gates/G-0001/answer", data=b"{}", method="POST",
+                                      headers={"X-Ledger-Token": key, "Content-Type": "application/json"})
+        with self.assertRaises(urllib.error.HTTPError) as e:
+            opener.open(post)
+        self.assertEqual(e.exception.code, 403)
+        self.assertIn("read-only", e.exception.read().decode())
+
+    def test_ui_targets_names(self):
+        mod = fixtures.load_ledger_module()
+        d = fixtures.temp_dir("w4-names-")
+        page = d / "page.html"
+        page.write_text("<h1>x</h1>")
+        on_http = mod._ui_targets(["#/issues", "#/inbox", "#/issue/ISS-0001", "#/", "#/issues?status=open&q=Secret"],
+                                  "http://127.0.0.1:8765")
+        self.assertEqual([n for n, _ in on_http], ["issues", "inbox", "issue-iss-0001", "home", "issues-status-q"])
+        self.assertEqual(on_http[0][1], "http://127.0.0.1:8765/#/issues")
+        self.assertEqual(mod._ui_targets(["#/issues"], "http://h:1/app/")[0][1], "http://h:1/app/#/issues")
+        on_file = mod._ui_targets(["#/issues", "#/inbox", "#/issue/ISS-0001", "#/"], str(page))
+        self.assertEqual([n for n, _ in on_file], ["issues", "inbox", "issue-iss-0001", "home"])
+        self.assertEqual(on_file[0][1], page.resolve().as_uri() + "#/issues")
+        (name, url), = mod._ui_targets([f"{page}#/issues"], None)
+        self.assertEqual(name, "issues")
+        self.assertTrue(url.startswith("file://"))
+        self.assertEqual(mod.urlsplit(url).fragment, "/issues")
+        self.assertEqual(mod._ui_targets([str(page)], None)[0][0], "page-html")
+        self.assertEqual([n for n, _ in mod._ui_targets(["http://a.example:3000/", "http://b.example/docs/start?x=1"],
+                                                        None)], ["home", "start"])
+        with self.assertRaises(mod.WriteError) as e:
+            mod._ui_targets([str(d / "missing.html") + "#/inbox"], None)
+        self.assertIn("hub.html#/inbox", str(e.exception))
+
 
 PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>Planted</title>
 <style>
@@ -213,6 +292,88 @@ class UiCommands(unittest.TestCase):
         text = L.run_ok("ui-audit", page, timeout=180).stdout
         self.assertIn("contrast", text)
         self.assertIn("rgb(187, 187, 187)", text)
+
+    def test_ui_capture_route_on_keyed_base(self):
+        # with no --base, ui-capture serves the ledger itself, keyed, and the page gets the key without the address
+        repo, L, _ = project(self)
+        p = L.run("ui-capture", "#/issues", "#/inbox", "--review", "R-0001", "--widths", "390", "--themes", "light",
+                  "--actor", "A-0001", timeout=180)
+        if p.returncode == 2:
+            browser.unavailable(p.stderr.strip())
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        folder = L.dir / "reviews" / "R-0001" / "ui"
+        self.assertEqual(sorted(f.name for f in folder.iterdir()), ["inbox-390-light.png", "issues-390-light.png"])
+        self.assertIn("issues-390-light.png: Issues", p.stdout)
+        self.assertIn("inbox-390-light.png: Waiting on you", p.stdout)
+        self.assertNotIn("could not be loaded", p.stdout)
+        self.assertNotIn("k=", p.stdout + p.stderr)
+        for f in folder.iterdir():
+            self.assertEqual(f.stat().st_mode & 0o777, 0o600, f.name)
+        self.assertNotEqual((folder / "issues-390-light.png").read_bytes(), (folder / "inbox-390-light.png").read_bytes())
+        p = L.run("ui-audit", "#/issues", "#/inbox", "--json", timeout=300)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        pages = json.loads(p.stdout)["pages"]
+        self.assertEqual({(x["page"], x["width"], x["theme"]) for x in pages},
+                         {(r, w, t) for r in ("#/issues", "#/inbox") for w in (390, 1280) for t in ("light", "dark")})
+        self.assertNotEqual([x["inventory"] for x in pages if x["page"] == "#/issues"],
+                            [x["inventory"] for x in pages if x["page"] == "#/inbox"])
+
+    def test_ui_capture_viewer_routes_show_data(self):
+        # a running viewer's key comes from LEDGER_VIEWER_KEY and goes into no output
+        repo, L, _ = project(self)
+        L.commit()
+        with fixtures.ServerThread(L) as srv:
+            env = fixtures.git_env({"LEDGER_VIEWER_KEY": srv.token})
+            p = L.run("ui-capture", "#/inbox", "#/issues", "--base", srv.url, "--review", "R-0001", "--widths", "390",
+                      "--themes", "light", "--actor", "A-0001", env=env, timeout=180)
+            if p.returncode == 2:
+                browser.unavailable(p.stderr.strip())
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            self.assertIn("inbox-390-light.png: Waiting on you", p.stdout)
+            self.assertNotIn(srv.token, p.stdout + p.stderr)
+            audit = L.run("ui-audit", "#/inbox", "--base", srv.url, "--json", env=env, timeout=300)
+        self.assertEqual(audit.returncode, 0, audit.stdout + audit.stderr)
+        self.assertNotIn(srv.token, audit.stdout + audit.stderr)
+        self.assertNotIn("k=", audit.stdout)
+        self.assertEqual(len(json.loads(audit.stdout)["pages"]), 4)
+        L.commit()
+        paths = [r["path"] for r in L.all("SELECT path FROM artifacts")]
+        self.assertEqual(sorted(Path(x).name for x in paths), ["inbox-390-light.png", "issues-390-light.png"])
+        self.assertFalse(any(srv.token in x or "k-" in Path(x).name for x in paths), paths)
+
+    def test_ui_capture_error_page_fails(self):
+        # a viewer whose key was not given draws its missing-key page: one line, exit 1, nothing kept or recorded
+        repo, L, _ = project(self)
+        L.commit()
+        with fixtures.ServerThread(L) as srv:
+            p = L.run("ui-capture", "#/issues", "--base", srv.url, "--review", "R-0001", "--widths", "390",
+                      "--themes", "light", "--actor", "A-0001", timeout=180)
+        if p.returncode == 2:
+            browser.unavailable(p.stderr.strip())
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertEqual(len(p.stderr.strip().split("\n")), 1, p.stderr)
+        self.assertIn("could not be loaded", p.stderr)
+        self.assertIn("LEDGER_VIEWER_KEY", p.stderr)
+        folder = L.dir / "reviews" / "R-0001" / "ui"
+        self.assertEqual(list(folder.iterdir()) if folder.exists() else [], [])
+        L.commit()
+        self.assertEqual(L.all("SELECT path FROM artifacts"), [])
+        for n in ("a", "b"):
+            (L.dir / f"{n}.html").write_text(PAGE, encoding="utf-8")
+        p = L.run("ui-capture", L.dir / "a.html", L.dir / "b.html", "--review", "R-0001", "--widths", "390",
+                  "--themes", "light", "--actor", "A-0001", timeout=180)
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertIn("same image", p.stderr)
+        self.assertEqual(list(folder.iterdir()) if folder.exists() else [], [])
+
+
+class TakeToken(browser.ViewerTestCase):
+    def test_take_token_accepts_slash(self):
+        page = self.new_page(token=None)
+        page.page.goto(self.server.url + "#k=" + self.server.token + "/#/inbox")
+        page.settle()
+        self.assertEqual(page.text("h1"), "Waiting on you")
+        self.assertEqual(page.js("location.hash"), "#/inbox")
 
 
 if __name__ == "__main__":
