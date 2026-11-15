@@ -262,6 +262,14 @@ the excerpt is read again from the same commit.
 ledger.py correct-location R-0002:SPEC-M1 --from src/requests.py:2-4#can_request --to src/requests.py:2-3#can_request --reason 'the limit is on lines 2-3' --actor A-0002
 ```
 
+### Correct a renamed file
+
+A recorded file has a new name or folder. Rename it first; the command checks the new path exists.
+
+```sh
+ledger.py correct-artifact 42 --path .code-review/reviews/R-0002/ui/issues-1280-light.png --reason 'the old name held the viewer key' --actor A-0002
+```
+
 ### Correct a review's check
 
 `supersede-check` replaces a check's outcome, evidence or the point it cites (`--finding none` for none); the

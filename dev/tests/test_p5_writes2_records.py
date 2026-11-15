@@ -256,3 +256,32 @@ class FixWritesTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CorrectArtifact(unittest.TestCase):
+    """correct-artifact points a recorded file at its new path (plan P-0002 step 334)."""
+
+    def test_correct_artifact(self):
+        repo, L, sha = project(self)
+        old = L.dir / "reviews" / "R-0001" / "127-0-0-1-k-secret-issues.png"
+        old.parent.mkdir(parents=True)
+        old.write_bytes(b"png")
+        ok(L, "add-artifact", "other", "--path", old, "--review", "R-0001")
+        aid = L.scalar("SELECT id FROM artifacts")
+        new = old.with_name("issues.png")
+        self.assertIn("--reason", refused(self, L, "correct-artifact", str(aid), "--path", new, "--actor", "A-0001"))
+        self.assertIn("no such file", refused(self, L, "correct-artifact", str(aid), "--path", new, "--reason",
+                                                "renamed", "--actor", "A-0001"))
+        old.rename(new)
+        self.assertIn("no artifact 99", refused(self, L, "correct-artifact", "99", "--path", new, "--reason", "x",
+                                                "--actor", "A-0001"))
+        ok(L, "correct-artifact", str(aid), "--path", new, "--reason", "the name held the viewer key",
+           "--actor", "A-0001")
+        self.assertEqual(L.scalar("SELECT path FROM artifacts"), ".code-review/reviews/R-0001/issues.png")
+        self.assertEqual(L.one("SELECT entity_type, event, from_value, to_value, note FROM events "
+                               "WHERE event='artifact-path-corrected'"),
+                         {"entity_type": "review", "event": "artifact-path-corrected",
+                          "from_value": ".code-review/reviews/R-0001/127-0-0-1-k-secret-issues.png",
+                          "to_value": ".code-review/reviews/R-0001/issues.png", "note": "the name held the viewer key"})
+        self.assertIn("already at", refused(self, L, "correct-artifact", str(aid), "--path", new, "--reason", "x",
+                                            "--actor", "A-0001"))

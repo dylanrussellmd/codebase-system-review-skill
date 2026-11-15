@@ -19,7 +19,7 @@ Reviews:      new-review, review-status, add-repo, add-actor, add-domain, review
               set-verdict, set-doc-url, add-requirement, add-metric, add-artifact, record-test-run, redact
 Points:       import-findings, import-checks, load-index, match, verify, report-finding, issue-status
 Corrections:  rematch, correct-location, supersede-check, correct-issue, withdraw-gate, reopen-gate, rename-guard,
-              drop-guard
+              drop-guard, correct-artifact
 Owner:        open-gate, answer-gate, apply-gate, interview-ask, interview-answer, propose-goal, approve-goals,
               reject-goal, link-step-goals
 Ideas:        propose-feature, feature-gate, feature-status, features
@@ -7653,6 +7653,27 @@ def cmd_add_artifact(ctx):
     return out
 
 
+@_command("correct-artifact", "point a recorded file at its new path after it was renamed or moved; logs an "
+                              "artifact-path-corrected event on its review or plan with who and why",
+          "ledger.py correct-artifact ID --path FILE --reason TEXT --actor A-0001")
+def cmd_correct_artifact(ctx):
+    a, con = ctx.a, ctx.con
+    reason, actor = _correction_context(ctx, a.reason)
+    art = one(con, "SELECT * FROM artifacts WHERE id=?", (a.artifact,))
+    if not art:
+        raise WriteError(f"no artifact {a.artifact}")
+    if not art["path"]:
+        raise WriteError(f"artifact {art['id']} is an address ({art['url']}), not a file")
+    path, sha = _ledger_file(ctx, _need(a.path, "--path (where the file is now)"), "the artifact", must_exist=True)
+    if path == art["path"]:
+        raise WriteError(f"artifact {art['id']} is already at {path}")
+    ctx.x("UPDATE artifacts SET path=?, sha256=? WHERE id=?", (path, sha, art["id"]))
+    entity, eid = ("review", art["review_id"]) if art["review_id"] else ("plan", art["plan_id"])
+    ctx.x("""INSERT INTO events(entity_type, entity_id, event, from_value, to_value, actor_id, note)
+             VALUES (?,?,?,?,?,?,?)""", (entity, eid, "artifact-path-corrected", art["path"], path, actor, reason))
+    return [f"artifact {art['id']}: {art['path']} -> {path}"]
+
+
 def cmd_tag_review_pushed(ctx):
     """tag-review R-0001 --pushed: record that the review's tags were pushed (after git push origin review/R-0001)."""
     con = ctx.con
@@ -8064,6 +8085,8 @@ def add_write_commands_131(p):
     s = p("add-artifact"); s.add_argument("kind", help=", ".join(ARTIFACT_KINDS))
     for o in ("--path", "--url", "--review", "--plan", "--run"):
         s.add_argument(o)
+    s = p("correct-artifact"); s.add_argument("artifact", type=int, help="the artifact's id")
+    s.add_argument("--path", help="where the file is now, in the ledger's folder"); s.add_argument("--reason")
     s = p("redact"); s.add_argument("field", help="TABLE.COLUMN, e.g. findings.summary")
     s.add_argument("row", help="a row id, a code (ISS-0001), or R-0001:SEC-H1 for a finding")
     s.add_argument("--reason"); s.add_argument("--only", help="redact only this part of the text (the secret)")
